@@ -1,0 +1,10 @@
+# Add real funding links before enabling the sponsor button in repository settings.
+# GitHub supports up to four custom URLs in this file.
+#
+# Example:
+# custom:
+#   - "https://openmesh.net/donate"
+#   - "https://github.com/sponsors/YOUR_ACCOUNT"
+
+custom: []
+

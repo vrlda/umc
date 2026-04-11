@@ -1,0 +1,26 @@
+name: openmesh_desktop
+description: Desktop tray controller for the OpenMesh daemon.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.3
+
+dependencies:
+  flutter:
+    sdk: flutter
+  crypto: ^3.0.6
+  path: ^1.9.1
+  tray_manager: ^0.5.2
+  window_manager: ^0.5.1
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/tray/openmesh.png
+    - assets/tray/openmesh.ico
