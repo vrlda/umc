@@ -1,0 +1,10 @@
+# Populate this file with real GitHub usernames or teams before enabling
+# required CODEOWNERS review in repository rulesets.
+#
+# Examples:
+# * @openmesh/maintainers
+# /core/ @openmesh/core
+# /mobile/ @openmesh/mobile
+# /desktop/ @openmesh/desktop
+# /docs/ @openmesh/docs
+
