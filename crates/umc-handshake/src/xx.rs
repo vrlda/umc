@@ -621,6 +621,80 @@ pub fn run_xx_handshake(
     Ok((client_secrets, server_secrets))
 }
 
+/// Client-side continuation of the XX handshake given a received
+/// `SERVER_HELLO` (handshake.md §14-18). The client has already sent
+/// `client_hello`; the transcript covers `CLIENT_HELLO` and `SERVER_HELLO` as
+/// the driver does. Returns `(client_session_secrets, client_finished_key)`.
+/// The `CLIENT_AUTH`/`SERVER_FINISHED` continuation arrives with the daemon
+/// loop.
+///
+/// # Errors
+///
+/// Returns a message describing the first failed protocol invariant: a
+/// `CLIENT_HELLO`/`SERVER_HELLO` encoding failure, a failed AEAD open of the
+/// server-auth block, or a truncated auth plaintext.
+// The DH variable names follow handshake.md §14-18 (DH_ee, DH_es, DH_se,
+// DH_ss) as in the deterministic driver.
+#[allow(clippy::similar_names)]
+pub fn complete_client_side(
+    client_identity: &IdentityKeyPair,
+    client_static: &StaticHandshakeKeyPair,
+    client_ephemeral: &StaticHandshakeKeyPair,
+    client_hello: &ClientHello,
+    server_hello: &ServerHello,
+    entropy: &dyn EntropySource,
+    carrier_binding: &[u8],
+) -> Result<(SessionSecrets, [u8; 32]), String> {
+    let _ = client_identity;
+    let _ = entropy;
+    // Transcript through CLIENT_HELLO; SERVER_HELLO fields are the preceding
+    // unencrypted fields for the auth-block AAD (handshake.md §16.1).
+    let mut transcript = Transcript::new(MODE_XX, CRYPTO_PROFILE, carrier_binding);
+    transcript
+        .update_message(
+            crate::encoding::CLIENT_HELLO,
+            &client_hello.encode().map_err(|e| format!("{e:?}"))?,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+    let server_auth_transcript = transcript.hash;
+
+    let dh_ee = client_ephemeral.diffie_hellman(&StaticHandshakePublicKey(
+        server_hello.server_ephemeral_public_key,
+    ));
+    let extract1 = umc_crypto::hkdf::extract(&[0u8; 32], &dh_ee);
+    let server_block = decrypt_server_auth(
+        &extract1,
+        &server_auth_transcript,
+        &server_hello.encrypted_server_authentication,
+        &server_hello.server_ephemeral_public_key,
+        &server_hello.server_random,
+        &server_hello.selected_crypto_profile,
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    let server_static_pub = StaticHandshakePublicKey(server_block.server_static_public_key);
+
+    // Append SERVER_HELLO to the transcript (decrypt used the pre-append hash).
+    transcript
+        .update_message(
+            crate::encoding::SERVER_HELLO,
+            &server_hello.encode().map_err(|e| format!("{e:?}"))?,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+
+    let dh_es = client_ephemeral.diffie_hellman(&server_static_pub);
+    let secret2 = umc_crypto::hkdf::extract(&extract1, &dh_es);
+    let dh_se = client_static.diffie_hellman(&StaticHandshakePublicKey(
+        server_hello.server_ephemeral_public_key,
+    ));
+    let secret3 = umc_crypto::hkdf::extract(&secret2, &dh_se);
+    let dh_ss = client_static.diffie_hellman(&server_static_pub);
+    let secret4 = umc_crypto::hkdf::extract(&secret3, &dh_ss);
+
+    let client_finished_key = finished_key(&secret4, b"client finished", &transcript.hash);
+    let client_secrets = crate::traffic::derive_session_secrets(&secret4, &transcript.hash);
+    Ok((client_secrets, client_finished_key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
