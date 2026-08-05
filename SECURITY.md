@@ -1,56 +1,68 @@
 # Security Policy
 
-## Supported versions
+**Universal Mesh Core (UMC) / Universal Mesh Protocol (UMP)**
 
-| Version | Supported |
-| --- | --- |
-| `main` | Yes |
-| Latest maintained release line | Yes |
-| Older release lines | No |
-
-Security fixes land on `main` first and may be backported to maintained release
-lines when practical.
-
-OpenMesh treats privacy, traffic-analysis resistance, operator safety, and
-censorship resistance as core security concerns.
+This file is the public entry point for security reporting and handling. The full process, authority, timelines, and procedures are defined in [spec/security-operations.md](spec/security-operations.md).
 
 ## Reporting a vulnerability
 
-Please do not report vulnerabilities in public issues, discussions, commits,
-or pull requests.
+Do NOT open a public issue for security vulnerabilities.
 
-Preferred path:
+Report privately to the security team:
 
-1. Use GitHub Private Vulnerability Reporting on the repository's Security tab.
+- **Contact:** security@example.invalid (replace with the published address before launch)
+- **Signing:** reports containing sensitive detail SHOULD be signed with the published security key
+- **Response target:** acknowledgment within 3 business days; severity assessment within 7 days
 
-Fallback path if private reporting is not yet enabled:
+Include:
 
-1. Contact the maintainers through a private channel listed in the repository
-   profile or project website.
-2. Share only the minimum details needed to reproduce and triage the issue.
+```text
+Affected component and version
+Vulnerability description
+Reproduction steps
+Impact assessment
+Suggested fix if known
+Disclosure constraints
+```
 
-Include the following when possible:
+## Handling
 
-- affected area or component
-- impact and attack scenario
-- reproduction steps or proof of concept
-- any logs or traces with secrets and personal data removed
-- whether the issue could affect privacy, traffic analysis resistance,
-  operator safety, or censorship resistance
+The security team triages reports using the severity classes in the threat model:
 
-## What to expect
+| Severity | Meaning |
+| --- | --- |
+| `CRITICAL` | Key or release compromise, remote code execution, cross-endpoint plaintext |
+| `HIGH` | Impersonation, session compromise, persistent isolation, major denial of service |
+| `MEDIUM` | Scoped metadata disclosure, route manipulation, bounded denial of service |
+| `LOW` | Minor fingerprinting or local degradation |
 
-- Initial acknowledgment target: within 72 hours
-- Initial triage target: within 7 days
-- Coordinated disclosure preferred after a fix or mitigation is available
+Coordinated disclosure is the default (90-day embargo from confirmation). Actively exploited critical issues are disclosed earlier.
 
-## Scope examples
+## Supported versions
 
-Examples of issues we especially want reported privately:
+Security fixes are supported for Tier-1 platforms:
 
-- deanonymization or traffic-correlation weaknesses
-- transport fingerprinting or active-probe bypasses
-- key handling or identity compromise
-- relay, exit, or policy bypass issues
-- logging, data retention, or metadata leaks
-- mobile or desktop privilege misuse
+```text
+Linux x86_64
+Linux aarch64
+macOS arm64
+Windows x86_64
+```
+
+Tier-2 fixes are best-effort. Nightly and beta releases receive no security-support commitment.
+
+## Verification
+
+Releases are published with:
+
+- Threshold maintainer signatures on release manifests
+- Sigstore-compatible provenance
+- SHA256SUMS and SBOM
+
+Verify artifacts before installation. Revocation data is distributed through multiple channels.
+
+## Related documents
+
+- Threat model: [spec/threat-model.md](spec/threat-model.md)
+- Security operations: [spec/security-operations.md](spec/security-operations.md)
+- Release signing and governance: [spec/decisions.md](spec/decisions.md)

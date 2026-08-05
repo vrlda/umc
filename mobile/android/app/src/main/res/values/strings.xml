@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <string name="app_name">OpenMesh</string>
-    <string name="openmesh_notification_title">OpenMesh active</string>
-    <string name="openmesh_notification_text">Traffic is routed through OpenMesh.</string>
-    <string name="openmesh_notification_channel_name">OpenMesh VPN</string>
-    <string name="openmesh_notification_channel_description">Foreground notification for the OpenMesh VPN service.</string>
-</resources>
