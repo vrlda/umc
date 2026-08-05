@@ -4,6 +4,7 @@ members = [
     "crates/umc-types",
     "crates/umc-wire",
     "crates/umc-crypto",
+    "crates/umc-handshake",
 ]
 
 [workspace.package]
