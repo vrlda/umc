@@ -55,6 +55,10 @@ pub enum Frame {
     RelayStatus(crate::frames::relay::RelayStatusFrame),
     RelayData(crate::frames::relay::RelayDataFrame),
     RelayClose(crate::frames::relay::RelayCloseFrame),
+    Bundle(crate::frames::bundle::BundleFrame),
+    BundleAck(crate::frames::bundle::BundleAckFrame),
+    PeerHint(crate::frames::misc::PeerHintFrame),
+    ServiceHint(crate::frames::misc::ServiceHintFrame),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +266,10 @@ pub fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, FrameError> {
                     FrameType::RELAY_STATUS => { let (f, used) = crate::frames::relay::RelayStatusFrame::decode(rest)?; pos += used; out.push(Frame::RelayStatus(f)); }
                     FrameType::RELAY_DATA => { let (f, used) = crate::frames::relay::RelayDataFrame::decode(rest)?; pos += used; out.push(Frame::RelayData(f)); }
                     FrameType::RELAY_CLOSE => { let (f, used) = crate::frames::relay::RelayCloseFrame::decode(rest)?; pos += used; out.push(Frame::RelayClose(f)); }
+                    FrameType::BUNDLE => { let (f, used) = crate::frames::bundle::BundleFrame::decode(rest)?; pos += used; out.push(Frame::Bundle(f)); }
+                    FrameType::BUNDLE_ACK => { let (f, used) = crate::frames::bundle::BundleAckFrame::decode(rest)?; pos += used; out.push(Frame::BundleAck(f)); }
+                    FrameType::PEER_HINT => { let (f, used) = crate::frames::misc::PeerHintFrame::decode(rest)?; pos += used; out.push(Frame::PeerHint(f)); }
+                    FrameType::SERVICE_HINT => { let (f, used) = crate::frames::misc::ServiceHintFrame::decode(rest)?; pos += used; out.push(Frame::ServiceHint(f)); }
                     _ if ty.behavior() == ExtensionBehavior::OptionalFixed => {
                         return Err(FrameError::UnknownOptionalFixedFrame(ty));
                     }
