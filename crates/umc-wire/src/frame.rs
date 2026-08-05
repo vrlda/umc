@@ -30,6 +30,9 @@ pub enum Frame {
     Ping,
     Ack(AckFrame),
     ConnectionClose(ConnectionCloseFrame),
+    Stream(crate::frames::stream::StreamFrame),
+    ResetStream(crate::frames::stream::ResetStreamFrame),
+    StopSending(crate::frames::stream::StopSendingFrame),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +186,21 @@ pub fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, FrameError> {
                         let (f, used) = ConnectionCloseFrame::decode(rest)?;
                         pos += used;
                         out.push(Frame::ConnectionClose(f));
+                    }
+                    FrameType::STREAM => {
+                        let (f, used) = crate::frames::stream::StreamFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::Stream(f));
+                    }
+                    FrameType::RESET_STREAM => {
+                        let (f, used) = crate::frames::stream::ResetStreamFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::ResetStream(f));
+                    }
+                    FrameType::STOP_SENDING => {
+                        let (f, used) = crate::frames::stream::StopSendingFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::StopSending(f));
                     }
                     _ if ty.behavior() == ExtensionBehavior::OptionalFixed => {
                         return Err(FrameError::UnknownOptionalFixedFrame(ty));
