@@ -34,6 +34,19 @@ pub fn encode_message(
     Ok(())
 }
 
+/// Encoded length of one message (type varint + len varint + body).
+///
+/// # Errors
+///
+/// Returns `EncodeError::MessageTooLarge` if the body exceeds
+/// [`MAX_HANDSHAKE_MESSAGE`], or `EncodeError::Varint` if the message type
+/// does not fit a varint.
+pub fn message_encoded_len(message_type: u64, body: &[u8]) -> Result<usize, EncodeError> {
+    let mut scratch = Vec::new();
+    encode_message(&mut scratch, message_type, body)?;
+    Ok(scratch.len())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodeError {
     MessageTooLarge,
