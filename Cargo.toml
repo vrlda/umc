@@ -9,6 +9,7 @@ members = [
     "crates/umc-session",
     "crates/umc-carrier",
     "crates/umc-core",
+    "crates/umc-storage",
     "carriers/umc-carrier-tcp",
     "carriers/umc-carrier-udp",
     "examples/echo",
