@@ -17,7 +17,7 @@ Specifications are licensed under Creative Commons Attribution 4.0 International
 ## Status
 
 - [x] Phase 0: foundations — workspace, wire parser, vectors, fuzzing, CI
-- [ ] Phase 1: secure direct communication
+- [x] Phase 1: secure direct communication — crypto, handshake, session, TCP/UDP, echo
 - [ ] Phase 2: node runtime
 - [ ] Phase 3: routing and relaying
 - [ ] Phase 4: mobility
