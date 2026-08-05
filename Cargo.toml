@@ -10,6 +10,7 @@ members = [
     "crates/umc-core",
     "carriers/umc-carrier-tcp",
     "carriers/umc-carrier-udp",
+    "examples/echo",
 ]
 
 [workspace.package]

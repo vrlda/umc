@@ -1,0 +1,26 @@
+[package]
+name = "umc-echo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "umc-echo-server"
+path = "src/server.rs"
+
+[[bin]]
+name = "umc-echo-client"
+path = "src/client.rs"
+
+[dependencies]
+umc-types = { path = "../../crates/umc-types" }
+umc-carrier = { path = "../../crates/umc-carrier" }
+umc-carrier-tcp = { path = "../../carriers/umc-carrier-tcp" }
+umc-carrier-udp = { path = "../../carriers/umc-carrier-udp" }
+umc-core = { path = "../../crates/umc-core" }
+rand_core = { version = "0.6", features = ["getrandom"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+
+[lints]
+workspace = true
