@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/umc-types",
     "crates/umc-wire",
+    "crates/umc-crypto",
 ]
 
 [workspace.package]
