@@ -48,6 +48,13 @@ pub enum Frame {
     HandshakeData(crate::frames::handshake::HandshakeDataFrame),
     Capabilities(crate::frames::handshake::CapabilitiesFrame),
     SessionTicket(crate::frames::handshake::SessionTicketFrame),
+    RouteRequest(crate::frames::routing::RouteRequestFrame),
+    RouteResponse(crate::frames::routing::RouteResponseFrame),
+    RouteError(crate::frames::routing::RouteErrorFrame),
+    RelayOpen(crate::frames::relay::RelayOpenFrame),
+    RelayStatus(crate::frames::relay::RelayStatusFrame),
+    RelayData(crate::frames::relay::RelayDataFrame),
+    RelayClose(crate::frames::relay::RelayCloseFrame),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,6 +255,13 @@ pub fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, FrameError> {
                     FrameType::HANDSHAKE_DATA => { let (f, used) = crate::frames::handshake::HandshakeDataFrame::decode(rest)?; pos += used; out.push(Frame::HandshakeData(f)); }
                     FrameType::CAPABILITIES => { let (f, used) = crate::frames::handshake::CapabilitiesFrame::decode(rest)?; pos += used; out.push(Frame::Capabilities(f)); }
                     FrameType::SESSION_TICKET => { let (f, used) = crate::frames::handshake::SessionTicketFrame::decode(rest)?; pos += used; out.push(Frame::SessionTicket(f)); }
+                    FrameType::ROUTE_REQUEST => { let (f, used) = crate::frames::routing::RouteRequestFrame::decode(rest)?; pos += used; out.push(Frame::RouteRequest(f)); }
+                    FrameType::ROUTE_RESPONSE => { let (f, used) = crate::frames::routing::RouteResponseFrame::decode(rest)?; pos += used; out.push(Frame::RouteResponse(f)); }
+                    FrameType::ROUTE_ERROR => { let (f, used) = crate::frames::routing::RouteErrorFrame::decode(rest)?; pos += used; out.push(Frame::RouteError(f)); }
+                    FrameType::RELAY_OPEN => { let (f, used) = crate::frames::relay::RelayOpenFrame::decode(rest)?; pos += used; out.push(Frame::RelayOpen(f)); }
+                    FrameType::RELAY_STATUS => { let (f, used) = crate::frames::relay::RelayStatusFrame::decode(rest)?; pos += used; out.push(Frame::RelayStatus(f)); }
+                    FrameType::RELAY_DATA => { let (f, used) = crate::frames::relay::RelayDataFrame::decode(rest)?; pos += used; out.push(Frame::RelayData(f)); }
+                    FrameType::RELAY_CLOSE => { let (f, used) = crate::frames::relay::RelayCloseFrame::decode(rest)?; pos += used; out.push(Frame::RelayClose(f)); }
                     _ if ty.behavior() == ExtensionBehavior::OptionalFixed => {
                         return Err(FrameError::UnknownOptionalFixedFrame(ty));
                     }
