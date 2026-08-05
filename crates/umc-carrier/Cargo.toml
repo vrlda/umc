@@ -1,0 +1,11 @@
+[package]
+name = "umc-carrier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+umc-types = { path = "../umc-types" }
+
+[lints]
+workspace = true
