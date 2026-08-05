@@ -1,0 +1,16 @@
+[package]
+name = "umc-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+prost = "0.13"
+umc-types = { path = "../umc-types" }
+
+[build-dependencies]
+prost-build = "0.13"
+
+[lints]
+workspace = true
