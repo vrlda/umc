@@ -1,0 +1,21 @@
+[package]
+name = "phase1-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+umc-types = { path = "../../crates/umc-types" }
+umc-wire = { path = "../../crates/umc-wire" }
+umc-crypto = { path = "../../crates/umc-crypto" }
+umc-handshake = { path = "../../crates/umc-handshake" }
+umc-session = { path = "../../crates/umc-session" }
+umc-carrier = { path = "../../crates/umc-carrier" }
+umc-carrier-tcp = { path = "../../carriers/umc-carrier-tcp" }
+umc-carrier-udp = { path = "../../carriers/umc-carrier-udp" }
+umc-core = { path = "../../crates/umc-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+
+[lints]
+workspace = true

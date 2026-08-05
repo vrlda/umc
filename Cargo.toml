@@ -11,6 +11,7 @@ members = [
     "carriers/umc-carrier-tcp",
     "carriers/umc-carrier-udp",
     "examples/echo",
+    "tests/phase1",
 ]
 
 [workspace.package]
