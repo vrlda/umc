@@ -1,0 +1,13 @@
+[package]
+name = "umc-carrier-udp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+umc-types = { path = "../../crates/umc-types" }
+umc-carrier = { path = "../../crates/umc-carrier" }
+tokio = { version = "1", features = ["rt", "net", "sync", "rt-multi-thread"] }
+
+[lints]
+workspace = true
