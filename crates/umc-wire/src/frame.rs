@@ -37,6 +37,13 @@ pub enum Frame {
     MaxStreamData(crate::frames::flow::MaxStreamDataFrame),
     MaxStreams(crate::frames::flow::MaxStreamsFrame),
     Datagram(crate::frames::datagram::DatagramFrame),
+    NewConnectionId(crate::frames::path::NewConnectionIdFrame),
+    RetireConnectionId(crate::frames::path::RetireConnectionIdFrame),
+    PathChallenge(crate::frames::path::PathChallengeFrame),
+    PathResponse(crate::frames::path::PathResponseFrame),
+    PathStatus(crate::frames::path::PathStatusFrame),
+    Migrate(crate::frames::path::MigrateFrame),
+    KeyUpdate(crate::frames::path::KeyUpdateFrame),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +233,13 @@ pub fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, FrameError> {
                         pos += used;
                         out.push(Frame::Datagram(f));
                     }
+                    FrameType::NEW_CONNECTION_ID => { let (f, used) = crate::frames::path::NewConnectionIdFrame::decode(rest)?; pos += used; out.push(Frame::NewConnectionId(f)); }
+                    FrameType::RETIRE_CONNECTION_ID => { let (f, used) = crate::frames::path::RetireConnectionIdFrame::decode(rest)?; pos += used; out.push(Frame::RetireConnectionId(f)); }
+                    FrameType::PATH_CHALLENGE => { let (f, used) = crate::frames::path::PathChallengeFrame::decode(rest)?; pos += used; out.push(Frame::PathChallenge(f)); }
+                    FrameType::PATH_RESPONSE => { let (f, used) = crate::frames::path::PathResponseFrame::decode(rest)?; pos += used; out.push(Frame::PathResponse(f)); }
+                    FrameType::PATH_STATUS => { let (f, used) = crate::frames::path::PathStatusFrame::decode(rest)?; pos += used; out.push(Frame::PathStatus(f)); }
+                    FrameType::MIGRATE => { let (f, used) = crate::frames::path::MigrateFrame::decode(rest)?; pos += used; out.push(Frame::Migrate(f)); }
+                    FrameType::KEY_UPDATE => { let (f, used) = crate::frames::path::KeyUpdateFrame::decode(rest)?; pos += used; out.push(Frame::KeyUpdate(f)); }
                     _ if ty.behavior() == ExtensionBehavior::OptionalFixed => {
                         return Err(FrameError::UnknownOptionalFixedFrame(ty));
                     }
