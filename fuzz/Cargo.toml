@@ -1,0 +1,19 @@
+[package]
+name = "umc-wire-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+umc-wire = { path = "../crates/umc-wire" }
+
+[[bin]]
+name = "wire_parser"
+path = "fuzz_targets/wire_parser.rs"
+test = false
+doc = false
+bench = false
