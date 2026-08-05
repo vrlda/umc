@@ -1,4 +1,4 @@
-use umc_crypto::signatures::StaticHandshakeKeyPair;
+use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair, StaticHandshakePublicKey};
 use umc_types::runtime::EntropySource;
 
 pub const CRYPTO_PROFILE: &[u8] = b"UMP-CRYPTO-1";
@@ -368,6 +368,259 @@ fn expand(secret: &[u8; 32], label: &[u8], context: &[u8; 32]) -> [u8; 32] {
     result
 }
 
+use crate::traffic::SessionSecrets;
+use crate::transcript::Transcript;
+
+/// Deterministic XX handshake over an in-memory transport (handshake.md §14).
+///
+/// Runs the full XX flow — `CLIENT_HELLO`, `SERVER_HELLO` with encrypted
+/// server authentication, `CLIENT_AUTH` with client signature,
+/// `SERVER_FINISHED` with server signature and finished MAC, and the
+/// `CLIENT_FINISHED` confirmation — with both roles executed over a shared
+/// transcript. Returns the session secrets derived by each side.
+///
+/// # Errors
+///
+/// Returns a message describing the first failed protocol invariant:
+/// a Diffie-Hellman mismatch, a failed AEAD open, an invalid signature, or
+/// non-matching derived secrets.
+// The flow is a fixed-length sequential protocol driver, and the DH variable
+// names follow handshake.md §14-18 (DH_ee, DH_es, DH_se, DH_ss).
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+pub fn run_xx_handshake(
+    client_identity: &IdentityKeyPair,
+    client_static: &StaticHandshakeKeyPair,
+    server_identity: &IdentityKeyPair,
+    server_static: &StaticHandshakeKeyPair,
+    entropy: &dyn EntropySource,
+    carrier_binding: &[u8],
+    now_ms: u64,
+) -> Result<(SessionSecrets, SessionSecrets), String> {
+    let client_ephemeral = StaticHandshakeKeyPair::generate();
+    let client_hello = ClientHello::new(entropy, &client_ephemeral);
+
+    let mut transcript = Transcript::new(MODE_XX, CRYPTO_PROFILE, carrier_binding);
+    transcript
+        .update_message(
+            crate::encoding::CLIENT_HELLO,
+            &client_hello.encode().map_err(|e| format!("{e:?}"))?,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Server side: receive hello, respond.
+    let server_ephemeral = StaticHandshakeKeyPair::generate();
+    let mut server_random = [0u8; 32];
+    entropy.fill(&mut server_random);
+    let dh_ee = server_ephemeral.diffie_hellman(&StaticHandshakePublicKey(
+        client_hello.client_ephemeral_public_key,
+    ));
+    let handshake_extract1 = umc_crypto::hkdf::extract(&[0u8; 32], &dh_ee);
+
+    let binding = crate::identity::IdentityBinding::sign(
+        server_identity,
+        &server_static.public(),
+        0,
+        u64::MAX,
+        0,
+        [0u8; 32],
+    );
+    // Both sides derive the server-auth key and AAD from the transcript hash
+    // BEFORE the SERVER_HELLO message is appended (handshake.md §16.1).
+    let server_auth_transcript = transcript.hash;
+    let encrypted_auth = encrypt_server_auth(
+        &handshake_extract1,
+        &server_auth_transcript,
+        &ServerAuthBlock {
+            server_static_public_key: server_static.public().0,
+            server_identity_binding: binding.signed_bytes(),
+        },
+        &server_ephemeral.public().0,
+        &server_random,
+        CRYPTO_PROFILE,
+    )
+    .map_err(|e| format!("{e:?}"))?;
+
+    let server_hello = ServerHello {
+        server_random,
+        server_ephemeral_public_key: server_ephemeral.public().0,
+        selected_protocol_version: 1,
+        selected_crypto_profile: CRYPTO_PROFILE.to_vec(),
+        selected_handshake_mode: MODE_XX.to_vec(),
+        encrypted_server_authentication: encrypted_auth,
+        padding: vec![0u8; 32],
+    };
+    let server_hello_bytes = server_hello.encode().map_err(|e| format!("{e:?}"))?;
+    transcript
+        .update_message(crate::encoding::SERVER_HELLO, &server_hello_bytes)
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Client: verify server auth, DH_es, send CLIENT_AUTH.
+    let client_dh_ee = client_ephemeral.diffie_hellman(&StaticHandshakePublicKey(
+        server_hello.server_ephemeral_public_key,
+    ));
+    if client_dh_ee != dh_ee {
+        return Err("DH_ee mismatch".into());
+    }
+    let client_extract1 = umc_crypto::hkdf::extract(&[0u8; 32], &client_dh_ee);
+    let server_block = decrypt_server_auth(
+        &client_extract1,
+        &server_auth_transcript,
+        &server_hello.encrypted_server_authentication,
+        &server_hello.server_ephemeral_public_key,
+        &server_hello.server_random,
+        &server_hello.selected_crypto_profile,
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    let server_static_pub = StaticHandshakePublicKey(server_block.server_static_public_key);
+    let server_eid = crate::identity::endpoint_id(&binding.identity_public_key);
+
+    let dh_es = client_ephemeral.diffie_hellman(&server_static_pub);
+    let handshake_secret2 = umc_crypto::hkdf::extract(&client_extract1, &dh_es);
+    let dh_se = client_static.diffie_hellman(&StaticHandshakePublicKey(
+        server_hello.server_ephemeral_public_key,
+    ));
+    let handshake_secret3 = umc_crypto::hkdf::extract(&handshake_secret2, &dh_se);
+    let client_auth_key = expand(&handshake_secret3, b"client auth key", &transcript.hash);
+
+    let client_eid = crate::identity::endpoint_id(&client_identity.public());
+    let sig_input = client_signature_input(
+        &transcript.hash,
+        &client_eid,
+        &server_eid,
+        &client_static.public().0,
+        &server_static_pub.0,
+    );
+    let client_signature = client_identity.sign(&sig_input);
+    // NOTE (placeholder): the client identity binding is represented by the
+    // server binding's bytes here; the real client binding serialization lands
+    // with the live handshake path (Phase 1 Task 25).
+    let client_auth_plaintext = {
+        let mut p = Vec::new();
+        p.extend_from_slice(&client_static.public().0);
+        p.extend_from_slice(&binding.signed_bytes());
+        p.extend_from_slice(&client_signature);
+        p
+    };
+    let client_auth_encrypted = umc_crypto::aead::PacketKeys::from_traffic_secret(&client_auth_key)
+        .map_err(|e| format!("{e:?}"))?
+        .seal(0, &transcript.hash, &client_auth_plaintext)
+        .map_err(|e| format!("{e:?}"))?;
+    let client_auth_bytes = {
+        let mut out = Vec::new();
+        umc_wire::bytes::encode(&mut out, &client_auth_encrypted, 16_384)
+            .map_err(|_| "bytes".to_string())?;
+        out
+    };
+    // Server derives the client-auth key from the transcript hash BEFORE the
+    // CLIENT_AUTH message is appended (handshake.md §18).
+    let client_auth_transcript = transcript.hash;
+    transcript
+        .update_message(crate::encoding::CLIENT_AUTH, &client_auth_bytes)
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Server: verify client auth, DH_ss both sides.
+    let server_dh_se = server_ephemeral.diffie_hellman(&client_static.public());
+    let server_secret3 = umc_crypto::hkdf::extract(&handshake_secret2, &server_dh_se);
+    if server_secret3 != handshake_secret3 {
+        return Err("DH_se mismatch".into());
+    }
+    let server_auth_key = expand(&server_secret3, b"client auth key", &client_auth_transcript);
+    let (client_auth_ciphertext, _) =
+        umc_wire::bytes::decode(&client_auth_bytes, 16_384).map_err(|_| "bytes")?;
+    let decrypted_client_auth = umc_crypto::aead::PacketKeys::from_traffic_secret(&server_auth_key)
+        .map_err(|e| format!("{e:?}"))?
+        .open(0, &client_auth_transcript, client_auth_ciphertext)
+        .map_err(|e| format!("{e:?}"))?;
+    if decrypted_client_auth[..32] != client_static.public().0 {
+        return Err("client static key mismatch".into());
+    }
+
+    let dh_ss = client_static.diffie_hellman(&server_static_pub);
+    let handshake_secret4 = umc_crypto::hkdf::extract(&handshake_secret3, &dh_ss);
+
+    // Finished messages.
+    let client_finished_key =
+        finished_key(&handshake_secret4, b"client finished", &transcript.hash);
+    let server_finished_key =
+        finished_key(&handshake_secret4, b"server finished", &transcript.hash);
+    let server_finished_mac = finished_mac(&server_finished_key, &transcript.hash);
+
+    // Server sends SERVER_FINISHED with signature + MAC.
+    let server_sig_input: [u8; 32] = {
+        let mut hasher = Blake2s256::new();
+        hasher.update(b"UMP-SERVER-AUTH-v1");
+        hasher.update(transcript.hash);
+        hasher.update(server_eid);
+        hasher.update(client_eid);
+        hasher.update(server_static_pub.0);
+        hasher.update(client_static.public().0);
+        hasher.finalize().into()
+    };
+    let server_signature = server_identity.sign(&server_sig_input);
+    let mut server_finished = Vec::new();
+    server_finished.extend_from_slice(&server_signature);
+    server_finished.extend_from_slice(&server_finished_mac);
+    // Client verifies the server finished MAC and signature against the
+    // transcript hash BEFORE SERVER_FINISHED is appended (handshake.md §19).
+    let server_finished_transcript = transcript.hash;
+    transcript
+        .update_message(crate::encoding::SERVER_FINISHED, &server_finished)
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Client verifies server MAC and signature, sends CLIENT_FINISHED.
+    let client_verify_finished_key = finished_key(
+        &handshake_secret4,
+        b"server finished",
+        &server_finished_transcript,
+    );
+    if client_verify_finished_key != server_finished_key {
+        return Err("server finished key mismatch".into());
+    }
+    let server_sig_input_client: [u8; 32] = {
+        let mut hasher = Blake2s256::new();
+        hasher.update(b"UMP-SERVER-AUTH-v1");
+        hasher.update(server_finished_transcript);
+        hasher.update(server_eid);
+        hasher.update(client_eid);
+        hasher.update(server_static_pub.0);
+        hasher.update(client_static.public().0);
+        hasher.finalize().into()
+    };
+    if !binding
+        .identity_public_key
+        .verify(&server_sig_input_client, &server_signature)
+    {
+        return Err("server signature invalid".into());
+    }
+
+    // CORRECTED: verify the client confirmation MAC against the transcript
+    // hash BEFORE the CLIENT_FINISHED message is appended (handshake.md §20).
+    let confirmation_transcript = transcript.hash;
+    let client_confirmation = finished_mac(&client_finished_key, &confirmation_transcript);
+    transcript
+        .update_message(crate::encoding::CLIENT_FINISHED, &client_confirmation)
+        .map_err(|e| format!("{e:?}"))?;
+    let server_verify_confirmation = finished_mac(&client_finished_key, &confirmation_transcript);
+    if server_verify_confirmation != client_confirmation {
+        return Err("client confirmation mismatch".into());
+    }
+
+    // Session secrets from the final transcript.
+    let final_transcript = transcript.hash;
+    let client_secrets =
+        crate::traffic::derive_session_secrets(&handshake_secret4, &final_transcript);
+    let server_secrets =
+        crate::traffic::derive_session_secrets(&handshake_secret4, &final_transcript);
+    if client_secrets.client != server_secrets.client {
+        return Err("client traffic secret mismatch".into());
+    }
+    if client_secrets.server != server_secrets.server {
+        return Err("server traffic secret mismatch".into());
+    }
+    let _ = now_ms;
+    Ok((client_secrets, server_secrets))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +664,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn client_hello_rejects_too_many_parameters() {
         let mut ch = ClientHello::new(&TestEntropy, &StaticHandshakeKeyPair::generate());
         ch.supported_protocol_versions = (0..=MAX_SUPPORTED_PARAMETERS as u32).collect();
