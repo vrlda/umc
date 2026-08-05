@@ -206,6 +206,7 @@ impl ConnectionCloseFrame {
 /// `UnknownOptionalFixedFrame` for unrecognized optional fixed frames,
 /// `UnsupportedLengthDelimited` for length-delimited frames, and the frame
 /// body's decode error for malformed or truncated frames.
+#[allow(clippy::too_many_lines)]
 pub fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, FrameError> {
     let mut out = Vec::new();
     let mut pos = 0usize;
