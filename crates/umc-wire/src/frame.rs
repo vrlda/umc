@@ -33,6 +33,10 @@ pub enum Frame {
     Stream(crate::frames::stream::StreamFrame),
     ResetStream(crate::frames::stream::ResetStreamFrame),
     StopSending(crate::frames::stream::StopSendingFrame),
+    MaxData(crate::frames::flow::MaxDataFrame),
+    MaxStreamData(crate::frames::flow::MaxStreamDataFrame),
+    MaxStreams(crate::frames::flow::MaxStreamsFrame),
+    Datagram(crate::frames::datagram::DatagramFrame),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +205,26 @@ pub fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, FrameError> {
                         let (f, used) = crate::frames::stream::StopSendingFrame::decode(rest)?;
                         pos += used;
                         out.push(Frame::StopSending(f));
+                    }
+                    FrameType::MAX_DATA => {
+                        let (f, used) = crate::frames::flow::MaxDataFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::MaxData(f));
+                    }
+                    FrameType::MAX_STREAM_DATA => {
+                        let (f, used) = crate::frames::flow::MaxStreamDataFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::MaxStreamData(f));
+                    }
+                    FrameType::MAX_STREAMS => {
+                        let (f, used) = crate::frames::flow::MaxStreamsFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::MaxStreams(f));
+                    }
+                    FrameType::DATAGRAM => {
+                        let (f, used) = crate::frames::datagram::DatagramFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::Datagram(f));
                     }
                     _ if ty.behavior() == ExtensionBehavior::OptionalFixed => {
                         return Err(FrameError::UnknownOptionalFixedFrame(ty));
