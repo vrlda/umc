@@ -251,6 +251,123 @@ impl ServerHello {
     }
 }
 
+use blake2::{Blake2s256, Digest};
+
+/// Server authentication block encryption (handshake.md §16.1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerAuthBlock {
+    pub server_static_public_key: [u8; 32],
+    pub server_identity_binding: Vec<u8>,
+}
+
+/// Encrypts the server authentication block.
+///
+/// # Errors
+///
+/// Returns `EncodeError::Bytes` if key derivation or sealing fails.
+pub fn encrypt_server_auth(
+    handshake_extract1: &[u8; 32],
+    transcript_before: &[u8; 32],
+    block: &ServerAuthBlock,
+    server_ephemeral_public_key: &[u8; 32],
+    server_random: &[u8; 32],
+    selected_profile: &[u8],
+) -> Result<Vec<u8>, EncodeError> {
+    let server_hello_key = expand(handshake_extract1, b"server hello key", transcript_before);
+    let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&server_hello_key)
+        .map_err(|_| EncodeError::Bytes)?;
+    let mut plaintext = Vec::new();
+    plaintext.extend_from_slice(&block.server_static_public_key);
+    plaintext.extend_from_slice(&block.server_identity_binding);
+    let mut aad = Vec::new();
+    aad.extend_from_slice(transcript_before); // §16.1: transcript hash + preceding fields
+    aad.extend_from_slice(server_random);
+    aad.extend_from_slice(server_ephemeral_public_key);
+    aad.extend_from_slice(selected_profile);
+    keys.seal(0, &aad, &plaintext)
+        .map_err(|_| EncodeError::Bytes)
+}
+
+/// Decrypts the server authentication block.
+///
+/// # Errors
+///
+/// Returns `EncodeError::Bytes` if key derivation or opening fails, or
+/// `EncodeError::Truncated` if the plaintext is shorter than 32 bytes.
+pub fn decrypt_server_auth(
+    handshake_extract1: &[u8; 32],
+    transcript_before: &[u8; 32],
+    ciphertext: &[u8],
+    server_ephemeral_public_key: &[u8; 32],
+    server_random: &[u8; 32],
+    selected_profile: &[u8],
+) -> Result<ServerAuthBlock, EncodeError> {
+    let server_hello_key = expand(handshake_extract1, b"server hello key", transcript_before);
+    let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&server_hello_key)
+        .map_err(|_| EncodeError::Bytes)?;
+    let mut aad = Vec::new();
+    aad.extend_from_slice(transcript_before);
+    aad.extend_from_slice(server_random);
+    aad.extend_from_slice(server_ephemeral_public_key);
+    aad.extend_from_slice(selected_profile);
+    let plaintext = keys
+        .open(0, &aad, ciphertext)
+        .map_err(|_| EncodeError::Bytes)?;
+    let mut server_static_public_key = [0u8; 32];
+    server_static_public_key.copy_from_slice(plaintext.get(..32).ok_or(EncodeError::Truncated)?);
+    Ok(ServerAuthBlock {
+        server_static_public_key,
+        server_identity_binding: plaintext[32..].to_vec(),
+    })
+}
+
+/// Finished MACs (handshake.md §19.2): HMAC-BLAKE2s(FinishedKey, `TranscriptHash`).
+///
+/// # Panics
+///
+/// Panics if `finished_key` is not exactly 32 bytes (it always is by type).
+#[must_use]
+pub fn finished_mac(finished_key: &[u8; 32], transcript: &[u8; 32]) -> [u8; 32] {
+    use blake2::digest::{KeyInit, Mac};
+    let mut mac =
+        <blake2::Blake2sMac256 as KeyInit>::new_from_slice(finished_key).expect("32-byte key");
+    mac.update(transcript);
+    mac.finalize().into_bytes().into()
+}
+
+/// Derives a finished key from the handshake secret (handshake.md §19.2).
+#[must_use]
+pub fn finished_key(handshake_secret4: &[u8; 32], label: &[u8], transcript: &[u8; 32]) -> [u8; 32] {
+    expand(handshake_secret4, label, transcript)
+}
+
+/// Client authentication signature input (handshake.md §18.1).
+#[must_use]
+pub fn client_signature_input(
+    transcript_before: &[u8; 32],
+    client_endpoint_id: &[u8; 32],
+    server_endpoint_id: &[u8; 32],
+    client_static_public_key: &[u8; 32],
+    server_static_public_key: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Blake2s256::new();
+    hasher.update(b"UMP-CLIENT-AUTH-v1");
+    hasher.update(transcript_before);
+    hasher.update(client_endpoint_id);
+    hasher.update(server_endpoint_id);
+    hasher.update(client_static_public_key);
+    hasher.update(server_static_public_key);
+    hasher.finalize().into()
+}
+
+fn expand(secret: &[u8; 32], label: &[u8], context: &[u8; 32]) -> [u8; 32] {
+    let out =
+        umc_crypto::label::expand_label(secret, label, context, 32).expect("32-byte expansion");
+    let mut result = [0u8; 32];
+    result.copy_from_slice(&out);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +419,59 @@ mod tests {
             ClientHello::decode(&enc),
             Err(EncodeError::TooManyParameters)
         );
+    }
+
+    #[test]
+    fn server_auth_block_round_trip() {
+        let e1 = [1u8; 32];
+        let tr = [2u8; 32];
+        let block = ServerAuthBlock {
+            server_static_public_key: [3u8; 32],
+            server_identity_binding: vec![4u8; 100],
+        };
+        let eph = [5u8; 32];
+        let rnd = [6u8; 32];
+        let ct = encrypt_server_auth(&e1, &tr, &block, &eph, &rnd, CRYPTO_PROFILE).unwrap();
+        let dec = decrypt_server_auth(&e1, &tr, &ct, &eph, &rnd, CRYPTO_PROFILE).unwrap();
+        assert_eq!(dec.server_static_public_key, block.server_static_public_key);
+        assert_eq!(dec.server_identity_binding, block.server_identity_binding);
+    }
+
+    #[test]
+    fn wrong_transcript_fails_decryption() {
+        let e1 = [1u8; 32];
+        let block = ServerAuthBlock {
+            server_static_public_key: [3u8; 32],
+            server_identity_binding: vec![4u8; 16],
+        };
+        let ct = encrypt_server_auth(
+            &e1,
+            &[2u8; 32],
+            &block,
+            &[5u8; 32],
+            &[6u8; 32],
+            CRYPTO_PROFILE,
+        )
+        .unwrap();
+        assert!(
+            decrypt_server_auth(&e1, &[7u8; 32], &ct, &[5u8; 32], &[6u8; 32], CRYPTO_PROFILE)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn finished_mac_binds_transcript() {
+        let key = [1u8; 32];
+        let a = finished_mac(&key, &[2u8; 32]);
+        let b = finished_mac(&key, &[3u8; 32]);
+        assert_ne!(a, b);
+        assert_eq!(finished_mac(&key, &[2u8; 32]), a);
+    }
+
+    #[test]
+    fn signature_input_binds_identities() {
+        let a = client_signature_input(&[1u8; 32], &[2u8; 32], &[3u8; 32], &[4u8; 32], &[5u8; 32]);
+        let b = client_signature_input(&[1u8; 32], &[2u8; 32], &[9u8; 32], &[4u8; 32], &[5u8; 32]);
+        assert_ne!(a, b);
     }
 }
