@@ -44,6 +44,10 @@ pub enum Frame {
     PathStatus(crate::frames::path::PathStatusFrame),
     Migrate(crate::frames::path::MigrateFrame),
     KeyUpdate(crate::frames::path::KeyUpdateFrame),
+    Auth(crate::frames::handshake::AuthFrame),
+    HandshakeData(crate::frames::handshake::HandshakeDataFrame),
+    Capabilities(crate::frames::handshake::CapabilitiesFrame),
+    SessionTicket(crate::frames::handshake::SessionTicketFrame),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +244,10 @@ pub fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, FrameError> {
                     FrameType::PATH_STATUS => { let (f, used) = crate::frames::path::PathStatusFrame::decode(rest)?; pos += used; out.push(Frame::PathStatus(f)); }
                     FrameType::MIGRATE => { let (f, used) = crate::frames::path::MigrateFrame::decode(rest)?; pos += used; out.push(Frame::Migrate(f)); }
                     FrameType::KEY_UPDATE => { let (f, used) = crate::frames::path::KeyUpdateFrame::decode(rest)?; pos += used; out.push(Frame::KeyUpdate(f)); }
+                    FrameType::AUTH => { let (f, used) = crate::frames::handshake::AuthFrame::decode(rest)?; pos += used; out.push(Frame::Auth(f)); }
+                    FrameType::HANDSHAKE_DATA => { let (f, used) = crate::frames::handshake::HandshakeDataFrame::decode(rest)?; pos += used; out.push(Frame::HandshakeData(f)); }
+                    FrameType::CAPABILITIES => { let (f, used) = crate::frames::handshake::CapabilitiesFrame::decode(rest)?; pos += used; out.push(Frame::Capabilities(f)); }
+                    FrameType::SESSION_TICKET => { let (f, used) = crate::frames::handshake::SessionTicketFrame::decode(rest)?; pos += used; out.push(Frame::SessionTicket(f)); }
                     _ if ty.behavior() == ExtensionBehavior::OptionalFixed => {
                         return Err(FrameError::UnknownOptionalFixedFrame(ty));
                     }
