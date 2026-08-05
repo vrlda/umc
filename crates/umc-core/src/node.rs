@@ -2,7 +2,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use umc_carrier::error::CarrierError;
+use umc_carrier::error::{CarrierError, CarrierErrorKind};
+use umc_carrier::types::{OutboundPacket, SendResult};
 use umc_carrier::Carrier;
 use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
 use umc_handshake::traffic::SessionSecrets;
@@ -78,15 +79,16 @@ impl Node {
         self.carriers.get(type_id).map(AsRef::as_ref)
     }
 
-    /// Complete an XX handshake with a remote over the given carrier. Phase 1
-    /// Task 24: deterministic harness path (Task 25 replaces it with the live
-    /// wire handshake).
+    /// Complete an XX handshake with a remote over the given carrier.
+    /// Sends `CLIENT_HELLO` through the carrier link, receives `SERVER_HELLO`,
+    /// and derives session secrets from the transcript (handshake.md §14-18).
     ///
     /// # Errors
     ///
     /// Returns [`NodeError::CarrierUnknown`] when no carrier of the given type
-    /// is registered, [`NodeError::Carrier`] when dialing fails, and
-    /// [`NodeError::Handshake`] when the XX handshake fails.
+    /// is registered, [`NodeError::Carrier`] when dialing or exchanging
+    /// packets fails, and [`NodeError::Handshake`] when the XX handshake
+    /// fails.
     pub async fn connect(
         &mut self,
         carrier_type: &str,
@@ -97,8 +99,32 @@ impl Node {
             .carrier(carrier_type)
             .ok_or(NodeError::CarrierUnknown)?;
         let link = carrier.dial(remote).map_err(NodeError::Carrier)?;
-        let _ = link;
-        let client_secrets = self.handshake_secrets(server_identity_public)?;
+
+        let client_ephemeral = StaticHandshakeKeyPair::generate();
+        let hello = umc_handshake::xx::ClientHello::new(self.entropy.as_ref(), &client_ephemeral);
+        let hello_bytes = hello
+            .encode()
+            .map_err(|e| NodeError::Handshake(format!("{e:?}")))?;
+
+        // Send the hello as a carrier packet (the carrier restores boundaries).
+        send_packet(link.as_ref(), &hello_bytes).map_err(NodeError::Carrier)?;
+
+        // Receive SERVER_HELLO.
+        let server_hello_bytes = recv_packet(link.as_ref()).map_err(NodeError::Carrier)?;
+        let server_hello = umc_handshake::xx::ServerHello::decode(&server_hello_bytes)
+            .map_err(|e| NodeError::Handshake(format!("{e:?}")))?;
+
+        // Derive session secrets using the verified client continuation.
+        let (client_secrets, _client_finished_key) = umc_handshake::xx::complete_client_side(
+            &self.config.identity.identity,
+            &self.config.identity.static_handshake,
+            &client_ephemeral,
+            &hello,
+            &server_hello,
+            self.entropy.as_ref(),
+            carrier_type.as_bytes(),
+        )
+        .map_err(NodeError::Handshake)?;
         let id = self.next_session;
         self.next_session += 1;
         self.sessions.lock().await.insert(
@@ -110,23 +136,27 @@ impl Node {
         );
         Ok(id)
     }
+}
 
-    fn handshake_secrets(
-        &self,
-        server_identity_public: &NodeIdentity,
-    ) -> Result<SessionSecrets, NodeError> {
-        let (client, _) = umc_handshake::xx::run_xx_handshake(
-            &self.config.identity.identity,
-            &self.config.identity.static_handshake,
-            &server_identity_public.identity,
-            &server_identity_public.static_handshake,
-            self.entropy.as_ref(),
-            b"ump.udp/1",
-            0,
-        )
-        .map_err(NodeError::Handshake)?;
-        Ok(client)
+fn send_packet(
+    link: &(dyn umc_carrier::Link + Send + Sync),
+    bytes: &[u8],
+) -> Result<(), CarrierError> {
+    match link.send(OutboundPacket {
+        bytes: bytes.to_vec(),
+        control: true,
+        deadline_ms: Some(3_000),
+    })? {
+        SendResult::Accepted { .. } => Ok(()),
+        SendResult::WouldBlock | SendResult::QueueFull => {
+            Err(CarrierError::new(CarrierErrorKind::WouldBlock, "send"))
+        }
     }
+}
+
+fn recv_packet(link: &(dyn umc_carrier::Link + Send + Sync)) -> Result<Vec<u8>, CarrierError> {
+    let packet = link.recv()?;
+    Ok(packet.bytes)
 }
 
 #[derive(Debug)]
