@@ -31,22 +31,37 @@ impl RelayOpenFrame {
     /// within [`MAX_REQUESTED_LIFETIME_MS`], `LengthExceedsLimit` if a field
     /// exceeds its limit, and `VarintEncode` if a field cannot be encoded.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
-        if self.requested_lifetime != 0 && !(1_000..=MAX_REQUESTED_LIFETIME_MS).contains(&self.requested_lifetime) {
+        if self.requested_lifetime != 0
+            && !(1_000..=MAX_REQUESTED_LIFETIME_MS).contains(&self.requested_lifetime)
+        {
             return Err(FrameError::InvalidPadding);
         }
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::RELAY_OPEN.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::RELAY_OPEN.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.circuit_id).map_err(FrameError::VarintEncode)?;
         let mut flags = 0u8;
-        if self.bidirectional { flags |= 0x01; }
-        if self.store_forward_allowed { flags |= 0x02; }
-        if self.private_circuit { flags |= 0x04; }
-        if self.multipath_allowed { flags |= 0x08; }
+        if self.bidirectional {
+            flags |= 0x01;
+        }
+        if self.store_forward_allowed {
+            flags |= 0x02;
+        }
+        if self.private_circuit {
+            flags |= 0x04;
+        }
+        if self.multipath_allowed {
+            flags |= 0x08;
+        }
         out.push(flags);
-        crate::varint::encode_into(&mut out, self.requested_lifetime).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.requested_byte_quota).map_err(FrameError::VarintEncode)?;
-        crate::bytes::encode(&mut out, &self.next_hop_hint, Self::MAX_NEXT_HOP_HINT).map_err(|_| FrameError::LengthExceedsLimit)?;
-        crate::bytes::encode(&mut out, &self.authorization, MAX_RELAY_AUTH).map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::varint::encode_into(&mut out, self.requested_lifetime)
+            .map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.requested_byte_quota)
+            .map_err(FrameError::VarintEncode)?;
+        crate::bytes::encode(&mut out, &self.next_hop_hint, Self::MAX_NEXT_HOP_HINT)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::bytes::encode(&mut out, &self.authorization, MAX_RELAY_AUTH)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
         Ok(out)
     }
 
@@ -76,9 +91,11 @@ impl RelayOpenFrame {
             return Err(FrameError::InvalidPadding);
         }
         let quota = read_varint(&mut pos)?;
-        let (nh, n) = crate::bytes::decode(&body[pos..], Self::MAX_NEXT_HOP_HINT).map_err(|_| FrameError::Truncated)?;
+        let (nh, n) = crate::bytes::decode(&body[pos..], Self::MAX_NEXT_HOP_HINT)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
-        let (auth, n) = crate::bytes::decode(&body[pos..], MAX_RELAY_AUTH).map_err(|_| FrameError::Truncated)?;
+        let (auth, n) = crate::bytes::decode(&body[pos..], MAX_RELAY_AUTH)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
         Ok((
             Self {
@@ -124,22 +141,39 @@ impl RelayStatusFrame {
     /// exceeds its limit, and `VarintEncode` if a field cannot be encoded.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::RELAY_STATUS.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::RELAY_STATUS.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.circuit_id).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.status_sequence).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.status_sequence)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.status_code).map_err(FrameError::VarintEncode)?;
         let mut flags = 0u8;
-        if self.bidirectional_granted { flags |= 0x01; }
-        if self.private_handling_granted { flags |= 0x02; }
-        if self.multipath_granted { flags |= 0x04; }
-        if self.downstream_authenticated { flags |= 0x08; }
-        if self.retryable { flags |= 0x10; }
+        if self.bidirectional_granted {
+            flags |= 0x01;
+        }
+        if self.private_handling_granted {
+            flags |= 0x02;
+        }
+        if self.multipath_granted {
+            flags |= 0x04;
+        }
+        if self.downstream_authenticated {
+            flags |= 0x08;
+        }
+        if self.retryable {
+            flags |= 0x10;
+        }
         out.push(flags);
-        crate::varint::encode_into(&mut out, self.granted_lifetime).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.granted_byte_quota).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.maximum_relay_payload).map_err(FrameError::VarintEncode)?;
-        crate::bytes::encode(&mut out, &self.diagnostic, MAX_RELAY_DIAGNOSTIC).map_err(|_| FrameError::LengthExceedsLimit)?;
-        crate::bytes::encode(&mut out, &self.authentication, MAX_RELAY_AUTH).map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::varint::encode_into(&mut out, self.granted_lifetime)
+            .map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.granted_byte_quota)
+            .map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.maximum_relay_payload)
+            .map_err(FrameError::VarintEncode)?;
+        crate::bytes::encode(&mut out, &self.diagnostic, MAX_RELAY_DIAGNOSTIC)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::bytes::encode(&mut out, &self.authentication, MAX_RELAY_AUTH)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
         Ok(out)
     }
 
@@ -168,9 +202,11 @@ impl RelayStatusFrame {
         let lifetime = read_varint(&mut pos)?;
         let quota = read_varint(&mut pos)?;
         let max_payload = read_varint(&mut pos)?;
-        let (diag, n) = crate::bytes::decode(&body[pos..], MAX_RELAY_DIAGNOSTIC).map_err(|_| FrameError::Truncated)?;
+        let (diag, n) = crate::bytes::decode(&body[pos..], MAX_RELAY_DIAGNOSTIC)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
-        let (auth, n) = crate::bytes::decode(&body[pos..], MAX_RELAY_AUTH).map_err(|_| FrameError::Truncated)?;
+        let (auth, n) = crate::bytes::decode(&body[pos..], MAX_RELAY_AUTH)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
         Ok((
             Self {
@@ -219,15 +255,24 @@ impl RelayDataFrame {
             return Err(FrameError::InvalidPadding);
         }
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::RELAY_DATA.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::RELAY_DATA.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.circuit_id).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.relay_sequence).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.relay_sequence)
+            .map_err(FrameError::VarintEncode)?;
         let mut flags = 0u8;
-        if self.fin { flags |= 0x01; }
-        if self.ack_requested { flags |= 0x02; }
-        if self.high_priority { flags |= 0x04; }
+        if self.fin {
+            flags |= 0x01;
+        }
+        if self.ack_requested {
+            flags |= 0x02;
+        }
+        if self.high_priority {
+            flags |= 0x04;
+        }
         out.push(flags);
-        crate::bytes::encode(&mut out, &self.data, MAX_RELAY_PAYLOAD).map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::bytes::encode(&mut out, &self.data, MAX_RELAY_PAYLOAD)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
         Ok(out)
     }
 
@@ -253,7 +298,8 @@ impl RelayDataFrame {
         if flags & 0xF8 != 0 {
             return Err(FrameError::InvalidPadding);
         }
-        let (data, n) = crate::bytes::decode(&body[pos..], MAX_RELAY_PAYLOAD).map_err(|_| FrameError::Truncated)?;
+        let (data, n) = crate::bytes::decode(&body[pos..], MAX_RELAY_PAYLOAD)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
         if data.is_empty() && flags & 0x01 == 0 {
             return Err(FrameError::InvalidPadding);
@@ -289,10 +335,12 @@ impl RelayCloseFrame {
     /// Returns `VarintEncode` if a field cannot be encoded.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::RELAY_CLOSE.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::RELAY_CLOSE.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.circuit_id).map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.reason_code).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.final_relay_sequence).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.final_relay_sequence)
+            .map_err(FrameError::VarintEncode)?;
         Ok(out)
     }
 
@@ -312,7 +360,14 @@ impl RelayCloseFrame {
         let circuit_id = read_varint(&mut pos)?;
         let reason = read_varint(&mut pos)?;
         let final_seq = read_varint(&mut pos)?;
-        Ok((Self { circuit_id, reason_code: reason, final_relay_sequence: final_seq }, pos))
+        Ok((
+            Self {
+                circuit_id,
+                reason_code: reason,
+                final_relay_sequence: final_seq,
+            },
+            pos,
+        ))
     }
 }
 
@@ -326,16 +381,37 @@ mod tests {
 
     #[test]
     fn relay_open_round_trip() {
-        let f = RelayOpenFrame { circuit_id: 7, bidirectional: true, store_forward_allowed: false, private_circuit: true, multipath_allowed: false, requested_lifetime: 600_000, requested_byte_quota: 1_048_576, next_hop_hint: b"peer-candidate".to_vec(), authorization: b"proof".to_vec() };
+        let f = RelayOpenFrame {
+            circuit_id: 7,
+            bidirectional: true,
+            store_forward_allowed: false,
+            private_circuit: true,
+            multipath_allowed: false,
+            requested_lifetime: 600_000,
+            requested_byte_quota: 1_048_576,
+            next_hop_hint: b"peer-candidate".to_vec(),
+            authorization: b"proof".to_vec(),
+        };
         let enc = f.encode().unwrap();
-        let (dec, used) = RelayOpenFrame::decode(&enc[type_len(FrameType::RELAY_OPEN.0)..]).unwrap();
+        let (dec, used) =
+            RelayOpenFrame::decode(&enc[type_len(FrameType::RELAY_OPEN.0)..]).unwrap();
         assert_eq!(dec, f);
         assert_eq!(used, enc.len() - type_len(FrameType::RELAY_OPEN.0));
     }
 
     #[test]
     fn relay_open_rejects_out_of_range_lifetime() {
-        let mut f = RelayOpenFrame { circuit_id: 1, bidirectional: false, store_forward_allowed: false, private_circuit: false, multipath_allowed: false, requested_lifetime: 100, requested_byte_quota: 0, next_hop_hint: vec![], authorization: vec![] };
+        let mut f = RelayOpenFrame {
+            circuit_id: 1,
+            bidirectional: false,
+            store_forward_allowed: false,
+            private_circuit: false,
+            multipath_allowed: false,
+            requested_lifetime: 100,
+            requested_byte_quota: 0,
+            next_hop_hint: vec![],
+            authorization: vec![],
+        };
         assert_eq!(f.encode(), Err(FrameError::InvalidPadding));
         f.requested_lifetime = MAX_REQUESTED_LIFETIME_MS + 1;
         assert_eq!(f.encode(), Err(FrameError::InvalidPadding));
@@ -343,25 +419,58 @@ mod tests {
 
     #[test]
     fn relay_status_round_trip() {
-        let f = RelayStatusFrame { circuit_id: 3, status_sequence: 0, status_code: 1, bidirectional_granted: true, private_handling_granted: false, multipath_granted: false, downstream_authenticated: true, retryable: false, granted_lifetime: 600_000, granted_byte_quota: 1_048_576, maximum_relay_payload: 65_536, diagnostic: vec![], authentication: vec![] };
+        let f = RelayStatusFrame {
+            circuit_id: 3,
+            status_sequence: 0,
+            status_code: 1,
+            bidirectional_granted: true,
+            private_handling_granted: false,
+            multipath_granted: false,
+            downstream_authenticated: true,
+            retryable: false,
+            granted_lifetime: 600_000,
+            granted_byte_quota: 1_048_576,
+            maximum_relay_payload: 65_536,
+            diagnostic: vec![],
+            authentication: vec![],
+        };
         let enc = f.encode().unwrap();
-        let (dec, _) = RelayStatusFrame::decode(&enc[type_len(FrameType::RELAY_STATUS.0)..]).unwrap();
+        let (dec, _) =
+            RelayStatusFrame::decode(&enc[type_len(FrameType::RELAY_STATUS.0)..]).unwrap();
         assert_eq!(dec, f);
     }
 
     #[test]
     fn relay_data_round_trip_and_empty_rule() {
-        let f = RelayDataFrame { circuit_id: 5, relay_sequence: 0, fin: false, ack_requested: true, high_priority: false, data: b"inner-packet".to_vec() };
+        let f = RelayDataFrame {
+            circuit_id: 5,
+            relay_sequence: 0,
+            fin: false,
+            ack_requested: true,
+            high_priority: false,
+            data: b"inner-packet".to_vec(),
+        };
         let enc = f.encode().unwrap();
         let (dec, _) = RelayDataFrame::decode(&enc[type_len(FrameType::RELAY_DATA.0)..]).unwrap();
         assert_eq!(dec, f);
-        let empty = RelayDataFrame { circuit_id: 5, relay_sequence: 1, fin: false, ack_requested: false, high_priority: false, data: vec![] };
+        let empty = RelayDataFrame {
+            circuit_id: 5,
+            relay_sequence: 1,
+            fin: false,
+            ack_requested: false,
+            high_priority: false,
+            data: vec![],
+        };
         assert_eq!(empty.encode(), Err(FrameError::InvalidPadding));
     }
 
     #[test]
     fn relay_close_round_trip() {
-        let f = RelayCloseFrame { circuit_id: 9, reason_code: 6, final_relay_sequence: 100 };
+        let f = RelayCloseFrame {
+            circuit_id: 9,
+            reason_code: 6,
+            final_relay_sequence: 100,
+        };
         let enc = f.encode().unwrap();
         let (dec, _) = RelayCloseFrame::decode(&enc[type_len(FrameType::RELAY_CLOSE.0)..]).unwrap();
         assert_eq!(dec, f);

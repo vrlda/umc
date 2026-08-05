@@ -15,8 +15,14 @@ fn varint_vectors() {
         (1_073_741_823, &[0xBF, 0xFF, 0xFF, 0xFF]),
         // 2^30 = 1073741824: exceeds the 4-byte width maximum (2^30 - 1),
         // MUST use the 8-byte width.
-        (1_073_741_824, &[0xC0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00]),
-        (4_611_686_018_427_387_903, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+        (
+            1_073_741_824,
+            &[0xC0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00],
+        ),
+        (
+            4_611_686_018_427_387_903,
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        ),
     ];
     for (v, expected) in cases {
         assert_eq!(&encode(*v).unwrap(), expected, "encode {v}");

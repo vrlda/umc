@@ -66,14 +66,23 @@ mod tests {
     #[test]
     fn rejects_oversize_before_allocation() {
         let mut out = Vec::new();
-        assert_eq!(encode(&mut out, &[0u8; 5], 4), Err(BytesError::LengthExceedsLimit));
+        assert_eq!(
+            encode(&mut out, &[0u8; 5], 4),
+            Err(BytesError::LengthExceedsLimit)
+        );
         // Declared length larger than the buffer and larger than limit.
-        assert_eq!(decode(&[0x40, 0x40], 3), Err(BytesError::LengthExceedsLimit));
+        assert_eq!(
+            decode(&[0x40, 0x40], 3),
+            Err(BytesError::LengthExceedsLimit)
+        );
     }
 
     #[test]
     fn rejects_truncated() {
-        assert_eq!(decode(&[0x40, 0x40, 0x01], 1024), Err(BytesError::Truncated));
+        assert_eq!(
+            decode(&[0x40, 0x40, 0x01], 1024),
+            Err(BytesError::Truncated)
+        );
         assert_eq!(decode(&[], 1024), Err(BytesError::Truncated));
     }
 }

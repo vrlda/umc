@@ -30,20 +30,32 @@ impl StreamFrame {
     /// encoded.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::STREAM.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::STREAM.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.stream_id).map_err(FrameError::VarintEncode)?;
         let mut flags = 0u8;
-        if self.fin { flags |= 0x01; }
-        if self.offset_present { flags |= 0x02; }
-        if self.len_present { flags |= 0x04; }
-        if self.open { flags |= 0x08; }
-        if self.unidirectional { flags |= 0x10; }
+        if self.fin {
+            flags |= 0x01;
+        }
+        if self.offset_present {
+            flags |= 0x02;
+        }
+        if self.len_present {
+            flags |= 0x04;
+        }
+        if self.open {
+            flags |= 0x08;
+        }
+        if self.unidirectional {
+            flags |= 0x10;
+        }
         out.push(flags);
         if self.offset_present {
             crate::varint::encode_into(&mut out, self.offset).map_err(FrameError::VarintEncode)?;
         }
         if self.len_present {
-            crate::varint::encode_into(&mut out, self.data.len() as u64).map_err(FrameError::VarintEncode)?;
+            crate::varint::encode_into(&mut out, self.data.len() as u64)
+                .map_err(FrameError::VarintEncode)?;
         }
         out.extend_from_slice(&self.data);
         if self.open {
@@ -79,7 +91,11 @@ impl StreamFrame {
         }
         let offset_present = flags & 0x02 != 0;
         let len_present = flags & 0x04 != 0;
-        let offset = if offset_present { read_varint(&mut pos)? } else { 0 };
+        let offset = if offset_present {
+            read_varint(&mut pos)?
+        } else {
+            0
+        };
         let data_len = if len_present {
             let l = read_varint(&mut pos)?;
             u32::try_from(l).map_err(|_| FrameError::LengthExceedsLimit)? as usize
@@ -92,10 +108,12 @@ impl StreamFrame {
         let mut protocol_id = Vec::new();
         let mut metadata = Vec::new();
         if flags & 0x08 != 0 {
-            let (v, n) = crate::bytes::decode(&body[pos..], MAX_PROTOCOL_ID_LEN).map_err(|_| FrameError::Truncated)?;
+            let (v, n) = crate::bytes::decode(&body[pos..], MAX_PROTOCOL_ID_LEN)
+                .map_err(|_| FrameError::Truncated)?;
             protocol_id = v.to_vec();
             pos += n;
-            let (v, n) = crate::bytes::decode(&body[pos..], MAX_STREAM_METADATA_LEN).map_err(|_| FrameError::Truncated)?;
+            let (v, n) = crate::bytes::decode(&body[pos..], MAX_STREAM_METADATA_LEN)
+                .map_err(|_| FrameError::Truncated)?;
             metadata = v.to_vec();
             pos += n;
         }
@@ -132,9 +150,11 @@ impl ResetStreamFrame {
     /// Returns `VarintEncode` if a field cannot be encoded.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::RESET_STREAM.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::RESET_STREAM.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.stream_id).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.app_error_code).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.app_error_code)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.final_size).map_err(FrameError::VarintEncode)?;
         Ok(out)
     }
@@ -155,7 +175,14 @@ impl ResetStreamFrame {
         let stream_id = read_varint(&mut pos)?;
         let code = read_varint(&mut pos)?;
         let final_size = read_varint(&mut pos)?;
-        Ok((Self { stream_id, app_error_code: code, final_size }, pos))
+        Ok((
+            Self {
+                stream_id,
+                app_error_code: code,
+                final_size,
+            },
+            pos,
+        ))
     }
 }
 
@@ -173,9 +200,11 @@ impl StopSendingFrame {
     /// Returns `VarintEncode` if a field cannot be encoded.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::STOP_SENDING.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::STOP_SENDING.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.stream_id).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.app_error_code).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.app_error_code)
+            .map_err(FrameError::VarintEncode)?;
         Ok(out)
     }
 
@@ -194,7 +223,13 @@ impl StopSendingFrame {
         };
         let stream_id = read_varint(&mut pos)?;
         let code = read_varint(&mut pos)?;
-        Ok((Self { stream_id, app_error_code: code }, pos))
+        Ok((
+            Self {
+                stream_id,
+                app_error_code: code,
+            },
+            pos,
+        ))
     }
 }
 
@@ -234,7 +269,11 @@ mod tests {
 
     #[test]
     fn reset_stream_round_trip() {
-        let f = ResetStreamFrame { stream_id: 4, app_error_code: 7, final_size: 100 };
+        let f = ResetStreamFrame {
+            stream_id: 4,
+            app_error_code: 7,
+            final_size: 100,
+        };
         let enc = f.encode().unwrap();
         let (dec, _) = ResetStreamFrame::decode(&enc[1..]).unwrap();
         assert_eq!(dec, f);
@@ -242,7 +281,10 @@ mod tests {
 
     #[test]
     fn stop_sending_round_trip() {
-        let f = StopSendingFrame { stream_id: 5, app_error_code: 1 };
+        let f = StopSendingFrame {
+            stream_id: 5,
+            app_error_code: 1,
+        };
         let enc = f.encode().unwrap();
         let (dec, _) = StopSendingFrame::decode(&enc[1..]).unwrap();
         assert_eq!(dec, f);

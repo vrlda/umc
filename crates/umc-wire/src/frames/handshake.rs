@@ -25,9 +25,11 @@ impl AuthFrame {
             return Err(FrameError::LengthExceedsLimit);
         }
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::AUTH.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::AUTH.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.method).map_err(FrameError::VarintEncode)?;
-        crate::bytes::encode(&mut out, &self.data, MAX_HANDSHAKE_MESSAGE).map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::bytes::encode(&mut out, &self.data, MAX_HANDSHAKE_MESSAGE)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
         Ok(out)
     }
 
@@ -40,8 +42,15 @@ impl AuthFrame {
     /// and `Varint` if a field is malformed or truncated.
     pub fn decode(body: &[u8]) -> Result<(Self, usize), FrameError> {
         let (method, n1) = crate::varint::decode(body).map_err(FrameError::Varint)?;
-        let (data, n2) = crate::bytes::decode(&body[n1..], MAX_HANDSHAKE_MESSAGE).map_err(|_| FrameError::Truncated)?;
-        Ok((Self { method, data: data.to_vec() }, n1 + n2))
+        let (data, n2) = crate::bytes::decode(&body[n1..], MAX_HANDSHAKE_MESSAGE)
+            .map_err(|_| FrameError::Truncated)?;
+        Ok((
+            Self {
+                method,
+                data: data.to_vec(),
+            },
+            n1 + n2,
+        ))
     }
 }
 
@@ -64,9 +73,11 @@ impl HandshakeDataFrame {
             return Err(FrameError::LengthExceedsLimit);
         }
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::HANDSHAKE_DATA.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::HANDSHAKE_DATA.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.offset).map_err(FrameError::VarintEncode)?;
-        crate::bytes::encode(&mut out, &self.data, MAX_HANDSHAKE_MESSAGE).map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::bytes::encode(&mut out, &self.data, MAX_HANDSHAKE_MESSAGE)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
         Ok(out)
     }
 
@@ -79,8 +90,15 @@ impl HandshakeDataFrame {
     /// and `Varint` if a field is malformed or truncated.
     pub fn decode(body: &[u8]) -> Result<(Self, usize), FrameError> {
         let (offset, n1) = crate::varint::decode(body).map_err(FrameError::Varint)?;
-        let (data, n2) = crate::bytes::decode(&body[n1..], MAX_HANDSHAKE_MESSAGE).map_err(|_| FrameError::Truncated)?;
-        Ok((Self { offset, data: data.to_vec() }, n1 + n2))
+        let (data, n2) = crate::bytes::decode(&body[n1..], MAX_HANDSHAKE_MESSAGE)
+            .map_err(|_| FrameError::Truncated)?;
+        Ok((
+            Self {
+                offset,
+                data: data.to_vec(),
+            },
+            n1 + n2,
+        ))
     }
 }
 
@@ -108,11 +126,14 @@ impl CapabilitiesFrame {
             return Err(FrameError::LengthExceedsLimit);
         }
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::CAPABILITIES.0).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.entries.len() as u64).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::CAPABILITIES.0)
+            .map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.entries.len() as u64)
+            .map_err(FrameError::VarintEncode)?;
         for e in &self.entries {
             crate::varint::encode_into(&mut out, e.id).map_err(FrameError::VarintEncode)?;
-            crate::bytes::encode(&mut out, &e.value, MAX_CAPABILITY_VALUE).map_err(|_| FrameError::LengthExceedsLimit)?;
+            crate::bytes::encode(&mut out, &e.value, MAX_CAPABILITY_VALUE)
+                .map_err(|_| FrameError::LengthExceedsLimit)?;
         }
         Ok(out)
     }
@@ -136,9 +157,13 @@ impl CapabilitiesFrame {
         for _ in 0..count {
             let (id, n) = crate::varint::decode(&body[pos..]).map_err(FrameError::Varint)?;
             pos += n;
-            let (value, n) = crate::bytes::decode(&body[pos..], MAX_CAPABILITY_VALUE).map_err(|_| FrameError::Truncated)?;
+            let (value, n) = crate::bytes::decode(&body[pos..], MAX_CAPABILITY_VALUE)
+                .map_err(|_| FrameError::Truncated)?;
             pos += n;
-            entries.push(Capability { id, value: value.to_vec() });
+            entries.push(Capability {
+                id,
+                value: value.to_vec(),
+            });
         }
         Ok((Self { entries }, pos))
     }
@@ -164,11 +189,14 @@ impl SessionTicketFrame {
     /// field cannot be encoded.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::SESSION_TICKET.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::SESSION_TICKET.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.lifetime).map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.age_add).map_err(FrameError::VarintEncode)?;
-        crate::bytes::encode(&mut out, &self.nonce, 256).map_err(|_| FrameError::LengthExceedsLimit)?;
-        crate::bytes::encode(&mut out, &self.ticket, Self::MAX_TICKET).map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::bytes::encode(&mut out, &self.nonce, 256)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::bytes::encode(&mut out, &self.ticket, Self::MAX_TICKET)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
         Ok(out)
     }
 
@@ -188,11 +216,21 @@ impl SessionTicketFrame {
         };
         let lifetime = read_varint(&mut pos)?;
         let age_add = read_varint(&mut pos)?;
-        let (nonce, n) = crate::bytes::decode(&body[pos..], 256).map_err(|_| FrameError::Truncated)?;
+        let (nonce, n) =
+            crate::bytes::decode(&body[pos..], 256).map_err(|_| FrameError::Truncated)?;
         pos += n;
-        let (ticket, n) = crate::bytes::decode(&body[pos..], Self::MAX_TICKET).map_err(|_| FrameError::Truncated)?;
+        let (ticket, n) = crate::bytes::decode(&body[pos..], Self::MAX_TICKET)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
-        Ok((Self { lifetime, age_add, nonce: nonce.to_vec(), ticket: ticket.to_vec() }, pos))
+        Ok((
+            Self {
+                lifetime,
+                age_add,
+                nonce: nonce.to_vec(),
+                ticket: ticket.to_vec(),
+            },
+            pos,
+        ))
     }
 }
 
@@ -202,7 +240,10 @@ mod tests {
 
     #[test]
     fn auth_round_trip() {
-        let f = AuthFrame { method: 1, data: b"invitation-proof".to_vec() };
+        let f = AuthFrame {
+            method: 1,
+            data: b"invitation-proof".to_vec(),
+        };
         let enc = f.encode().unwrap();
         let type_len = crate::varint::encode(FrameType::AUTH.0).unwrap().len();
         let (dec, _) = AuthFrame::decode(&enc[type_len..]).unwrap();
@@ -211,27 +252,46 @@ mod tests {
 
     #[test]
     fn handshake_data_round_trip() {
-        let f = HandshakeDataFrame { offset: 0, data: b"client hello bytes".to_vec() };
+        let f = HandshakeDataFrame {
+            offset: 0,
+            data: b"client hello bytes".to_vec(),
+        };
         let enc = f.encode().unwrap();
-        let type_len = crate::varint::encode(FrameType::HANDSHAKE_DATA.0).unwrap().len();
+        let type_len = crate::varint::encode(FrameType::HANDSHAKE_DATA.0)
+            .unwrap()
+            .len();
         let (dec, _) = HandshakeDataFrame::decode(&enc[type_len..]).unwrap();
         assert_eq!(dec, f);
     }
 
     #[test]
     fn capabilities_round_trip() {
-        let f = CapabilitiesFrame { entries: vec![Capability { id: 1, value: b"1200".to_vec() }] };
+        let f = CapabilitiesFrame {
+            entries: vec![Capability {
+                id: 1,
+                value: b"1200".to_vec(),
+            }],
+        };
         let enc = f.encode().unwrap();
-        let type_len = crate::varint::encode(FrameType::CAPABILITIES.0).unwrap().len();
+        let type_len = crate::varint::encode(FrameType::CAPABILITIES.0)
+            .unwrap()
+            .len();
         let (dec, _) = CapabilitiesFrame::decode(&enc[type_len..]).unwrap();
         assert_eq!(dec, f);
     }
 
     #[test]
     fn session_ticket_round_trip() {
-        let f = SessionTicketFrame { lifetime: 86_400, age_add: 7, nonce: vec![1, 2, 3], ticket: vec![9; 64] };
+        let f = SessionTicketFrame {
+            lifetime: 86_400,
+            age_add: 7,
+            nonce: vec![1, 2, 3],
+            ticket: vec![9; 64],
+        };
         let enc = f.encode().unwrap();
-        let type_len = crate::varint::encode(FrameType::SESSION_TICKET.0).unwrap().len();
+        let type_len = crate::varint::encode(FrameType::SESSION_TICKET.0)
+            .unwrap()
+            .len();
         let (dec, _) = SessionTicketFrame::decode(&enc[type_len..]).unwrap();
         assert_eq!(dec, f);
     }

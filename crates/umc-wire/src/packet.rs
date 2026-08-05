@@ -38,7 +38,10 @@ pub fn parse_payload(context: &PacketContext, payload: &[u8]) -> Result<ParsedPa
     for f in &frames {
         check_context(context, f)?;
     }
-    Ok(ParsedPacket { context: context.clone(), frames })
+    Ok(ParsedPacket {
+        context: context.clone(),
+        frames,
+    })
 }
 
 #[must_use]
@@ -50,17 +53,27 @@ pub fn context_allows(context: &PacketContext, ty: umc_types::frame::FrameType) 
         (_, T::PADDING | T::PING | T::ACK | T::CAPABILITIES) => true,
         (PacketContext::Initial | PacketContext::Handshake, T::AUTH | T::HANDSHAKE_DATA) => true,
         (PacketContext::Protected(_), T::STREAM | T::DATAGRAM) => true,
-        (PacketContext::Protected(_), T::ROUTE_REQUEST | T::ROUTE_RESPONSE | T::ROUTE_ERROR) => true,
-        (PacketContext::Protected(_), T::RELAY_OPEN | T::RELAY_STATUS | T::RELAY_DATA | T::RELAY_CLOSE) => true,
+        (PacketContext::Protected(_), T::ROUTE_REQUEST | T::ROUTE_RESPONSE | T::ROUTE_ERROR) => {
+            true
+        }
+        (
+            PacketContext::Protected(_),
+            T::RELAY_OPEN | T::RELAY_STATUS | T::RELAY_DATA | T::RELAY_CLOSE,
+        ) => true,
         (PacketContext::Protected(_), T::BUNDLE | T::BUNDLE_ACK) => true,
-        (PacketContext::Protected(_), T::PATH_CHALLENGE | T::PATH_RESPONSE | T::PATH_STATUS | T::MIGRATE) => true,
+        (
+            PacketContext::Protected(_),
+            T::PATH_CHALLENGE | T::PATH_RESPONSE | T::PATH_STATUS | T::MIGRATE,
+        ) => true,
         (PacketContext::Protected(_), T::KEY_UPDATE) => true,
         (PacketContext::Protected(_), T::NEW_CONNECTION_ID | T::RETIRE_CONNECTION_ID) => true,
         (PacketContext::Protected(_), T::PEER_HINT | T::SERVICE_HINT) => true,
         (PacketContext::Protected(_), T::MAX_DATA | T::MAX_STREAM_DATA | T::MAX_STREAMS) => true,
         (PacketContext::Protected(_), T::RESET_STREAM | T::STOP_SENDING) => true,
         (PacketContext::Protected(_), T::CONNECTION_CLOSE) => true,
-        (PacketContext::Protected(SessionData | PathControl | RelayData), T::SESSION_TICKET) => true,
+        (PacketContext::Protected(SessionData | PathControl | RelayData), T::SESSION_TICKET) => {
+            true
+        }
         _ => false,
     }
 }
@@ -122,7 +135,11 @@ mod tests {
     #[test]
     fn stream_allowed_in_protected_not_initial() {
         let payload = [0x10, 0x00, 0x00, 0x61];
-        assert!(parse_payload(&PacketContext::Protected(ShortPacketSpace::SessionData), &payload).is_ok());
+        assert!(parse_payload(
+            &PacketContext::Protected(ShortPacketSpace::SessionData),
+            &payload
+        )
+        .is_ok());
         assert_eq!(
             parse_payload(&PacketContext::Initial, &payload).unwrap_err(),
             PacketError::ContextViolation(T::STREAM)
@@ -136,7 +153,11 @@ mod tests {
         let payload = [0x40, 0x74, 0x00, 0x00];
         assert!(parse_payload(&PacketContext::Initial, &payload).is_ok());
         assert_eq!(
-            parse_payload(&PacketContext::Protected(ShortPacketSpace::SessionData), &payload).unwrap_err(),
+            parse_payload(
+                &PacketContext::Protected(ShortPacketSpace::SessionData),
+                &payload
+            )
+            .unwrap_err(),
             PacketError::ContextViolation(T::HANDSHAKE_DATA)
         );
     }
@@ -165,7 +186,11 @@ mod tests {
         let enc = frame.encode().unwrap();
         let type_len = crate::varint::encode(T::ROUTE_REQUEST.0).unwrap().len();
         payload.extend_from_slice(&enc[type_len..]);
-        assert!(parse_payload(&PacketContext::Protected(ShortPacketSpace::SessionData), &payload).is_ok());
+        assert!(parse_payload(
+            &PacketContext::Protected(ShortPacketSpace::SessionData),
+            &payload
+        )
+        .is_ok());
         assert_eq!(
             parse_payload(&PacketContext::Handshake, &payload).unwrap_err(),
             PacketError::ContextViolation(T::ROUTE_REQUEST)
@@ -176,7 +201,10 @@ mod tests {
     fn oversize_payload_rejected() {
         let big = vec![0x04; MAX_PACKET_SIZE + 1];
         assert_eq!(
-            parse_payload(&PacketContext::Protected(ShortPacketSpace::SessionData), &big),
+            parse_payload(
+                &PacketContext::Protected(ShortPacketSpace::SessionData),
+                &big
+            ),
             Err(PacketError::TooLarge)
         );
     }

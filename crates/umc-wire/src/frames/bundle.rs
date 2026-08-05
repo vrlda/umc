@@ -36,22 +36,44 @@ impl BundleFrame {
             return Err(FrameError::LengthExceedsLimit);
         }
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::BUNDLE.0).map_err(FrameError::VarintEncode)?;
-        crate::bytes::encode(&mut out, &self.bundle_id, MAX_BUNDLE_ID).map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::varint::encode_into(&mut out, FrameType::BUNDLE.0)
+            .map_err(FrameError::VarintEncode)?;
+        crate::bytes::encode(&mut out, &self.bundle_id, MAX_BUNDLE_ID)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
         let mut flags = 0u8;
-        if self.custody_requested { flags |= 0x01; }
-        if self.delivery_ack_requested { flags |= 0x02; }
-        if self.do_not_replicate { flags |= 0x04; }
-        if self.local_scope_only { flags |= 0x08; }
-        if self.high_sensitivity { flags |= 0x10; }
+        if self.custody_requested {
+            flags |= 0x01;
+        }
+        if self.delivery_ack_requested {
+            flags |= 0x02;
+        }
+        if self.do_not_replicate {
+            flags |= 0x04;
+        }
+        if self.local_scope_only {
+            flags |= 0x08;
+        }
+        if self.high_sensitivity {
+            flags |= 0x10;
+        }
         out.push(flags);
         crate::varint::encode_into(&mut out, self.priority).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.creation_time).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.expiration_time).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.replication_limit).map_err(FrameError::VarintEncode)?;
-        crate::bytes::encode(&mut out, &self.destination_hint, MAX_BUNDLE_DESTINATION_HINT).map_err(|_| FrameError::LengthExceedsLimit)?;
-        crate::bytes::encode(&mut out, &self.payload, MAX_BUNDLE_PAYLOAD).map_err(|_| FrameError::LengthExceedsLimit)?;
-        crate::bytes::encode(&mut out, &self.bundle_auth, MAX_BUNDLE_AUTH).map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::varint::encode_into(&mut out, self.creation_time)
+            .map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.expiration_time)
+            .map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.replication_limit)
+            .map_err(FrameError::VarintEncode)?;
+        crate::bytes::encode(
+            &mut out,
+            &self.destination_hint,
+            MAX_BUNDLE_DESTINATION_HINT,
+        )
+        .map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::bytes::encode(&mut out, &self.payload, MAX_BUNDLE_PAYLOAD)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::bytes::encode(&mut out, &self.bundle_auth, MAX_BUNDLE_AUTH)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
         Ok(out)
     }
 
@@ -69,7 +91,8 @@ impl BundleFrame {
             *p += n;
             Ok(v)
         };
-        let (id, n) = crate::bytes::decode(&body[pos..], MAX_BUNDLE_ID).map_err(|_| FrameError::Truncated)?;
+        let (id, n) =
+            crate::bytes::decode(&body[pos..], MAX_BUNDLE_ID).map_err(|_| FrameError::Truncated)?;
         pos += n;
         let flags = *body.get(pos).ok_or(FrameError::Truncated)?;
         pos += 1;
@@ -80,11 +103,14 @@ impl BundleFrame {
         let created = read_varint(&mut pos)?;
         let expires = read_varint(&mut pos)?;
         let replication = read_varint(&mut pos)?;
-        let (dh, n) = crate::bytes::decode(&body[pos..], MAX_BUNDLE_DESTINATION_HINT).map_err(|_| FrameError::Truncated)?;
+        let (dh, n) = crate::bytes::decode(&body[pos..], MAX_BUNDLE_DESTINATION_HINT)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
-        let (payload, n) = crate::bytes::decode(&body[pos..], MAX_BUNDLE_PAYLOAD).map_err(|_| FrameError::Truncated)?;
+        let (payload, n) = crate::bytes::decode(&body[pos..], MAX_BUNDLE_PAYLOAD)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
-        let (auth, n) = crate::bytes::decode(&body[pos..], MAX_BUNDLE_AUTH).map_err(|_| FrameError::Truncated)?;
+        let (auth, n) = crate::bytes::decode(&body[pos..], MAX_BUNDLE_AUTH)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
         Ok((
             Self {
@@ -124,11 +150,15 @@ impl BundleAckFrame {
     /// `VarintEncode` if a field cannot be encoded.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::BUNDLE_ACK.0).map_err(FrameError::VarintEncode)?;
-        crate::bytes::encode(&mut out, &self.bundle_id, MAX_BUNDLE_ID).map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::varint::encode_into(&mut out, FrameType::BUNDLE_ACK.0)
+            .map_err(FrameError::VarintEncode)?;
+        crate::bytes::encode(&mut out, &self.bundle_id, MAX_BUNDLE_ID)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
         crate::varint::encode_into(&mut out, self.status).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.stored_until).map_err(FrameError::VarintEncode)?;
-        crate::bytes::encode(&mut out, &self.authentication, MAX_BUNDLE_AUTH).map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::varint::encode_into(&mut out, self.stored_until)
+            .map_err(FrameError::VarintEncode)?;
+        crate::bytes::encode(&mut out, &self.authentication, MAX_BUNDLE_AUTH)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
         Ok(out)
     }
 
@@ -140,15 +170,25 @@ impl BundleAckFrame {
     /// Returns `Truncated` or `Varint` if the body is malformed or truncated.
     pub fn decode(body: &[u8]) -> Result<(Self, usize), FrameError> {
         let mut pos = 0usize;
-        let (id, n) = crate::bytes::decode(&body[pos..], MAX_BUNDLE_ID).map_err(|_| FrameError::Truncated)?;
+        let (id, n) =
+            crate::bytes::decode(&body[pos..], MAX_BUNDLE_ID).map_err(|_| FrameError::Truncated)?;
         pos += n;
         let (status, n) = crate::varint::decode(&body[pos..]).map_err(FrameError::Varint)?;
         pos += n;
         let (stored_until, n) = crate::varint::decode(&body[pos..]).map_err(FrameError::Varint)?;
         pos += n;
-        let (auth, n) = crate::bytes::decode(&body[pos..], MAX_BUNDLE_AUTH).map_err(|_| FrameError::Truncated)?;
+        let (auth, n) = crate::bytes::decode(&body[pos..], MAX_BUNDLE_AUTH)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
-        Ok((Self { bundle_id: id.to_vec(), status, stored_until, authentication: auth.to_vec() }, pos))
+        Ok((
+            Self {
+                bundle_id: id.to_vec(),
+                status,
+                stored_until,
+                authentication: auth.to_vec(),
+            },
+            pos,
+        ))
     }
 }
 
@@ -185,7 +225,12 @@ mod tests {
 
     #[test]
     fn bundle_ack_round_trip() {
-        let f = BundleAckFrame { bundle_id: vec![1, 2, 3], status: 1, stored_until: 1_700_086_400_000, authentication: vec![] };
+        let f = BundleAckFrame {
+            bundle_id: vec![1, 2, 3],
+            status: 1,
+            stored_until: 1_700_086_400_000,
+            authentication: vec![],
+        };
         let enc = f.encode().unwrap();
         let (dec, _) = BundleAckFrame::decode(&enc[type_len(FrameType::BUNDLE_ACK.0)..]).unwrap();
         assert_eq!(dec, f);

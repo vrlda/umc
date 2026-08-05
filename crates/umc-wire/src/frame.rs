@@ -89,11 +89,13 @@ impl AckFrame {
         }
         let mut out = Vec::new();
         crate::varint::encode_into(&mut out, FrameType::ACK.0).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.largest_acknowledged).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.largest_acknowledged)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.ack_delay).map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, (self.additional_ranges.len() + 1) as u64)
             .map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.first_ack_range).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.first_ack_range)
+            .map_err(FrameError::VarintEncode)?;
         for r in &self.additional_ranges {
             crate::varint::encode_into(&mut out, r.gap).map_err(FrameError::VarintEncode)?;
             crate::varint::encode_into(&mut out, r.length).map_err(FrameError::VarintEncode)?;
@@ -116,7 +118,8 @@ impl AckFrame {
             *p += n;
             Ok(v)
         };
-        let largest = read_varint(&mut pos)?;        let delay = read_varint(&mut pos)?;
+        let largest = read_varint(&mut pos)?;
+        let delay = read_varint(&mut pos)?;
         let range_count = read_varint(&mut pos)?;
         if range_count == 0 || range_count > MAX_ACK_RANGES as u64 + 1 {
             return Err(FrameError::TooManyAckRanges);
@@ -131,7 +134,15 @@ impl AckFrame {
             }
             ranges.push(AckRange { gap, length });
         }
-        Ok((Self { largest_acknowledged: largest, ack_delay: delay, first_ack_range: first, additional_ranges: ranges }, pos))
+        Ok((
+            Self {
+                largest_acknowledged: largest,
+                ack_delay: delay,
+                first_ack_range: first,
+                additional_ranges: ranges,
+            },
+            pos,
+        ))
     }
 }
 
@@ -147,10 +158,13 @@ impl ConnectionCloseFrame {
             return Err(FrameError::LengthExceedsLimit);
         }
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::CONNECTION_CLOSE.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::CONNECTION_CLOSE.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.error_code).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.trigger_frame_type).map_err(FrameError::VarintEncode)?;
-        crate::bytes::encode(&mut out, &self.reason, MAX_REASON_LEN).map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::varint::encode_into(&mut out, self.trigger_frame_type)
+            .map_err(FrameError::VarintEncode)?;
+        crate::bytes::encode(&mut out, &self.reason, MAX_REASON_LEN)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
         Ok(out)
     }
 
@@ -170,9 +184,17 @@ impl ConnectionCloseFrame {
         };
         let code = read_varint(&mut pos)?;
         let trigger = read_varint(&mut pos)?;
-        let (reason, n) = crate::bytes::decode(&body[pos..], MAX_REASON_LEN).map_err(|_| FrameError::Truncated)?;
+        let (reason, n) = crate::bytes::decode(&body[pos..], MAX_REASON_LEN)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
-        Ok((Self { error_code: code, trigger_frame_type: trigger, reason: reason.to_vec() }, pos))
+        Ok((
+            Self {
+                error_code: code,
+                trigger_frame_type: trigger,
+                reason: reason.to_vec(),
+            },
+            pos,
+        ))
     }
 }
 
@@ -248,35 +270,124 @@ pub fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, FrameError> {
                         pos += used;
                         out.push(Frame::Datagram(f));
                     }
-                    FrameType::NEW_CONNECTION_ID => { let (f, used) = crate::frames::path::NewConnectionIdFrame::decode(rest)?; pos += used; out.push(Frame::NewConnectionId(f)); }
-                    FrameType::RETIRE_CONNECTION_ID => { let (f, used) = crate::frames::path::RetireConnectionIdFrame::decode(rest)?; pos += used; out.push(Frame::RetireConnectionId(f)); }
-                    FrameType::PATH_CHALLENGE => { let (f, used) = crate::frames::path::PathChallengeFrame::decode(rest)?; pos += used; out.push(Frame::PathChallenge(f)); }
-                    FrameType::PATH_RESPONSE => { let (f, used) = crate::frames::path::PathResponseFrame::decode(rest)?; pos += used; out.push(Frame::PathResponse(f)); }
-                    FrameType::PATH_STATUS => { let (f, used) = crate::frames::path::PathStatusFrame::decode(rest)?; pos += used; out.push(Frame::PathStatus(f)); }
-                    FrameType::MIGRATE => { let (f, used) = crate::frames::path::MigrateFrame::decode(rest)?; pos += used; out.push(Frame::Migrate(f)); }
-                    FrameType::KEY_UPDATE => { let (f, used) = crate::frames::path::KeyUpdateFrame::decode(rest)?; pos += used; out.push(Frame::KeyUpdate(f)); }
-                    FrameType::AUTH => { let (f, used) = crate::frames::handshake::AuthFrame::decode(rest)?; pos += used; out.push(Frame::Auth(f)); }
-                    FrameType::HANDSHAKE_DATA => { let (f, used) = crate::frames::handshake::HandshakeDataFrame::decode(rest)?; pos += used; out.push(Frame::HandshakeData(f)); }
-                    FrameType::CAPABILITIES => { let (f, used) = crate::frames::handshake::CapabilitiesFrame::decode(rest)?; pos += used; out.push(Frame::Capabilities(f)); }
-                    FrameType::SESSION_TICKET => { let (f, used) = crate::frames::handshake::SessionTicketFrame::decode(rest)?; pos += used; out.push(Frame::SessionTicket(f)); }
-                    FrameType::ROUTE_REQUEST => { let (f, used) = crate::frames::routing::RouteRequestFrame::decode(rest)?; pos += used; out.push(Frame::RouteRequest(f)); }
-                    FrameType::ROUTE_RESPONSE => { let (f, used) = crate::frames::routing::RouteResponseFrame::decode(rest)?; pos += used; out.push(Frame::RouteResponse(f)); }
-                    FrameType::ROUTE_ERROR => { let (f, used) = crate::frames::routing::RouteErrorFrame::decode(rest)?; pos += used; out.push(Frame::RouteError(f)); }
-                    FrameType::RELAY_OPEN => { let (f, used) = crate::frames::relay::RelayOpenFrame::decode(rest)?; pos += used; out.push(Frame::RelayOpen(f)); }
-                    FrameType::RELAY_STATUS => { let (f, used) = crate::frames::relay::RelayStatusFrame::decode(rest)?; pos += used; out.push(Frame::RelayStatus(f)); }
-                    FrameType::RELAY_DATA => { let (f, used) = crate::frames::relay::RelayDataFrame::decode(rest)?; pos += used; out.push(Frame::RelayData(f)); }
-                    FrameType::RELAY_CLOSE => { let (f, used) = crate::frames::relay::RelayCloseFrame::decode(rest)?; pos += used; out.push(Frame::RelayClose(f)); }
-                    FrameType::BUNDLE => { let (f, used) = crate::frames::bundle::BundleFrame::decode(rest)?; pos += used; out.push(Frame::Bundle(f)); }
-                    FrameType::BUNDLE_ACK => { let (f, used) = crate::frames::bundle::BundleAckFrame::decode(rest)?; pos += used; out.push(Frame::BundleAck(f)); }
-                    FrameType::PEER_HINT => { let (f, used) = crate::frames::misc::PeerHintFrame::decode(rest)?; pos += used; out.push(Frame::PeerHint(f)); }
-                    FrameType::SERVICE_HINT => { let (f, used) = crate::frames::misc::ServiceHintFrame::decode(rest)?; pos += used; out.push(Frame::ServiceHint(f)); }
+                    FrameType::NEW_CONNECTION_ID => {
+                        let (f, used) = crate::frames::path::NewConnectionIdFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::NewConnectionId(f));
+                    }
+                    FrameType::RETIRE_CONNECTION_ID => {
+                        let (f, used) = crate::frames::path::RetireConnectionIdFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::RetireConnectionId(f));
+                    }
+                    FrameType::PATH_CHALLENGE => {
+                        let (f, used) = crate::frames::path::PathChallengeFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::PathChallenge(f));
+                    }
+                    FrameType::PATH_RESPONSE => {
+                        let (f, used) = crate::frames::path::PathResponseFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::PathResponse(f));
+                    }
+                    FrameType::PATH_STATUS => {
+                        let (f, used) = crate::frames::path::PathStatusFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::PathStatus(f));
+                    }
+                    FrameType::MIGRATE => {
+                        let (f, used) = crate::frames::path::MigrateFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::Migrate(f));
+                    }
+                    FrameType::KEY_UPDATE => {
+                        let (f, used) = crate::frames::path::KeyUpdateFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::KeyUpdate(f));
+                    }
+                    FrameType::AUTH => {
+                        let (f, used) = crate::frames::handshake::AuthFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::Auth(f));
+                    }
+                    FrameType::HANDSHAKE_DATA => {
+                        let (f, used) = crate::frames::handshake::HandshakeDataFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::HandshakeData(f));
+                    }
+                    FrameType::CAPABILITIES => {
+                        let (f, used) = crate::frames::handshake::CapabilitiesFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::Capabilities(f));
+                    }
+                    FrameType::SESSION_TICKET => {
+                        let (f, used) = crate::frames::handshake::SessionTicketFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::SessionTicket(f));
+                    }
+                    FrameType::ROUTE_REQUEST => {
+                        let (f, used) = crate::frames::routing::RouteRequestFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::RouteRequest(f));
+                    }
+                    FrameType::ROUTE_RESPONSE => {
+                        let (f, used) = crate::frames::routing::RouteResponseFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::RouteResponse(f));
+                    }
+                    FrameType::ROUTE_ERROR => {
+                        let (f, used) = crate::frames::routing::RouteErrorFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::RouteError(f));
+                    }
+                    FrameType::RELAY_OPEN => {
+                        let (f, used) = crate::frames::relay::RelayOpenFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::RelayOpen(f));
+                    }
+                    FrameType::RELAY_STATUS => {
+                        let (f, used) = crate::frames::relay::RelayStatusFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::RelayStatus(f));
+                    }
+                    FrameType::RELAY_DATA => {
+                        let (f, used) = crate::frames::relay::RelayDataFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::RelayData(f));
+                    }
+                    FrameType::RELAY_CLOSE => {
+                        let (f, used) = crate::frames::relay::RelayCloseFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::RelayClose(f));
+                    }
+                    FrameType::BUNDLE => {
+                        let (f, used) = crate::frames::bundle::BundleFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::Bundle(f));
+                    }
+                    FrameType::BUNDLE_ACK => {
+                        let (f, used) = crate::frames::bundle::BundleAckFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::BundleAck(f));
+                    }
+                    FrameType::PEER_HINT => {
+                        let (f, used) = crate::frames::misc::PeerHintFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::PeerHint(f));
+                    }
+                    FrameType::SERVICE_HINT => {
+                        let (f, used) = crate::frames::misc::ServiceHintFrame::decode(rest)?;
+                        pos += used;
+                        out.push(Frame::ServiceHint(f));
+                    }
                     _ if ty.behavior() == ExtensionBehavior::OptionalFixed => {
                         return Err(FrameError::UnknownOptionalFixedFrame(ty));
                     }
                     _ => return Err(FrameError::UnknownCriticalFrame(ty)),
                 }
             }
-            ExtensionBehavior::CriticalLengthDelimited | ExtensionBehavior::OptionalLengthDelimited => {
+            ExtensionBehavior::CriticalLengthDelimited
+            | ExtensionBehavior::OptionalLengthDelimited => {
                 return Err(FrameError::UnsupportedLengthDelimited);
             }
         }
@@ -295,17 +406,28 @@ mod tests {
 
     #[test]
     fn padding_is_one_byte_per_frame() {
-        assert_eq!(decode_frames(&[0x00, 0x00, 0x00]).unwrap(), vec![Frame::Padding, Frame::Padding, Frame::Padding]);
+        assert_eq!(
+            decode_frames(&[0x00, 0x00, 0x00]).unwrap(),
+            vec![Frame::Padding, Frame::Padding, Frame::Padding]
+        );
     }
 
     #[test]
     fn non_zero_padding_byte_is_an_error() {
-        assert_eq!(decode_frames(&[0x00, 0x01]), Err(FrameError::UnknownOptionalFixedFrame(FrameType(0x01))));
+        assert_eq!(
+            decode_frames(&[0x00, 0x01]),
+            Err(FrameError::UnknownOptionalFixedFrame(FrameType(0x01)))
+        );
     }
 
     #[test]
     fn ack_round_trip_with_ranges() {
-        let f = AckFrame { largest_acknowledged: 100, ack_delay: 5, first_ack_range: 3, additional_ranges: vec![AckRange { gap: 2, length: 4 }] };
+        let f = AckFrame {
+            largest_acknowledged: 100,
+            ack_delay: 5,
+            first_ack_range: 3,
+            additional_ranges: vec![AckRange { gap: 2, length: 4 }],
+        };
         let enc = f.encode().unwrap();
         let (dec, used) = AckFrame::decode(&enc[1..]).unwrap();
         assert_eq!(dec, f);
@@ -320,7 +442,11 @@ mod tests {
 
     #[test]
     fn connection_close_round_trip() {
-        let f = ConnectionCloseFrame { error_code: 0x02, trigger_frame_type: 0x10, reason: b"bad stream".to_vec() };
+        let f = ConnectionCloseFrame {
+            error_code: 0x02,
+            trigger_frame_type: 0x10,
+            reason: b"bad stream".to_vec(),
+        };
         let enc = f.encode().unwrap();
         let (dec, used) = ConnectionCloseFrame::decode(&enc[1..]).unwrap();
         assert_eq!(dec, f);
@@ -329,6 +455,9 @@ mod tests {
 
     #[test]
     fn unknown_optional_fixed_is_rejected() {
-        assert_eq!(decode_frames(&[0x01]), Err(FrameError::UnknownOptionalFixedFrame(FrameType(0x01))));
+        assert_eq!(
+            decode_frames(&[0x01]),
+            Err(FrameError::UnknownOptionalFixedFrame(FrameType(0x01)))
+        );
     }
 }
