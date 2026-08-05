@@ -94,7 +94,17 @@ mod tests {
 
     #[test]
     fn canonical_round_trips() {
-        for v in [0u64, 1, 63, 64, 16_383, 16_384, 1_073_741_823, 1_073_741_824, MAX_VARINT] {
+        for v in [
+            0u64,
+            1,
+            63,
+            64,
+            16_383,
+            16_384,
+            1_073_741_823,
+            1_073_741_824,
+            MAX_VARINT,
+        ] {
             let enc = encode(v).unwrap();
             let (dec, n) = decode(&enc).unwrap();
             assert_eq!((dec, n), (v, enc.len()), "value {v}");
@@ -107,21 +117,36 @@ mod tests {
         assert_eq!(encode(63).unwrap(), vec![0x3F]);
         assert_eq!(encode(64).unwrap(), vec![0x40, 0x40]);
         assert_eq!(encode(16_383).unwrap(), vec![0x7F, 0xFF]);
-        assert_eq!(encode(1_073_741_824).unwrap(), vec![0xC0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            encode(1_073_741_824).unwrap(),
+            vec![0xC0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00]
+        );
     }
 
     #[test]
     fn rejects_non_canonical_encodings() {
-        assert_eq!(decode(&[0x40, 0x00]).unwrap_err(), DecodeError::NonCanonical);
-        assert_eq!(decode(&[0x80, 0x00, 0x00, 0x00]).unwrap_err(), DecodeError::NonCanonical);
-        assert_eq!(decode(&[0xC0, 0, 0, 0, 0, 0, 0, 0]).unwrap_err(), DecodeError::NonCanonical);
+        assert_eq!(
+            decode(&[0x40, 0x00]).unwrap_err(),
+            DecodeError::NonCanonical
+        );
+        assert_eq!(
+            decode(&[0x80, 0x00, 0x00, 0x00]).unwrap_err(),
+            DecodeError::NonCanonical
+        );
+        assert_eq!(
+            decode(&[0xC0, 0, 0, 0, 0, 0, 0, 0]).unwrap_err(),
+            DecodeError::NonCanonical
+        );
     }
 
     #[test]
     fn rejects_truncated_and_oversized() {
         assert_eq!(decode(&[]).unwrap_err(), DecodeError::Truncated);
         assert_eq!(decode(&[0x40]).unwrap_err(), DecodeError::Truncated);
-        assert_eq!(encode(MAX_VARINT + 1).unwrap_err(), EncodeError::ValueTooLarge);
+        assert_eq!(
+            encode(MAX_VARINT + 1).unwrap_err(),
+            EncodeError::ValueTooLarge
+        );
     }
 }
 

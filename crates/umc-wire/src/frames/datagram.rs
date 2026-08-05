@@ -25,17 +25,25 @@ impl DatagramFrame {
             return Err(FrameError::LengthExceedsLimit);
         }
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::DATAGRAM.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::DATAGRAM.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.context_id).map_err(FrameError::VarintEncode)?;
         let mut flags = 0u8;
-        if self.ack_requested { flags |= 0x01; }
-        if self.duplicate_suppression { flags |= 0x02; }
-        if self.expiration_delta.is_some() { flags |= 0x04; }
+        if self.ack_requested {
+            flags |= 0x01;
+        }
+        if self.duplicate_suppression {
+            flags |= 0x02;
+        }
+        if self.expiration_delta.is_some() {
+            flags |= 0x04;
+        }
         out.push(flags);
         if let Some(d) = self.expiration_delta {
             crate::varint::encode_into(&mut out, d).map_err(FrameError::VarintEncode)?;
         }
-        crate::varint::encode_into(&mut out, self.data.len() as u64).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.data.len() as u64)
+            .map_err(FrameError::VarintEncode)?;
         out.extend_from_slice(&self.data);
         Ok(out)
     }
@@ -61,12 +69,17 @@ impl DatagramFrame {
         if flags & 0xF8 != 0 {
             return Err(FrameError::InvalidPadding);
         }
-        let expiration_delta = if flags & 0x04 != 0 { Some(read_varint(&mut pos)?) } else { None };
+        let expiration_delta = if flags & 0x04 != 0 {
+            Some(read_varint(&mut pos)?)
+        } else {
+            None
+        };
         let data_len = read_varint(&mut pos)?;
         if data_len > MAX_DATAGRAM_PAYLOAD as u64 {
             return Err(FrameError::LengthExceedsLimit);
         }
-        let end = pos.checked_add(usize::try_from(data_len).map_err(|_| FrameError::Truncated)?)
+        let end = pos
+            .checked_add(usize::try_from(data_len).map_err(|_| FrameError::Truncated)?)
             .ok_or(FrameError::Truncated)?;
         let data = body.get(pos..end).ok_or(FrameError::Truncated)?.to_vec();
         Ok((

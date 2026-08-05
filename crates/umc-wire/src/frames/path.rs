@@ -17,7 +17,8 @@ impl PathChallengeFrame {
     /// Returns `VarintEncode` if the type byte cannot be encoded.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::PATH_CHALLENGE.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::PATH_CHALLENGE.0)
+            .map_err(FrameError::VarintEncode)?;
         out.extend_from_slice(&self.data);
         Ok(out)
     }
@@ -48,7 +49,8 @@ impl PathResponseFrame {
     /// Returns `VarintEncode` if the type byte cannot be encoded.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::PATH_RESPONSE.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::PATH_RESPONSE.0)
+            .map_err(FrameError::VarintEncode)?;
         out.extend_from_slice(&self.data);
         Ok(out)
     }
@@ -90,19 +92,35 @@ impl PathStatusFrame {
     /// Returns `VarintEncode` if a field cannot be encoded.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::PATH_STATUS.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::PATH_STATUS.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.path_id).map_err(FrameError::VarintEncode)?;
         let mut flags = 0u8;
-        if self.validated { flags |= 0x01; }
-        if self.active { flags |= 0x02; }
-        if self.degraded { flags |= 0x04; }
-        if self.local { flags |= 0x08; }
-        if self.metered { flags |= 0x10; }
-        if self.censored_or_filtered { flags |= 0x20; }
+        if self.validated {
+            flags |= 0x01;
+        }
+        if self.active {
+            flags |= 0x02;
+        }
+        if self.degraded {
+            flags |= 0x04;
+        }
+        if self.local {
+            flags |= 0x08;
+        }
+        if self.metered {
+            flags |= 0x10;
+        }
+        if self.censored_or_filtered {
+            flags |= 0x20;
+        }
         out.push(flags);
-        crate::varint::encode_into(&mut out, self.estimated_rtt).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.estimated_bandwidth).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.estimated_loss).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.estimated_rtt)
+            .map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.estimated_bandwidth)
+            .map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.estimated_loss)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.cost_class).map_err(FrameError::VarintEncode)?;
         Ok(out)
     }
@@ -168,14 +186,22 @@ impl MigrateFrame {
     /// Returns `VarintEncode` if a field cannot be encoded.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::MIGRATE.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::MIGRATE.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.old_path_id).map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.new_path_id).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.migration_sequence).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.migration_sequence)
+            .map_err(FrameError::VarintEncode)?;
         let mut flags = 0u8;
-        if self.make_primary { flags |= 0x01; }
-        if self.keep_old_path { flags |= 0x02; }
-        if self.duplicate_critical_frames { flags |= 0x04; }
+        if self.make_primary {
+            flags |= 0x01;
+        }
+        if self.keep_old_path {
+            flags |= 0x02;
+        }
+        if self.duplicate_critical_frames {
+            flags |= 0x04;
+        }
         out.push(flags);
         Ok(out)
     }
@@ -230,8 +256,10 @@ impl KeyUpdateFrame {
     /// Returns `VarintEncode` if the sequence cannot be encoded.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::KEY_UPDATE.0).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.update_sequence).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::KEY_UPDATE.0)
+            .map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.update_sequence)
+            .map_err(FrameError::VarintEncode)?;
         out.push(u8::from(self.request_peer_update));
         Ok(out)
     }
@@ -249,7 +277,13 @@ impl KeyUpdateFrame {
         if flags & 0xFE != 0 {
             return Err(FrameError::InvalidPadding);
         }
-        Ok((Self { update_sequence: seq, request_peer_update: flags & 0x01 != 0 }, n + 1))
+        Ok((
+            Self {
+                update_sequence: seq,
+                request_peer_update: flags & 0x01 != 0,
+            },
+            n + 1,
+        ))
     }
 }
 
@@ -277,9 +311,11 @@ impl NewConnectionIdFrame {
             return Err(FrameError::InvalidPadding);
         }
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::NEW_CONNECTION_ID.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::NEW_CONNECTION_ID.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.sequence).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.retire_prior_to).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.retire_prior_to)
+            .map_err(FrameError::VarintEncode)?;
         #[allow(clippy::cast_possible_truncation)]
         out.push(self.connection_id.len() as u8);
         out.extend_from_slice(&self.connection_id);
@@ -304,16 +340,34 @@ impl NewConnectionIdFrame {
             return Err(FrameError::LengthExceedsLimit);
         }
         let cid_start = len_pos + 1;
-        let cid_end = cid_start.checked_add(cid_len).ok_or(FrameError::Truncated)?;
-        let cid = body.get(cid_start..cid_end).ok_or(FrameError::Truncated)?.to_vec();
+        let cid_end = cid_start
+            .checked_add(cid_len)
+            .ok_or(FrameError::Truncated)?;
+        let cid = body
+            .get(cid_start..cid_end)
+            .ok_or(FrameError::Truncated)?
+            .to_vec();
         let token_start = cid_end;
-        let token_end = token_start.checked_add(RESET_TOKEN_LEN).ok_or(FrameError::Truncated)?;
+        let token_end = token_start
+            .checked_add(RESET_TOKEN_LEN)
+            .ok_or(FrameError::Truncated)?;
         let mut reset_token = [0u8; RESET_TOKEN_LEN];
-        reset_token.copy_from_slice(body.get(token_start..token_end).ok_or(FrameError::Truncated)?);
+        reset_token.copy_from_slice(
+            body.get(token_start..token_end)
+                .ok_or(FrameError::Truncated)?,
+        );
         if retire > seq {
             return Err(FrameError::InvalidPadding);
         }
-        Ok((Self { sequence: seq, retire_prior_to: retire, connection_id: cid, reset_token }, token_end))
+        Ok((
+            Self {
+                sequence: seq,
+                retire_prior_to: retire,
+                connection_id: cid,
+                reset_token,
+            },
+            token_end,
+        ))
     }
 }
 
@@ -330,7 +384,8 @@ impl RetireConnectionIdFrame {
     /// Returns `VarintEncode` if the sequence cannot be encoded.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::RETIRE_CONNECTION_ID.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::RETIRE_CONNECTION_ID.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.sequence).map_err(FrameError::VarintEncode)?;
         Ok(out)
     }
@@ -353,7 +408,9 @@ mod tests {
 
     #[test]
     fn path_challenge_round_trip() {
-        let f = PathChallengeFrame { data: [7u8; CHALLENGE_LEN] };
+        let f = PathChallengeFrame {
+            data: [7u8; CHALLENGE_LEN],
+        };
         let enc = f.encode().unwrap();
         let (dec, used) = PathChallengeFrame::decode(&enc[1..]).unwrap();
         assert_eq!(dec, f);
@@ -382,7 +439,14 @@ mod tests {
 
     #[test]
     fn migrate_round_trip() {
-        let f = MigrateFrame { old_path_id: 0, new_path_id: 1, migration_sequence: 3, make_primary: true, keep_old_path: true, duplicate_critical_frames: false };
+        let f = MigrateFrame {
+            old_path_id: 0,
+            new_path_id: 1,
+            migration_sequence: 3,
+            make_primary: true,
+            keep_old_path: true,
+            duplicate_critical_frames: false,
+        };
         let enc = f.encode().unwrap();
         let ty_len = crate::varint::encode(FrameType::MIGRATE.0).unwrap().len();
         let (dec, _) = MigrateFrame::decode(&enc[ty_len..]).unwrap();
@@ -391,21 +455,36 @@ mod tests {
 
     #[test]
     fn key_update_round_trip() {
-        let f = KeyUpdateFrame { update_sequence: 1, request_peer_update: true };
+        let f = KeyUpdateFrame {
+            update_sequence: 1,
+            request_peer_update: true,
+        };
         let enc = f.encode().unwrap();
-        let ty_len = crate::varint::encode(FrameType::KEY_UPDATE.0).unwrap().len();
+        let ty_len = crate::varint::encode(FrameType::KEY_UPDATE.0)
+            .unwrap()
+            .len();
         let (dec, _) = KeyUpdateFrame::decode(&enc[ty_len..]).unwrap();
         assert_eq!(dec, f);
     }
 
     #[test]
     fn new_connection_id_round_trip_and_validation() {
-        let f = NewConnectionIdFrame { sequence: 0, retire_prior_to: 0, connection_id: vec![1, 2, 3, 4, 5, 6, 7, 8], reset_token: [9u8; RESET_TOKEN_LEN] };
+        let f = NewConnectionIdFrame {
+            sequence: 0,
+            retire_prior_to: 0,
+            connection_id: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            reset_token: [9u8; RESET_TOKEN_LEN],
+        };
         let enc = f.encode().unwrap();
         let (dec, used) = NewConnectionIdFrame::decode(&enc[1..]).unwrap();
         assert_eq!(dec, f);
         assert_eq!(used, enc.len() - 1);
-        let bad = NewConnectionIdFrame { sequence: 1, retire_prior_to: 2, connection_id: vec![1], reset_token: [0u8; 16] };
+        let bad = NewConnectionIdFrame {
+            sequence: 1,
+            retire_prior_to: 2,
+            connection_id: vec![1],
+            reset_token: [0u8; 16],
+        };
         assert_eq!(bad.encode(), Err(FrameError::InvalidPadding));
     }
 

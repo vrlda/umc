@@ -40,13 +40,48 @@ pub struct HeaderByte {
 }
 
 impl HeaderByte {
-    pub const LONG_INITIAL: Self = Self { long: true, kind: 0, key_phase: false, pn_bits: 8 };
-    pub const LONG_RETRY: Self = Self { long: true, kind: 1, key_phase: false, pn_bits: 8 };
-    pub const LONG_HANDSHAKE: Self = Self { long: true, kind: 2, key_phase: false, pn_bits: 8 };
-    pub const LONG_VERSION_NEGOTIATION: Self = Self { long: true, kind: 3, key_phase: false, pn_bits: 8 };
-    pub const SHORT_SESSION: Self = Self { long: false, kind: 0, key_phase: false, pn_bits: 8 };
-    pub const SHORT_PATH: Self = Self { long: false, kind: 1, key_phase: false, pn_bits: 8 };
-    pub const SHORT_RELAY: Self = Self { long: false, kind: 2, key_phase: false, pn_bits: 8 };
+    pub const LONG_INITIAL: Self = Self {
+        long: true,
+        kind: 0,
+        key_phase: false,
+        pn_bits: 8,
+    };
+    pub const LONG_RETRY: Self = Self {
+        long: true,
+        kind: 1,
+        key_phase: false,
+        pn_bits: 8,
+    };
+    pub const LONG_HANDSHAKE: Self = Self {
+        long: true,
+        kind: 2,
+        key_phase: false,
+        pn_bits: 8,
+    };
+    pub const LONG_VERSION_NEGOTIATION: Self = Self {
+        long: true,
+        kind: 3,
+        key_phase: false,
+        pn_bits: 8,
+    };
+    pub const SHORT_SESSION: Self = Self {
+        long: false,
+        kind: 0,
+        key_phase: false,
+        pn_bits: 8,
+    };
+    pub const SHORT_PATH: Self = Self {
+        long: false,
+        kind: 1,
+        key_phase: false,
+        pn_bits: 8,
+    };
+    pub const SHORT_RELAY: Self = Self {
+        long: false,
+        kind: 2,
+        key_phase: false,
+        pn_bits: 8,
+    };
 
     /// Encodes the header-form byte.
     #[must_use]
@@ -163,9 +198,11 @@ impl LongHeader {
         out.extend_from_slice(&self.dcid);
         out.push(self.scid.len() as u8);
         out.extend_from_slice(&self.scid);
-        crate::varint::encode_into(&mut out, self.token.len() as u64).map_err(|_| HeaderError::Truncated)?;
+        crate::varint::encode_into(&mut out, self.token.len() as u64)
+            .map_err(|_| HeaderError::Truncated)?;
         out.extend_from_slice(&self.token);
-        crate::varint::encode_into(&mut out, self.payload_len).map_err(|_| HeaderError::Truncated)?;
+        crate::varint::encode_into(&mut out, self.payload_len)
+            .map_err(|_| HeaderError::Truncated)?;
         let pn_bytes = (self.pn_bits as usize) / 8;
         out.extend_from_slice(&self.packet_number.to_be_bytes()[8 - pn_bytes..]);
         Ok(out)

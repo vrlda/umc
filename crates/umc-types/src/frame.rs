@@ -63,12 +63,24 @@ mod tests {
 
     #[test]
     fn registered_frame_types_are_critical_fixed_layout() {
-        assert_eq!(FrameType::PADDING.behavior(), ExtensionBehavior::CriticalFixed);
+        assert_eq!(
+            FrameType::PADDING.behavior(),
+            ExtensionBehavior::CriticalFixed
+        );
         assert_eq!(FrameType::PING.behavior(), ExtensionBehavior::CriticalFixed);
         assert_eq!(FrameType::ACK.behavior(), ExtensionBehavior::CriticalFixed);
-        assert_eq!(FrameType::ROUTE_REQUEST.behavior(), ExtensionBehavior::CriticalFixed);
-        assert_eq!(FrameType::RELAY_STATUS.behavior(), ExtensionBehavior::CriticalLengthDelimited);
-        assert_eq!(FrameType::BUNDLE.behavior(), ExtensionBehavior::CriticalFixed);
+        assert_eq!(
+            FrameType::ROUTE_REQUEST.behavior(),
+            ExtensionBehavior::CriticalFixed
+        );
+        assert_eq!(
+            FrameType::RELAY_STATUS.behavior(),
+            ExtensionBehavior::CriticalLengthDelimited
+        );
+        assert_eq!(
+            FrameType::BUNDLE.behavior(),
+            ExtensionBehavior::CriticalFixed
+        );
     }
 
     #[test]

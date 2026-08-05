@@ -40,23 +40,39 @@ impl RouteRequestFrame {
             return Err(FrameError::LengthExceedsLimit);
         }
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::ROUTE_REQUEST.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::ROUTE_REQUEST.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.request_id).map_err(FrameError::VarintEncode)?;
         let mut flags = 0u8;
-        if self.allow_relay { flags |= 0x01; }
-        if self.allow_store_forward { flags |= 0x02; }
-        if self.require_private_response { flags |= 0x04; }
-        if self.local_scope_only { flags |= 0x08; }
-        if self.gateway_query { flags |= 0x10; }
+        if self.allow_relay {
+            flags |= 0x01;
+        }
+        if self.allow_store_forward {
+            flags |= 0x02;
+        }
+        if self.require_private_response {
+            flags |= 0x04;
+        }
+        if self.local_scope_only {
+            flags |= 0x08;
+        }
+        if self.gateway_query {
+            flags |= 0x10;
+        }
         out.push(flags);
         crate::varint::encode_into(&mut out, self.hop_limit).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.expiration_delta).map_err(FrameError::VarintEncode)?;
-        crate::bytes::encode(&mut out, &self.destination_hint, MAX_DESTINATION_HINT).map_err(|_| FrameError::LengthExceedsLimit)?;
-        crate::varint::encode_into(&mut out, self.path_exclusions.len() as u64).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.expiration_delta)
+            .map_err(FrameError::VarintEncode)?;
+        crate::bytes::encode(&mut out, &self.destination_hint, MAX_DESTINATION_HINT)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::varint::encode_into(&mut out, self.path_exclusions.len() as u64)
+            .map_err(FrameError::VarintEncode)?;
         for e in &self.path_exclusions {
-            crate::bytes::encode(&mut out, e, MAX_EXCLUSION_ENTRY).map_err(|_| FrameError::LengthExceedsLimit)?;
+            crate::bytes::encode(&mut out, e, MAX_EXCLUSION_ENTRY)
+                .map_err(|_| FrameError::LengthExceedsLimit)?;
         }
-        crate::bytes::encode(&mut out, &self.requester_auth, MAX_ROUTE_AUTH).map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::bytes::encode(&mut out, &self.requester_auth, MAX_ROUTE_AUTH)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
         Ok(out)
     }
 
@@ -87,7 +103,8 @@ impl RouteRequestFrame {
             return Err(FrameError::InvalidPadding);
         }
         let expiration = read_varint(&mut pos)?;
-        let (hint, n) = crate::bytes::decode(&body[pos..], MAX_DESTINATION_HINT).map_err(|_| FrameError::Truncated)?;
+        let (hint, n) = crate::bytes::decode(&body[pos..], MAX_DESTINATION_HINT)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
         let ex_count = read_varint(&mut pos)?;
         #[allow(clippy::cast_possible_truncation)]
@@ -96,11 +113,13 @@ impl RouteRequestFrame {
         }
         let mut exclusions = Vec::new();
         for _ in 0..ex_count {
-            let (e, n) = crate::bytes::decode(&body[pos..], MAX_EXCLUSION_ENTRY).map_err(|_| FrameError::Truncated)?;
+            let (e, n) = crate::bytes::decode(&body[pos..], MAX_EXCLUSION_ENTRY)
+                .map_err(|_| FrameError::Truncated)?;
             pos += n;
             exclusions.push(e.to_vec());
         }
-        let (auth, n) = crate::bytes::decode(&body[pos..], MAX_ROUTE_AUTH).map_err(|_| FrameError::Truncated)?;
+        let (auth, n) = crate::bytes::decode(&body[pos..], MAX_ROUTE_AUTH)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
         Ok((
             Self {
@@ -153,20 +172,36 @@ impl RouteResponseFrame {
             return Err(FrameError::InvalidPadding);
         }
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::ROUTE_RESPONSE.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::ROUTE_RESPONSE.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.request_id).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.response_sequence).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.response_sequence)
+            .map_err(FrameError::VarintEncode)?;
         let mut flags = 0u8;
-        if self.direct { flags |= 0x01; }
-        if self.relay_required { flags |= 0x02; }
-        if self.store_forward_available { flags |= 0x04; }
-        if self.local_path { flags |= 0x08; }
-        if self.gateway_path { flags |= 0x10; }
+        if self.direct {
+            flags |= 0x01;
+        }
+        if self.relay_required {
+            flags |= 0x02;
+        }
+        if self.store_forward_available {
+            flags |= 0x04;
+        }
+        if self.local_path {
+            flags |= 0x08;
+        }
+        if self.gateway_path {
+            flags |= 0x10;
+        }
         out.push(flags);
-        crate::varint::encode_into(&mut out, self.route_lifetime).map_err(FrameError::VarintEncode)?;
-        crate::bytes::encode(&mut out, &self.next_hop_hint, Self::MAX_NEXT_HOP_HINT).map_err(|_| FrameError::LengthExceedsLimit)?;
-        crate::bytes::encode(&mut out, &self.route_metadata, Self::MAX_ROUTE_METADATA).map_err(|_| FrameError::LengthExceedsLimit)?;
-        crate::bytes::encode(&mut out, &self.authentication, MAX_ROUTE_AUTH).map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::varint::encode_into(&mut out, self.route_lifetime)
+            .map_err(FrameError::VarintEncode)?;
+        crate::bytes::encode(&mut out, &self.next_hop_hint, Self::MAX_NEXT_HOP_HINT)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::bytes::encode(&mut out, &self.route_metadata, Self::MAX_ROUTE_METADATA)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::bytes::encode(&mut out, &self.authentication, MAX_ROUTE_AUTH)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
         Ok(out)
     }
 
@@ -192,11 +227,14 @@ impl RouteResponseFrame {
             return Err(FrameError::InvalidPadding);
         }
         let lifetime = read_varint(&mut pos)?;
-        let (nh, n) = crate::bytes::decode(&body[pos..], Self::MAX_NEXT_HOP_HINT).map_err(|_| FrameError::Truncated)?;
+        let (nh, n) = crate::bytes::decode(&body[pos..], Self::MAX_NEXT_HOP_HINT)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
-        let (meta, n) = crate::bytes::decode(&body[pos..], Self::MAX_ROUTE_METADATA).map_err(|_| FrameError::Truncated)?;
+        let (meta, n) = crate::bytes::decode(&body[pos..], Self::MAX_ROUTE_METADATA)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
-        let (auth, n) = crate::bytes::decode(&body[pos..], MAX_ROUTE_AUTH).map_err(|_| FrameError::Truncated)?;
+        let (auth, n) = crate::bytes::decode(&body[pos..], MAX_ROUTE_AUTH)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
         Ok((
             Self {
@@ -240,11 +278,14 @@ impl RouteErrorFrame {
     /// encoded.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::ROUTE_ERROR.0).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, FrameType::ROUTE_ERROR.0)
+            .map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.request_id).map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.error_code).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.failed_hop_index).map_err(FrameError::VarintEncode)?;
-        crate::bytes::encode(&mut out, &self.diagnostic, Self::MAX_DIAGNOSTIC).map_err(|_| FrameError::LengthExceedsLimit)?;
+        crate::varint::encode_into(&mut out, self.failed_hop_index)
+            .map_err(FrameError::VarintEncode)?;
+        crate::bytes::encode(&mut out, &self.diagnostic, Self::MAX_DIAGNOSTIC)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
         Ok(out)
     }
 
@@ -265,9 +306,18 @@ impl RouteErrorFrame {
         let request_id = read_varint(&mut pos)?;
         let code = read_varint(&mut pos)?;
         let hop = read_varint(&mut pos)?;
-        let (diag, n) = crate::bytes::decode(&body[pos..], Self::MAX_DIAGNOSTIC).map_err(|_| FrameError::Truncated)?;
+        let (diag, n) = crate::bytes::decode(&body[pos..], Self::MAX_DIAGNOSTIC)
+            .map_err(|_| FrameError::Truncated)?;
         pos += n;
-        Ok((Self { request_id, error_code: code, failed_hop_index: hop, diagnostic: diag.to_vec() }, pos))
+        Ok((
+            Self {
+                request_id,
+                error_code: code,
+                failed_hop_index: hop,
+                diagnostic: diag.to_vec(),
+            },
+            pos,
+        ))
     }
 }
 
@@ -295,14 +345,27 @@ mod tests {
             requester_auth: b"proof".to_vec(),
         };
         let enc = f.encode().unwrap();
-        let (dec, used) = RouteRequestFrame::decode(&enc[type_len(FrameType::ROUTE_REQUEST.0)..]).unwrap();
+        let (dec, used) =
+            RouteRequestFrame::decode(&enc[type_len(FrameType::ROUTE_REQUEST.0)..]).unwrap();
         assert_eq!(dec, f);
         assert_eq!(used, enc.len() - type_len(FrameType::ROUTE_REQUEST.0));
     }
 
     #[test]
     fn route_request_rejects_bad_hop_limit() {
-        let mut f = RouteRequestFrame { request_id: 1, allow_relay: false, allow_store_forward: false, require_private_response: false, local_scope_only: false, gateway_query: false, hop_limit: 33, expiration_delta: 100, destination_hint: vec![], path_exclusions: vec![], requester_auth: vec![] };
+        let mut f = RouteRequestFrame {
+            request_id: 1,
+            allow_relay: false,
+            allow_store_forward: false,
+            require_private_response: false,
+            local_scope_only: false,
+            gateway_query: false,
+            hop_limit: 33,
+            expiration_delta: 100,
+            destination_hint: vec![],
+            path_exclusions: vec![],
+            requester_auth: vec![],
+        };
         assert_eq!(f.encode(), Err(FrameError::InvalidPadding));
         f.hop_limit = 0;
         assert_eq!(f.encode(), Err(FrameError::InvalidPadding));
@@ -310,13 +373,30 @@ mod tests {
 
     #[test]
     fn route_response_rejects_direct_and_relay() {
-        let f = RouteResponseFrame { request_id: 1, response_sequence: 0, direct: true, relay_required: true, store_forward_available: false, local_path: false, gateway_path: false, route_lifetime: 600, next_hop_hint: vec![], route_metadata: vec![], authentication: vec![] };
+        let f = RouteResponseFrame {
+            request_id: 1,
+            response_sequence: 0,
+            direct: true,
+            relay_required: true,
+            store_forward_available: false,
+            local_path: false,
+            gateway_path: false,
+            route_lifetime: 600,
+            next_hop_hint: vec![],
+            route_metadata: vec![],
+            authentication: vec![],
+        };
         assert_eq!(f.encode(), Err(FrameError::InvalidPadding));
     }
 
     #[test]
     fn route_error_round_trip() {
-        let f = RouteErrorFrame { request_id: 2, error_code: 0x0D, failed_hop_index: RouteErrorFrame::UNKNOWN_HOP, diagnostic: vec![] };
+        let f = RouteErrorFrame {
+            request_id: 2,
+            error_code: 0x0D,
+            failed_hop_index: RouteErrorFrame::UNKNOWN_HOP,
+            diagnostic: vec![],
+        };
         let enc = f.encode().unwrap();
         let (dec, _) = RouteErrorFrame::decode(&enc[type_len(FrameType::ROUTE_ERROR.0)..]).unwrap();
         assert_eq!(dec, f);
