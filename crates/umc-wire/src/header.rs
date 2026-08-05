@@ -172,6 +172,44 @@ impl LongHeader {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShortHeader {
+    pub space: ShortPacketSpace,
+    pub dcid: Vec<u8>,
+    pub path_id: u64,
+    pub packet_number: u64,
+    pub pn_bits: u32,
+    pub key_phase: bool,
+}
+
+impl ShortHeader {
+    /// Encodes the short header into its wire representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionIdTooLong` if the destination connection ID exceeds
+    /// the protocol limit, or `Truncated` if a varint cannot be encoded.
+    pub fn encode(&self) -> Result<Vec<u8>, HeaderError> {
+        if self.dcid.len() > MAX_CONNECTION_ID_LEN {
+            return Err(HeaderError::ConnectionIdTooLong);
+        }
+        let mut out = Vec::new();
+        let mut hb = match self.space {
+            ShortPacketSpace::SessionData => HeaderByte::SHORT_SESSION,
+            ShortPacketSpace::PathControl => HeaderByte::SHORT_PATH,
+            ShortPacketSpace::RelayData => HeaderByte::SHORT_RELAY,
+        };
+        hb.key_phase = self.key_phase;
+        hb.pn_bits = self.pn_bits;
+        out.push(hb.encode());
+        out.extend_from_slice(&self.dcid);
+        crate::varint::encode_into(&mut out, self.path_id).map_err(|_| HeaderError::Truncated)?;
+        let pn_bytes = (self.pn_bits as usize) / 8;
+        out.extend_from_slice(&self.packet_number.to_be_bytes()[8 - pn_bytes..]);
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +271,37 @@ mod tests {
             payload_len: 0,
             packet_number: 0,
             pn_bits: 8,
+        };
+        assert_eq!(h.encode(), Err(HeaderError::ConnectionIdTooLong));
+    }
+
+    #[test]
+    fn short_header_round_trip() {
+        let h = ShortHeader {
+            space: ShortPacketSpace::SessionData,
+            dcid: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            path_id: 1,
+            packet_number: 4021,
+            pn_bits: 16,
+            key_phase: false,
+        };
+        let enc = h.encode().unwrap();
+        assert_eq!(enc[0], 0b0000_0100);
+        // Layout: header byte (1) + dcid (8) + path id varint (1) + pn 2 bytes.
+        assert_eq!(&enc[9..], &[0x01, 0x0F, 0xB5]);
+        let space = HeaderByte::decode(enc[0]).unwrap().short_space().unwrap();
+        assert_eq!(space, ShortPacketSpace::SessionData);
+    }
+
+    #[test]
+    fn short_header_rejects_oversized_dcid() {
+        let h = ShortHeader {
+            space: ShortPacketSpace::SessionData,
+            dcid: vec![0u8; 21],
+            path_id: 0,
+            packet_number: 0,
+            pn_bits: 8,
+            key_phase: false,
         };
         assert_eq!(h.encode(), Err(HeaderError::ConnectionIdTooLong));
     }
