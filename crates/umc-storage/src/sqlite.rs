@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 #[allow(missing_debug_implementations)] // rusqlite::Connection has no Debug impl
 pub struct SqliteStore {
@@ -33,6 +33,7 @@ impl SqliteStore {
             conn: Mutex::new(conn),
         };
         store.init_schema()?;
+        crate::migrations::run_migrations(&store)?;
         Ok(store)
     }
 
@@ -63,7 +64,7 @@ impl SqliteStore {
                 r.get(0)
             })
             .map_err(|e| StoreError::Corrupt(e.to_string()))?;
-        if current != SCHEMA_VERSION {
+        if current > SCHEMA_VERSION {
             return Err(StoreError::Corrupt(format!(
                 "schema version {current}, expected {SCHEMA_VERSION}"
             )));
@@ -84,6 +85,39 @@ impl SqliteStore {
             r.get(0)
         })
         .map_err(|e| StoreError::Corrupt(e.to_string()))
+    }
+}
+
+impl SqliteStore {
+    pub fn connection(&self) -> &Mutex<Connection> {
+        &self.conn
+    }
+
+    /// Applies one migration and advances the stored schema version.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Corrupt`] if the migration or version bump fails.
+    ///
+    /// # Panics
+    /// Panics if the connection mutex is poisoned.
+    pub fn run_migration(
+        &self,
+        from_version: i64,
+        apply: fn(&Connection) -> Result<(), String>,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        {
+            apply(&tx).map_err(StoreError::Corrupt)?;
+            tx.execute(
+                "UPDATE schema_version SET version = ?1",
+                params![from_version + 1],
+            )
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        }
+        tx.commit().map_err(|e| StoreError::Corrupt(e.to_string()))
     }
 }
 
