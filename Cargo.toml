@@ -8,6 +8,7 @@ members = [
     "crates/umc-session",
     "crates/umc-carrier",
     "carriers/umc-carrier-tcp",
+    "carriers/umc-carrier-udp",
 ]
 
 [workspace.package]
