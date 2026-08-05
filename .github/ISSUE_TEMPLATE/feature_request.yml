@@ -36,11 +36,11 @@ body:
     id: related_area
     attributes:
       label: Related area or component
-      placeholder: For example, routing, transport, mobile, or desktop
+      placeholder: For example, identity, link, discovery, routing, or storage
   - type: textarea
     id: security
     attributes:
-      label: Privacy, security, or operator impact
+      label: Privacy, security, or resource impact
       description: Explain any tradeoffs or new risks.
   - type: checkboxes
     id: checks
