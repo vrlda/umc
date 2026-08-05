@@ -1,0 +1,14 @@
+[package]
+name = "umc-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+umc-types = { path = "../umc-types" }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true
