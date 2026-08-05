@@ -30,11 +30,7 @@ impl LossDetector {
     /// Packet-threshold loss: packet is lost when a peer ACKs a packet at least
     /// three numbers higher in the same space (session.md §14.1).
     #[must_use]
-    pub fn packet_threshold_lost(
-        &self,
-        sent_pn: u64,
-        largest_acked: u64,
-    ) -> bool {
+    pub fn packet_threshold_lost(&self, sent_pn: u64, largest_acked: u64) -> bool {
         largest_acked >= sent_pn + PACKET_THRESHOLD
     }
 
@@ -58,7 +54,12 @@ impl LossDetector {
     /// Persistent congestion: all ack-eliciting packets lost over at least
     /// three PTO durations (session.md §14.4).
     #[must_use]
-    pub fn persistent_congestion(&self, pto: Duration, oldest_lost_at: Instant, newest_lost_at: Instant) -> bool {
+    pub fn persistent_congestion(
+        &self,
+        pto: Duration,
+        oldest_lost_at: Instant,
+        newest_lost_at: Instant,
+    ) -> bool {
         let span = newest_lost_at.duration_since(oldest_lost_at);
         span.as_millis() >= 3 * pto.as_millis()
     }
@@ -100,7 +101,10 @@ mod tests {
     #[test]
     fn pto_defaults_before_rtt() {
         let d = LossDetector::new(25);
-        assert_eq!(d.pto(&RttEstimator::new()), Duration::from_millis(DEFAULT_PTO_MS));
+        assert_eq!(
+            d.pto(&RttEstimator::new()),
+            Duration::from_millis(DEFAULT_PTO_MS)
+        );
     }
 
     #[test]
@@ -134,7 +138,14 @@ mod tests {
     fn detect_lost_packets_marks_and_removes() {
         let mut sent = AckSendState::new();
         for pn in 0..6 {
-            sent.record_sent(SentPacket::new(pn, PacketSpace::SessionData, Instant(0), 64, true, 0));
+            sent.record_sent(SentPacket::new(
+                pn,
+                PacketSpace::SessionData,
+                Instant(0),
+                64,
+                true,
+                0,
+            ));
         }
         let mut rtt = RttEstimator::new();
         rtt.sample(100);
