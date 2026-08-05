@@ -71,7 +71,7 @@ mod tests {
             s.connection_id,
             s.stateless_reset,
         ];
-        secrets.sort();
+        secrets.sort_unstable();
         secrets.dedup();
         assert_eq!(secrets.len(), 7);
     }

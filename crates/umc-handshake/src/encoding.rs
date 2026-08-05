@@ -104,8 +104,9 @@ mod tests {
     #[test]
     fn rejects_oversize() {
         let mut out = Vec::new();
+        let big = vec![0u8; MAX_HANDSHAKE_MESSAGE + 1];
         assert_eq!(
-            encode_message(&mut out, CLIENT_HELLO, &[0u8; MAX_HANDSHAKE_MESSAGE + 1]),
+            encode_message(&mut out, CLIENT_HELLO, &big),
             Err(EncodeError::MessageTooLarge)
         );
         // Declared length 16385 (4-byte varint 0x80 0x00 0x40 0x01) exceeds
