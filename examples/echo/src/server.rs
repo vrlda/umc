@@ -10,7 +10,9 @@ struct OsClock;
 impl Clock for OsClock {
     fn now(&self) -> Instant {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let millis = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
         Instant(millis)
     }
 }
@@ -25,7 +27,14 @@ impl EntropySource for OsEntropy {
 
 fn echo_loop(link: &(dyn Link + Send + Sync)) {
     while let Ok(inbound) = link.recv() {
-        if link.send(umc_carrier::types::OutboundPacket { bytes: inbound.bytes, control: false, deadline_ms: None }).is_err() {
+        if link
+            .send(umc_carrier::types::OutboundPacket {
+                bytes: inbound.bytes,
+                control: false,
+                deadline_ms: None,
+            })
+            .is_err()
+        {
             break;
         }
     }
@@ -35,7 +44,10 @@ fn echo_loop(link: &(dyn Link + Send + Sync)) {
 async fn main() {
     let identity = NodeIdentity::generate(&OsEntropy);
     let mut node = Node::new(
-        NodeConfig { identity, dcid: vec![1u8; 8] },
+        NodeConfig {
+            identity,
+            dcid: vec![1u8; 8],
+        },
         Arc::new(OsClock),
         Arc::new(OsEntropy),
     );

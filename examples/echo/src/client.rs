@@ -9,7 +9,9 @@ struct OsClock;
 impl Clock for OsClock {
     fn now(&self) -> Instant {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let millis = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
         Instant(millis)
     }
 }
@@ -29,7 +31,10 @@ async fn main() {
     let remote = args.next().unwrap_or_else(|| "127.0.0.1:9001".to_string());
     let identity = NodeIdentity::generate(&OsEntropy);
     let mut node = Node::new(
-        NodeConfig { identity, dcid: vec![2u8; 8] },
+        NodeConfig {
+            identity,
+            dcid: vec![2u8; 8],
+        },
         Arc::new(OsClock),
         Arc::new(OsEntropy),
     );
@@ -38,9 +43,15 @@ async fn main() {
     } else {
         node.register_carrier(Box::new(umc_carrier_tcp::TcpCarrier));
     }
-    println!("client endpoint: {:02x?}", node.config.identity.endpoint_id());
+    println!(
+        "client endpoint: {:02x?}",
+        node.config.identity.endpoint_id()
+    );
     println!("connecting via {carrier_type} to {remote}");
-    match node.connect(&carrier_type, remote, &NodeIdentity::generate(&OsEntropy)).await {
+    match node
+        .connect(&carrier_type, remote, &NodeIdentity::generate(&OsEntropy))
+        .await
+    {
         Ok(_) => println!("session established (live path)"),
         Err(e) => println!("session attempt failed (Phase 8 will complete the loop): {e:?}"),
     }
