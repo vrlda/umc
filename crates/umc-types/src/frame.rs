@@ -72,6 +72,48 @@ mod tests {
     }
 
     #[test]
+    fn all_registered_frame_types_have_exact_values() {
+        let table: &[(FrameType, u64)] = &[
+            (FrameType::PADDING, 0x00),
+            (FrameType::PING, 0x04),
+            (FrameType::ACK, 0x08),
+            (FrameType::CONNECTION_CLOSE, 0x0C),
+            (FrameType::STREAM, 0x10),
+            (FrameType::RESET_STREAM, 0x14),
+            (FrameType::STOP_SENDING, 0x18),
+            (FrameType::MAX_DATA, 0x1C),
+            (FrameType::MAX_STREAM_DATA, 0x20),
+            (FrameType::MAX_STREAMS, 0x24),
+            (FrameType::DATAGRAM, 0x28),
+            (FrameType::NEW_CONNECTION_ID, 0x2C),
+            (FrameType::RETIRE_CONNECTION_ID, 0x30),
+            (FrameType::PATH_CHALLENGE, 0x34),
+            (FrameType::PATH_RESPONSE, 0x38),
+            (FrameType::PATH_STATUS, 0x3C),
+            (FrameType::MIGRATE, 0x40),
+            (FrameType::KEY_UPDATE, 0x44),
+            (FrameType::ROUTE_REQUEST, 0x48),
+            (FrameType::ROUTE_RESPONSE, 0x4C),
+            (FrameType::ROUTE_ERROR, 0x50),
+            (FrameType::RELAY_OPEN, 0x54),
+            (FrameType::RELAY_DATA, 0x58),
+            (FrameType::RELAY_CLOSE, 0x5C),
+            (FrameType::BUNDLE, 0x60),
+            (FrameType::BUNDLE_ACK, 0x64),
+            (FrameType::PEER_HINT, 0x68),
+            (FrameType::CAPABILITIES, 0x6C),
+            (FrameType::AUTH, 0x70),
+            (FrameType::HANDSHAKE_DATA, 0x74),
+            (FrameType::SESSION_TICKET, 0x78),
+            (FrameType::SERVICE_HINT, 0x7C),
+            (FrameType::RELAY_STATUS, 0x82),
+        ];
+        for (frame_type, expected) in table {
+            assert_eq!(frame_type.0, *expected, "{frame_type:?}");
+        }
+    }
+
+    #[test]
     fn unknown_optional_length_delimited_is_skippable() {
         let t = FrameType(0x0F);
         assert_eq!(t.behavior(), ExtensionBehavior::OptionalLengthDelimited);

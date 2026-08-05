@@ -33,6 +33,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn all_error_codes_are_sequential() {
+        let codes = [
+            TransportError::NO_ERROR,
+            TransportError::INTERNAL_ERROR,
+            TransportError::PROTOCOL_VIOLATION,
+            TransportError::FRAME_ENCODING_ERROR,
+            TransportError::UNSUPPORTED_VERSION,
+            TransportError::UNSUPPORTED_FRAME,
+            TransportError::CRYPTO_ERROR,
+            TransportError::AUTHENTICATION_FAILED,
+            TransportError::REPLAY_DETECTED,
+            TransportError::FLOW_CONTROL_ERROR,
+            TransportError::STREAM_LIMIT_ERROR,
+            TransportError::CONNECTION_ID_ERROR,
+            TransportError::PATH_VALIDATION_FAILED,
+            TransportError::ROUTE_NOT_FOUND,
+            TransportError::ROUTE_LOOP,
+            TransportError::RELAY_REFUSED,
+            TransportError::RESOURCE_LIMIT,
+            TransportError::STORAGE_LIMIT,
+            TransportError::EXPIRED,
+            TransportError::POLICY_REJECTED,
+            TransportError::CARRIER_FAILURE,
+            TransportError::HANDSHAKE_TIMEOUT,
+            TransportError::IDLE_TIMEOUT,
+            TransportError::KEY_UPDATE_ERROR,
+        ];
+        for (i, code) in codes.iter().enumerate() {
+            assert_eq!(code.0, i as u64);
+        }
+    }
+
+    #[test]
     fn error_codes_match_wire_format_registry() {
         assert_eq!(TransportError::NO_ERROR.0, 0x00);
         assert_eq!(TransportError::PROTOCOL_VIOLATION.0, 0x02);
