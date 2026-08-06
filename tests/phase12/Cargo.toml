@@ -1,0 +1,24 @@
+[package]
+name = "phase12-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+umc-core = { path = "../../crates/umc-core" }
+umc-handshake = { path = "../../crates/umc-handshake" }
+umc-crypto = { path = "../../crates/umc-crypto" }
+umc-carrier = { path = "../../crates/umc-carrier" }
+umc-carrier-tcp = { path = "../../carriers/umc-carrier-tcp" }
+umc-session = { path = "../../crates/umc-session" }
+umc-wire = { path = "../../crates/umc-wire" }
+umc-types = { path = "../../crates/umc-types" }
+umc-sdk = { path = "../../crates/umc-sdk" }
+umc-control = { path = "../../crates/umc-control" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
+serde_json = "1"
+prost = "0.13"
+
+[lints]
+workspace = true
