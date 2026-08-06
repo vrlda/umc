@@ -14,6 +14,7 @@ members = [
     "crates/umc-core",
     "crates/umc-storage",
     "crates/umc-sdk",
+    "crates/umc-plugin",
     "crates/umc-bundle",
     "bins/umc",
     "bins/umcd",
