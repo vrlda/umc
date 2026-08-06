@@ -22,6 +22,7 @@ members = [
     "tests/phase1",
     "tests/phase2",
     "tests/phase3",
+    "tests/phase4",
 ]
 
 [workspace.package]
