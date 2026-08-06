@@ -11,6 +11,11 @@ pub struct NodeConfig {
     pub carriers: Vec<String>,
     pub tcp_listen: Option<String>,
     pub udp_listen: Option<String>,
+    /// Local mesh mode (core.md §23.3). Conservative default: off
+    /// (decisions.md §3.2).
+    pub mesh: bool,
+    /// Keystore directory; defaults to `<data_dir>/keystore`.
+    pub keystore: Option<PathBuf>,
     pub public_relay: bool,
     pub telemetry: bool,
 }
@@ -24,6 +29,8 @@ impl Default for NodeConfig {
             carriers: vec!["ump.tcp/1".to_string(), "ump.udp/1".to_string()],
             tcp_listen: None,
             udp_listen: None,
+            mesh: false,
+            keystore: None,
             public_relay: false,
             telemetry: false,
         }
@@ -52,6 +59,13 @@ impl NodeConfig {
     pub fn resolved_socket(&self) -> PathBuf {
         expand_tilde(&self.control_socket)
     }
+
+    pub fn resolved_keystore_dir(&self) -> PathBuf {
+        match &self.keystore {
+            Some(path) => expand_tilde(path),
+            None => self.resolved_data_dir().join("keystore"),
+        }
+    }
 }
 
 fn expand_tilde(path: &std::path::Path) -> PathBuf {
@@ -73,6 +87,17 @@ mod tests {
         let config = NodeConfig::default();
         assert!(!config.public_relay);
         assert!(!config.telemetry);
+        assert!(!config.mesh);
+        assert!(config.keystore.is_none());
+    }
+
+    #[test]
+    fn resolved_keystore_defaults_under_data_dir() {
+        let config = NodeConfig {
+            data_dir: PathBuf::from("~/tmp/umc-node"),
+            ..NodeConfig::default()
+        };
+        assert!(config.resolved_keystore_dir().ends_with("keystore"));
     }
 
     #[test]
