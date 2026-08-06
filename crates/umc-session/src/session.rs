@@ -321,6 +321,9 @@ impl Session {
                 umc_wire::frame::Frame::ConnectionClose(_) => {
                     self.state = SessionState::Closed;
                 }
+                umc_wire::frame::Frame::Ack(ack) => {
+                    self.apply_peer_ack(&ack, now)?;
+                }
                 _ => {}
             }
         }
@@ -351,7 +354,6 @@ impl Session {
                 }
             }
         }
-        let _ = now;
         Ok(ack_payload)
     }
 
@@ -404,6 +406,44 @@ impl Session {
             .apply_ack(largest, &flat)
             .map_err(SessionError::Ack)?;
         Ok(())
+    }
+
+    /// Apply a peer ACK to the sent-packet state and sample RTT
+    /// (congestion.md §8): each newly acknowledged packet yields a sample of
+    /// `now - sent_at` minus the peer's reported ack delay; non-positive
+    /// samples are skipped. Returns the acknowledged packet numbers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::Ack`] if the ACK acknowledges unsent packets.
+    pub fn apply_peer_ack(
+        &mut self,
+        ack: &umc_wire::frame::AckFrame,
+        now: Instant,
+    ) -> Result<Vec<u64>, SessionError> {
+        let mut flat = Vec::with_capacity(ack.additional_ranges.len() + 1);
+        flat.push((ack.first_ack_range, 0));
+        flat.extend(ack.additional_ranges.iter().map(|r| (r.gap, r.length)));
+        let sent_at_by_pn: HashMap<u64, Instant> = self
+            .sent
+            .sent()
+            .iter()
+            .map(|p| (p.packet_number, p.sent_at))
+            .collect();
+        let acked = self
+            .sent
+            .apply_ack(ack.largest_acknowledged, &flat)
+            .map_err(SessionError::Ack)?;
+        for pn in &acked {
+            if let Some(sent_at) = sent_at_by_pn.get(pn) {
+                let sample_ms = now.duration_since(*sent_at).as_millis();
+                let sample = sample_ms.saturating_sub(ack.ack_delay);
+                if sample > 0 {
+                    self.rtt.sample(sample);
+                }
+            }
+        }
+        Ok(acked)
     }
 
     #[must_use]
