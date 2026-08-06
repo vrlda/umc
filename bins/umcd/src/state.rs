@@ -66,6 +66,9 @@ pub struct RuntimeState {
     pub routing: RoutingService,
     /// Bounded daemon event log; services push transitions into it.
     pub events: Arc<Mutex<DaemonEvents>>,
+    /// Development-only control API bearer credential (control-api.md
+    /// §11.3). `None` in production: every request is accepted at hello.
+    pub development_token: Option<Vec<u8>>,
     /// Set when a graceful shutdown was requested.
     pub shutdown_requested: Arc<AtomicBool>,
     /// Released once shutdown completes; the main task waits on it.
@@ -121,6 +124,10 @@ impl RuntimeState {
         };
 
         let events = Arc::new(Mutex::new(DaemonEvents::new(200)));
+        let development_token = config
+            .development_token
+            .as_deref()
+            .map(|token| token.as_bytes().to_vec());
         let bundle_objects = ObjectStore::open(data_dir.join("objects"))
             .map_err(|e| format!("bundle object store: {e:?}"))?;
         let bundle_quota = QuotaAccount::new(
@@ -147,6 +154,7 @@ impl RuntimeState {
             bundle: BundleService::new(bundle_objects, bundle_quota, events.clone()),
             routing: RoutingService::new(),
             events,
+            development_token,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_channel,
         })

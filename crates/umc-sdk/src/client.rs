@@ -21,6 +21,7 @@ pub enum ClientError {
     Proto(String),
     VersionMismatch,
     Denied,
+    Unauthenticated,
     Unimplemented(String),
 }
 
@@ -77,9 +78,11 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`ClientError::Unimplemented`] for unknown methods,
-    /// [`ClientError::Denied`] for unexpected envelopes, and
-    /// [`ClientError::Io`], [`ClientError::Framing`], or [`ClientError::Proto`]
-    /// for transport and decode failures.
+    /// [`ClientError::Unauthenticated`] when the daemon requires a bearer
+    /// credential this connection did not present, [`ClientError::Denied`]
+    /// for unexpected envelopes, and [`ClientError::Io`],
+    /// [`ClientError::Framing`], or [`ClientError::Proto`] for transport and
+    /// decode failures.
     pub async fn request(
         &mut self,
         service: &str,
@@ -105,6 +108,9 @@ impl Client {
                 let code = response.status.as_ref().map_or(0, |s| s.code);
                 if code == api::StatusCode::Unimplemented as i32 {
                     return Err(ClientError::Unimplemented(method.to_string()));
+                }
+                if code == api::StatusCode::Unauthenticated as i32 {
+                    return Err(ClientError::Unauthenticated);
                 }
                 Ok(response)
             }

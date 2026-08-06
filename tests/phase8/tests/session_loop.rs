@@ -6,6 +6,7 @@
 //! synchronously: the carriers run blocking `Handle::block_on` calls that
 //! panic from an async context on the same runtime, so the handshake runs
 //! on a `spawn_blocking` thread exactly like the daemon's accept loops.
+use prost::Message;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -13,10 +14,50 @@ use std::sync::Arc;
 use std::time::Duration;
 use umc_carrier::types::OutboundPacket;
 use umc_carrier::BoxLink;
+use umc_control::proto::umc::api::v1 as api;
 use umc_core::node::{Node, NodeConfig, NodeIdentity};
 use umc_crypto::signatures::StaticHandshakeKeyPair;
 use umc_handshake::xx::{complete_client_side, ClientHello, ServerHello};
 use umc_types::runtime::{Clock, EntropySource, Instant};
+
+/// Wire shape of the daemon's `PeerService.ListCandidates` payload. No proto
+/// message exists yet; the field layout mirrors the daemon's wire struct.
+#[derive(Clone, PartialEq, prost::Message)]
+struct ListCandidatesResponse {
+    #[prost(message, repeated, tag = "1")]
+    candidates: Vec<CandidateSummary>,
+    #[prost(uint32, tag = "2")]
+    total: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct CandidateSummary {
+    #[prost(uint64, tag = "1")]
+    candidate_id: u64,
+    #[prost(string, tag = "2")]
+    carrier_type: String,
+    #[prost(uint64, tag = "3")]
+    expires_at_ms: u64,
+    #[prost(bool, tag = "4")]
+    public: bool,
+}
+
+/// Wire shape of the daemon's `NodeAdmin.GetEvents` payload.
+#[derive(Clone, PartialEq, prost::Message)]
+struct GetEventsResponse {
+    #[prost(message, repeated, tag = "1")]
+    events: Vec<EventRecord>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct EventRecord {
+    #[prost(uint64, tag = "1")]
+    at_ms: u64,
+    #[prost(string, tag = "2")]
+    kind: String,
+    #[prost(string, tag = "3")]
+    detail: String,
+}
 
 struct TestClock;
 
@@ -57,6 +98,30 @@ struct Daemon {
     _dir: PathBuf,
 }
 
+impl Daemon {
+    /// Send SIGINT and wait for the daemon to exit cleanly.
+    fn shutdown_with_sigint(&mut self) {
+        let pid = self.child.id();
+        let status = Command::new("kill")
+            .args(["-INT", &pid.to_string()])
+            .status()
+            .expect("run kill -INT");
+        assert!(status.success(), "kill -INT {pid} failed");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(exit) = self.child.try_wait().expect("try_wait") {
+                assert!(exit.success(), "daemon exited with {exit}");
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemon did not exit after SIGINT"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -65,16 +130,27 @@ impl Drop for Daemon {
 }
 
 fn spawn_daemon(tcp_port: u16, udp_port: u16) -> (Daemon, PathBuf) {
+    spawn_daemon_with_token(tcp_port, udp_port, None)
+}
+
+fn spawn_daemon_with_token(
+    tcp_port: u16,
+    udp_port: u16,
+    development_token: Option<&str>,
+) -> (Daemon, PathBuf) {
     let dir = std::env::temp_dir().join(format!("phase8-daemon-{}-{tcp_port}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("daemon dir");
-    let config = serde_json::json!({
+    let mut config = serde_json::json!({
         "data_dir": dir.join("data"),
         "control_socket": dir.join("umc.sock"),
         "carriers": ["ump.tcp/1", "ump.udp/1"],
         "tcp_listen": format!("127.0.0.1:{tcp_port}"),
         "udp_listen": format!("127.0.0.1:{udp_port}"),
     });
+    if let Some(token) = development_token {
+        config["development_token"] = serde_json::Value::String(token.to_string());
+    }
     let config_path = dir.join("node.json");
     fs::write(
         &config_path,
@@ -269,4 +345,143 @@ async fn live_handshake_over_udp() {
         .expect("handshake failed");
     assert_eq!(result, 1);
     drop(daemon);
+}
+
+async fn control_client(socket: &Path) -> umc_sdk::client::Client {
+    umc_sdk::client::Client::connect(socket.to_str().expect("socket path"), "phase8-test")
+        .await
+        .expect("control client connect")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn control_api_reports_real_state() {
+    let tcp_port = free_tcp_port();
+    let (daemon, socket) = spawn_daemon(tcp_port, free_udp_port());
+    wait_for_control_socket(&socket);
+    let mut client = control_client(&socket).await;
+
+    let status = api::GetStatusResponse::decode(
+        client
+            .request("NodeAdmin", "GetStatus", vec![])
+            .await
+            .expect("GetStatus")
+            .payload
+            .as_slice(),
+    )
+    .expect("status payload")
+    .status
+    .expect("status");
+    assert_eq!(status.active_sessions, 0);
+    assert_eq!(status.active_relay_circuits, 0);
+
+    let candidates = ListCandidatesResponse::decode(
+        client
+            .request("DiscoveryService", "ListCandidates", vec![])
+            .await
+            .expect("ListCandidates")
+            .payload
+            .as_slice(),
+    )
+    .expect("candidates payload");
+    assert_eq!(candidates.total, 0);
+    assert!(candidates.candidates.is_empty());
+
+    let events = client
+        .request("NodeAdmin", "GetEvents", vec![])
+        .await
+        .expect("GetEvents");
+    assert_eq!(
+        events.status.as_ref().expect("status").code,
+        api::StatusCode::Ok as i32
+    );
+    drop(daemon);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthenticated_requests_rejected_when_token_configured() {
+    let tcp_port = free_tcp_port();
+    let (daemon, socket) = spawn_daemon_with_token(tcp_port, free_udp_port(), Some("dev-token"));
+    wait_for_control_socket(&socket);
+    let mut client = control_client(&socket).await;
+
+    let result = client.request("NodeAdmin", "GetStatus", vec![]).await;
+    match result {
+        Err(umc_sdk::client::ClientError::Unauthenticated) => {}
+        other => panic!("expected Unauthenticated, got {other:?}"),
+    }
+    drop(daemon);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_serves_control_and_sessions_together() {
+    let tcp_port = free_tcp_port();
+    let (mut daemon, socket) = spawn_daemon(tcp_port, free_udp_port());
+    wait_for_control_socket(&socket);
+    let mut client = control_client(&socket).await;
+
+    let status = api::GetStatusResponse::decode(
+        client
+            .request("NodeAdmin", "GetStatus", vec![])
+            .await
+            .expect("GetStatus")
+            .payload
+            .as_slice(),
+    )
+    .expect("status payload")
+    .status
+    .expect("status");
+    assert_eq!(status.active_sessions, 0);
+
+    let node = client_node("ump.tcp/1");
+    let remote = format!("127.0.0.1:{tcp_port}");
+    let handshake = tokio::task::spawn_blocking(move || tcp_handshake(&node, &remote));
+    let result = tokio::time::timeout(Duration::from_secs(20), handshake)
+        .await
+        .expect("live TCP handshake timed out")
+        .expect("client thread panicked")
+        .expect("handshake failed");
+    assert_eq!(result, 1);
+
+    let mut active = 0u32;
+    for _ in 0..50 {
+        let status = api::GetStatusResponse::decode(
+            client
+                .request("NodeAdmin", "GetStatus", vec![])
+                .await
+                .expect("GetStatus")
+                .payload
+                .as_slice(),
+        )
+        .expect("status payload")
+        .status
+        .expect("status");
+        active = status.active_sessions;
+        if active == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(active, 1, "session must show up in GetStatus");
+
+    let mut saw_active = false;
+    for _ in 0..50 {
+        let events = GetEventsResponse::decode(
+            client
+                .request("NodeAdmin", "GetEvents", vec![])
+                .await
+                .expect("GetEvents")
+                .payload
+                .as_slice(),
+        )
+        .expect("events payload")
+        .events;
+        if events.iter().any(|e| e.kind == "session_active") {
+            saw_active = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(saw_active, "event log must contain a session_active entry");
+
+    daemon.shutdown_with_sigint();
 }

@@ -18,6 +18,9 @@ pub struct NodeConfig {
     pub keystore: Option<PathBuf>,
     pub public_relay: bool,
     pub telemetry: bool,
+    /// Bearer credential for the control API (control-api.md §11.3).
+    /// Development-only: honored when set, never persisted or exposed.
+    pub development_token: Option<String>,
 }
 
 impl Default for NodeConfig {
@@ -33,6 +36,7 @@ impl Default for NodeConfig {
             keystore: None,
             public_relay: false,
             telemetry: false,
+            development_token: None,
         }
     }
 }

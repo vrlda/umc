@@ -126,7 +126,7 @@ async fn unimplemented_methods_return_unimplemented() {
         .await
         .expect("connect");
     let err = client
-        .request("BundleService", "ListBundles", Vec::new())
+        .request("ApplicationService", "Connect", Vec::new())
         .await
         .unwrap_err();
     assert!(matches!(err, ClientError::Unimplemented(_)));

@@ -1,14 +1,15 @@
 //! Session manager (core.md §9.5): the registry of live daemon sessions.
 //!
 //! Entries are stored behind `Arc` so `lookup` can hand out a shareable
-//! handle — `tokio::task::JoinHandle` is not `Clone`.
+//! handle — the session task's `JoinHandle` is owned by the daemon's
+//! completion watcher, so the registry keeps an `AbortHandle` instead.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::task::JoinHandle;
+use tokio::task::AbortHandle;
 
-/// One live session: the peer endpoint id, the carrier it rides on, and a
-/// handle to the wire-loop task.
+/// One live session: the peer endpoint id, the carrier it rides on, when it
+/// became active, and a handle to abort the wire-loop task.
 #[derive(Debug)]
 pub struct SessionEntry {
     /// Peer endpoint id. Provisional until the client's identity binding
@@ -21,10 +22,13 @@ pub struct SessionEntry {
     /// control-socket session API in Task 20+.
     #[allow(dead_code)]
     pub carrier_type: String,
-    /// The session task; kept so the daemon can abort sessions at shutdown.
-    /// Placeholder: consumed by the control-socket session API in Task 20+.
+    /// Aborts the session task at shutdown. The task itself is awaited by a
+    /// watcher in the accept loop, which records the `session_closed` event.
     #[allow(dead_code)]
-    pub task: JoinHandle<()>,
+    pub task: AbortHandle,
+    /// Wall-clock millisecond timestamp of the `session_active` transition.
+    #[allow(dead_code)]
+    pub established_at_ms: u64,
 }
 
 /// Thread-safe session registry keyed by monotonically increasing ids.
@@ -90,13 +94,15 @@ mod tests {
             SessionEntry {
                 peer_endpoint_id: [7u8; 32],
                 carrier_type: "ump.tcp/1".to_string(),
-                task: tokio::spawn(async {}),
+                task: tokio::spawn(async {}).abort_handle(),
+                established_at_ms: 1_000,
             },
         );
         assert_eq!(manager.count(), 1);
         let entry = manager.lookup(3).expect("registered");
         assert_eq!(entry.peer_endpoint_id, [7u8; 32]);
         assert_eq!(entry.carrier_type, "ump.tcp/1");
+        assert_eq!(entry.established_at_ms, 1_000);
         assert!(manager.lookup(99).is_none());
     }
 }

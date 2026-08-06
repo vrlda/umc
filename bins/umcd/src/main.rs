@@ -169,16 +169,35 @@ async fn accept_loop(
             // link's recv() (both pull from the same socket).
             if let Err(e) = handle_inbound_link(&link_state, &link_carrier, link, &link_tracker) {
                 println!("[session] link rejected: {e}");
+                record_handshake_failure(&link_state, e);
             }
         } else {
             tokio::spawn(async move {
                 if let Err(e) = handle_inbound_link(&link_state, &link_carrier, link, &link_tracker)
                 {
                     println!("[session] link rejected: {e}");
+                    record_handshake_failure(&link_state, e);
                 }
             });
         }
     }
+}
+
+/// Record a failed inbound handshake in the daemon event log (core.md §8).
+fn record_handshake_failure(state: &Arc<std::sync::Mutex<state::RuntimeState>>, detail: String) {
+    let Ok(state) = state.lock() else {
+        return;
+    };
+    let now = state.node.clock.as_ref().now();
+    state
+        .events
+        .lock()
+        .expect("event log")
+        .push(event_log::DaemonEvent {
+            kind: "handshake_failed".into(),
+            at_ms: now.0,
+            detail,
+        });
 }
 
 /// Handle one inbound link: extract the `CLIENT_HELLO` from the first
@@ -278,12 +297,30 @@ fn handle_inbound_link_locked(
         session,
         session_id,
     );
+    // The session task's JoinHandle moves into a watcher that records
+    // `session_closed` when the wire loop exits; the registry keeps an
+    // AbortHandle so shutdown can still cancel the task.
+    let abort_handle = task.abort_handle();
+    let session_events = state.events.clone();
+    let closed_at_ms = now.0;
+    tokio::spawn(async move {
+        let _ = task.await;
+        session_events
+            .lock()
+            .expect("event log")
+            .push(event_log::DaemonEvent {
+                kind: "session_closed".into(),
+                at_ms: closed_at_ms,
+                detail: format!("session {session_id} closed"),
+            });
+    });
     state.sessions.register(
         session_id,
         session_manager::SessionEntry {
             peer_endpoint_id,
             carrier_type: carrier_type.to_string(),
-            task,
+            task: abort_handle,
+            established_at_ms: now.0,
         },
     );
     state
