@@ -9,16 +9,20 @@ use crate::relay_service::RelayService;
 use crate::routing_service::RoutingService;
 use crate::runtime_adapters::{OsClock, OsEntropy, TokioAdaptor};
 use crate::session_manager::SessionManager;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use umc_carrier::Listener;
+use umc_core::app::AppRegistry;
+use umc_core::app_io::{AppRx, AppTx};
 use umc_core::block::Blocklist;
 use umc_core::mesh::MeshConfig;
 use umc_core::node::{Node, NodeConfig as NodeRuntimeConfig, NodeIdentity};
 use umc_core::rate_limiter::RateLimiter;
 use umc_core::trust::{TrustLevel, TrustStore};
+use umc_core::well_known::WELL_KNOWN_APP;
 use umc_storage::objects::ObjectStore;
 use umc_storage::quota::{Profile, QuotaAccount};
 use umc_storage::sqlite::SqliteStore;
@@ -66,6 +70,16 @@ pub struct RuntimeState {
     pub routing: RoutingService,
     /// Bounded daemon event log; services push transitions into it.
     pub events: Arc<Mutex<DaemonEvents>>,
+    /// Registered applications (core.md §9.6); the echo application is
+    /// installed at startup so `org.umc.app/1` streams dispatch end to end.
+    #[allow(dead_code)] // app registration over the control API lands in Phase 10
+    pub apps: AppRegistry,
+    /// Per-application inbound stream channels: session tasks forward
+    /// received stream data into the application's channel.
+    pub app_channels: Arc<Mutex<HashMap<Vec<u8>, AppTx>>>,
+    /// Per-application echo receivers: the application's outbound channel,
+    /// drained by the session writers and sent back on the same stream.
+    pub app_echo_rx: Arc<Mutex<HashMap<Vec<u8>, AppRx>>>,
     /// Development-only control API bearer credential (control-api.md
     /// §11.3). `None` in production: every request is accepted at hello.
     pub development_token: Option<Vec<u8>>,
@@ -136,6 +150,13 @@ impl RuntimeState {
             Profile::Standard.bundle_storage_bytes(),
         );
 
+        let mut apps = AppRegistry::new();
+        apps.register(
+            WELL_KNOWN_APP.to_vec(),
+            crate::app_layer::ECHO_APP_NAME.to_string(),
+        )
+        .map_err(|e| format!("echo app registration: {e:?}"))?;
+
         Ok(Self {
             control_socket: config.resolved_socket(),
             started_at: OsClock.now(),
@@ -154,6 +175,9 @@ impl RuntimeState {
             bundle: BundleService::new(bundle_objects, bundle_quota, events.clone()),
             routing: RoutingService::new(),
             events,
+            apps,
+            app_channels: Arc::new(Mutex::new(HashMap::new())),
+            app_echo_rx: Arc::new(Mutex::new(HashMap::new())),
             development_token,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_channel,

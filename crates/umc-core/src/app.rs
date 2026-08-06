@@ -49,11 +49,7 @@ impl AppRegistry {
     /// Returns [`AppError::InvalidProtocolId`] when the ID exceeds
     /// [`MAX_PROTOCOL_ID_LEN`] bytes and [`AppError::AlreadyRegistered`]
     /// when the ID is already taken.
-    pub fn register(
-        &mut self,
-        protocol_id: Vec<u8>,
-        service_name: String,
-    ) -> Result<(), AppError> {
+    pub fn register(&mut self, protocol_id: Vec<u8>, service_name: String) -> Result<(), AppError> {
         if protocol_id.len() > MAX_PROTOCOL_ID_LEN {
             return Err(AppError::InvalidProtocolId);
         }
