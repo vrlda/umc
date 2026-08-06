@@ -1,9 +1,14 @@
+mod bundle_service;
 mod carriers;
 mod config;
+mod discovery_service;
 mod doctor;
+mod event_log;
 mod handshake_responder;
 mod handshake_timeout;
 mod initial;
+mod relay_service;
+mod routing_service;
 mod runtime_adapters;
 mod server;
 mod session_manager;
@@ -12,7 +17,6 @@ mod state;
 
 use clap::Parser;
 use config::NodeConfig;
-use state::RuntimeState;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -88,17 +92,20 @@ async fn run(config: NodeConfig) {
     let mut listeners: std::collections::VecDeque<Box<dyn Listener + Send + Sync>> =
         state.listeners.drain(..).collect();
     println!("carrier listeners: {} bound", listeners.len());
-    let state = Arc::new(state);
+    // The runtime state is the daemon's shared mutable context (core.md §8):
+    // the accept loops and the control socket both mutate it, so it rides
+    // behind one mutex.
+    let state = Arc::new(std::sync::Mutex::new(state));
 
     // One accept loop per bound listener, paired with its carrier type
     // (carriers.rs pushes listeners in config order).
-    let carrier_types = state.config.carriers.clone();
+    let carrier_types = state.lock().expect("state").config.carriers.clone();
     for carrier_type in carrier_types {
         if matches!(carrier_type.as_str(), "ump.tcp/1" | "ump.udp/1") {
             if let Some(listener) = listeners.pop_front() {
                 let accept_state = state.clone();
                 tokio::spawn(async move {
-                    accept_loop(accept_state, carrier_type, listener).await;
+                    accept_loop(&accept_state, carrier_type, listener).await;
                 });
             }
         }
@@ -108,8 +115,13 @@ async fn run(config: NodeConfig) {
     let server_task = tokio::spawn(server::run(server_state));
 
     // Graceful shutdown: SIGINT sets the flag and releases the channel.
-    let shutdown_flag = state.shutdown_requested.clone();
-    let shutdown_tx = state.shutdown_channel.clone();
+    let (shutdown_flag, shutdown_tx) = {
+        let state = state.lock().expect("state");
+        (
+            state.shutdown_requested.clone(),
+            state.shutdown_channel.clone(),
+        )
+    };
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         println!("shutdown: signal received");
@@ -127,7 +139,7 @@ async fn run(config: NodeConfig) {
 /// inbound handler, and keep accepting. The handshake tracker is shared
 /// across links so per-connection-id retry storms are capped.
 async fn accept_loop(
-    state: Arc<RuntimeState>,
+    state: &Arc<std::sync::Mutex<state::RuntimeState>>,
     carrier_type: String,
     listener: Box<dyn Listener + Send + Sync>,
 ) {
@@ -135,7 +147,12 @@ async fn accept_loop(
         handshake_timeout::HandshakeTracker::new(),
     ));
     loop {
-        if state.shutdown_requested.load(Ordering::Relaxed) {
+        if state
+            .lock()
+            .expect("state")
+            .shutdown_requested
+            .load(Ordering::Relaxed)
+        {
             break;
         }
         let Ok(link) = tokio::task::block_in_place(|| listener.accept()) else {
@@ -150,12 +167,12 @@ async fn accept_loop(
             // learn the remote; the hello must be read before the next
             // accept(), otherwise a second accept() steals it from the
             // link's recv() (both pull from the same socket).
-            if let Err(e) = handle_inbound_link(link_state, &link_carrier, link, &link_tracker) {
+            if let Err(e) = handle_inbound_link(&link_state, &link_carrier, link, &link_tracker) {
                 println!("[session] link rejected: {e}");
             }
         } else {
             tokio::spawn(async move {
-                if let Err(e) = handle_inbound_link(link_state, &link_carrier, link, &link_tracker)
+                if let Err(e) = handle_inbound_link(&link_state, &link_carrier, link, &link_tracker)
                 {
                     println!("[session] link rejected: {e}");
                 }
@@ -166,11 +183,20 @@ async fn accept_loop(
 
 /// Handle one inbound link: extract the `CLIENT_HELLO` from the first
 /// packet, answer with `SERVER_HELLO`, build the server session, and start
-/// the wire loop.
-// The Arc is handed (cloned) to the spawned session task below.
-#[allow(clippy::needless_pass_by_value)]
+/// the wire loop. The caller holds the state mutex for the connection
+/// setup; per-packet work runs on the session task.
 fn handle_inbound_link(
-    state: Arc<RuntimeState>,
+    state: &Arc<std::sync::Mutex<state::RuntimeState>>,
+    carrier_type: &str,
+    link: BoxLink,
+    tracker: &std::sync::Mutex<handshake_timeout::HandshakeTracker>,
+) -> Result<(), String> {
+    let state = state.lock().expect("state");
+    handle_inbound_link_locked(&state, carrier_type, link, tracker)
+}
+
+fn handle_inbound_link_locked(
+    state: &state::RuntimeState,
     carrier_type: &str,
     link: BoxLink,
     tracker: &std::sync::Mutex<handshake_timeout::HandshakeTracker>,
@@ -211,7 +237,7 @@ fn handle_inbound_link(
     // SERVER_HELLO itself binds only DH_ee and the transcript).
     let client_static = StaticHandshakePublicKey([0u8; 32]);
     let (server_hello_bytes, secrets) = handshake_responder::respond_hello(
-        &state,
+        state,
         carrier_type.as_bytes(),
         &hello_bytes,
         &client_static,
@@ -245,7 +271,13 @@ fn handle_inbound_link(
     )
     .map_err(|e| format!("session: {e:?}"))?;
     let session_id = state.sessions.next_id();
-    let task = session_task::spawn_session_task(state.clone(), link, session, session_id);
+    let task = session_task::spawn_session_task(
+        state.node.clock.clone(),
+        state.shutdown_requested.clone(),
+        link,
+        session,
+        session_id,
+    );
     state.sessions.register(
         session_id,
         session_manager::SessionEntry {
@@ -254,6 +286,15 @@ fn handle_inbound_link(
             task,
         },
     );
+    state
+        .events
+        .lock()
+        .expect("event log")
+        .push(event_log::DaemonEvent {
+            kind: "session_active".into(),
+            at_ms: now.0,
+            detail: format!("session {session_id} peer {peer_endpoint_id:02x?} via {carrier_type}"),
+        });
     println!("[session] active with peer {peer_endpoint_id:02x?}");
     Ok(())
 }
