@@ -21,6 +21,6 @@ Specifications are licensed under Creative Commons Attribution 4.0 International
 - [x] Phase 2: node runtime — daemon, Control API, storage, config, diagnostics
 - [x] Phase 3: routing and relaying — route discovery, single relay, quotas
 - [x] Phase 4: mobility — paths, migration, connection IDs, key update, resumption
-- [ ] Phase 5: local mesh
+- [x] Phase 5: local mesh — LAN discovery, local preference, disconnected tests
 - [ ] Phase 6: store-and-forward
 - [ ] Phase 7: adversarial resilience
