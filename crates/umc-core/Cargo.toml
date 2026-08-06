@@ -11,6 +11,7 @@ umc-crypto = { path = "../umc-crypto" }
 umc-handshake = { path = "../umc-handshake" }
 umc-session = { path = "../umc-session" }
 umc-carrier = { path = "../umc-carrier" }
+umc-storage = { path = "../umc-storage" }
 tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time"] }
 
 [dev-dependencies]
