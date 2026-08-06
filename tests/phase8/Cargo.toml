@@ -1,0 +1,20 @@
+[package]
+name = "phase8-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+umc-core = { path = "../../crates/umc-core" }
+umc-handshake = { path = "../../crates/umc-handshake" }
+umc-crypto = { path = "../../crates/umc-crypto" }
+umc-carrier = { path = "../../crates/umc-carrier" }
+umc-carrier-tcp = { path = "../../carriers/umc-carrier-tcp" }
+umc-carrier-udp = { path = "../../carriers/umc-carrier-udp" }
+umc-types = { path = "../../crates/umc-types" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
+serde_json = "1"
+
+[lints]
+workspace = true
