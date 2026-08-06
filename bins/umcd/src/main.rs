@@ -12,6 +12,7 @@ mod relay_service;
 mod routing_service;
 mod runtime_adapters;
 mod server;
+mod session_bus;
 mod session_manager;
 mod session_task;
 mod state;
@@ -301,6 +302,11 @@ fn handle_inbound_link_locked(
     let session_id = state.sessions.next_id();
     let remote_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&secrets.client)
         .map_err(|e| format!("remote keys: {e:?}"))?;
+    // The session's bus channels: created here so the registration can
+    // happen under the state lock the caller already holds (the task itself
+    // must not re-lock it); the rx sides move into the wire loop.
+    let (bus_inbound_tx, bus_inbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (bus_outbound_tx, bus_outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let task = session_task::spawn_session_task(
         state.node.clock.clone(),
         state.shutdown_requested.clone(),
@@ -311,6 +317,14 @@ fn handle_inbound_link_locked(
         state.app_echo_rx.clone(),
         runtime,
         remote_keys,
+        bus_inbound_rx,
+        bus_outbound_rx,
+    );
+    state.bus.lock().expect("session bus").register(
+        peer_endpoint_id.to_vec(),
+        session_id,
+        bus_inbound_tx,
+        bus_outbound_tx,
     );
     // The session task's JoinHandle moves into a watcher that records
     // `session_closed` when the wire loop exits; the registry keeps an

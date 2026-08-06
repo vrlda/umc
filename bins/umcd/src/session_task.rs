@@ -76,6 +76,11 @@ pub const RELAY_STATUS_REFUSED: u64 = 2;
 /// or a delivery sweep is due, so contention with the control socket stays
 /// low. `remote_keys` is the daemon's copy of the peer's traffic keys for
 /// parsing the control frames the session layer does not expose.
+///
+/// The session's bus channels are registered by the caller (which holds the
+/// runtime state lock at the spawn site) with the tx sides of
+/// `bus_inbound_rx` and `bus_outbound_rx`; the reader selects over the
+/// carrier pump, the bus-inbound channel, and the bus-outbound channel.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)] // shared runtime handles cloned for the spawned tasks
 pub fn spawn_session_task(
     clock: Arc<dyn Clock>,
@@ -87,10 +92,52 @@ pub fn spawn_session_task(
     app_echo_rx: Arc<Mutex<HashMap<Vec<u8>, AppRx>>>,
     runtime: Arc<Mutex<RuntimeState>>,
     remote_keys: PacketKeys,
+    bus_inbound_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    bus_outbound_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 ) -> JoinHandle<()> {
     let link = Arc::new(link);
     let session = Arc::new(tokio::sync::Mutex::new(session));
     let ended = Arc::new(AtomicBool::new(false));
+
+    // The carrier API is blocking (Handle::block_on internally); it runs on
+    // its own pump task so the reader's select can serve the session bus
+    // channels while the link is idle. The pump exits on link failure or
+    // shutdown; dropping the packet channel ends the reader.
+    //
+    // The TCP carrier serializes reads and writes behind one mutex, so a
+    // recv in flight starves the carrier's background writer; the pause
+    // after each handoff gives queued ACKs, echoes, and bus-outbound
+    // frames a window to flush (carriers/tcp.md).
+    let (packet_tx, packet_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    // The carrier API is blocking and internally `block_on`s, so the pump
+    // must run on a blocking thread (spawn_blocking) — block_on on a tokio
+    // worker panics, and block_in_place nests dangerously here.
+    let pump_link = link.clone();
+    let pump_shutdown = shutdown_flag.clone();
+    tokio::task::spawn_blocking(move || loop {
+        if pump_shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let inbound = pump_link.recv();
+        match inbound {
+            Ok(packet) => {
+                #[cfg(debug_assertions)]
+                println!("[session {session_id}] recv {} bytes", packet.bytes.len());
+                if packet_tx.send(packet.bytes).is_err() {
+                    break;
+                }
+                std::thread::sleep(FLUSH_INTERVAL);
+            }
+            Err(e) if e.kind == CarrierErrorKind::WouldBlock => {
+                std::thread::sleep(RECV_POLL_INTERVAL);
+            }
+            Err(e) => {
+                #[cfg(debug_assertions)]
+                println!("[session {session_id}] recv error: {e:?}");
+                break;
+            }
+        }
+    });
 
     let reader_link = link.clone();
     let reader_session = session.clone();
@@ -109,6 +156,9 @@ pub fn spawn_session_task(
             &reader_runtime,
             &remote_keys,
             session_id,
+            packet_rx,
+            bus_inbound_rx,
+            bus_outbound_rx,
         )
         .await;
     });
@@ -130,10 +180,19 @@ pub fn spawn_session_task(
     })
 }
 
-/// Reader loop: pull packets off the link, feed the session state machine,
-/// send the ACKs it produces, forward stream data to applications, and
-/// dispatch control frames (relay/bundle/routing/key-update) to the
-/// runtime services.
+/// Per-session schedule state threaded through inbound processing: session
+/// establishment time, the last key update, the last bundle sweep.
+#[derive(Default)]
+struct SweepState {
+    established: Option<Instant>,
+    last_key_update: Option<Instant>,
+    last_bundle_flush: Option<Instant>,
+}
+
+/// Reader loop: pull packets off the carrier pump or the session bus, feed
+/// the session state machine, send the ACKs it produces, forward stream
+/// data to applications, and dispatch control frames (relay/bundle/routing/
+/// key-update) to the runtime services.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn reader_loop(
     link: &Arc<BoxLink>,
@@ -145,137 +204,67 @@ async fn reader_loop(
     runtime: &Arc<Mutex<RuntimeState>>,
     remote_keys: &PacketKeys,
     session_id: u64,
+    mut packet_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    mut bus_inbound_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    mut bus_outbound_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
-    let mut established: Option<Instant> = None;
-    let mut last_key_update: Option<Instant> = None;
-    let mut last_bundle_flush: Option<Instant> = None;
+    let mut sweep = SweepState::default();
     loop {
         if shutdown_flag.load(Ordering::Relaxed) {
             break;
         }
-        // The carrier API is blocking (Handle::block_on internally);
-        // move off the async machinery for the call.
-        let inbound = tokio::task::block_in_place(|| link.recv());
-        let packet = match inbound {
-            Ok(packet) => packet,
-            Err(e) if e.kind == CarrierErrorKind::WouldBlock => {
-                tokio::time::sleep(RECV_POLL_INTERVAL).await;
-                continue;
+        tokio::select! {
+            recv = packet_rx.recv() => {
+                match recv {
+                    Some(bytes) => process_inbound_packet(
+                        link,
+                        session,
+                        clock,
+                        app_channels,
+                        runtime,
+                        remote_keys,
+                        session_id,
+                        &bytes,
+                        &mut sweep,
+                    )
+                    .await,
+                    None => break,
+                }
             }
-            Err(_) => break,
-        };
-        #[cfg(debug_assertions)]
-        println!("[session {session_id}] recv {} bytes", packet.bytes.len());
-        let now = clock.now();
-        // The control frames the session layer does not expose: relay,
-        // bundle, routing, and key updates.
-        let frames = parse_control_frames(remote_keys, &packet.bytes);
-        let mut outbound = None;
-        let mut pending: Vec<(Vec<u8>, u64, Vec<u8>)> = Vec::new();
-        {
-            let mut session = session.lock().await;
-            let ack_payload = match session.on_inbound(now, &packet.bytes) {
-                Ok(payload) => payload,
-                Err(e) => {
-                    #[cfg(debug_assertions)]
-                    println!("[session {session_id}] inbound error: {e:?}");
-                    continue;
+            recv = bus_inbound_rx.recv() => {
+                match recv {
+                    Some(bytes) => process_inbound_packet(
+                        link,
+                        session,
+                        clock,
+                        app_channels,
+                        runtime,
+                        remote_keys,
+                        session_id,
+                        &bytes,
+                        &mut sweep,
+                    )
+                    .await,
+                    None => break,
                 }
-            };
-            let mut combined = ack_payload;
-            let sweep_due = bundle_flush_due(now, last_bundle_flush);
-            let rotation_due =
-                established.is_some_and(|started| key_rotation_due(now, started, last_key_update));
-            if established.is_none() {
-                established = Some(now);
             }
-            if frames.is_some() || sweep_due || rotation_due {
-                let mut state = runtime.lock().expect("runtime state");
-                if let Some(frames) = &frames {
-                    if let Some(payload) =
-                        handle_control_frames(&mut state, session_id, &mut session, frames, now)
-                    {
-                        combined.extend_from_slice(&payload);
-                    }
-                }
-                if sweep_due {
-                    let payload = flush_pending_bundles(&mut state, now);
-                    combined.extend_from_slice(&payload);
-                    last_bundle_flush = Some(now);
-                }
-                if rotation_due {
-                    if let Some(started) = established {
-                        if let Some(payload) =
-                            maybe_rotate_keys(&mut session, now, started, &mut last_key_update)
-                        {
-                            combined.extend_from_slice(&payload);
+            recv = bus_outbound_rx.recv() => {
+                match recv {
+                    Some(bytes) => {
+                        let sent = tokio::task::block_in_place(|| {
+                            link.send(OutboundPacket {
+                                bytes,
+                                control: false,
+                                deadline_ms: None,
+                            })
+                        });
+                        if let Err(e) = sent {
+                            #[cfg(debug_assertions)]
+                            println!("[session {session_id}] send error: {e:?}");
                         }
                     }
+                    None => break,
                 }
-            }
-            if !combined.is_empty() {
-                let built = session.build_outbound(clock.as_ref(), now, &combined);
-                outbound = match built {
-                    Ok(outbound) => outbound,
-                    Err(e) => {
-                        #[cfg(debug_assertions)]
-                        println!("[session {session_id}] ack build error: {e:?}");
-                        None
-                    }
-                };
-            }
-            // Forward contiguous data of streams whose protocol ID has an
-            // application channel; reading drains the session buffer, which
-            // is the app-layer delivery.
-            let stream_ids: Vec<u64> = session.streams.keys().copied().collect();
-            for stream_id in stream_ids {
-                let protocol_id = session
-                    .streams
-                    .get(&stream_id)
-                    .map(|s| s.protocol_id.clone())
-                    .unwrap_or_default();
-                if !app_channels
-                    .lock()
-                    .expect("app channels")
-                    .contains_key(&protocol_id)
-                {
-                    continue;
-                }
-                if let Ok((data, _eof)) = session.read_stream(stream_id) {
-                    if !data.is_empty() {
-                        pending.push((protocol_id, stream_id, data));
-                    }
-                }
-            }
-        }
-        for (protocol_id, stream_id, data) in pending {
-            let channel = app_channels
-                .lock()
-                .expect("app channels")
-                .get(&protocol_id)
-                .expect("channel exists")
-                .clone();
-            #[cfg(debug_assertions)]
-            println!(
-                "[session {session_id}] dispatch stream {stream_id} to {:?} ({} bytes)",
-                protocol_id,
-                data.len()
-            );
-            if channel.send_stream_frame(stream_id, data).await.is_err() {
-                break;
-            }
-        }
-        if let Some(outbound) = outbound {
-            let sent = tokio::task::block_in_place(|| {
-                link.send(OutboundPacket {
-                    bytes: outbound,
-                    control: false,
-                    deadline_ms: None,
-                })
-            });
-            if let Err(e) = sent {
-                #[cfg(debug_assertions)]
-                println!("[session {session_id}] send error: {e:?}");
             }
         }
         // Give the carrier's background writer a window to flush before the
@@ -283,6 +272,144 @@ async fn reader_loop(
         tokio::time::sleep(FLUSH_INTERVAL).await;
     }
     ended.store(true, Ordering::Relaxed);
+    runtime
+        .lock()
+        .expect("runtime state")
+        .bus
+        .lock()
+        .expect("session bus")
+        .unregister(session_id);
+}
+
+/// Process one inbound byte buffer — from the carrier pump or the session
+/// bus — as a carrier packet: feed the session state machine, send the ACK
+/// payloads it produces, dispatch control frames, and forward matching
+/// stream data to registered applications.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn process_inbound_packet(
+    link: &Arc<BoxLink>,
+    session: &Arc<tokio::sync::Mutex<Session>>,
+    clock: &Arc<dyn Clock>,
+    app_channels: &Arc<Mutex<HashMap<Vec<u8>, AppTx>>>,
+    runtime: &Arc<Mutex<RuntimeState>>,
+    remote_keys: &PacketKeys,
+    session_id: u64,
+    bytes: &[u8],
+    sweep: &mut SweepState,
+) {
+    let now = clock.now();
+    // The control frames the session layer does not expose: relay,
+    // bundle, routing, and key updates.
+    let frames = parse_control_frames(remote_keys, bytes);
+    let mut outbound = None;
+    let mut pending: Vec<(Vec<u8>, u64, Vec<u8>)> = Vec::new();
+    {
+        let mut session = session.lock().await;
+        let ack_payload = match session.on_inbound(now, bytes) {
+            Ok(payload) => payload,
+            Err(e) => {
+                #[cfg(debug_assertions)]
+                println!("[session {session_id}] inbound error: {e:?}");
+                return;
+            }
+        };
+        let mut combined = ack_payload;
+        let sweep_due = bundle_flush_due(now, sweep.last_bundle_flush);
+        let rotation_due = sweep
+            .established
+            .is_some_and(|started| key_rotation_due(now, started, sweep.last_key_update));
+        if sweep.established.is_none() {
+            sweep.established = Some(now);
+        }
+        if frames.is_some() || sweep_due || rotation_due {
+            let mut state = runtime.lock().expect("runtime state");
+            if let Some(frames) = &frames {
+                if let Some(payload) =
+                    handle_control_frames(&mut state, session_id, &mut session, frames, now)
+                {
+                    combined.extend_from_slice(&payload);
+                }
+            }
+            if sweep_due {
+                let payload = flush_pending_bundles(&mut state, now);
+                combined.extend_from_slice(&payload);
+                sweep.last_bundle_flush = Some(now);
+            }
+            if rotation_due {
+                if let Some(started) = sweep.established {
+                    if let Some(payload) =
+                        maybe_rotate_keys(&mut session, now, started, &mut sweep.last_key_update)
+                    {
+                        combined.extend_from_slice(&payload);
+                    }
+                }
+            }
+        }
+        if !combined.is_empty() {
+            let built = session.build_outbound(clock.as_ref(), now, &combined);
+            outbound = match built {
+                Ok(outbound) => outbound,
+                Err(e) => {
+                    #[cfg(debug_assertions)]
+                    println!("[session {session_id}] ack build error: {e:?}");
+                    None
+                }
+            };
+        }
+        // Forward contiguous data of streams whose protocol ID has an
+        // application channel; reading drains the session buffer, which
+        // is the app-layer delivery.
+        let stream_ids: Vec<u64> = session.streams.keys().copied().collect();
+        for stream_id in stream_ids {
+            let protocol_id = session
+                .streams
+                .get(&stream_id)
+                .map(|s| s.protocol_id.clone())
+                .unwrap_or_default();
+            if !app_channels
+                .lock()
+                .expect("app channels")
+                .contains_key(&protocol_id)
+            {
+                continue;
+            }
+            if let Ok((data, _eof)) = session.read_stream(stream_id) {
+                if !data.is_empty() {
+                    pending.push((protocol_id, stream_id, data));
+                }
+            }
+        }
+    }
+    for (protocol_id, stream_id, data) in pending {
+        let channel = app_channels
+            .lock()
+            .expect("app channels")
+            .get(&protocol_id)
+            .expect("channel exists")
+            .clone();
+        #[cfg(debug_assertions)]
+        println!(
+            "[session {session_id}] dispatch stream {stream_id} to {:?} ({} bytes)",
+            protocol_id,
+            data.len()
+        );
+        if channel.send_stream_frame(stream_id, data).await.is_err() {
+            break;
+        }
+    }
+    if let Some(outbound) = outbound {
+        let sent = tokio::task::block_in_place(|| {
+            link.send(OutboundPacket {
+                bytes: outbound,
+                control: false,
+                deadline_ms: None,
+            })
+        });
+        if let Err(e) = sent {
+            #[cfg(debug_assertions)]
+            println!("[session {session_id}] send error: {e:?}");
+        }
+    }
 }
 
 /// Parse the control frames out of an inbound protected packet with the
@@ -327,7 +454,9 @@ fn handle_control_frames(
                         flags: relay_request_flags(open),
                         bidirectional: open.bidirectional,
                         private_handling: open.private_circuit,
+                        destination_hint: open.next_hop_hint.clone(),
                     },
+                    peer_endpoint_id.to_vec(),
                     now,
                 );
                 let (code, retryable, granted) = match result {
@@ -358,6 +487,21 @@ fn handle_control_frames(
                 }
             }
             Frame::RelayData(data) => {
+                // The circuit's peer end is the session that opened it: only
+                // the owning session may send `RELAY_DATA` on the circuit
+                // (relay.md §16-18).
+                if state.relay.circuit_owner(data.circuit_id) != Some(session_id) {
+                    push_event(
+                        state,
+                        "relay_data_rejected",
+                        now,
+                        format!(
+                            "circuit {}: sender is not the circuit owner",
+                            data.circuit_id
+                        ),
+                    );
+                    continue;
+                }
                 match state.relay.accept_upstream(
                     data.circuit_id,
                     data.relay_sequence,
@@ -366,23 +510,31 @@ fn handle_control_frames(
                     now,
                 ) {
                     Ok(()) => {
-                        // The circuit's peer end is the session that opened
-                        // it; cross-session forwarding rides the session bus
-                        // once multi-hop relaying lands — the daemon records
-                        // the forward decision for now.
-                        if let Some(owner) = state.relay.circuit_owner(data.circuit_id) {
-                            let peer_local = state.sessions.lookup(owner).is_some();
-                            push_event(
+                        // Cross-session forwarding (relay.md §18): the
+                        // circuit's destination peer gets a fresh
+                        // `RELAY_DATA` pushed into its session via the bus.
+                        match state.relay.forward_data(data.circuit_id, &data.data, now) {
+                            Ok((dest_peer, frame_bytes)) => {
+                                let injected = state
+                                    .bus
+                                    .lock()
+                                    .expect("session bus")
+                                    .inject_outbound(&dest_peer, frame_bytes);
+                                if let Err(e) = injected {
+                                    push_event(
+                                        state,
+                                        "relay_forward_dropped",
+                                        now,
+                                        format!("circuit {}: {e:?}", data.circuit_id),
+                                    );
+                                }
+                            }
+                            Err(e) => push_event(
                                 state,
-                                "relay_data_forwarded",
+                                "relay_forward_dropped",
                                 now,
-                                format!(
-                                    "circuit {} {} bytes to session {owner}{}",
-                                    data.circuit_id,
-                                    data.data.len(),
-                                    if peer_local { "" } else { " (peer unknown)" }
-                                ),
-                            );
+                                format!("circuit {}: {e}", data.circuit_id),
+                            ),
                         }
                     }
                     Err(e) => push_event(
@@ -856,7 +1008,7 @@ mod tests {
 
     fn relay_status_of(payload: &[u8]) -> umc_wire::frames::relay::RelayStatusFrame {
         let body = body_of(payload, umc_types::frame::FrameType::RELAY_STATUS);
-        umc_wire::frames::relay::RelayStatusFrame::decode(body)
+        umc_wire::frames::relay::RelayStatusFrame::decode_length_delimited(body)
             .expect("relay status body")
             .0
     }

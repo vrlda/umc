@@ -581,8 +581,11 @@ fn open_circuit(state: &mut RuntimeState, request: &api::Request) -> (i32, Optio
         flags: u8::try_from(open.flags).unwrap_or(u8::MAX),
         bidirectional: open.bidirectional,
         private_handling: open.private_handling,
+        // Control-opened circuits carry no wire destination hint; forwarding
+        // targets come from `RELAY_OPEN.next_hop_hint` on session circuits.
+        destination_hint: Vec::new(),
     };
-    match state.relay.open_circuit(&circuit_request, now) {
+    match state.relay.open_circuit(&circuit_request, Vec::new(), now) {
         Ok(result) => {
             let response = OpenCircuitResponse {
                 circuit_id: result.circuit_id,
