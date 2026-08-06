@@ -2,8 +2,10 @@
 use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
 use umc_handshake::xx::run_xx_handshake;
 use umc_session::datagram::Datagram;
-use umc_session::session::{Role, Session, SessionConfig};
-use umc_types::runtime::{Clock, EntropySource, Instant};
+use umc_session::session::{
+    Role, Session, SessionConfig, SessionState, CLOSE_REASON_IDLE_TIMEOUT, IDLE_TIMEOUT_MS,
+};
+use umc_types::runtime::{Clock, Duration, EntropySource, Instant};
 
 struct TestEntropy;
 
@@ -308,4 +310,74 @@ fn lost_packet_payload_retransmitted() {
     let fresh = client.sent_state().sent().back().expect("fresh packet");
     assert!(fresh.ack_eliciting);
     assert!(fresh.in_flight);
+}
+
+#[test]
+fn idle_timeout_triggers_close() {
+    let (client_secrets, _server_secrets) = run_xx_handshake(
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &TestEntropy,
+        b"ump.udp/1",
+        0,
+    )
+    .expect("handshake");
+    let mut client = Session::new(
+        SessionConfig {
+            role: Role::Client,
+            dcid: vec![9u8; 8],
+            local_traffic_secret: client_secrets.client,
+            remote_traffic_secret: client_secrets.server,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("client session");
+
+    let t0 = Instant(1_000_000);
+    // No activity yet: a fresh session is never idle (session.md §22), so
+    // the timer cannot fire before the first packet.
+    assert!(!client.idle_expired(t0 + Duration::from_millis(IDLE_TIMEOUT_MS)));
+    // First activity anchors the timer; nothing expires before the timeout.
+    client.touch(t0);
+    assert!(!client.idle_expired(t0 + Duration::from_millis(IDLE_TIMEOUT_MS - 1)));
+    assert!(client.idle_expired(t0 + Duration::from_millis(IDLE_TIMEOUT_MS)));
+    // Activity resets the timer.
+    client.touch(t0 + Duration::from_millis(IDLE_TIMEOUT_MS));
+    assert!(!client.idle_expired(t0 + Duration::from_millis(2 * IDLE_TIMEOUT_MS - 1)));
+
+    // Idle-expired: the session offers a CONNECTION_CLOSE carrying the idle
+    // timeout reason (wire-format.md §64: 0x16 = IDLE_TIMEOUT).
+    let expired = t0 + Duration::from_millis(2 * IDLE_TIMEOUT_MS);
+    assert!(
+        client.build_idle_close(Instant(expired.0 - 1)).is_none(),
+        "not yet expired offers no close"
+    );
+    let payload = client
+        .build_idle_close(expired)
+        .expect("idle close payload");
+    let frames = umc_wire::frame::decode_frames(&payload).expect("close frames");
+    assert!(matches!(
+        &frames[..],
+        [umc_wire::frame::Frame::ConnectionClose(cc)]
+            if cc.error_code == CLOSE_REASON_IDLE_TIMEOUT
+                && cc.trigger_frame_type == 0
+                && cc.reason == b"idle timeout"
+    ));
+
+    // Closing enters DRAINING with a 3 x PTO (min 1 s) deadline; with no RTT
+    // sample the probe timeout is the 1 s default, so draining lasts 3 s.
+    client.close(expired);
+    assert_eq!(client.state, SessionState::Draining);
+    let drain = Duration::from_millis(3 * 1_000);
+    let deadline = expired + drain;
+    assert!(!client.draining_expired(Instant(deadline.0 - 1)));
+    assert!(client.draining_expired(deadline));
+    // Draining expiry transitions to CLOSED.
+    client.finalize_close();
+    assert_eq!(client.state, SessionState::Closed);
 }

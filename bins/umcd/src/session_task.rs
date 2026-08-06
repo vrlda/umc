@@ -41,6 +41,10 @@ use crate::state::RuntimeState;
 pub const RECV_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Poll interval of the echo drain when no echo is pending.
 pub const ECHO_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// Period of the reader's idle/draining sweep (session.md §6.4, §22). The
+/// sweep only checks the session's idle and draining timers; it never
+/// touches the PTO schedule.
+pub const IDLE_SWEEP_INTERVAL: Duration = Duration::from_millis(1_000);
 /// Pause after processing a packet before the next blocking recv. The TCP
 /// carrier serializes reads and writes behind one mutex, so a recv in
 /// flight starves the carrier's background writer; the pause gives queued
@@ -115,6 +119,40 @@ fn pto_deadline_after(
         return None;
     }
     armed.or_else(|| pto_deadline_at(session, multiplier))
+}
+
+/// One idle/draining sweep on the reader's 1 s interval arm (session.md
+/// §6.4, §22): when the session has been idle past the timeout, send a
+/// `CONNECTION_CLOSE` and enter draining; once the draining deadline has
+/// passed, finalize the close. Returns whether the reader loop should exit
+/// (the draining period ended).
+fn handle_idle_timers(
+    session: &mut Session,
+    clock: &dyn Clock,
+    now: Instant,
+    link: &Arc<BoxLink>,
+    session_id: u64,
+) -> bool {
+    if session.draining_expired(now) {
+        session.finalize_close();
+        return true;
+    }
+    if session.idle_expired(now) {
+        if let Some(payload) = session.build_idle_close(now) {
+            if let Ok(Some(bytes)) = session.build_outbound(clock, now, &payload) {
+                if let Err(e) = link.send(OutboundPacket {
+                    bytes,
+                    control: false,
+                    deadline_ms: None,
+                }) {
+                    #[cfg(debug_assertions)]
+                    println!("[session {session_id}] idle close send error: {e:?}");
+                }
+            }
+        }
+        session.close(now);
+    }
+    false
 }
 
 /// Spawn the per-session wire loop. The tasks exit when `link.recv` errors
@@ -271,6 +309,10 @@ async fn reader_loop(
     // extended by inbound traffic, so the probe cannot be starved.
     let mut pto_deadline: Option<tokio::time::Instant> = None;
     let mut pto_multiplier: u32 = 1;
+    // Idle/draining sweep (session.md §6.4, §22): checks the session's idle
+    // timer and draining deadline; it must not interfere with the PTO
+    // schedule (an armed PTO deadline is never extended by this arm).
+    let mut idle_sweep = tokio::time::interval(IDLE_SWEEP_INTERVAL);
     loop {
         if shutdown_flag.load(Ordering::Relaxed) {
             break;
@@ -336,6 +378,22 @@ async fn reader_loop(
                         }
                     }
                     None => break,
+                }
+            }
+            _ = idle_sweep.tick() => {
+                let now = clock.now();
+                let done = {
+                    let mut session = session.lock().await;
+                    // The carrier API is blocking; run the sweep on a worker
+                    // like the other send sites.
+                    tokio::task::block_in_place(|| {
+                        handle_idle_timers(&mut session, clock.as_ref(), now, link, session_id)
+                    })
+                };
+                if done {
+                    #[cfg(debug_assertions)]
+                    println!("[session {session_id}] draining period ended, closing session");
+                    break;
                 }
             }
             () = pto_sleep(pto_deadline) => {
@@ -1121,7 +1179,9 @@ mod tests {
     use crate::config::NodeConfig;
     use crate::session_manager::SessionEntry;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use umc_session::session::{Role, SessionConfig};
+    use umc_session::session::{
+        Role, Session, SessionConfig, SessionState, CLOSE_REASON_IDLE_TIMEOUT, IDLE_TIMEOUT_MS,
+    };
     use umc_wire::frame::Frame as WireFrame;
     use umc_wire::frames::path::KeyUpdateFrame;
     use umc_wire::frames::relay::RelayOpenFrame;
@@ -1668,5 +1728,64 @@ mod tests {
         // Nothing in flight, nothing armed: stays disarmed.
         let idle = test_session();
         assert!(pto_deadline_after(&idle, 1, None).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_timeout_sends_close_and_drains() {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let link: Arc<BoxLink> = Arc::new(Box::new(RecordingLink {
+            sent: recorded.clone(),
+        }));
+        let clock = FixedClock(1_000_000);
+        let mut session = test_session();
+        let t0 = Instant(1_000_000);
+        session.touch(t0);
+
+        // Before the timeout the interval sweep is a no-op.
+        assert!(!handle_idle_timers(
+            &mut session,
+            &clock,
+            Instant(1_000_000 + IDLE_TIMEOUT_MS - 1),
+            &link,
+            1,
+        ));
+        assert_eq!(session.state, SessionState::Active);
+        assert!(recorded.lock().unwrap().is_empty());
+
+        // Past the idle timeout: a CONNECTION_CLOSE is sent and the session
+        // enters draining; the loop keeps running.
+        let now = Instant(1_000_000 + IDLE_TIMEOUT_MS);
+        assert!(!handle_idle_timers(&mut session, &clock, now, &link, 1));
+        assert_eq!(session.state, SessionState::Draining);
+        let sent = recorded.lock().expect("link sent");
+        assert_eq!(sent.len(), 1, "exactly one idle close packet");
+        let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[1u8; 32]).unwrap();
+        let (space, _dcid, _path, _pn, payload) =
+            umc_session::packet::parse_protected_packet(&keys, &sent[0]).unwrap();
+        let parsed = umc_wire::packet::parse_payload(
+            &umc_wire::packet::PacketContext::Protected(space),
+            &payload,
+        )
+        .unwrap();
+        assert!(parsed.frames.iter().any(|f| matches!(
+            f,
+            WireFrame::ConnectionClose(cc)
+                if cc.error_code == CLOSE_REASON_IDLE_TIMEOUT && cc.reason == b"idle timeout"
+        )));
+        drop(sent);
+
+        // Inside the drain window the sweep stays quiet and the session is
+        // not yet expired...
+        assert!(!session.draining_expired(Instant(now.0 + 3 * 1_000 - 1)));
+        // ...and once draining expires the loop must exit with the session
+        // finalized as closed.
+        assert!(handle_idle_timers(
+            &mut session,
+            &clock,
+            Instant(now.0 + 3 * 1_000),
+            &link,
+            1,
+        ));
+        assert_eq!(session.state, SessionState::Closed);
     }
 }
