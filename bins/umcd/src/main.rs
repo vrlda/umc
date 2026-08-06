@@ -1,4 +1,5 @@
 mod config;
+mod doctor;
 mod server;
 
 use clap::Parser;
@@ -26,8 +27,15 @@ fn main() {
         return;
     }
     if args.doctor {
-        // Phase 2 minimal placeholder; full checks land with Task 15.
-        println!("doctor: checks not yet implemented (Phase 2 minimal)");
+        let report = doctor::run_doctor(&config);
+        for check in report.checks {
+            println!(
+                "{}: {} ({})",
+                if check.passed { "[ok]" } else { "[FAIL]" },
+                check.name,
+                check.detail
+            );
+        }
         return;
     }
     let rt = tokio::runtime::Runtime::new().expect("runtime");

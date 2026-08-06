@@ -16,6 +16,14 @@ pub async fn run(config: NodeConfig) {
     let store = Arc::new(SqliteStore::open(&data_dir.join("node.db")).expect("open store"));
     println!("data directory: {}", data_dir.display());
 
+    if let Ok((profile, carriers)) = load_node_state(&store) {
+        println!(
+            "node state: profile {profile}, carriers [{}]",
+            carriers.join(", ")
+        );
+    }
+    persist_node_state(&store, &config).expect("persist node state");
+
     let socket_path = config.resolved_socket();
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).expect("socket dir");
@@ -105,6 +113,36 @@ fn handle_request(request: &api::Request, store: &SqliteStore) -> Vec<u8> {
     out
 }
 
+/// Persist node state at shutdown and reload at startup (storage.md §22).
+pub fn persist_node_state(store: &SqliteStore, config: &NodeConfig) -> Result<(), String> {
+    use umc_storage::store::{Namespace, Store};
+    store
+        .put(Namespace::Config, b"profile", config.profile.as_bytes())
+        .map_err(|e| format!("{e:?}"))?;
+    let carriers = serde_json::to_vec(&config.carriers).map_err(|e| e.to_string())?;
+    store
+        .put(Namespace::Config, b"carriers", &carriers)
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(())
+}
+
+pub fn load_node_state(store: &SqliteStore) -> Result<(String, Vec<String>), String> {
+    use umc_storage::store::{Namespace, Store};
+    let profile = store
+        .get(Namespace::Config, b"profile")
+        .map_err(|e| format!("{e:?}"))?
+        .map(|v| String::from_utf8(v).map_err(|_| "invalid profile".to_string()))
+        .transpose()?
+        .unwrap_or_else(|| "standard".to_string());
+    let carriers = store
+        .get(Namespace::Config, b"carriers")
+        .map_err(|e| format!("{e:?}"))?
+        .map(|v| serde_json::from_slice::<Vec<String>>(&v).map_err(|e| e.to_string()))
+        .transpose()?
+        .unwrap_or_default();
+    Ok((profile, carriers))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +165,26 @@ mod tests {
             decoded.body,
             Some(api::envelope::Body::ClientHello(_))
         ));
+    }
+
+    #[test]
+    fn node_state_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!("umcd-persist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.db");
+        let _ = std::fs::remove_file(&path);
+        let store = SqliteStore::open(&path).unwrap();
+        let config = NodeConfig {
+            profile: "relay".to_string(),
+            carriers: vec!["ump.udp/1".to_string()],
+            ..Default::default()
+        };
+        persist_node_state(&store, &config).unwrap();
+        drop(store);
+
+        let reopened = SqliteStore::open(&path).unwrap();
+        let (profile, carriers) = load_node_state(&reopened).unwrap();
+        assert_eq!(profile, "relay");
+        assert_eq!(carriers, vec!["ump.udp/1"]);
     }
 }
