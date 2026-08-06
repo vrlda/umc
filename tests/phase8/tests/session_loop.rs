@@ -42,23 +42,6 @@ struct CandidateSummary {
     public: bool,
 }
 
-/// Wire shape of the daemon's `NodeAdmin.GetEvents` payload.
-#[derive(Clone, PartialEq, prost::Message)]
-struct GetEventsResponse {
-    #[prost(message, repeated, tag = "1")]
-    events: Vec<EventRecord>,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct EventRecord {
-    #[prost(uint64, tag = "1")]
-    at_ms: u64,
-    #[prost(string, tag = "2")]
-    kind: String,
-    #[prost(string, tag = "3")]
-    detail: String,
-}
-
 struct TestClock;
 
 impl Clock for TestClock {
@@ -465,7 +448,7 @@ async fn daemon_serves_control_and_sessions_together() {
 
     let mut saw_active = false;
     for _ in 0..50 {
-        let events = GetEventsResponse::decode(
+        let events = api::GetEventsResponse::decode(
             client
                 .request("NodeAdmin", "GetEvents", vec![])
                 .await

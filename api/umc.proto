@@ -362,6 +362,16 @@ message GetResourceUsageResponse {
   repeated ResourceUsage usages = 2;
 }
 
+message EventRecord {
+  string kind = 1;
+  int64 at_ms = 2;
+  string detail = 3;
+}
+
+message GetEventsResponse {
+  repeated EventRecord events = 1;
+}
+
 enum IdentityKind {
   IDENTITY_KIND_UNSPECIFIED = 0;
   IDENTITY_KIND_NODE_MANAGEMENT = 1;

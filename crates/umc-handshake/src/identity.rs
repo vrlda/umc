@@ -97,7 +97,9 @@ impl IdentityBinding {
         {
             return Err(BindingError::BadSignature);
         }
-        if now + skew_ms < self.not_before || now > self.not_after + skew_ms {
+        if now.saturating_add(skew_ms) < self.not_before
+            || now > self.not_after.saturating_add(skew_ms)
+        {
             return Err(BindingError::ValidityWindow);
         }
         Ok(())
@@ -170,5 +172,26 @@ mod tests {
         assert!(b5.is_newer_than(b3.sequence));
         assert!(!b3.is_newer_than(b5.sequence));
         assert!(!b5.is_newer_than(b5.sequence));
+    }
+
+    #[test]
+    fn max_not_after_does_not_overflow() {
+        let identity = IdentityKeyPair::generate();
+        let static_key = StaticHandshakeKeyPair::generate();
+        let binding =
+            IdentityBinding::sign(&identity, &static_key.public(), 0, u64::MAX, 0, [0u8; 32]);
+        assert_eq!(binding.validate(1_900_000_000_000, 300_000), Ok(()));
+        let short = IdentityBinding::sign(
+            &identity,
+            &static_key.public(),
+            0,
+            1_900_000_000_000,
+            0,
+            [0u8; 32],
+        );
+        assert_eq!(
+            short.validate(1_900_000_000_000 + 600_000, 300_000),
+            Err(BindingError::ValidityWindow)
+        );
     }
 }

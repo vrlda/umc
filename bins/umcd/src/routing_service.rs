@@ -13,7 +13,6 @@ pub const REVERSE_RETENTION_MS: u64 = 30_000;
 
 /// Process-local routing state.
 #[derive(Debug)]
-#[allow(dead_code)] // route-request network path lands in Phase 12
 pub struct RoutingService {
     pub cache: RouteCache,
     pub reverse: ReverseState,
@@ -21,7 +20,7 @@ pub struct RoutingService {
     pub request_policy: RequestPolicy,
 }
 
-#[allow(dead_code, clippy::too_many_arguments)] // admit/record/find wired to the network loop in Phase 12
+#[allow(clippy::too_many_arguments)] // admit_route_request() takes the full ROUTE_REQUEST header
 impl RoutingService {
     #[must_use]
     pub fn new() -> Self {
@@ -101,6 +100,9 @@ impl RoutingService {
     }
 
     /// Best cached route for a key (routing.md §24).
+    // find_route is test-only until a forwarder consults the cache before
+    // probing; the session loop currently records responses only.
+    #[allow(dead_code)]
     #[must_use]
     pub fn find_route(&self, key: &RouteKey, now: Instant) -> Option<RouteRecord> {
         self.cache.candidates(key, now).into_iter().next()
