@@ -1,0 +1,15 @@
+[package]
+name = "umc-bundle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+umc-types = { path = "../umc-types" }
+umc-crypto = { path = "../umc-crypto" }
+umc-storage = { path = "../umc-storage" }
+umc-wire = { path = "../umc-wire" }
+blake2 = "0.10"
+
+[lints]
+workspace = true
