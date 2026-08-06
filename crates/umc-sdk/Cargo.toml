@@ -1,0 +1,13 @@
+[package]
+name = "umc-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+umc-control = { path = "../umc-control" }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time"] }
+prost = "0.13"
+
+[lints]
+workspace = true
