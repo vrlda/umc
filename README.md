@@ -30,3 +30,4 @@ Specifications are licensed under Creative Commons Attribution 4.0 International
 - [x] Phase 11: plugin contract — manifest, registry, and in-process plugin lifecycle (dynamic loading deferred until the security model is spec-frozen)
 - [x] Phase 12: protocol completion over sessions — relay, bundle store/forward, and route requests over live sessions; config persistence; key rotation; CLIENT_AUTH continuation; two-daemon integration
 - [x] Phase 13: hardening — property tests for the varint and replay window, relay-frame fuzz target, resource-limit enforcement, and DoS-resilience tests
+- [x] Phase 14: conformance — errata E1-E13, hostile-input bounds for the initial parser and frame decode, padding and length-delimited skipping, stream-id reuse rejection, relay status-code table and per-direction sequences, identity-binding validation at session establishment, and control-connection caps
