@@ -3,7 +3,7 @@
 use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
 use umc_handshake::ticket::{issue_ticket, validate_ticket, TicketPayload};
 use umc_handshake::xx::run_xx_handshake;
-use umc_session::session::{Session, SessionConfig, Role};
+use umc_session::session::{Role, Session, SessionConfig};
 use umc_types::runtime::{Clock, EntropySource, Instant};
 
 struct E;
@@ -61,9 +61,7 @@ fn full_mobility_cycle() {
 
     // 1. Data over path 0.
     let sid = client.open_stream();
-    let payload = client
-        .send_stream_data(sid, b"first", true)
-        .unwrap();
+    let payload = client.send_stream_data(sid, b"first", true).unwrap();
     let pkt = client
         .build_outbound(&C, Instant(42_000_000), &payload)
         .unwrap()
@@ -87,15 +85,16 @@ fn full_mobility_cycle() {
         .unwrap();
     // Library test: the daemon drives challenge/response; force validation.
     client.force_validate(1);
-    client
-        .migrate_to(1, false, Instant(42_000_300))
-        .unwrap();
+    client.migrate_to(1, false, Instant(42_000_300)).unwrap();
 
     // 4. Stream continues after migration with the same handle.
     let (data, eof) = server.read_stream(sid).unwrap();
     assert_eq!(data, b"first");
     assert!(eof);
-    assert!(client.read_stream(sid).is_ok(), "stream handle survives migration");
+    assert!(
+        client.read_stream(sid).is_ok(),
+        "stream handle survives migration"
+    );
 }
 
 #[test]
