@@ -3,6 +3,7 @@
 //! socket and carrier tasks.
 use crate::config::NodeConfig;
 use crate::runtime_adapters::{OsClock, OsEntropy, TokioAdaptor};
+use crate::session_manager::SessionManager;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -45,6 +46,8 @@ pub struct RuntimeState {
     pub node: Node,
     /// Bound carrier listeners; held here so the sockets stay alive.
     pub listeners: Vec<Box<dyn Listener + Send + Sync>>,
+    /// Live session registry (core.md §9.5); populated by the accept loops.
+    pub sessions: Arc<SessionManager>,
     /// Set when a graceful shutdown was requested.
     pub shutdown_requested: Arc<AtomicBool>,
     /// Released once shutdown completes; the main task waits on it.
@@ -111,6 +114,7 @@ impl RuntimeState {
             mesh,
             node,
             listeners: Vec::new(),
+            sessions: Arc::new(SessionManager::new()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_channel,
         })

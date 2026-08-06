@@ -14,6 +14,10 @@ umc-core = { path = "../../crates/umc-core" }
 umc-carrier = { path = "../../crates/umc-carrier" }
 umc-storage = { path = "../../crates/umc-storage" }
 umc-control = { path = "../../crates/umc-control" }
+umc-handshake = { path = "../../crates/umc-handshake" }
+umc-wire = { path = "../../crates/umc-wire" }
+umc-session = { path = "../../crates/umc-session" }
+umc-crypto = { path = "../../crates/umc-crypto" }
 umc-carrier-tcp = { path = "../../carriers/umc-carrier-tcp" }
 umc-carrier-udp = { path = "../../carriers/umc-carrier-udp" }
 umc-carrier-lan = { path = "../../carriers/umc-carrier-lan" }
