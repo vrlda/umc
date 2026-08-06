@@ -22,5 +22,5 @@ Specifications are licensed under Creative Commons Attribution 4.0 International
 - [x] Phase 3: routing and relaying — route discovery, single relay, quotas
 - [x] Phase 4: mobility — paths, migration, connection IDs, key update, resumption
 - [x] Phase 5: local mesh — LAN discovery, local preference, disconnected tests
-- [ ] Phase 6: store-and-forward
+- [x] Phase 6: store-and-forward — experimental bundles, one-hop delayed delivery
 - [ ] Phase 7: adversarial resilience
