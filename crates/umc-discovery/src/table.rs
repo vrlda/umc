@@ -57,6 +57,11 @@ impl CandidateTable {
         self.entries.retain(|_, c| !c.is_expired(now));
     }
 
+    /// Iterate the live candidates (arbitrary order).
+    pub fn iter(&self) -> impl Iterator<Item = &PeerCandidate> {
+        self.entries.values()
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -144,6 +149,22 @@ mod tests {
             ),
             Err(TableError::Full)
         );
+    }
+
+    #[test]
+    fn iteration_visits_all_entries() {
+        let mut table = CandidateTable::new(100);
+        for id in 1..=3 {
+            table
+                .upsert(
+                    candidate(id, crate::provider::SharingPolicy::LocalUseOnly),
+                    Instant(0),
+                )
+                .unwrap();
+        }
+        let mut ids: Vec<u64> = table.iter().map(|c| c.candidate_id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 
     #[test]

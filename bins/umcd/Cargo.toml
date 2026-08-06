@@ -27,6 +27,10 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 prost = "0.13"
+umc-bundle = { path = "../../crates/umc-bundle" }
+umc-discovery = { path = "../../crates/umc-discovery" }
+umc-relay = { path = "../../crates/umc-relay" }
+umc-routing = { path = "../../crates/umc-routing" }
 
 [lints]
 workspace = true

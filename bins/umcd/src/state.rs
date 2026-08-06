@@ -1,12 +1,17 @@
 //! Runtime state (core.md §8): the daemon's shared mutable runtime context,
 //! built once at startup and shared (behind an `Arc`) with the control
 //! socket and carrier tasks.
+use crate::bundle_service::BundleService;
 use crate::config::NodeConfig;
+use crate::discovery_service::DiscoveryService;
+use crate::event_log::DaemonEvents;
+use crate::relay_service::RelayService;
+use crate::routing_service::RoutingService;
 use crate::runtime_adapters::{OsClock, OsEntropy, TokioAdaptor};
 use crate::session_manager::SessionManager;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use umc_carrier::Listener;
 use umc_core::block::Blocklist;
@@ -14,6 +19,8 @@ use umc_core::mesh::MeshConfig;
 use umc_core::node::{Node, NodeConfig as NodeRuntimeConfig, NodeIdentity};
 use umc_core::rate_limiter::RateLimiter;
 use umc_core::trust::{TrustLevel, TrustStore};
+use umc_storage::objects::ObjectStore;
+use umc_storage::quota::{Profile, QuotaAccount};
 use umc_storage::sqlite::SqliteStore;
 use umc_types::runtime::{Clock, Instant};
 
@@ -48,6 +55,17 @@ pub struct RuntimeState {
     pub listeners: Vec<Box<dyn Listener + Send + Sync>>,
     /// Live session registry (core.md §9.5); populated by the accept loops.
     pub sessions: Arc<SessionManager>,
+    /// Discovery service: candidate table + `PEER_HINT` builder.
+    pub discovery: DiscoveryService,
+    /// Relay service: circuit registry, admission, forwarding.
+    pub relay: RelayService,
+    /// Bundle service: object-store-backed bundle admission and expiry.
+    pub bundle: BundleService,
+    /// Routing service: request admission, reverse paths, route cache.
+    #[allow(dead_code)] // route-request handling lands in Phase 12
+    pub routing: RoutingService,
+    /// Bounded daemon event log; services push transitions into it.
+    pub events: Arc<Mutex<DaemonEvents>>,
     /// Set when a graceful shutdown was requested.
     pub shutdown_requested: Arc<AtomicBool>,
     /// Released once shutdown completes; the main task waits on it.
@@ -102,6 +120,15 @@ impl RuntimeState {
             MeshConfig::endpoint()
         };
 
+        let events = Arc::new(Mutex::new(DaemonEvents::new(200)));
+        let bundle_objects = ObjectStore::open(data_dir.join("objects"))
+            .map_err(|e| format!("bundle object store: {e:?}"))?;
+        let bundle_quota = QuotaAccount::new(
+            Profile::Standard,
+            0,
+            Profile::Standard.bundle_storage_bytes(),
+        );
+
         Ok(Self {
             control_socket: config.resolved_socket(),
             started_at: OsClock.now(),
@@ -115,6 +142,11 @@ impl RuntimeState {
             node,
             listeners: Vec::new(),
             sessions: Arc::new(SessionManager::new()),
+            discovery: DiscoveryService::new(umc_discovery::table::DEFAULT_TABLE_CAP),
+            relay: RelayService::new(events.clone()),
+            bundle: BundleService::new(bundle_objects, bundle_quota, events.clone()),
+            routing: RoutingService::new(),
+            events,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_channel,
         })

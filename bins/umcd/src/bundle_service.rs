@@ -1,0 +1,243 @@
+//! Bundle service (bundles.md §9-12): the daemon's bundle admission, lookup,
+//! expiry, and control-surface listing, backed by the object store.
+use crate::event_log::{DaemonEvent, DaemonEvents};
+use std::sync::{Arc, Mutex};
+use umc_bundle::expiry::evict_expired;
+use umc_bundle::manager::BundleStatus;
+use umc_bundle::manager::{BundleError, BundleManager, BundleRecord};
+use umc_storage::objects::ObjectStore;
+use umc_storage::quota::QuotaAccount;
+use umc_types::runtime::Instant;
+
+/// Upper bound for control-surface bundle listings.
+pub const MAX_LIST_BUNDLES: usize = 100;
+
+/// Process-local bundle service over the shared object store.
+#[derive(Debug)]
+#[allow(dead_code)] // events wired to session/network loop in Phase 12
+pub struct BundleService {
+    pub manager: BundleManager,
+    events: Arc<Mutex<DaemonEvents>>,
+}
+
+#[allow(dead_code)] // admit/find/count/expire_old wired to the network loop in Phase 12
+#[allow(clippy::too_many_arguments)]
+impl BundleService {
+    #[must_use]
+    pub fn new(
+        objects: ObjectStore,
+        quota: QuotaAccount,
+        events: Arc<Mutex<DaemonEvents>>,
+    ) -> Self {
+        Self {
+            manager: BundleManager::new(objects, quota),
+            events,
+        }
+    }
+
+    /// Admit a bundle (bundles.md §8.1), recording a `bundle_admitted` event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError`] for policy violations, duplicates, quota
+    /// exhaustion, and object-store failures.
+    pub fn admit(
+        &mut self,
+        payload: &[u8],
+        sender: &[u8],
+        destination_hint: &[u8],
+        priority: u64,
+        lifetime_ms: u64,
+        replication_limit: u64,
+        custody: bool,
+        now: Instant,
+    ) -> Result<[u8; 32], BundleError> {
+        let id = self.manager.admit(
+            payload,
+            sender,
+            destination_hint,
+            priority,
+            lifetime_ms,
+            replication_limit,
+            custody,
+            now,
+        )?;
+        self.events.lock().expect("event log").push(DaemonEvent {
+            kind: "bundle_admitted".into(),
+            at_ms: now.0,
+            detail: format!("bundle {:02x?} ({} bytes)", id, payload.len()),
+        });
+        Ok(id)
+    }
+
+    /// Look up a bundle record by id.
+    #[must_use]
+    pub fn find(&self, id: &[u8; 32]) -> Option<&BundleRecord> {
+        self.manager.record(id)
+    }
+
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.manager.len()
+    }
+
+    /// Remove expired bundles (bundles.md §11); returns the count removed.
+    pub fn expire_old(&mut self, now: Instant) -> usize {
+        evict_expired(&mut self.manager, now)
+    }
+
+    /// Control-surface listing: `(id, size, status)` tuples, bounded to
+    /// [`MAX_LIST_BUNDLES`].
+    #[must_use]
+    pub fn list(&self) -> Vec<(Vec<u8>, usize, BundleStatus)> {
+        self.manager
+            .records_iter()
+            .take(MAX_LIST_BUNDLES)
+            .map(|r| (r.id.to_vec(), r.size, r.status.clone()))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn service() -> BundleService {
+        let dir = std::env::temp_dir().join(format!(
+            "umcd-bundle-service-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        BundleService::new(
+            ObjectStore::open(dir).unwrap(),
+            QuotaAccount::new(
+                umc_storage::quota::Profile::Standard,
+                0,
+                umc_storage::quota::Profile::Standard.bundle_storage_bytes(),
+            ),
+            Arc::new(Mutex::new(DaemonEvents::new(200))),
+        )
+    }
+
+    fn admit(
+        service: &mut BundleService,
+        payload: &[u8],
+        lifetime_ms: u64,
+        now: Instant,
+    ) -> [u8; 32] {
+        service
+            .admit(
+                payload,
+                b"sender-a",
+                b"dest-hint",
+                1,
+                lifetime_ms,
+                3,
+                false,
+                now,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn admit_find_round_trip() {
+        let mut service = service();
+        let id = admit(
+            &mut service,
+            b"payload",
+            umc_bundle::manager::DEFAULT_LIFETIME_MS,
+            Instant(0),
+        );
+        let record = service.find(&id).expect("record");
+        assert_eq!(record.size, 7);
+        assert_eq!(record.sender, b"sender-a");
+        assert_eq!(service.manager.get_payload(&id).unwrap(), b"payload");
+        assert!(service.find(&[0u8; 32]).is_none());
+    }
+
+    #[test]
+    fn expire_removes_expired_bundles() {
+        let mut service = service();
+        admit(&mut service, b"a", 1_000, Instant(0));
+        admit(&mut service, b"b", 1_000, Instant(0));
+        assert_eq!(service.count(), 2);
+        assert_eq!(service.expire_old(Instant(999)), 0);
+        assert_eq!(service.expire_old(Instant(1_000)), 2);
+        assert_eq!(service.count(), 0);
+    }
+
+    #[test]
+    fn duplicate_rejected() {
+        let mut service = service();
+        admit(
+            &mut service,
+            b"same",
+            umc_bundle::manager::DEFAULT_LIFETIME_MS,
+            Instant(0),
+        );
+        assert_eq!(
+            service.admit(
+                b"same",
+                b"sender-a",
+                b"dest-hint",
+                1,
+                umc_bundle::manager::DEFAULT_LIFETIME_MS,
+                3,
+                false,
+                Instant(0)
+            ),
+            Err(BundleError::Duplicate)
+        );
+    }
+
+    #[test]
+    fn admit_pushes_event() {
+        let events = Arc::new(Mutex::new(DaemonEvents::new(200)));
+        let mut service = BundleService::new(
+            ObjectStore::open(
+                std::env::temp_dir().join(format!("umcd-bundle-events-{}", std::process::id())),
+            )
+            .unwrap(),
+            QuotaAccount::new(
+                umc_storage::quota::Profile::Standard,
+                0,
+                umc_storage::quota::Profile::Standard.bundle_storage_bytes(),
+            ),
+            events.clone(),
+        );
+        admit(
+            &mut service,
+            b"p",
+            umc_bundle::manager::DEFAULT_LIFETIME_MS,
+            Instant(9),
+        );
+        let recent = events.lock().unwrap().recent(10);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].kind, "bundle_admitted");
+        assert_eq!(recent[0].at_ms, 9);
+    }
+
+    #[test]
+    fn list_bounded_and_shaped() {
+        let mut service = service();
+        for i in 0..3 {
+            admit(
+                &mut service,
+                &[i],
+                umc_bundle::manager::DEFAULT_LIFETIME_MS,
+                Instant(0),
+            );
+        }
+        let listing = service.list();
+        assert_eq!(listing.len(), 3);
+        assert!(listing.iter().all(|(id, size, state)| {
+            id.len() == 32
+                && *size == 1
+                && matches!(state, umc_bundle::manager::BundleStatus::Received)
+        }));
+    }
+}

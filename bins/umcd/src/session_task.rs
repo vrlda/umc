@@ -2,8 +2,7 @@
 //! the session state machine, and send the ACK payloads it produces.
 //!
 //! App-layer framing (streams to the control API) lands in Task 20+.
-use crate::state::RuntimeState;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -11,22 +10,27 @@ use umc_carrier::error::CarrierErrorKind;
 use umc_carrier::types::OutboundPacket;
 use umc_carrier::BoxLink;
 use umc_session::session::Session;
+use umc_types::runtime::Clock;
 
 /// Poll interval when the link reports `WouldBlock`.
 pub const RECV_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Spawn the per-session wire loop. The task exits when `link.recv` errors
 /// or the daemon's shutdown flag is set.
+///
+/// The runtime state lives behind one mutex in the daemon; the session loop
+/// only needs the clock and the shutdown flag, so it takes those clones and
+/// never touches the shared context.
 pub fn spawn_session_task(
-    state: Arc<RuntimeState>,
+    clock: Arc<dyn Clock>,
+    shutdown_flag: Arc<AtomicBool>,
     link: BoxLink,
     mut session: Session,
     session_id: u64,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let clock = state.node.clock.clone();
         loop {
-            if state.shutdown_requested.load(Ordering::Relaxed) {
+            if shutdown_flag.load(Ordering::Relaxed) {
                 break;
             }
             // The carrier API is blocking (Handle::block_on internally);
