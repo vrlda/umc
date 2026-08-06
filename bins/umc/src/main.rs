@@ -1,12 +1,35 @@
 //! umc CLI (core.md §44): control and diagnostics client.
+use std::collections::HashMap;
+
 use clap::{Parser, Subcommand};
 use prost::Message;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
-use umc_control::framing::{frame_envelope, EnvelopeDecoder};
 use umc_control::proto::umc::api::v1 as api;
+use umc_sdk::client::ClientError;
+use umc_sdk::config::ConfigClient;
+use umc_sdk::daemon::DaemonClient;
+use umc_sdk::status::StatusClient;
 
 const DEFAULT_SOCKET: &str = "/tmp/umc.sock";
+const CLIENT_NAME: &str = "umc-cli";
+
+/// Wire shape of the daemon's `NodeAdmin.GetEvents` payload (control-api.md
+/// §38-41). No proto message exists in `api/umc.proto` yet; this mirrors the
+/// daemon's `EventRecord` exactly.
+#[derive(Clone, PartialEq, prost::Message)]
+struct EventRecord {
+    #[prost(uint64, tag = "1")]
+    at_ms: u64,
+    #[prost(string, tag = "2")]
+    kind: String,
+    #[prost(string, tag = "3")]
+    detail: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GetEventsResponse {
+    #[prost(message, repeated, tag = "1")]
+    events: Vec<EventRecord>,
+}
 
 #[derive(Parser)]
 #[command(name = "umc", about = "Universal Mesh Core control client")]
@@ -22,6 +45,13 @@ struct Cli {
 enum Command {
     /// Node status.
     Status,
+    /// Node configuration.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+    /// Recent daemon events, newest first.
+    Events,
     /// List identities.
     Identity {
         #[command(subcommand)]
@@ -32,66 +62,151 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum ConfigAction {
+    /// Print config entries.
+    Get,
+    /// Set config entries (key=value); unimplemented until Phase 12.
+    Set { entries: Vec<String> },
+}
+
+#[derive(Subcommand)]
 enum IdentityAction {
     List,
 }
 
-async fn call(socket: &str, service: &str, method: &str) -> Result<api::Envelope, String> {
-    let mut stream = UnixStream::connect(socket)
-        .await
-        .map_err(|e| format!("connect: {e}"))?;
-    let hello = api::Envelope {
-        api_version: Some(api::ApiVersion { major: 1, minor: 0 }),
-        sequence: 1,
-        body: Some(api::envelope::Body::ClientHello(api::ClientHello {
-            supported_versions: vec![api::ApiVersion { major: 1, minor: 0 }],
-            client_name: "umc-cli".to_string(),
-            ..Default::default()
-        })),
-    };
-    let mut out = Vec::new();
-    Message::encode(&hello, &mut out).map_err(|e| e.to_string())?;
-    let mut framed = Vec::new();
-    frame_envelope(&mut framed, &out, 4 * 1024 * 1024).map_err(|e| format!("{e:?}"))?;
-    stream
-        .write_all(&framed)
-        .await
-        .map_err(|e| format!("write: {e}"))?;
+fn print_error(prefix: &str, error: &ClientError) {
+    println!("{prefix}: {error:?}");
+}
 
-    let request = api::Envelope {
-        api_version: Some(api::ApiVersion { major: 1, minor: 0 }),
-        sequence: 2,
-        body: Some(api::envelope::Body::Request(api::Request {
-            request_id: 1,
-            service: service.to_string(),
-            method: method.to_string(),
-            ..Default::default()
-        })),
-    };
-    let mut out = Vec::new();
-    Message::encode(&request, &mut out).map_err(|e| e.to_string())?;
-    let mut framed = Vec::new();
-    frame_envelope(&mut framed, &out, 4 * 1024 * 1024).map_err(|e| format!("{e:?}"))?;
-    stream
-        .write_all(&framed)
-        .await
-        .map_err(|e| format!("write: {e}"))?;
-
-    let mut decoder = EnvelopeDecoder::new(4 * 1024 * 1024);
-    let mut buf = [0u8; 8 * 1024];
-    loop {
-        let n = stream
-            .read(&mut buf)
-            .await
-            .map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
-            return Err("connection closed".into());
+async fn cmd_status(socket: &str) {
+    let mut client = match StatusClient::connect(socket, CLIENT_NAME).await {
+        Ok(client) => client,
+        Err(e) => {
+            print_error("status", &e);
+            return;
         }
-        for envelope in decoder.feed(&buf[..n]).map_err(|e| format!("{e:?}"))? {
-            let msg = api::Envelope::decode(envelope.as_slice()).map_err(|e| e.to_string())?;
-            if matches!(msg.body, Some(api::envelope::Body::Response(_))) {
-                return Ok(msg);
+    };
+    match client.get_status().await {
+        Ok(status) => {
+            println!("node reachable");
+            println!("uptime: {} ms", status.uptime_ms);
+            println!("sessions: {}", status.active_sessions);
+            println!("links: {}", status.active_links);
+            println!("relay circuits: {}", status.active_relay_circuits);
+            println!("started at: {} ms", status.started_at_unix_ms);
+        }
+        Err(e) => print_error("status", &e),
+    }
+}
+
+async fn cmd_config_get(socket: &str) {
+    let mut client = match ConfigClient::connect(socket, CLIENT_NAME).await {
+        Ok(client) => client,
+        Err(e) => {
+            print_error("config", &e);
+            return;
+        }
+    };
+    match client.get_config().await {
+        Ok(entries) => {
+            let mut keys: Vec<&String> = entries.keys().collect();
+            keys.sort();
+            for key in keys {
+                println!("{key}={}", entries[key]);
             }
+        }
+        Err(e) => print_error("config", &e),
+    }
+}
+
+async fn cmd_config_set(socket: &str, entries: Vec<String>) {
+    let mut map = HashMap::new();
+    for entry in entries {
+        let Some((key, value)) = entry.split_once('=') else {
+            println!("config: invalid entry (expected key=value): {entry}");
+            return;
+        };
+        map.insert(key.to_string(), value.to_string());
+    }
+    let mut client = match ConfigClient::connect(socket, CLIENT_NAME).await {
+        Ok(client) => client,
+        Err(e) => {
+            print_error("config", &e);
+            return;
+        }
+    };
+    match client.set_config(map) {
+        Ok(()) => println!("config updated"),
+        Err(e) => print_error("config", &e),
+    }
+}
+
+async fn cmd_events(socket: &str) {
+    let mut daemon = match DaemonClient::connect(socket, CLIENT_NAME).await {
+        Ok(daemon) => daemon,
+        Err(e) => {
+            print_error("events", &e);
+            return;
+        }
+    };
+    match daemon
+        .request_raw("NodeAdmin", "GetEvents", Vec::new())
+        .await
+    {
+        Ok((code, payload)) if code == api::StatusCode::Ok as i32 => {
+            match GetEventsResponse::decode(payload.as_slice()) {
+                Ok(response) => {
+                    if response.events.is_empty() {
+                        println!("no recent events");
+                        return;
+                    }
+                    for event in response.events {
+                        println!("{} {} {}", event.at_ms, event.kind, event.detail);
+                    }
+                }
+                Err(e) => println!("events: decode failed: {e}"),
+            }
+        }
+        Ok((code, _)) => println!("events: status {code}"),
+        Err(e) => print_error("events", &e),
+    }
+}
+
+async fn cmd_identity(socket: &str) {
+    let mut daemon = match DaemonClient::connect(socket, CLIENT_NAME).await {
+        Ok(daemon) => daemon,
+        Err(e) => {
+            print_error("identity", &e);
+            return;
+        }
+    };
+    match daemon
+        .request_raw("IdentityService", "ListIdentities", Vec::new())
+        .await
+    {
+        Ok((code, _)) if code == api::StatusCode::Ok as i32 => {
+            println!("identity list (Phase 2 minimal)");
+        }
+        Ok((code, _)) => println!("identity: status {code}"),
+        Err(e) => print_error("identity", &e),
+    }
+}
+
+async fn run(cli: Cli) {
+    match cli.command {
+        Command::Status => cmd_status(&cli.socket).await,
+        Command::Config {
+            action: ConfigAction::Get,
+        } => cmd_config_get(&cli.socket).await,
+        Command::Config {
+            action: ConfigAction::Set { entries },
+        } => cmd_config_set(&cli.socket, entries).await,
+        Command::Events => cmd_events(&cli.socket).await,
+        Command::Identity {
+            action: IdentityAction::List,
+        } => cmd_identity(&cli.socket).await,
+        Command::Doctor => {
+            println!("doctor: run `umcd --doctor` output locally (Phase 2 minimal)");
         }
     }
 }
@@ -102,21 +217,5 @@ fn main() {
         .enable_io()
         .build()
         .expect("runtime");
-    runtime.block_on(async {
-        match cli.command {
-            Command::Status => match call(&cli.socket, "NodeAdmin", "GetStatus").await {
-                Ok(_) => println!("node reachable"),
-                Err(e) => println!("status: {e}"),
-            },
-            Command::Identity {
-                action: IdentityAction::List,
-            } => match call(&cli.socket, "IdentityService", "ListIdentities").await {
-                Ok(_) => println!("identity list (Phase 2 minimal)"),
-                Err(e) => println!("identity: {e}"),
-            },
-            Command::Doctor => {
-                println!("doctor: run `umcd --doctor` output locally (Phase 2 minimal)");
-            }
-        }
-    });
+    runtime.block_on(run(cli));
 }
