@@ -9,7 +9,7 @@ use super::spaces::{PacketSpace, PacketSpaceState};
 use super::stream::{Stream, StreamError};
 use std::collections::HashMap;
 use umc_crypto::aead::PacketKeys;
-use umc_types::runtime::{Clock, Instant};
+use umc_types::runtime::{Clock, Duration, Instant};
 use umc_wire::header::ShortPacketSpace;
 use umc_wire::packet::PacketContext;
 
@@ -20,6 +20,14 @@ pub const DEFAULT_INITIAL_MAX_STREAM_DATA: u64 = 256 * 1024;
 /// Cap on remembered closed stream ids (session.md §29): ids are kept only
 /// to reject reuse, so the set is bounded with FIFO eviction.
 pub const MAX_CLOSED_STREAM_IDS: usize = 1_024;
+/// Idle timeout (session.md §22): a session that has not touched its idle
+/// timer for this long is closed locally with an `IDLE_TIMEOUT` close.
+pub const IDLE_TIMEOUT_MS: u64 = 30_000;
+/// Transport error code carried by an idle-timeout `CONNECTION_CLOSE`
+/// (wire-format.md §64: `0x16` = `IDLE_TIMEOUT`).
+pub const CLOSE_REASON_IDLE_TIMEOUT: u64 = 0x16;
+/// Minimum draining period (session.md §6.4): 1 s.
+pub const MIN_DRAIN_MS: u64 = 1_000;
 
 /// Bounded set of stream ids that reached EOF and were read: re-opening
 /// (or delivering to) a closed id is a protocol violation (session.md §29).
@@ -101,6 +109,13 @@ pub struct Session {
     pub paths: HashMap<u64, crate::path::Path>,
     #[allow(dead_code)]
     cids: crate::cid::ConnectionIdManager,
+    /// When the idle timer was last reset (session.md §22): every processed
+    /// inbound packet and every built outbound packet touches it. `None`
+    /// until the first activity, so a fresh session is never idle.
+    last_activity: Option<Instant>,
+    /// Absolute deadline of the draining period (session.md §6.4), set by
+    /// [`Session::close`]; `None` until the session starts draining.
+    draining_deadline: Option<Instant>,
 }
 
 impl Session {
@@ -152,6 +167,8 @@ impl Session {
             ),
             paths: HashMap::new(),
             cids: crate::cid::ConnectionIdManager::new(crate::cid::DEFAULT_ACTIVE_LIMIT),
+            last_activity: None,
+            draining_deadline: None,
         })
     }
 
@@ -260,6 +277,8 @@ impl Session {
         if self.state != SessionState::Active {
             return Ok(None);
         }
+        // A built outbound packet resets the idle timer (session.md §22).
+        self.last_activity = Some(now);
         let space = self
             .spaces
             .get_mut(&PacketSpace::SessionData)
@@ -304,6 +323,8 @@ impl Session {
         let (space_kind, _dcid, _path, truncated_pn, payload) =
             super::packet::parse_protected_packet(&self.remote_keys, bytes)
                 .map_err(SessionError::Packet)?;
+        // An authenticated packet resets the idle timer (session.md §22).
+        self.last_activity = Some(now);
         let space = match space_kind {
             ShortPacketSpace::SessionData => PacketSpace::SessionData,
             ShortPacketSpace::PathControl => PacketSpace::PathControl,
@@ -502,6 +523,75 @@ impl Session {
     /// by packet number, so pruning an absent entry is a no-op.
     pub fn prune_retransmit_payload(&mut self, pn: u64) {
         self.retransmit_payloads.remove(&pn);
+    }
+
+    /// Reset the idle timer (session.md §22): called on inbound packets and
+    /// built outbound packets, and by the daemon for traffic the session
+    /// layer cannot observe itself.
+    pub fn touch(&mut self, now: Instant) {
+        self.last_activity = Some(now);
+    }
+
+    /// Whether the idle timeout elapsed since the last activity (session.md
+    /// §22). A session with no activity yet (`None`) is never idle: the
+    /// timer cannot fire before the first packet.
+    #[must_use]
+    pub fn idle_expired(&self, now: Instant) -> bool {
+        self.last_activity
+            .is_some_and(|activity| now.duration_since(activity).as_millis() >= IDLE_TIMEOUT_MS)
+    }
+
+    /// Build the `CONNECTION_CLOSE` payload for an idle-timeout close
+    /// (session.md §22): a transport close with the `IDLE_TIMEOUT` error
+    /// code (wire-format.md §64). Returns `None` while the session is not
+    /// idle.
+    #[must_use]
+    pub fn build_idle_close(&self, now: Instant) -> Option<Vec<u8>> {
+        if !self.idle_expired(now) {
+            return None;
+        }
+        let frame = umc_wire::frame::ConnectionCloseFrame {
+            error_code: CLOSE_REASON_IDLE_TIMEOUT,
+            trigger_frame_type: 0,
+            reason: b"idle timeout".to_vec(),
+        };
+        let enc = frame.encode().ok()?;
+        let mut payload = Vec::with_capacity(enc.len());
+        umc_wire::varint::encode_into(
+            &mut payload,
+            umc_types::frame::FrameType::CONNECTION_CLOSE.0,
+        )
+        .ok()?;
+        // The frame's encoding includes its type byte (CONNECTION_CLOSE is a
+        // 1-byte varint): strip it and re-prefix the payload with the type.
+        payload.extend_from_slice(&enc[1..]);
+        Some(payload)
+    }
+
+    /// Enter the draining period (session.md §6.4): after sending or
+    /// receiving `CONNECTION_CLOSE` the endpoint stops opening streams,
+    /// sending application data, and migrating paths. The draining deadline
+    /// is at least three times the current probe timeout with a 1-second
+    /// minimum.
+    pub fn close(&mut self, now: Instant) {
+        self.state = SessionState::Draining;
+        let pto_ms = self.loss.pto(&self.rtt).as_millis();
+        let drain_ms = (3 * pto_ms).max(MIN_DRAIN_MS);
+        self.draining_deadline = Some(now + Duration::from_millis(drain_ms));
+    }
+
+    /// Whether the draining period (session.md §6.4) has elapsed; afterwards
+    /// the transport state is released via [`Session::finalize_close`].
+    #[must_use]
+    pub fn draining_expired(&self, now: Instant) -> bool {
+        self.draining_deadline
+            .is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Release the session transport state after the draining period:
+    /// transition to `CLOSED` (session.md §6.5).
+    pub fn finalize_close(&mut self) {
+        self.state = SessionState::Closed;
     }
 
     /// Replay-window footprint in bytes for `space` (session.md §8.2): a
