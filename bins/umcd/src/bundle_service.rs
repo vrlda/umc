@@ -14,14 +14,12 @@ pub const MAX_LIST_BUNDLES: usize = 100;
 
 /// Process-local bundle service over the shared object store.
 #[derive(Debug)]
-#[allow(dead_code)] // events wired to session/network loop in Phase 12
 pub struct BundleService {
     pub manager: BundleManager,
     events: Arc<Mutex<DaemonEvents>>,
 }
 
-#[allow(dead_code)] // admit/find/count/expire_old wired to the network loop in Phase 12
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // admit() takes the full bundle header
 impl BundleService {
     #[must_use]
     pub fn new(
@@ -71,17 +69,22 @@ impl BundleService {
     }
 
     /// Look up a bundle record by id.
+    // find/count/expire_old are test-only until a delivery sweep or
+    // diagnostics surface needs them outside the control path.
+    #[allow(dead_code)]
     #[must_use]
     pub fn find(&self, id: &[u8; 32]) -> Option<&BundleRecord> {
         self.manager.record(id)
     }
 
+    #[allow(dead_code)]
     #[must_use]
     pub fn count(&self) -> usize {
         self.manager.len()
     }
 
     /// Remove expired bundles (bundles.md §11); returns the count removed.
+    #[allow(dead_code)]
     pub fn expire_old(&mut self, now: Instant) -> usize {
         evict_expired(&mut self.manager, now)
     }

@@ -12,25 +12,6 @@ use umc_sdk::status::StatusClient;
 const DEFAULT_SOCKET: &str = "/tmp/umc.sock";
 const CLIENT_NAME: &str = "umc-cli";
 
-/// Wire shape of the daemon's `NodeAdmin.GetEvents` payload (control-api.md
-/// §38-41). No proto message exists in `api/umc.proto` yet; this mirrors the
-/// daemon's `EventRecord` exactly.
-#[derive(Clone, PartialEq, prost::Message)]
-struct EventRecord {
-    #[prost(uint64, tag = "1")]
-    at_ms: u64,
-    #[prost(string, tag = "2")]
-    kind: String,
-    #[prost(string, tag = "3")]
-    detail: String,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct GetEventsResponse {
-    #[prost(message, repeated, tag = "1")]
-    events: Vec<EventRecord>,
-}
-
 #[derive(Parser)]
 #[command(name = "umc", about = "Universal Mesh Core control client")]
 struct Cli {
@@ -154,7 +135,7 @@ async fn cmd_events(socket: &str) {
         .await
     {
         Ok((code, payload)) if code == api::StatusCode::Ok as i32 => {
-            match GetEventsResponse::decode(payload.as_slice()) {
+            match api::GetEventsResponse::decode(payload.as_slice()) {
                 Ok(response) => {
                     if response.events.is_empty() {
                         println!("no recent events");

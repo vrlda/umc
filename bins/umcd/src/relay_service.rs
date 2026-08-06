@@ -43,7 +43,6 @@ pub struct RelayService {
     events: Arc<Mutex<DaemonEvents>>,
 }
 
-#[allow(dead_code)] // network relay loop lands in Phase 12
 impl RelayService {
     #[must_use]
     pub fn new(events: Arc<Mutex<DaemonEvents>>) -> Self {
@@ -205,11 +204,16 @@ impl RelayService {
             .count()
     }
 
+    // circuit_count() is the live count the control surface reads; len and
+    // is_empty are test-only helpers until a diagnostics surface needs the
+    // raw registry size.
+    #[allow(dead_code)]
     #[must_use]
     pub fn len(&self) -> usize {
         self.circuits.len()
     }
 
+    #[allow(dead_code)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.circuits.is_empty()

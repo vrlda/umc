@@ -84,25 +84,6 @@ struct CandidateSummary {
     public: bool,
 }
 
-/// Wire response for `NodeAdmin.GetEvents` (control-api.md §38-41): the
-/// bounded recent event log. No proto message exists yet; the shape mirrors
-/// the daemon's `DaemonEvent`.
-#[derive(Clone, PartialEq, prost::Message)]
-struct EventRecord {
-    #[prost(uint64, tag = "1")]
-    at_ms: u64,
-    #[prost(string, tag = "2")]
-    kind: String,
-    #[prost(string, tag = "3")]
-    detail: String,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct GetEventsResponse {
-    #[prost(message, repeated, tag = "1")]
-    events: Vec<EventRecord>,
-}
-
 pub async fn run(state: Arc<Mutex<RuntimeState>>) {
     let data_dir = {
         let state = state.lock().expect("runtime state");
@@ -544,13 +525,13 @@ fn get_events(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
         .expect("event log")
         .recent(100)
         .into_iter()
-        .map(|event| EventRecord {
-            at_ms: event.at_ms,
+        .map(|event| api::EventRecord {
             kind: event.kind,
+            at_ms: i64::try_from(event.at_ms).unwrap_or(i64::MAX),
             detail: event.detail,
         })
         .collect();
-    let response = GetEventsResponse { events };
+    let response = api::GetEventsResponse { events };
     let mut payload = Vec::new();
     Message::encode(&response, &mut payload).expect("encode");
     (api::StatusCode::Ok as i32, Some(payload))
@@ -1116,7 +1097,7 @@ mod tests {
             response.status.as_ref().unwrap().code,
             api::StatusCode::Ok as i32
         );
-        let events = GetEventsResponse::decode(response.payload.as_slice())
+        let events = api::GetEventsResponse::decode(response.payload.as_slice())
             .expect("payload")
             .events;
         assert_eq!(events.len(), 1);

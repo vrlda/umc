@@ -26,7 +26,6 @@ pub struct DaemonEvents {
     max_entries: usize,
 }
 
-#[allow(dead_code)] // recent() surfaced via control API in Phase 12
 impl DaemonEvents {
     #[must_use]
     pub fn new(max_entries: usize) -> Self {
@@ -52,11 +51,15 @@ impl DaemonEvents {
         self.log[start..].iter().rev().cloned().collect()
     }
 
+    // len/is_empty are test-only until a metrics or diagnostics surface
+    // reports the ring occupancy; the control path reads via recent().
+    #[allow(dead_code)]
     #[must_use]
     pub fn len(&self) -> usize {
         self.log.len()
     }
 
+    #[allow(dead_code)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.log.is_empty()
