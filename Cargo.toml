@@ -8,6 +8,7 @@ members = [
     "crates/umc-handshake",
     "crates/umc-session",
     "crates/umc-routing",
+    "crates/umc-relay",
     "crates/umc-carrier",
     "crates/umc-core",
     "crates/umc-storage",

@@ -1,0 +1,15 @@
+[package]
+name = "umc-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+umc-types = { path = "../umc-types" }
+umc-wire = { path = "../umc-wire" }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true
