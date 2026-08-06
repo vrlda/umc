@@ -1,7 +1,10 @@
 //! Control socket server: Unix stream socket, framing, connection handling.
 use crate::config::NodeConfig;
+use crate::state::RuntimeState;
 use prost::Message;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use umc_control::framing::{frame_envelope, EnvelopeDecoder};
@@ -10,10 +13,10 @@ use umc_storage::sqlite::SqliteStore;
 
 const DEFAULT_ENVELOPE_MAX: usize = 4 * 1024 * 1024;
 
-pub async fn run(config: NodeConfig) {
-    let data_dir = config.resolved_data_dir();
+pub async fn run(state: Arc<RuntimeState>) {
+    let data_dir = state.config.resolved_data_dir();
     std::fs::create_dir_all(&data_dir).expect("data dir");
-    let store = Arc::new(SqliteStore::open(&data_dir.join("node.db")).expect("open store"));
+    let store = state.store.clone();
     println!("data directory: {}", data_dir.display());
 
     if let Ok((profile, carriers)) = load_node_state(&store) {
@@ -22,9 +25,9 @@ pub async fn run(config: NodeConfig) {
             carriers.join(", ")
         );
     }
-    persist_node_state(&store, &config).expect("persist node state");
+    persist_node_state(&store, &state.config).expect("persist node state");
 
-    let socket_path = config.resolved_socket();
+    let socket_path = state.control_socket.clone();
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).expect("socket dir");
     }
@@ -34,10 +37,22 @@ pub async fn run(config: NodeConfig) {
     println!("node initialized");
 
     loop {
-        let (stream, _) = listener.accept().await.expect("accept");
-        let store = store.clone();
-        tokio::spawn(handle_connection(stream, store));
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_millis(200)) => {
+                if state.shutdown_requested.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            accepted = listener.accept() => {
+                if let Ok((stream, _)) = accepted {
+                    let store = store.clone();
+                    tokio::spawn(handle_connection(stream, store));
+                }
+            }
+        }
     }
+    let _ = std::fs::remove_file(&socket_path);
+    println!("control socket: closed");
 }
 
 async fn handle_connection(mut stream: UnixStream, store: Arc<SqliteStore>) {
