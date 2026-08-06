@@ -93,7 +93,7 @@ mod tests {
         );
         assert_eq!(
             Profile::Standard.bundle_storage_bytes(),
-            1 * 1024 * 1024 * 1024
+            1024 * 1024 * 1024
         );
         assert_eq!(Profile::Constrained.bundle_storage_bytes(), 0);
     }
