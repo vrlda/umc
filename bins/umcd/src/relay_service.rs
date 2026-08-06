@@ -36,6 +36,9 @@ pub struct CircuitOpenResult {
 pub struct RelayService {
     circuits: HashMap<u64, Circuit>,
     next_circuit_id: u64,
+    /// Circuit id -> session id of the session that opened it. The opening
+    /// session is the circuit's other (peer) end for `RELAY_DATA` forwarding.
+    circuit_owners: HashMap<u64, u64>,
     pub limits: AdmissionLimits,
     events: Arc<Mutex<DaemonEvents>>,
 }
@@ -49,6 +52,7 @@ impl RelayService {
             next_circuit_id: 1,
             // Community relay: open by default so the daemon can relay for
             // its mesh, while per-peer and resource limits still apply.
+            circuit_owners: HashMap::new(),
             limits: AdmissionLimits {
                 policy: RelayPolicy::Community,
                 ..AdmissionLimits::default()
@@ -111,6 +115,29 @@ impl RelayService {
         })
     }
 
+    /// Record the session that opened a circuit. The opening session is the
+    /// circuit's peer end: `RELAY_DATA` arriving for the circuit is destined
+    /// for it (relay.md §16-18).
+    pub fn record_circuit_owner(&mut self, circuit_id: u64, session_id: u64) {
+        self.circuit_owners.insert(circuit_id, session_id);
+    }
+
+    /// The session that opened `circuit_id`, if any.
+    #[must_use]
+    pub fn circuit_owner(&self, circuit_id: u64) -> Option<u64> {
+        self.circuit_owners.get(&circuit_id).copied()
+    }
+
+    /// Circuits opened by one peer session; feeds the per-peer admission
+    /// cap (relay.md §34).
+    #[must_use]
+    pub fn circuits_for_peer(&self, session_id: u64) -> usize {
+        self.circuit_owners
+            .values()
+            .filter(|owner| **owner == session_id)
+            .count()
+    }
+
     /// Accept one `RELAY_DATA` from the upstream peer (relay.md §16-18).
     ///
     /// # Errors
@@ -160,6 +187,7 @@ impl RelayService {
             now,
             None,
         );
+        self.circuit_owners.remove(&circuit_id);
         self.events.lock().expect("event log").push(DaemonEvent {
             kind: "circuit_closed".into(),
             at_ms: now.0,
@@ -272,6 +300,28 @@ mod tests {
         let mut request = open_request();
         request.flags = 0x10;
         assert!(relay.open_circuit(&request, Instant(0)).is_err());
+    }
+
+    #[test]
+    fn circuit_owners_track_the_opening_session() {
+        let mut relay = service();
+        let id = relay
+            .open_circuit(&open_request(), Instant(0))
+            .unwrap()
+            .circuit_id;
+        assert!(relay.circuit_owner(id).is_none());
+        relay.record_circuit_owner(id, 7);
+        assert_eq!(relay.circuit_owner(id), Some(7));
+        assert_eq!(relay.circuits_for_peer(7), 1);
+        let other = relay
+            .open_circuit(&open_request(), Instant(0))
+            .unwrap()
+            .circuit_id;
+        relay.record_circuit_owner(other, 9);
+        assert_eq!(relay.circuits_for_peer(7), 1);
+        assert_eq!(relay.circuits_for_peer(9), 1);
+        relay.close_circuit(id, 0, Instant(10)).unwrap();
+        assert!(relay.circuit_owner(id).is_none(), "close forgets the owner");
     }
 
     #[test]

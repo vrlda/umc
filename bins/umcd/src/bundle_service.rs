@@ -96,6 +96,43 @@ impl BundleService {
             .map(|r| (r.id.to_vec(), r.size, r.status.clone()))
             .collect()
     }
+
+    /// Ids of bundles awaiting delivery (status `Received`, not yet
+    /// expired): the session loop wraps each stored ciphertext in a `BUNDLE`
+    /// frame over active sessions (bundles.md §10.1).
+    #[must_use]
+    pub fn pending_delivery(&self, now: Instant) -> Vec<[u8; 32]> {
+        self.manager
+            .records_iter()
+            .filter(|r| matches!(r.status, BundleStatus::Received) && now < r.expires_at)
+            .map(|r| r.id)
+            .collect()
+    }
+
+    /// The stored ciphertext for a bundle id, when it exists.
+    #[must_use]
+    pub fn payload(&self, id: &[u8; 32]) -> Option<Vec<u8>> {
+        self.manager.get_payload(id).ok()
+    }
+
+    /// Record a bundle that has been wrapped into a `BUNDLE` frame as
+    /// `Forwarded` (bundles.md §10.2).
+    pub fn mark_forwarded(&mut self, id: &[u8; 32]) {
+        let _ = self.manager.set_status(id, BundleStatus::Forwarded);
+    }
+
+    /// Apply a peer-reported `BUNDLE_ACK` status to a locally held bundle
+    /// (bundles.md §13). Unknown ids are ignored.
+    pub fn mark_status(&mut self, id: &[u8; 32], status: BundleStatus) {
+        let _ = self.manager.set_status(id, status);
+    }
+
+    /// The record for a bundle id, for frame wrapping (destination hint,
+    /// priority, lifetime).
+    #[must_use]
+    pub fn record(&self, id: &[u8; 32]) -> Option<&BundleRecord> {
+        self.manager.record(id)
+    }
 }
 
 #[cfg(test)]
@@ -239,5 +276,38 @@ mod tests {
                 && *size == 1
                 && matches!(state, umc_bundle::manager::BundleStatus::Received)
         }));
+    }
+
+    #[test]
+    fn pending_delivery_lists_only_received_not_expired() {
+        let mut service = service();
+        admit(&mut service, b"a", 5_000, Instant(0));
+        admit(&mut service, b"b", 5_000, Instant(0));
+        // Lifetimes below 1s are clamped up by the manager (minimum 1000ms).
+        let expired_id = admit(&mut service, b"c", 1_000, Instant(0));
+        assert_eq!(service.pending_delivery(Instant(0)).len(), 3);
+        assert_eq!(service.pending_delivery(Instant(1_001)).len(), 2);
+        assert!(!service
+            .pending_delivery(Instant(1_001))
+            .contains(&expired_id));
+        let forwarded_id = service.pending_delivery(Instant(0))[0];
+        service.mark_forwarded(&forwarded_id);
+        let pending = service.pending_delivery(Instant(0));
+        assert_eq!(pending.len(), 2);
+        assert!(!pending.contains(&forwarded_id));
+    }
+
+    #[test]
+    fn payload_and_record_expose_the_stored_bundle() {
+        let mut service = service();
+        let id = admit(&mut service, b"ciphertext", 1_000, Instant(0));
+        assert_eq!(service.payload(&id).expect("payload"), b"ciphertext");
+        let record = service.record(&id).expect("record");
+        assert_eq!(record.destination_hint, b"dest-hint");
+        assert_eq!(record.priority, 1);
+        assert!(service.payload(&[0u8; 32]).is_none());
+        assert!(service.record(&[0u8; 32]).is_none());
+        service.mark_forwarded(&[0u8; 32]); // unknown id: no-op
+        assert!(service.payload(&id).is_some());
     }
 }

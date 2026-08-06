@@ -92,6 +92,15 @@ pub enum KeyUpdateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use umc_types::runtime::Clock;
+
+    struct TestClock;
+
+    impl Clock for TestClock {
+        fn now(&self) -> umc_types::runtime::Instant {
+            umc_types::runtime::Instant(0)
+        }
+    }
 
     #[test]
     fn initiate_toggles_phase_and_blocks_second_update() {
@@ -124,5 +133,34 @@ mod tests {
         state.mark_confirmed();
         state.initiate().unwrap();
         assert_eq!(state.update_sequence, 2);
+    }
+
+    #[test]
+    fn initiate_payload_is_a_valid_key_update_frame() {
+        // Regression: KEY_UPDATE's type varint is 2 bytes (0x44 > 63); the
+        // frame payload must decode back to the exact update.
+        let mut session = crate::session::Session::new(
+            crate::session::SessionConfig {
+                role: crate::session::Role::Client,
+                dcid: vec![3u8; 8],
+                local_traffic_secret: [1u8; 32],
+                remote_traffic_secret: [2u8; 32],
+                initial_max_data: crate::session::DEFAULT_INITIAL_MAX_DATA,
+                initial_max_stream_data: crate::session::DEFAULT_INITIAL_MAX_STREAM_DATA,
+                max_ack_delay_ms: 25,
+            },
+            &TestClock,
+        )
+        .expect("session");
+        let payload = session.initiate_key_update().expect("initiate");
+        let frames = umc_wire::frame::decode_frames(&payload).expect("decodable frame");
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            umc_wire::frame::Frame::KeyUpdate(update) => {
+                assert_eq!(update.update_sequence, 1);
+                assert!(!update.request_peer_update);
+            }
+            other => panic!("expected a KEY_UPDATE frame, got {other:?}"),
+        }
     }
 }

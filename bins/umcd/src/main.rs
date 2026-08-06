@@ -214,16 +214,18 @@ fn handle_inbound_link(
     link: BoxLink,
     tracker: &std::sync::Mutex<handshake_timeout::HandshakeTracker>,
 ) -> Result<(), String> {
-    let state = state.lock().expect("state");
-    handle_inbound_link_locked(&state, carrier_type, link, tracker)
+    handle_inbound_link_locked(state, carrier_type, link, tracker)
 }
 
+#[allow(clippy::too_many_lines)] // one connection setup path: hello, session, registry
 fn handle_inbound_link_locked(
-    state: &state::RuntimeState,
+    state: &Arc<std::sync::Mutex<state::RuntimeState>>,
     carrier_type: &str,
     link: BoxLink,
     tracker: &std::sync::Mutex<handshake_timeout::HandshakeTracker>,
 ) -> Result<(), String> {
+    let runtime = state.clone();
+    let state = state.lock().expect("state");
     // The first framed packet is the CLIENT_HELLO: either an Initial
     // long-header packet (wire-format §24-25) or, on the raw path used by
     // `Node::connect`, the hello body itself.
@@ -256,16 +258,18 @@ fn handle_inbound_link_locked(
         .map_err(|e| format!("handshake rejected: {e}"))?;
 
     // The client's static handshake key arrives in CLIENT_AUTH (handshake.md
-    // §18); until Task 20+ parses it, the client's ephemeral stands in for
-    // it so the DH chain (es/se/ss) stays symmetric on both sides (the
-    // SERVER_HELLO itself binds only DH_ee and the transcript).
+    // §18); the accept loop's CLIENT_AUTH read lands with the wire wiring,
+    // so the client's ephemeral stands in for it to keep the DH chain
+    // (es/se/ss) symmetric on both sides (the SERVER_HELLO itself binds only
+    // DH_ee and the transcript).
     let client_static = StaticHandshakePublicKey(hello.client_ephemeral_public_key);
-    let (server_hello_bytes, secrets) = handshake_responder::respond_hello(
-        state,
+    let (server_hello_bytes, pending) = handshake_responder::respond_hello(
+        &state,
         carrier_type.as_bytes(),
         &hello_bytes,
         &client_static,
     )?;
+    let secrets = pending.session_secrets();
     let send_result = tokio::task::block_in_place(|| {
         link.send(OutboundPacket {
             bytes: server_hello_bytes,
@@ -295,6 +299,8 @@ fn handle_inbound_link_locked(
     )
     .map_err(|e| format!("session: {e:?}"))?;
     let session_id = state.sessions.next_id();
+    let remote_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&secrets.client)
+        .map_err(|e| format!("remote keys: {e:?}"))?;
     let task = session_task::spawn_session_task(
         state.node.clock.clone(),
         state.shutdown_requested.clone(),
@@ -303,6 +309,8 @@ fn handle_inbound_link_locked(
         session_id,
         state.app_channels.clone(),
         state.app_echo_rx.clone(),
+        runtime,
+        remote_keys,
     );
     // The session task's JoinHandle moves into a watcher that records
     // `session_closed` when the wire loop exits; the registry keeps an

@@ -31,6 +31,7 @@ umc-bundle = { path = "../../crates/umc-bundle" }
 umc-discovery = { path = "../../crates/umc-discovery" }
 umc-relay = { path = "../../crates/umc-relay" }
 umc-routing = { path = "../../crates/umc-routing" }
+blake2 = "0.10"
 
 [lints]
 workspace = true
