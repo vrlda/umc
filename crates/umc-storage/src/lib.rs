@@ -1,3 +1,4 @@
+pub mod abuse;
 pub mod keystore;
 pub mod migrations;
 pub mod objects;
