@@ -1,0 +1,16 @@
+[package]
+name = "phase5-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+umc-types = { path = "../../crates/umc-types" }
+umc-routing = { path = "../../crates/umc-routing" }
+umc-discovery = { path = "../../crates/umc-discovery" }
+umc-carrier-lan = { path = "../../carriers/umc-carrier-lan" }
+umc-core = { path = "../../crates/umc-core" }
+
+[lints]
+workspace = true
