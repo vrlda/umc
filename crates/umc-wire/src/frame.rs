@@ -392,15 +392,25 @@ pub fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, FrameError> {
             }
             ExtensionBehavior::CriticalLengthDelimited
             | ExtensionBehavior::OptionalLengthDelimited => {
-                // Unknown length-delimited frames are self-delimiting: skip
-                // the declared body instead of aborting the whole packet.
-                let (len, used) =
-                    crate::varint::decode(&payload[pos..]).map_err(FrameError::Varint)?;
-                pos += used;
-                let len = usize::try_from(len).map_err(|_| FrameError::LengthExceedsLimit)?;
-                pos = pos.checked_add(len).ok_or(FrameError::LengthExceedsLimit)?;
-                if pos > payload.len() {
-                    return Err(FrameError::Truncated);
+                // Known length-delimited frames decode with their declared
+                // length; unknown ones are self-delimiting and skipped
+                // (wire-format §80).
+                if ty == FrameType::RELAY_STATUS {
+                    let (f, used) =
+                        crate::frames::relay::RelayStatusFrame::decode_length_delimited(
+                            &payload[pos..],
+                        )?;
+                    pos += used;
+                    out.push(Frame::RelayStatus(f));
+                } else {
+                    let (len, used) =
+                        crate::varint::decode(&payload[pos..]).map_err(FrameError::Varint)?;
+                    pos += used;
+                    let len = usize::try_from(len).map_err(|_| FrameError::LengthExceedsLimit)?;
+                    pos = pos.checked_add(len).ok_or(FrameError::LengthExceedsLimit)?;
+                    if pos > payload.len() {
+                        return Err(FrameError::Truncated);
+                    }
                 }
             }
         }
