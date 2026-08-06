@@ -247,4 +247,31 @@ mod tests {
             ServiceHintFrame::decode(&enc[type_len(FrameType::SERVICE_HINT.0)..]).unwrap();
         assert_eq!(dec, f);
     }
+
+    #[test]
+    fn service_hint_decode_rejects_oversize_endpoint_hint() {
+        // The endpoint-hint cap (wire-format.md §56: 512 bytes) is enforced
+        // on decode as well as encode: a declared length above the cap is
+        // rejected before any copy.
+        let mut frame = Vec::new();
+        crate::varint::encode_into(&mut frame, FrameType::SERVICE_HINT.0).unwrap();
+        crate::bytes::encode(&mut frame, b"org.example.echo/1", MAX_PROTOCOL_ID).unwrap();
+        // Declared length above the cap; `bytes::encode` would reject, so the
+        // length varint is written by hand.
+        crate::varint::encode_into(&mut frame, 600).unwrap();
+        frame.extend_from_slice(&[0xAB; 32]);
+        crate::bytes::encode(&mut frame, b"", MAX_SERVICE_METADATA).unwrap();
+        crate::varint::encode_into(&mut frame, 1_700_000_000_000).unwrap();
+        crate::bytes::encode(&mut frame, b"sig", MAX_SIGNATURE).unwrap();
+        assert!(crate::frame::decode_frames(&frame).is_err());
+        // A 512-byte hint is exactly at the cap and decodes.
+        let mut frame = Vec::new();
+        crate::varint::encode_into(&mut frame, FrameType::SERVICE_HINT.0).unwrap();
+        crate::bytes::encode(&mut frame, b"org.example.echo/1", MAX_PROTOCOL_ID).unwrap();
+        crate::bytes::encode(&mut frame, &[0xAB; 512], MAX_ENDPOINT_HINT).unwrap();
+        crate::bytes::encode(&mut frame, b"", MAX_SERVICE_METADATA).unwrap();
+        crate::varint::encode_into(&mut frame, 1_700_000_000_000).unwrap();
+        crate::bytes::encode(&mut frame, b"sig", MAX_SIGNATURE).unwrap();
+        assert!(crate::frame::decode_frames(&frame).is_ok());
+    }
 }

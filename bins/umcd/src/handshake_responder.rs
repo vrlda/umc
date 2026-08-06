@@ -25,6 +25,21 @@ use umc_types::runtime::EntropySource;
 /// Protocol version selected by the responder (handshake.md §16).
 pub const SELECTED_PROTOCOL_VERSION: u32 = 1;
 
+/// Clock skew tolerated when checking a binding's validity window
+/// (handshake.md §4.4).
+pub const BINDING_SKEW_MS: u64 = 300_000;
+
+/// Length of an [`IdentityBinding`]'s signed bytes on the wire.
+pub const BINDING_SIGNED_LEN: usize = 153;
+
+/// The binding's own signature rides after its signed bytes: the recipient
+/// validates the whole binding with `IdentityBinding::validate` before
+/// accepting the session (handshake.md §4.3).
+pub const BINDING_SIGNATURE_LEN: usize = 64;
+
+/// Full on-wire length of an [`IdentityBinding`].
+pub const BINDING_WIRE_LEN: usize = BINDING_SIGNED_LEN + BINDING_SIGNATURE_LEN;
+
 /// The server-side handshake captured by [`respond_hello`], carried until
 /// the client's `CLIENT_AUTH` arrives (handshake.md §18).
 #[derive(Debug)]
@@ -65,21 +80,25 @@ impl HandshakePending {
     /// Complete the server side of the handshake with the client's
     /// `CLIENT_AUTH` message (handshake.md §18-19): decrypt it with the
     /// client-auth key derived from the DH chain (per the T13 driver),
-    /// verify the client's static handshake key, store the client's
-    /// identity binding, and build `SERVER_FINISHED` (server signature +
-    /// finished MAC). Returns `(SERVER_FINISHED bytes, session secrets,
-    /// peer identity)`.
+    /// verify the client's static handshake key, validate the client's
+    /// identity binding (`IdentityBinding::validate`: version, endpoint-id
+    /// binding, signature, validity window), and build `SERVER_FINISHED`
+    /// (server signature + finished MAC). Returns `(SERVER_FINISHED bytes,
+    /// session secrets, peer identity)`.
     ///
     /// # Errors
     ///
     /// Returns a message when the auth message cannot be decoded or
     /// decrypted, the recovered client static key does not match the key
-    /// the DH chain used, or the client identity binding fails validation.
+    /// the DH chain used, the client identity binding fails validation
+    /// (the session is refused), or the client's transcript-bound
+    /// signature does not verify.
     #[allow(clippy::similar_names, dead_code)] // consumed by the accept-loop wire wiring
     pub fn complete(
         &self,
         state: &RuntimeState,
         auth_bytes: &[u8],
+        now_ms: u64,
     ) -> Result<(Vec<u8>, SessionSecrets, PeerIdentity), String> {
         // The client-auth key derives from the transcript hash BEFORE the
         // CLIENT_AUTH message is appended (handshake.md §18).
@@ -92,8 +111,9 @@ impl HandshakePending {
             .open(0, &client_auth_transcript, ciphertext)
             .map_err(|e| format!("client auth open: {e:?}"))?;
 
-        // Plaintext: client static key (32) || identity binding (153) ||
-        // client signature (64), as the T13 driver lays it out.
+        // Plaintext: client static key (32) || identity binding (217: signed
+        // bytes + the binding's own signature) || client signature (64), as
+        // the T13 driver lays it out.
         let recovered_static = StaticHandshakePublicKey(
             plaintext
                 .get(..32)
@@ -104,19 +124,20 @@ impl HandshakePending {
             return Err("client static key mismatch".into());
         }
         let peer_signature: [u8; 64] = plaintext
-            .get(185..185 + 64)
+            .get(32 + BINDING_WIRE_LEN..32 + BINDING_WIRE_LEN + 64)
             .and_then(|s| s.try_into().ok())
             .ok_or("client auth truncated")?;
-        let binding =
-            parse_client_binding(plaintext.get(32..32 + 153).ok_or("client auth truncated")?)?;
-        // The binding travels without its signature; verify its structure
-        // and the client's transcript-bound signature over it.
-        if binding.version != umc_handshake::identity::BINDING_VERSION {
-            return Err("client binding version".into());
-        }
-        if endpoint_id(&binding.identity_public_key) != binding.endpoint_id {
-            return Err("client binding endpoint id mismatch".into());
-        }
+        let binding = parse_client_binding(
+            plaintext
+                .get(32..32 + BINDING_WIRE_LEN)
+                .ok_or("client auth truncated")?,
+        )?;
+        // The identity binding must be self-consistent and signed by the
+        // claimed identity key; a binding signed by a different key is
+        // refused before the session is accepted (handshake.md §4.3).
+        binding
+            .validate(now_ms, BINDING_SKEW_MS)
+            .map_err(|e| format!("client binding invalid: {e:?}"))?;
         if binding.static_handshake_public_key.0 != recovered_static.0 {
             return Err("client binding static key mismatch".into());
         }
@@ -165,9 +186,10 @@ impl HandshakePending {
     }
 }
 
-/// Reassemble an [`IdentityBinding`] from the canonical signed bytes
-/// (identity.rs §4.3 layout). The binding's own signature is not
-/// transmitted; the caller verifies the client's signature instead.
+/// Reassemble an [`IdentityBinding`] from the canonical signed bytes plus
+/// its own signature (identity.rs §4.3 layout). The client transmits the
+/// full binding; the server validates it wholesale with
+/// [`IdentityBinding::validate`] before accepting the session.
 ///
 /// # Errors
 ///
@@ -193,6 +215,9 @@ fn parse_client_binding(bytes: &[u8]) -> Result<IdentityBinding, String> {
         ))
     };
     let capabilities_hash = read(121, 32)?.try_into().map_err(|_| "capabilities")?;
+    let signature = read(BINDING_SIGNED_LEN, 64)?
+        .try_into()
+        .map_err(|_| "signature")?;
     Ok(IdentityBinding {
         version,
         endpoint_id,
@@ -202,9 +227,7 @@ fn parse_client_binding(bytes: &[u8]) -> Result<IdentityBinding, String> {
         not_after: be(105)?,
         sequence: be(113)?,
         capabilities_hash,
-        // Absent from the wire; the client's transcript-bound signature is
-        // verified separately.
-        signature: [0u8; 64],
+        signature,
     })
 }
 
@@ -363,18 +386,24 @@ mod tests {
     }
 
     /// The client's `CLIENT_AUTH` message, mirroring the T13 driver
-    /// (xx.rs): client static key + the client's identity binding + the
-    /// client signature, sealed with the client-auth key derived from
-    /// secret3 and the transcript before the message is appended.
+    /// (xx.rs): client static key + the client's identity binding (signed
+    /// bytes and the binding's own signature) + the client transcript
+    /// signature, sealed with the client-auth key derived from secret3 and
+    /// the transcript before the message is appended.
+    ///
+    /// `claimed_identity` signs the transcript-bound signature (the identity
+    /// the client claims); `client_binding` is transmitted verbatim. The
+    /// happy path passes the same key for both.
     #[allow(clippy::too_many_arguments, clippy::similar_names)]
     fn build_client_auth(
-        client_identity: &IdentityKeyPair,
+        claimed_identity: &IdentityKeyPair,
         client_static: &StaticHandshakeKeyPair,
         client_ephemeral: &StaticHandshakeKeyPair,
         hello: &ClientHello,
         server_hello: &ServerHello,
         server_binding: &IdentityBinding,
         carrier_binding: &[u8],
+        client_binding: &IdentityBinding,
     ) -> Vec<u8> {
         let mut transcript = Transcript::new(MODE_XX, CRYPTO_PROFILE, carrier_binding);
         transcript
@@ -405,15 +434,7 @@ mod tests {
         ));
         let secret3 = umc_crypto::hkdf::extract(&secret2, &dh_se);
         let auth_key = expand(&secret3, b"client auth key", &transcript.hash);
-        let client_binding = IdentityBinding::sign(
-            client_identity,
-            &client_static.public(),
-            0,
-            u64::MAX,
-            0,
-            [0u8; 32],
-        );
-        let client_eid = endpoint_id(&client_identity.public());
+        let client_eid = endpoint_id(&claimed_identity.public());
         let server_eid = endpoint_id(&server_binding.identity_public_key);
         let sig_input = client_signature_input(
             &transcript.hash,
@@ -422,10 +443,11 @@ mod tests {
             &client_static.public().0,
             &server_static_pub.0,
         );
-        let signature = client_identity.sign(&sig_input);
+        let signature = claimed_identity.sign(&sig_input);
         let mut plaintext = Vec::new();
         plaintext.extend_from_slice(&client_static.public().0);
         plaintext.extend_from_slice(&client_binding.signed_bytes());
+        plaintext.extend_from_slice(&client_binding.signature);
         plaintext.extend_from_slice(&signature);
         let encrypted = umc_crypto::aead::PacketKeys::from_traffic_secret(&auth_key)
             .expect("keys")
@@ -434,6 +456,22 @@ mod tests {
         let mut auth_bytes = Vec::new();
         umc_wire::bytes::encode(&mut auth_bytes, &encrypted, 16_384).expect("bytes");
         auth_bytes
+    }
+
+    /// Test binding with a finite validity window (`u64::MAX` would overflow
+    /// `IdentityBinding::validate`'s skew arithmetic in debug builds).
+    fn client_binding(
+        identity: &IdentityKeyPair,
+        static_key: &StaticHandshakeKeyPair,
+    ) -> IdentityBinding {
+        IdentityBinding::sign(
+            identity,
+            &static_key.public(),
+            0,
+            1_800_000_000_000,
+            0,
+            [0u8; 32],
+        )
     }
 
     #[test]
@@ -463,7 +501,7 @@ mod tests {
             &state.node_identity.identity,
             &state.node_identity.static_handshake.public(),
             0,
-            u64::MAX,
+            1_800_000_000_000,
             0,
             [0u8; 32],
         );
@@ -475,10 +513,12 @@ mod tests {
             &server_hello,
             &server_binding,
             b"ump.tcp/1",
+            &client_binding(&client_identity, &client_static),
         );
 
-        let (server_finished, secrets, peer) =
-            pending.complete(&state, &auth_bytes).expect("complete");
+        let (server_finished, secrets, peer) = pending
+            .complete(&state, &auth_bytes, 1_000)
+            .expect("complete");
         assert_eq!(peer.client_static_public_key, client_static.public());
         assert_eq!(
             peer.binding.endpoint_id,
@@ -518,7 +558,7 @@ mod tests {
             &state.node_identity.identity,
             &state.node_identity.static_handshake.public(),
             0,
-            u64::MAX,
+            1_800_000_000_000,
             0,
             [0u8; 32],
         );
@@ -533,8 +573,56 @@ mod tests {
             &server_hello,
             &server_binding,
             b"ump.tcp/1",
+            &client_binding(&identity, &other_static),
         );
-        assert!(pending.complete(&state, &auth_bytes).is_err());
+        assert!(pending.complete(&state, &auth_bytes, 1_000).is_err());
+    }
+
+    #[test]
+    fn responder_rejects_a_binding_signed_by_a_different_key() {
+        // The client signs its identity binding with its REAL identity key
+        // but claims a different identity (transcript signature made with
+        // the claimed key): `IdentityBinding::validate` detects the mismatch
+        // and the session is refused (handshake.md §4.3).
+        let state = test_state();
+        let (client_identity, client_static, client_ephemeral) = client_identity();
+        let claimed = IdentityKeyPair::generate();
+        let hello = ClientHello::new(&TestEntropy, &client_ephemeral);
+        let hello_bytes = hello.encode().expect("hello");
+
+        let (server_hello_bytes, pending) =
+            respond_hello(&state, b"ump.tcp/1", &hello_bytes, &client_static.public())
+                .expect("responder");
+        let server_hello = ServerHello::decode(&server_hello_bytes).expect("server hello");
+        let server_binding = IdentityBinding::sign(
+            &state.node_identity.identity,
+            &state.node_identity.static_handshake.public(),
+            0,
+            1_800_000_000_000,
+            0,
+            [0u8; 32],
+        );
+
+        // The binding is signed by the real identity but claims the other
+        // key: the transmitted signature no longer matches the claim.
+        let mut spoofed = client_binding(&client_identity, &client_static);
+        spoofed.identity_public_key = claimed.public();
+        spoofed.endpoint_id = endpoint_id(&claimed.public());
+
+        let auth_bytes = build_client_auth(
+            &claimed,
+            &client_static,
+            &client_ephemeral,
+            &hello,
+            &server_hello,
+            &server_binding,
+            b"ump.tcp/1",
+            &spoofed,
+        );
+        let error = pending
+            .complete(&state, &auth_bytes, 1_000)
+            .expect_err("refused");
+        assert!(error.contains("binding"), "{error}");
     }
 
     #[test]
@@ -546,6 +634,6 @@ mod tests {
         let (_server_hello_bytes, pending) =
             respond_hello(&state, b"ump.tcp/1", &hello_bytes, &client_static.public())
                 .expect("responder");
-        assert!(pending.complete(&state, b"garbage").is_err());
+        assert!(pending.complete(&state, b"garbage", 1_000).is_err());
     }
 }

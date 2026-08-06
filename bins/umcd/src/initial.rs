@@ -1,54 +1,12 @@
 //! Initial packet handling (wire-format §24-25): minimal long-header decode
 //! and AEAD open with the client initial keys.
 //!
-//! `umc_wire` exposes the long-header *builder* (`LongHeader::encode`) but
-//! no parser, so the minimal field decode lives here and mirrors the
-//! builder's layout: header byte, version, DCID length + DCID, SCID length
-//! + SCID, token length + token, payload length, PN bytes, ciphertext.
+//! The parser lives in `umc_handshake::initial` (Phase 13 hardening added
+//! bounds checks so hostile length fields are rejected, never panicked);
+//! this module re-exports it for the daemon's accept path.
 use umc_handshake::encoding::{self, CLIENT_HELLO};
-use umc_handshake::initial::derive_initial_keys;
-use umc_wire::header::{HeaderByte, LongPacketType};
-use umc_wire::pn;
-use umc_wire::varint;
 
-/// A parsed client Initial packet: `(dcid, truncated_pn, payload, scid)`.
-pub type ParsedInitial = (Vec<u8>, u64, Vec<u8>, Vec<u8>);
-
-/// Decode a client Initial packet into a [`ParsedInitial`].
-///
-/// Returns `None` when the bytes are not an Initial long-header packet, the
-/// header is malformed, or the AEAD open fails.
-pub fn try_parse_initial(bytes: &[u8]) -> Option<ParsedInitial> {
-    let hb = HeaderByte::decode(*bytes.first()?).ok()?;
-    if !hb.long || hb.long_type()? != LongPacketType::Initial {
-        return None;
-    }
-    let dcid_len = usize::from(*bytes.get(5)?);
-    let dcid = bytes.get(6..6 + dcid_len)?.to_vec();
-    let scid_len = usize::from(*bytes.get(6 + dcid_len)?);
-    let scid = bytes.get(7 + dcid_len..7 + dcid_len + scid_len)?.to_vec();
-    let mut pos = 7 + dcid_len + scid_len;
-    let (token_len, n) = varint::decode(&bytes[pos..]).ok()?;
-    pos += n;
-    let token_len = usize::try_from(token_len).ok()?;
-    pos = pos.checked_add(token_len)?;
-    let (_payload_len, n) = varint::decode(&bytes[pos..]).ok()?;
-    pos += n;
-    let pn_bytes = (hb.pn_bits as usize) / 8;
-    let protected_pn = bytes.get(pos..pos + pn_bytes)?;
-    let mut pn_full = [0u8; 8];
-    pn_full[8 - pn_bytes..].copy_from_slice(protected_pn);
-    let truncated_pn = u64::from_be_bytes(pn_full);
-    // AAD is the header up to and including the PN bytes (wire-format §25).
-    let aad = bytes.get(..pos + pn_bytes)?;
-    let keys = derive_initial_keys(&dcid).client;
-    // The first Initial packet of a connection has packet number 0.
-    let packet_number = pn::reconstruct(truncated_pn, hb.pn_bits, 0).ok()?;
-    let payload = keys
-        .open(packet_number, aad, bytes.get(pos + pn_bytes..)?)
-        .ok()?;
-    Some((dcid, truncated_pn, payload, scid))
-}
+pub use umc_handshake::initial::try_parse_initial;
 
 /// Extract the raw `CLIENT_HELLO` message bytes from the first inbound
 /// packet: either the decrypted Initial payload (which may carry the hello
@@ -78,6 +36,7 @@ pub fn decode_client_hello(bytes: &[u8]) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use umc_crypto::signatures::StaticHandshakeKeyPair;
+    use umc_handshake::initial::derive_initial_keys;
     use umc_handshake::xx::ClientHello;
     use umc_types::runtime::EntropySource;
     use umc_wire::header::{LongHeader, LongPacketType};
@@ -140,5 +99,25 @@ mod tests {
         // Long header, but the Retry packet type.
         assert!(try_parse_initial(&[0xA0, 0x00, 0x00, 0x00, 0x01]).is_none());
         assert!(decode_client_hello(b"garbage").is_err());
+    }
+
+    #[test]
+    fn hostile_oversized_token_length_does_not_panic() {
+        // A valid Initial long-header prefix (0xC0: long, Initial, 8-bit PN),
+        // then a token length varint declaring a body far beyond the buffer.
+        // The pre-hardening parser indexed past the buffer and panicked here.
+        let mut buf = vec![0xC0, 0x00, 0x00, 0x00, 0x01, 8];
+        buf.extend_from_slice(&[1u8; 8]);
+        buf.push(8);
+        buf.extend_from_slice(&[2u8; 8]);
+        umc_wire::varint::encode_into(&mut buf, 1_000_000).expect("varint");
+        assert!(try_parse_initial(&buf).is_none());
+        // MAX_VARINT token length: checked arithmetic must reject, not wrap.
+        let mut buf = vec![0xC0, 0x00, 0x00, 0x00, 0x01, 8];
+        buf.extend_from_slice(&[1u8; 8]);
+        buf.push(8);
+        buf.extend_from_slice(&[2u8; 8]);
+        umc_wire::varint::encode_into(&mut buf, umc_wire::varint::MAX_VARINT).expect("varint");
+        assert!(try_parse_initial(&buf).is_none());
     }
 }

@@ -181,4 +181,29 @@ mod tests {
             Err(ForwardError::Quota(QuotaError::Exhausted))
         );
     }
+
+    #[test]
+    fn per_direction_sequences_advance_independently() {
+        let mut c = Circuit::new(7, Instant(0), 600_000, 1_048_576, true, false);
+        c.accept(Instant(0));
+        // Sending N times advances only the sent counter.
+        assert_eq!(c.allocate_sequence(), 0);
+        assert_eq!(c.allocate_sequence(), 1);
+        assert_eq!(c.peer_next_relay_sequence, 2);
+        assert_eq!(
+            c.next_relay_sequence, 0,
+            "sending never moves the seen counter"
+        );
+        // Receiving advances only the seen counter.
+        accept_upstream_data(&mut c, 0, false, b"a", 64 * 1024).unwrap();
+        assert_eq!(c.next_relay_sequence, 1);
+        assert_eq!(
+            c.peer_next_relay_sequence, 2,
+            "receiving never moves the sent counter"
+        );
+        // A receive may not clobber the sent counter even across a gap.
+        accept_upstream_data(&mut c, 7, false, b"b", 64 * 1024).unwrap();
+        assert_eq!(c.next_relay_sequence, 8);
+        assert_eq!(c.peer_next_relay_sequence, 2);
+    }
 }

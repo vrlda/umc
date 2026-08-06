@@ -28,7 +28,12 @@ pub struct Circuit {
     pub idle_deadline: Instant,
     pub granted_byte_quota: u64,
     pub bytes_forwarded: u64,
+    /// Next relay sequence expected FROM the peer (relay.md §16.1, direction
+    /// 1): advanced by the accept path, never by local sends.
     pub next_relay_sequence: u64,
+    /// Next relay sequence this circuit has SENT to the peer (relay.md §16.1,
+    /// direction 2): advanced by `allocate_sequence`, never by receives.
+    pub peer_next_relay_sequence: u64,
     /// Last accepted data bytes, for exact-duplicate detection (relay.md §17).
     pub last_accepted_data: Option<Vec<u8>>,
     pub downstream: Option<Vec<u8>>,
@@ -59,8 +64,10 @@ impl Circuit {
                 .clamp(now, expires_at),
             granted_byte_quota: byte_quota,
             bytes_forwarded: 0,
-            // A single relay sequence space for Phase 3; per-direction sequences (relay.md §16.1) are Phase 14 work.
+            // Per-direction sequences (relay.md §16.1): the seen counter
+            // advances on accept, the sent counter on allocate_sequence.
             next_relay_sequence: 0,
+            peer_next_relay_sequence: 0,
             last_accepted_data: None,
             downstream: None,
             private_handling,
@@ -104,9 +111,11 @@ impl Circuit {
         Ok(())
     }
 
+    /// Allocate the next sequence number for data SENT to the peer
+    /// (relay.md §16.1, direction 2). Independent of the receive counter.
     pub fn allocate_sequence(&mut self) -> u64 {
-        let seq = self.next_relay_sequence;
-        self.next_relay_sequence += 1;
+        let seq = self.peer_next_relay_sequence;
+        self.peer_next_relay_sequence += 1;
         seq
     }
 

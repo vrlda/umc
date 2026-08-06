@@ -17,6 +17,10 @@ use umc_storage::sqlite::SqliteStore;
 
 const DEFAULT_ENVELOPE_MAX: usize = 4 * 1024 * 1024;
 
+/// Concurrent control connections are capped (control-api.md §16): the 65th
+/// connection is refused until an earlier one closes.
+pub const MAX_CONTROL_CONNECTIONS: usize = 64;
+
 /// Wire request for `RelayService.OpenCircuit` (relay.md §13). No proto
 /// message exists yet; the control surface carries these fields until the
 /// API spec gains a relay-open method.
@@ -126,6 +130,10 @@ pub async fn run(state: Arc<Mutex<RuntimeState>>) {
     println!("control socket: {}", socket_path.display());
     println!("node initialized");
 
+    // Concurrent control connections are capped: each live connection holds
+    // one permit for its lifetime (control-api.md §16).
+    let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONTROL_CONNECTIONS));
+
     loop {
         tokio::select! {
             () = tokio::time::sleep(Duration::from_millis(200)) => {
@@ -136,7 +144,9 @@ pub async fn run(state: Arc<Mutex<RuntimeState>>) {
             accepted = listener.accept() => {
                 if let Ok((stream, _)) = accepted {
                     let state = state.clone();
-                    tokio::spawn(handle_connection(stream, state));
+                    if !admit_connection(&connections, stream, state) {
+                        println!("control socket: connection refused (cap {MAX_CONTROL_CONNECTIONS})");
+                    }
                 }
             }
         }
@@ -145,7 +155,26 @@ pub async fn run(state: Arc<Mutex<RuntimeState>>) {
     println!("control socket: closed");
 }
 
-async fn handle_connection(mut stream: UnixStream, state: Arc<Mutex<RuntimeState>>) {
+/// Admit one control connection under the concurrent-connection cap. The
+/// permit is held for the connection's lifetime; returns `false` when the
+/// cap is reached and the connection is refused.
+fn admit_connection(
+    connections: &Arc<tokio::sync::Semaphore>,
+    stream: UnixStream,
+    state: Arc<Mutex<RuntimeState>>,
+) -> bool {
+    let Ok(permit) = connections.clone().try_acquire_owned() else {
+        return false;
+    };
+    tokio::spawn(handle_connection(stream, state, permit));
+    true
+}
+
+async fn handle_connection(
+    mut stream: UnixStream,
+    state: Arc<Mutex<RuntimeState>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) {
     let mut decoder = EnvelopeDecoder::new(DEFAULT_ENVELOPE_MAX);
     let mut buf = [0u8; 8 * 1024];
     // The credential presented at hello time gates every request on this
@@ -1170,5 +1199,47 @@ mod tests {
             decode_response(&bytes).status.unwrap().code,
             api::StatusCode::Ok as i32
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_control_connection_cap_enforced() {
+        let (state, _tx) = test_state();
+        let state = Arc::new(Mutex::new(state));
+        let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONTROL_CONNECTIONS));
+        // Fill the cap: every admitted connection holds a permit while its
+        // peer end stays open.
+        let mut peers = Vec::new();
+        for _ in 0..MAX_CONTROL_CONNECTIONS {
+            let (stream, peer) = UnixStream::pair().expect("pair");
+            peers.push(peer);
+            assert!(
+                admit_connection(&connections, stream, state.clone()),
+                "connection {MAX_CONTROL_CONNECTIONS} within cap must be admitted"
+            );
+        }
+        // The 65th connection is refused while the cap is full.
+        let (stream, peer) = UnixStream::pair().expect("pair");
+        assert!(
+            !admit_connection(&connections, stream, state.clone()),
+            "65th control connection must be refused"
+        );
+        drop(peer);
+        // Closing one admitted connection releases its permit; the next is
+        // admitted. `peers` holds the peer ends of the 64 admitted
+        // connections; dropping one delivers EOF and ends its task.
+        peers.pop();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if connections.clone().try_acquire_owned().is_ok() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("permit released after connection close");
+        let (stream, peer) = UnixStream::pair().expect("pair");
+        peers.push(peer);
+        assert!(admit_connection(&connections, stream, state.clone()));
     }
 }
