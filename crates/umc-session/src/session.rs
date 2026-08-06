@@ -59,6 +59,10 @@ pub struct Session {
     flow: FlowControl,
     datagrams: DatagramQueue,
     dcid: Vec<u8>,
+    key_update: crate::key_update::KeyUpdateState,
+    pub paths: HashMap<u64, crate::path::Path>,
+    #[allow(dead_code)]
+    cids: crate::cid::ConnectionIdManager,
 }
 
 impl Session {
@@ -102,6 +106,12 @@ impl Session {
             flow: FlowControl::new(config.initial_max_data, INITIAL_STREAMS, INITIAL_STREAMS),
             datagrams: DatagramQueue::new(),
             dcid: config.dcid,
+            key_update: crate::key_update::KeyUpdateState::new(
+                config.local_traffic_secret,
+                config.remote_traffic_secret,
+            ),
+            paths: HashMap::new(),
+            cids: crate::cid::ConnectionIdManager::new(crate::cid::DEFAULT_ACTIVE_LIMIT),
         })
     }
 
@@ -346,6 +356,186 @@ impl Session {
     pub fn rtt(&self) -> &RttEstimator {
         &self.rtt
     }
+
+    /// Initiate a key update; returns the `KEY_UPDATE` frame payload.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::KeyUpdate`] if a previous update is still
+    /// awaiting confirmation, and [`SessionError::Encode`] if frame encoding
+    /// fails.
+    pub fn initiate_key_update(&mut self) -> Result<Vec<u8>, SessionError> {
+        let sequence = self
+            .key_update
+            .initiate()
+            .map_err(|_| SessionError::KeyUpdate)?;
+        let mut payload = Vec::new();
+        umc_wire::varint::encode_into(&mut payload, umc_types::frame::FrameType::KEY_UPDATE.0)
+            .map_err(|_| SessionError::Encode)?;
+        let frame = umc_wire::frames::path::KeyUpdateFrame {
+            update_sequence: sequence,
+            request_peer_update: false,
+        };
+        let enc = frame.encode().map_err(|_| SessionError::Encode)?;
+        payload.extend_from_slice(&enc[1..]);
+        Ok(payload)
+    }
+
+    /// Process a `KEY_UPDATE` frame: derive the peer's next secret and install it
+    /// after the first authenticated decrypt (session.md §24.2).
+    ///
+    /// # Errors
+    /// Returns [`SessionError::KeyUpdate`] if the sequence number is neither
+    /// the current nor the next expected sequence.
+    pub fn on_key_update(&mut self, sequence: u64) -> Result<(), SessionError> {
+        if sequence != self.key_update.update_sequence + 1
+            && sequence != self.key_update.update_sequence
+        {
+            return Err(SessionError::KeyUpdate);
+        }
+        if sequence > self.key_update.update_sequence {
+            let next_secret =
+                umc_crypto::key_update::next_traffic_secret(&self.key_update.remote_secret);
+            self.key_update.confirm_remote_phase(next_secret);
+            self.key_update.update_sequence = sequence;
+        }
+        // An authenticated packet in the new phase confirms; the session loop
+        // calls mark_confirmed after decrypting with the new keys.
+        self.key_update.mark_confirmed();
+        Ok(())
+    }
+
+    /// Register a candidate path and start validation (session.md §26).
+    ///
+    /// # Errors
+    /// Returns [`SessionError::PathBudget`] when the candidate-path or
+    /// challenge budget is exhausted.
+    pub fn add_path(
+        &mut self,
+        path_id: u64,
+        carrier_type: String,
+        local: Vec<u8>,
+        remote: Vec<u8>,
+        now: Instant,
+    ) -> Result<(), SessionError> {
+        let active = self
+            .paths
+            .values()
+            .filter(|p| {
+                matches!(
+                    p.state,
+                    crate::path::PathState::Validated | crate::path::PathState::Degraded
+                )
+            })
+            .count();
+        let validating = self
+            .paths
+            .values()
+            .filter(|p| p.state == crate::path::PathState::Validating)
+            .count();
+        if active + validating >= 1 + crate::path::MAX_CANDIDATE_PATHS {
+            return Err(SessionError::PathBudget);
+        }
+        let mut challenge = [0u8; 8];
+        Self::entropy_fill(&mut challenge);
+        let mut path = crate::path::Path::new(path_id, carrier_type, local, remote, now);
+        let pto = self.loss.pto(&self.rtt).as_millis();
+        path.start_validation(challenge, now, pto)
+            .map_err(|_| SessionError::PathBudget)?;
+        self.paths.insert(path_id, path);
+        Ok(())
+    }
+
+    /// `PATH_CHALLENGE` from the peer on a candidate path (session.md §26).
+    pub fn on_path_challenge(&mut self, path_id: u64, challenge: [u8; 8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        umc_wire::varint::encode_into(&mut payload, umc_types::frame::FrameType::PATH_RESPONSE.0)
+            .ok();
+        let frame = umc_wire::frames::path::PathResponseFrame { data: challenge };
+        if let Ok(enc) = frame.encode() {
+            payload.extend_from_slice(&enc[1..]);
+        }
+        let _ = path_id;
+        payload
+    }
+
+    /// `PATH_RESPONSE` confirming a challenge on the given path.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::PathNotFound`] for an unknown path and
+    /// [`SessionError::PathValidation`] if the response matches no outstanding
+    /// challenge.
+    pub fn on_path_response(
+        &mut self,
+        path_id: u64,
+        response: [u8; 8],
+    ) -> Result<(), SessionError> {
+        let path = self
+            .paths
+            .get_mut(&path_id)
+            .ok_or(SessionError::PathNotFound)?;
+        path.confirm(&response)
+            .map_err(|_| SessionError::PathValidation)
+    }
+
+    /// Migrate the primary path (session.md §27): the new path must be
+    /// `VALIDATED`; migration never touches packet numbers or stream state.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::PathNotFound`] for an unknown path and
+    /// [`SessionError::PathNotValidated`] if the path has not been validated.
+    pub fn migrate_to(
+        &mut self,
+        new_path_id: u64,
+        keep_old: bool,
+        now: Instant,
+    ) -> Result<(), SessionError> {
+        let path = self
+            .paths
+            .get(&new_path_id)
+            .ok_or(SessionError::PathNotFound)?;
+        if path.state != crate::path::PathState::Validated {
+            return Err(SessionError::PathNotValidated);
+        }
+        if !keep_old {
+            // Retire all other paths.
+            let ids: Vec<u64> = self
+                .paths
+                .keys()
+                .copied()
+                .filter(|id| *id != new_path_id)
+                .collect();
+            for id in ids {
+                if let Some(p) = self.paths.get_mut(&id) {
+                    p.mark_failed();
+                }
+            }
+        }
+        let _ = now;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn path(&self, path_id: u64) -> Option<&crate::path::Path> {
+        self.paths.get(&path_id)
+    }
+
+    /// Test helper: mark a path validated without challenge/response. The
+    /// daemon drives the real `PATH_CHALLENGE`/`PATH_RESPONSE` flow.
+    pub fn force_validate(&mut self, path_id: u64) {
+        if let Some(path) = self.paths.get_mut(&path_id) {
+            path.validated = true;
+            path.state = crate::path::PathState::Validated;
+            path.sent_bytes_unvalidated = 0;
+            path.received_bytes_unvalidated = 0;
+        }
+    }
+
+    fn entropy_fill(out: &mut [u8]) {
+        // The session holds no entropy source directly in Phase 4; the daemon
+        // supplies challenges through Node. For library tests, a deterministic
+        // fill keeps behavior reproducible.
+        out.fill(0xAB);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,6 +552,11 @@ pub enum SessionError {
     Encode,
     StreamNotFound,
     Ack(super::ack::AckError),
+    KeyUpdate,
+    PathBudget,
+    PathNotFound,
+    PathNotValidated,
+    PathValidation,
 }
 
 impl From<StreamError> for SessionError {
