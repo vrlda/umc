@@ -140,13 +140,13 @@ impl RelayStatusFrame {
     /// Returns `LengthExceedsLimit` if the diagnostic or authentication
     /// exceeds its limit, and `VarintEncode` if a field cannot be encoded.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
-        let mut out = Vec::new();
-        crate::varint::encode_into(&mut out, FrameType::RELAY_STATUS.0)
+        // Length-delimited frame (relay.md §12.2): type || length || body.
+        let mut body = Vec::new();
+        crate::varint::encode_into(&mut body, self.circuit_id).map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut body, self.status_sequence)
             .map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.circuit_id).map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.status_sequence)
+        crate::varint::encode_into(&mut body, self.status_code)
             .map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.status_code).map_err(FrameError::VarintEncode)?;
         let mut flags = 0u8;
         if self.bidirectional_granted {
             flags |= 0x01;
@@ -163,17 +163,23 @@ impl RelayStatusFrame {
         if self.retryable {
             flags |= 0x10;
         }
-        out.push(flags);
-        crate::varint::encode_into(&mut out, self.granted_lifetime)
+        body.push(flags);
+        crate::varint::encode_into(&mut body, self.granted_lifetime)
             .map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.granted_byte_quota)
+        crate::varint::encode_into(&mut body, self.granted_byte_quota)
             .map_err(FrameError::VarintEncode)?;
-        crate::varint::encode_into(&mut out, self.maximum_relay_payload)
+        crate::varint::encode_into(&mut body, self.maximum_relay_payload)
             .map_err(FrameError::VarintEncode)?;
-        crate::bytes::encode(&mut out, &self.diagnostic, MAX_RELAY_DIAGNOSTIC)
+        crate::bytes::encode(&mut body, &self.diagnostic, MAX_RELAY_DIAGNOSTIC)
             .map_err(|_| FrameError::LengthExceedsLimit)?;
-        crate::bytes::encode(&mut out, &self.authentication, MAX_RELAY_AUTH)
+        crate::bytes::encode(&mut body, &self.authentication, MAX_RELAY_AUTH)
             .map_err(|_| FrameError::LengthExceedsLimit)?;
+        let mut out = Vec::new();
+        crate::varint::encode_into(&mut out, FrameType::RELAY_STATUS.0)
+            .map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, body.len() as u64)
+            .map_err(FrameError::VarintEncode)?;
+        out.extend_from_slice(&body);
         Ok(out)
     }
 
@@ -226,6 +232,21 @@ impl RelayStatusFrame {
             },
             pos,
         ))
+    }
+
+    /// Decodes a length-delimited `RELAY_STATUS` frame (type || length ||
+    /// body), returning the frame and the total bytes consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError::Truncated`] if the declared length exceeds the
+    /// remaining payload.
+    pub fn decode_length_delimited(payload: &[u8]) -> Result<(Self, usize), FrameError> {
+        let (len, used) = crate::varint::decode(payload).map_err(FrameError::Varint)?;
+        let len = usize::try_from(len).map_err(|_| FrameError::LengthExceedsLimit)?;
+        let body = payload.get(used..used + len).ok_or(FrameError::Truncated)?;
+        let (frame, _) = Self::decode(body)?;
+        Ok((frame, used + len))
     }
 }
 
@@ -435,9 +456,11 @@ mod tests {
             authentication: vec![],
         };
         let enc = f.encode().unwrap();
-        let (dec, _) =
-            RelayStatusFrame::decode(&enc[type_len(FrameType::RELAY_STATUS.0)..]).unwrap();
+        let (dec, used) =
+            RelayStatusFrame::decode_length_delimited(&enc[type_len(FrameType::RELAY_STATUS.0)..])
+                .unwrap();
         assert_eq!(dec, f);
+        assert_eq!(used + type_len(FrameType::RELAY_STATUS.0), enc.len());
     }
 
     #[test]
