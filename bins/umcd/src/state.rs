@@ -8,6 +8,7 @@ use crate::event_log::DaemonEvents;
 use crate::relay_service::RelayService;
 use crate::routing_service::RoutingService;
 use crate::runtime_adapters::{OsClock, OsEntropy, TokioAdaptor};
+use crate::session_bus::SessionBus;
 use crate::session_manager::SessionManager;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -59,6 +60,9 @@ pub struct RuntimeState {
     pub listeners: Vec<Box<dyn Listener + Send + Sync>>,
     /// Live session registry (core.md §9.5); populated by the accept loops.
     pub sessions: Arc<SessionManager>,
+    /// Session bus: cross-session delivery within one daemon (relay
+    /// forwarding, future bundle delivery).
+    pub bus: Arc<Mutex<SessionBus>>,
     /// Discovery service: candidate table + `PEER_HINT` builder.
     pub discovery: DiscoveryService,
     /// Relay service: circuit registry, admission, forwarding.
@@ -170,6 +174,7 @@ impl RuntimeState {
             node,
             listeners: Vec::new(),
             sessions: Arc::new(SessionManager::new()),
+            bus: Arc::new(Mutex::new(SessionBus::new())),
             discovery: DiscoveryService::new(umc_discovery::table::DEFAULT_TABLE_CAP),
             relay: RelayService::new(events.clone()),
             bundle: BundleService::new(bundle_objects, bundle_quota, events.clone()),

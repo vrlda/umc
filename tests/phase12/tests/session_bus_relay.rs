@@ -1,0 +1,562 @@
+//! Phase 12 deferral closure: cross-session `RELAY_DATA` forwarding over
+//! the daemon's session bus.
+//!
+//! The control API cannot express a forwarding destination (`OpenCircuit`
+//! has no destination field — the wire message in server.rs carries only
+//! quota/lifetime/flags), so the daemon-level check drives the wire path:
+//! each client opens a circuit by sending `RELAY_OPEN` with `next_hop_hint`
+//! = the other client's peer endpoint id over its live session, and the
+//! daemon forwards `RELAY_DATA` accepted on A's circuit into session B via
+//! the session bus.
+//!
+//! The peer endpoint id the daemon registers for a session is provisional
+//! (derived deterministically from the client's hello ephemeral), so the
+//! test computes it with the same derivation as the daemon's accept path.
+//!
+//! The TCP carrier serializes reads and writes behind one mutex
+//! (carriers/tcp.md): a recv in flight starves the link's background
+//! writer. The test therefore runs sends with no recv in flight, and B
+//! pings periodically so the daemon's recv pump hands the stream mutex to
+//! B's writer long enough to flush the forwarded frame.
+use prost::Message;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use umc_carrier::types::OutboundPacket;
+use umc_carrier::BoxLink;
+use umc_core::node::{Node, NodeConfig, NodeIdentity};
+use umc_crypto::aead::PacketKeys;
+use umc_crypto::signatures::StaticHandshakeKeyPair;
+use umc_handshake::xx::{complete_client_side, ClientHello, ServerHello};
+use umc_session::session::{Role, Session, SessionConfig};
+use umc_types::frame::FrameType;
+use umc_types::runtime::{Clock, EntropySource, Instant};
+use umc_wire::frames::relay::{RelayDataFrame, RelayOpenFrame, RelayStatusFrame};
+
+struct TestClock;
+
+impl Clock for TestClock {
+    fn now(&self) -> Instant {
+        Instant(0)
+    }
+}
+
+static TEST_CLOCK: TestClock = TestClock;
+
+struct TestEntropy;
+
+impl EntropySource for TestEntropy {
+    fn fill(&self, out: &mut [u8]) {
+        out.fill(0x5A);
+    }
+}
+
+/// The provisional peer endpoint id the daemon registers for a session:
+/// `HKDF("UMP-PEER-PROVISIONAL-v1" || hello ephemeral)` (main.rs).
+fn provisional_peer_id(ephemeral_public: &[u8; 32]) -> [u8; 32] {
+    let mut ikm = Vec::with_capacity(32);
+    ikm.extend_from_slice(b"UMP-PEER-PROVISIONAL-v1");
+    ikm.extend_from_slice(ephemeral_public);
+    umc_crypto::hkdf::extract(&[0u8; 32], &ikm)
+}
+
+/// Client-side TCP handshake over `Node`'s carrier, returning the live
+/// link, the client session, the hello ephemeral's public key (from which
+/// the daemon derives the session's peer endpoint id), and the client's
+/// remote packet keys for parsing the daemon's protected replies.
+#[allow(clippy::type_complexity)]
+fn tcp_handshake(
+    node: &umc_core::node::Node,
+    remote: &str,
+) -> Result<(BoxLink, Session, [u8; 32], PacketKeys), String> {
+    let carrier = node.carrier("ump.tcp/1").ok_or("tcp carrier missing")?;
+    let link = carrier
+        .dial(remote.to_string())
+        .map_err(|e| format!("dial: {e:?}"))?;
+    let client_ephemeral = StaticHandshakeKeyPair::generate();
+    let hello = ClientHello::new(node.entropy.as_ref(), &client_ephemeral);
+    let ephemeral_public = hello.client_ephemeral_public_key;
+    let hello_bytes = hello.encode().map_err(|e| format!("hello: {e:?}"))?;
+    link.send(OutboundPacket {
+        bytes: hello_bytes,
+        control: true,
+        deadline_ms: Some(3_000),
+    })
+    .map_err(|e| format!("send: {e:?}"))?;
+    std::thread::sleep(Duration::from_millis(100));
+    let server_hello_bytes = link.recv().map_err(|e| format!("recv: {e:?}"))?.bytes;
+    let server_hello =
+        ServerHello::decode(&server_hello_bytes).map_err(|e| format!("server hello: {e:?}"))?;
+    let (secrets, _) = complete_client_side(
+        &node.config.identity.identity,
+        // The daemon stands the client's ephemeral in for the static until
+        // the CLIENT_AUTH wire path lands; mirror that here so the derived
+        // session secrets match on both sides.
+        &client_ephemeral,
+        &client_ephemeral,
+        &hello,
+        &server_hello,
+        node.entropy.as_ref(),
+        "ump.tcp/1".as_bytes(),
+    )
+    .map_err(|e| format!("client side: {e}"))?;
+    let session = Session::new(
+        SessionConfig {
+            role: Role::Client,
+            dcid: node.config.dcid.clone(),
+            local_traffic_secret: secrets.client,
+            remote_traffic_secret: secrets.server,
+            initial_max_data: umc_session::session::DEFAULT_INITIAL_MAX_DATA,
+            initial_max_stream_data: umc_session::session::DEFAULT_INITIAL_MAX_STREAM_DATA,
+            max_ack_delay_ms: 25,
+        },
+        &TEST_CLOCK,
+    )
+    .map_err(|e| format!("session: {e:?}"))?;
+    let remote_keys = PacketKeys::from_traffic_secret(&secrets.server)
+        .map_err(|e| format!("remote keys: {e:?}"))?;
+    Ok((link, session, ephemeral_public, remote_keys))
+}
+
+/// Send one encoded frame as a protected packet over a client session.
+/// Must run with no recv in flight: the carrier's single stream mutex
+/// would otherwise starve the link's background writer.
+#[allow(clippy::needless_pass_by_value)]
+fn send_frame(session: &mut Session, link: &BoxLink, frame_bytes: Vec<u8>) -> Result<(), String> {
+    let packet = session
+        .build_outbound(&TEST_CLOCK, Instant(0), &frame_bytes)
+        .map_err(|e| format!("build: {e:?}"))?
+        .ok_or("no packet")?;
+    link.send(OutboundPacket {
+        bytes: packet,
+        control: false,
+        deadline_ms: None,
+    })
+    .map_err(|e| format!("send: {e:?}"))?;
+    Ok(())
+}
+
+/// What a client receive window waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitFor {
+    /// A `RELAY_STATUS` with the given code.
+    Status(u64),
+    /// A raw (bus-forwarded) `RELAY_DATA` frame.
+    ForwardedRelayData,
+}
+
+impl WaitFor {
+    fn satisfied(&self, statuses: &[u64], raw_frames: &[Vec<u8>]) -> bool {
+        match self {
+            Self::Status(code) => statuses.contains(code),
+            Self::ForwardedRelayData => raw_frames.iter().any(|bytes| {
+                let Ok((ty, used)) = umc_wire::varint::decode(bytes) else {
+                    return false;
+                };
+                FrameType(ty) == FrameType::RELAY_DATA
+                    && RelayDataFrame::decode(&bytes[used..]).is_ok()
+            }),
+        }
+    }
+}
+
+/// Decode the `RELAY_STATUS` code from a protected packet. `RELAY_STATUS`
+/// is a length-delimited type the generic frame parser refuses (the
+/// daemon's session layer has the same limitation), so the payload is
+/// walked varint-by-varint: `ACK` bodies are skipped via their own decode,
+/// the status body is decoded directly.
+fn status_from_protected(keys: &PacketKeys, bytes: &[u8]) -> Option<u64> {
+    let (_space, _dcid, _path, _pn, payload) =
+        umc_session::packet::parse_protected_packet(keys, bytes).ok()?;
+    let mut pos = 0usize;
+    while pos < payload.len() {
+        let (ty, used) = umc_wire::varint::decode(&payload[pos..]).ok()?;
+        pos += used;
+        if ty == FrameType::RELAY_STATUS.0 {
+            let (status, _) = RelayStatusFrame::decode(&payload[pos..]).ok()?;
+            return Some(status.status_code);
+        }
+        if ty == FrameType::ACK.0 {
+            let (_, used) = umc_wire::frame::AckFrame::decode(&payload[pos..]).ok()?;
+            pos += used;
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+/// Client receive window: drain the link, feed the session state machine,
+/// reply with ACK payloads, record relay statuses from protected packets
+/// (body-first, the generic parser refuses them), and capture raw
+/// (bus-forwarded) frames the session layer refuses. Runs until `wait_for`
+/// is satisfied, then returns so the caller can release the link's stream
+/// mutex before the next send phase.
+async fn recv_until(
+    link: &Arc<BoxLink>,
+    session: &Arc<Mutex<Session>>,
+    keys: PacketKeys,
+    statuses: &Arc<Mutex<Vec<u64>>>,
+    raw_frames: &Arc<Mutex<Vec<Vec<u8>>>>,
+    wait_for: WaitFor,
+    what: &str,
+) {
+    let what = what.to_string();
+    let link = link.clone();
+    let session = session.clone();
+    let statuses_arc = statuses.clone();
+    let raw_arc = raw_frames.clone();
+    let handle = tokio::task::spawn_blocking(move || loop {
+        let Ok(packet) = link.recv() else {
+            return;
+        };
+        let bytes = packet.bytes;
+        let mut session = session.lock().expect("client session");
+        match session.on_inbound(Instant(0), &bytes) {
+            Ok(ack) => {
+                if !ack.is_empty() {
+                    if let Ok(Some(reply)) = session.build_outbound(&TEST_CLOCK, Instant(0), &ack) {
+                        let _ = link.send(OutboundPacket {
+                            bytes: reply,
+                            control: false,
+                            deadline_ms: None,
+                        });
+                    }
+                }
+                if let Some(code) = status_from_protected(&keys, &bytes) {
+                    statuses_arc.lock().expect("statuses").push(code);
+                }
+            }
+            Err(_) => raw_arc.lock().expect("raw frames").push(bytes),
+        }
+        let snapshot_status = statuses_arc.lock().expect("statuses").clone();
+        let snapshot_raw = raw_arc.lock().expect("raw frames").clone();
+        if wait_for.satisfied(&snapshot_status, &snapshot_raw) {
+            return;
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(15), handle)
+        .await
+        .unwrap_or_else(|_| {
+            let statuses = statuses.lock().expect("statuses").clone();
+            let raw = raw_frames.lock().expect("raw frames").clone();
+            panic!("{what}: receive window timed out (statuses: {statuses:?}, raw: {raw:?})");
+        })
+        .expect("receive window panicked");
+}
+
+/// Locate (and if necessary build) the umcd binary. Fails loud when the
+/// binary cannot be produced.
+fn umcd_binary() -> std::path::PathBuf {
+    let here = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let bin = here.join("../../target/debug/umcd");
+    if !bin.exists() {
+        let status = std::process::Command::new(env!("CARGO"))
+            .args(["build", "-p", "umcd"])
+            .current_dir(here.join("../.."))
+            .status()
+            .expect("run cargo build -p umcd");
+        assert!(status.success(), "cargo build -p umcd failed");
+    }
+    assert!(bin.exists(), "umcd binary missing at {}", bin.display());
+    bin
+}
+
+/// A running daemon; kills the child on drop.
+struct Daemon {
+    child: std::process::Child,
+    _dir: std::path::PathBuf,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_daemon(name: &str, tcp_port: u16, udp_port: u16) -> (Daemon, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "phase12-bus-daemon-{name}-{}-{tcp_port}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("daemon dir");
+    let config = serde_json::json!({
+        "data_dir": dir.join("data"),
+        "control_socket": dir.join("umc.sock"),
+        "carriers": ["ump.tcp/1", "ump.udp/1"],
+        "tcp_listen": format!("127.0.0.1:{tcp_port}"),
+        "udp_listen": format!("127.0.0.1:{udp_port}"),
+    });
+    let config_path = dir.join("node.json");
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("config json"),
+    )
+    .expect("write config");
+    let log = std::fs::File::create(dir.join("umcd.log")).expect("log file");
+    let child = std::process::Command::new(umcd_binary())
+        .args(["--config", config_path.to_str().expect("config path")])
+        .stdout(std::process::Stdio::from(
+            log.try_clone().expect("clone log"),
+        ))
+        .stderr(std::process::Stdio::from(log))
+        .spawn()
+        .expect("spawn umcd");
+    (
+        Daemon {
+            child,
+            _dir: dir.clone(),
+        },
+        dir.join("umc.sock"),
+    )
+}
+
+/// Wait until the daemon's control socket exists: the carrier accept loops
+/// are spawned before the control socket binds, so a live socket implies
+/// the listeners are accepting.
+fn wait_for_control_socket(socket: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if socket.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "daemon control socket never appeared at {}",
+        socket.display()
+    );
+}
+
+fn free_tcp_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral tcp")
+        .local_addr()
+        .expect("tcp local addr")
+        .port()
+}
+
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .expect("bind ephemeral udp")
+        .local_addr()
+        .expect("udp local addr")
+        .port()
+}
+
+/// Wait until the daemon's event log contains an event with the given kind.
+async fn wait_for_event(socket: &std::path::Path, kind: &str) {
+    let mut client =
+        umc_sdk::client::Client::connect(socket.to_str().expect("socket path"), "phase12-bus")
+            .await
+            .expect("control connect");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let response = client
+            .request("NodeAdmin", "GetEvents", Vec::new())
+            .await
+            .expect("get events");
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            umc_control::proto::umc::api::v1::StatusCode::Ok as i32
+        );
+        let events = umc_control::proto::umc::api::v1::GetEventsResponse::decode(
+            response.payload.as_slice(),
+        )
+        .expect("payload")
+        .events;
+        if events.iter().any(|e| e.kind == kind) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "event {kind} never appeared; saw: {events:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Daemon-level smoke: two live clients, A's `RELAY_DATA` forwarded to
+/// session B over the daemon's session bus, riding B's live link as a raw
+/// `RELAY_DATA` frame on B's circuit.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn relay_data_forwarded_between_two_live_sessions() {
+    let tcp_port = free_tcp_port();
+    let (daemon, socket) = spawn_daemon("relay-forward", tcp_port, free_udp_port());
+    wait_for_control_socket(&socket);
+    let remote = format!("127.0.0.1:{tcp_port}");
+
+    let mut node_a = Node::new(
+        NodeConfig {
+            identity: NodeIdentity::generate(&TestEntropy),
+            dcid: vec![1u8; 8],
+        },
+        Arc::new(TestClock),
+        Arc::new(TestEntropy),
+    );
+    node_a.register_carrier(Box::new(umc_carrier_tcp::TcpCarrier));
+    let mut node_b = Node::new(
+        NodeConfig {
+            identity: NodeIdentity::generate(&TestEntropy),
+            dcid: vec![2u8; 8],
+        },
+        Arc::new(TestClock),
+        Arc::new(TestEntropy),
+    );
+    node_b.register_carrier(Box::new(umc_carrier_tcp::TcpCarrier));
+
+    let handshake_a = tokio::task::spawn_blocking({
+        let remote = remote.clone();
+        move || tcp_handshake(&node_a, &remote)
+    });
+    let (link_a, session_a, ephemeral_a, keys_a) =
+        tokio::time::timeout(Duration::from_secs(20), handshake_a)
+            .await
+            .expect("A handshake timed out")
+            .expect("A handshake panicked")
+            .expect("A handshake failed");
+    let handshake_b = tokio::task::spawn_blocking({
+        let remote = remote.clone();
+        move || tcp_handshake(&node_b, &remote)
+    });
+    let (link_b, session_b, ephemeral_b, keys_b) =
+        tokio::time::timeout(Duration::from_secs(20), handshake_b)
+            .await
+            .expect("B handshake timed out")
+            .expect("B handshake panicked")
+            .expect("B handshake failed");
+
+    // The daemon registers each session under its provisional peer id.
+    let peer_a = provisional_peer_id(&ephemeral_a).to_vec();
+    let peer_b = provisional_peer_id(&ephemeral_b).to_vec();
+
+    let link_a = Arc::new(link_a);
+    let link_b = Arc::new(link_b);
+    let session_a = Arc::new(Mutex::new(session_a));
+    let session_b = Arc::new(Mutex::new(session_b));
+    let statuses_a = Arc::new(Mutex::new(Vec::new()));
+    let statuses_b = Arc::new(Mutex::new(Vec::new()));
+    let raw_frames_b = Arc::new(Mutex::new(Vec::new()));
+
+    // A opens a circuit toward B (hint = B's peer id); the daemon allocates
+    // circuit 1 (the first open on a fresh relay service). The send runs
+    // with no recv in flight: the TCP carrier's single stream mutex would
+    // otherwise starve the client's own writer.
+    let open_a = RelayOpenFrame {
+        circuit_id: 1000,
+        bidirectional: true,
+        store_forward_allowed: false,
+        private_circuit: false,
+        multipath_allowed: false,
+        requested_lifetime: 600_000,
+        requested_byte_quota: 1_048_576,
+        next_hop_hint: peer_b.clone(),
+        authorization: Vec::new(),
+    };
+    send_frame(
+        &mut session_a.lock().expect("session a"),
+        &link_a,
+        open_a.encode().expect("encode"),
+    )
+    .expect("A open send");
+    recv_until(
+        &link_a,
+        &session_a,
+        keys_a.clone(),
+        &statuses_a,
+        &raw_frames_b,
+        WaitFor::Status(1),
+        "A open status",
+    )
+    .await;
+
+    // B opens a circuit toward A; the daemon allocates circuit 2.
+    let open_b = RelayOpenFrame {
+        circuit_id: 2000,
+        next_hop_hint: peer_a.clone(),
+        ..open_a.clone()
+    };
+    send_frame(
+        &mut session_b.lock().expect("session b"),
+        &link_b,
+        open_b.encode().expect("encode"),
+    )
+    .expect("B open send");
+    recv_until(
+        &link_b,
+        &session_b,
+        keys_b.clone(),
+        &statuses_b,
+        &raw_frames_b,
+        WaitFor::Status(1),
+        "B open status",
+    )
+    .await;
+
+    // A sends data on its circuit: the daemon accepts it and forwards a
+    // fresh `RELAY_DATA` into session B's bus channel, which B's session
+    // task queues for B's link.
+    let data = RelayDataFrame {
+        circuit_id: 1,
+        relay_sequence: 0,
+        fin: false,
+        ack_requested: false,
+        high_priority: false,
+        data: b"inner-packet".to_vec(),
+    };
+    send_frame(
+        &mut session_a.lock().expect("session a"),
+        &link_a,
+        data.encode().expect("encode"),
+    )
+    .expect("A data send");
+
+    // B's link is idle: the daemon's recv pump holds the stream mutex,
+    // starving B's carrier writer (carriers/tcp.md). PINGs from B cycle
+    // the pump; each recv window gives B's writer a flush window for the
+    // queued forward.
+    let ping = umc_wire::varint::encode(FrameType::PING.0).expect("ping encode");
+    for round in 0..5 {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        send_frame(
+            &mut session_b.lock().expect("session b"),
+            &link_b,
+            ping.clone(),
+        )
+        .expect("B ping send");
+        recv_until(
+            &link_b,
+            &session_b,
+            keys_b.clone(),
+            &statuses_b,
+            &raw_frames_b,
+            WaitFor::ForwardedRelayData,
+            &format!("B forward round {round}"),
+        )
+        .await;
+    }
+
+    // B's client received the raw forwarded frame on B's circuit.
+    let raw = raw_frames_b.lock().expect("raw frames").clone();
+    let forwarded = raw
+        .iter()
+        .find_map(|bytes| {
+            let (ty, used) = umc_wire::varint::decode(bytes).ok()?;
+            if FrameType(ty) != FrameType::RELAY_DATA {
+                return None;
+            }
+            RelayDataFrame::decode(&bytes[used..]).ok().map(|(f, _)| f)
+        })
+        .unwrap_or_else(|| panic!("forwarded relay data never arrived; raw: {raw:?}"));
+    assert_eq!(forwarded.circuit_id, 2, "forwarded on B's circuit");
+    assert_eq!(forwarded.relay_sequence, 0);
+    assert!(!forwarded.fin);
+    assert_eq!(forwarded.data, b"inner-packet");
+
+    // The daemon's event log records the forward.
+    wait_for_event(&socket, "relay_data_forwarded").await;
+
+    drop(daemon);
+}
