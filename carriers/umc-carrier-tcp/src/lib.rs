@@ -95,15 +95,21 @@ impl Listener for TcpListenerAdapter {
     }
 }
 
+/// How long `recv` holds the stream lock waiting for one byte before
+/// releasing it (returning `WouldBlock`) so the writer task can flush.
+/// A blocking read that holds the shared mutex indefinitely would starve
+/// the writer once a session reads ahead of its replies.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(20);
+
 #[derive(Debug)]
 pub struct TcpLink {
-    stream: Arc<Mutex<TcpStream>>,
+    stream: Arc<Mutex<(TcpStream, Vec<u8>)>>, // stream + partial-frame bytes
     outbound: mpsc::Sender<OutboundPacket>,
 }
 
 impl TcpLink {
     pub fn new(stream: TcpStream) -> Self {
-        let stream = Arc::new(Mutex::new(stream));
+        let stream = Arc::new(Mutex::new((stream, Vec::new())));
         let (tx, mut rx) = mpsc::channel::<OutboundPacket>(SEND_QUEUE_CAPACITY);
         let writer_stream = stream.clone();
         tokio::spawn(async move {
@@ -114,10 +120,10 @@ impl TcpLink {
                 }
                 framed.extend_from_slice(&packet.bytes);
                 let mut guard = writer_stream.lock().await;
-                if guard.write_all(&framed).await.is_err() {
+                if guard.0.write_all(&framed).await.is_err() {
                     break;
                 }
-                let _ = guard.flush().await;
+                let _ = guard.0.flush().await;
             }
         });
         Self {
@@ -201,22 +207,42 @@ impl Link for TcpLink {
         let stream = self.stream.clone();
         let packet = rt.block_on(async move {
             let mut guard = stream.lock().await;
-            let mut buf = Vec::new();
+            let mut buf = std::mem::take(&mut guard.1);
             loop {
                 let mut b = [0u8; 1];
-                if guard.read_exact(&mut b).await.is_err() {
-                    return Err(CarrierError::new(CarrierErrorKind::LinkFailed, "recv"));
+                match tokio::time::timeout(READ_TIMEOUT, guard.0.read_exact(&mut b)).await {
+                    Err(_) => {
+                        // Timed out waiting for a byte: park the partial
+                        // frame and release the lock so the writer flushes.
+                        guard.1 = buf;
+                        return Err(CarrierError::new(CarrierErrorKind::WouldBlock, "recv"));
+                    }
+                    Ok(Err(_)) => {
+                        return Err(CarrierError::new(CarrierErrorKind::LinkFailed, "recv"))
+                    }
+                    Ok(Ok(_)) => buf.push(b[0]),
                 }
-                buf.push(b[0]);
                 match umc_wire_framing::read_length(&buf) {
                     Ok(Some((len, used))) => {
                         let mut payload = vec![0u8; len];
-                        guard
-                            .read_exact(&mut payload)
+                        match tokio::time::timeout(READ_TIMEOUT, guard.0.read_exact(&mut payload))
                             .await
-                            .map_err(|_| CarrierError::new(CarrierErrorKind::LinkFailed, "recv"))?;
-                        let _ = used;
-                        return Ok(payload);
+                        {
+                            Err(_) => {
+                                guard.1 = buf;
+                                return Err(CarrierError::new(
+                                    CarrierErrorKind::WouldBlock,
+                                    "recv",
+                                ));
+                            }
+                            Ok(Err(_)) => {
+                                return Err(CarrierError::new(CarrierErrorKind::LinkFailed, "recv"))
+                            }
+                            Ok(Ok(_)) => {
+                                let _ = used;
+                                return Ok(payload);
+                            }
+                        }
                     }
                     Ok(None) => {}
                     Err(()) => {
@@ -241,7 +267,7 @@ impl Link for TcpLink {
             .map_err(|_| CarrierError::new(CarrierErrorKind::NotRunning, "close"))?;
         rt.block_on(async move {
             let mut guard = stream.lock().await;
-            let _ = guard.shutdown().await;
+            let _ = guard.0.shutdown().await;
         });
         Ok(())
     }
