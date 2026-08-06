@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn expiry_priority_over_idle() {
         let now = Instant(0);
-        let mut c = Circuit::new(2, now, 1_000, 100, true, false);
+        let c = Circuit::new(2, now, 1_000, 100, true, false);
         // Lifetime expires first at 1000ms; idle at 120s.
         assert_eq!(
             expiry_reason(&c, now + Duration::from_millis(1_000)),

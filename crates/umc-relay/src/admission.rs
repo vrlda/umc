@@ -103,8 +103,10 @@ mod tests {
 
     #[test]
     fn accepted_with_granted_limits() {
-        let mut limits = AdmissionLimits::default();
-        limits.policy = RelayPolicy::Community;
+        let limits = AdmissionLimits {
+            policy: RelayPolicy::Community,
+            ..Default::default()
+        };
         match evaluate_open(&limits, 0, 600_000, 1_048_576, 0x01) {
             AdmissionDecision::Accepted {
                 granted_lifetime_ms,
@@ -120,8 +122,10 @@ mod tests {
 
     #[test]
     fn per_peer_circuit_limit() {
-        let mut limits = AdmissionLimits::default();
-        limits.policy = RelayPolicy::Public;
+        let limits = AdmissionLimits {
+            policy: RelayPolicy::Public,
+            ..Default::default()
+        };
         assert_eq!(
             evaluate_open(&limits, 4, 600_000, 0, 0),
             AdmissionDecision::ResourceLimit
@@ -130,8 +134,10 @@ mod tests {
 
     #[test]
     fn quota_capped_at_local_max() {
-        let mut limits = AdmissionLimits::default();
-        limits.policy = RelayPolicy::Public;
+        let limits = AdmissionLimits {
+            policy: RelayPolicy::Public,
+            ..Default::default()
+        };
         match evaluate_open(&limits, 0, 600_000, 1 << 30, 0) {
             AdmissionDecision::Accepted {
                 granted_byte_quota, ..
@@ -142,8 +148,10 @@ mod tests {
 
     #[test]
     fn zero_quota_uses_policy_default() {
-        let mut limits = AdmissionLimits::default();
-        limits.policy = RelayPolicy::Public;
+        let limits = AdmissionLimits {
+            policy: RelayPolicy::Public,
+            ..Default::default()
+        };
         match evaluate_open(&limits, 0, 600_000, 0, 0) {
             AdmissionDecision::Accepted {
                 granted_byte_quota, ..
@@ -154,8 +162,10 @@ mod tests {
 
     #[test]
     fn unknown_flags_rejected() {
-        let mut limits = AdmissionLimits::default();
-        limits.policy = RelayPolicy::Public;
+        let limits = AdmissionLimits {
+            policy: RelayPolicy::Public,
+            ..Default::default()
+        };
         assert_eq!(
             evaluate_open(&limits, 0, 600_000, 0, 0x10),
             AdmissionDecision::UnsupportedFlags
