@@ -21,6 +21,7 @@ members = [
     "examples/echo",
     "tests/phase1",
     "tests/phase2",
+    "tests/phase3",
 ]
 
 [workspace.package]
