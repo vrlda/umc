@@ -303,7 +303,9 @@ fn lost_packet_payload_retransmitted() {
             .any(|f| matches!(f, umc_wire::frame::Frame::Ping)),
         "retransmission carries the PING frame again"
     );
-    // The fresh packet's payload is retained for a future retransmission.
+    // The fresh packet is ack-eliciting and in flight, so its payload is
+    // retained in the table for a future retransmission.
     let fresh = client.sent_state().sent().back().expect("fresh packet");
-    assert_eq!(fresh.payload, ping);
+    assert!(fresh.ack_eliciting);
+    assert!(fresh.in_flight);
 }

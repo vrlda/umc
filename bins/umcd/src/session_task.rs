@@ -31,6 +31,7 @@ use umc_wire::frame::Frame;
 use umc_wire::frames::bundle::BundleFrame;
 use umc_wire::frames::relay::RelayStatusFrame;
 use umc_wire::frames::routing::RouteResponseFrame;
+use umc_wire::header::ShortPacketSpace;
 use umc_wire::packet::{parse_payload, PacketContext};
 
 use crate::relay_service::CircuitOpenRequest;
@@ -90,6 +91,30 @@ fn pto_deadline_at(session: &Session, multiplier: u32) -> Option<tokio::time::In
         .as_millis()
         .saturating_mul(u64::from(multiplier));
     Some(tokio::time::Instant::now() + Duration::from_millis(ms))
+}
+
+/// PTO deadline for the next loop iteration. An armed deadline is kept while
+/// ack-eliciting packets remain in flight and cleared once they are all
+/// acknowledged; with nothing armed the deadline is armed from now whenever
+/// ack-eliciting packets are in flight (which covers every send site: the
+/// session writer, the bus, probes, and retransmits). Plain inbound
+/// processing, retransmits, and new sends never extend an armed deadline, so
+/// sustained traffic cannot push the probe out (RFC 9002 §6.2.1 arms the PTO
+/// timer only when it is not already set).
+fn pto_deadline_after(
+    session: &Session,
+    multiplier: u32,
+    armed: Option<tokio::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    let in_flight = session
+        .sent_state()
+        .sent()
+        .iter()
+        .any(|p| p.ack_eliciting && p.in_flight);
+    if !in_flight {
+        return None;
+    }
+    armed.or_else(|| pto_deadline_at(session, multiplier))
 }
 
 /// Spawn the per-session wire loop. The tasks exit when `link.recv` errors
@@ -239,10 +264,11 @@ async fn reader_loop(
     mut bus_outbound_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
     let mut sweep = SweepState::default();
-    // PTO probe schedule (session.md §14.3): the deadline is re-armed after
-    // every processed packet while ack-eliciting packets are in flight, and
-    // the backoff doubles on each consecutive expiry and resets to 1x when
-    // any ACK arrives.
+    // PTO probe schedule (session.md §14.3): the deadline is armed when
+    // nothing is armed and ack-eliciting packets are in flight, re-armed
+    // (with a doubled multiplier) when it fires and a probe was sent, and
+    // cleared once everything is acknowledged. An armed deadline is never
+    // extended by inbound traffic, so the probe cannot be starved.
     let mut pto_deadline: Option<tokio::time::Instant> = None;
     let mut pto_multiplier: u32 = 1;
     loop {
@@ -313,7 +339,6 @@ async fn reader_loop(
                 }
             }
             () = pto_sleep(pto_deadline) => {
-                pto_multiplier = pto_multiplier.saturating_mul(2);
                 let now = clock.now();
                 let probe = {
                     let mut session = session.lock().await;
@@ -341,20 +366,32 @@ async fn reader_loop(
                             deadline_ms: None,
                         })
                     });
-                    if let Err(e) = sent {
+                    if sent.is_ok() {
+                        // The backoff doubles only when a probe was actually
+                        // sent (session.md §14.3); a failed send leaves the
+                        // multiplier unchanged.
+                        pto_multiplier = pto_multiplier.saturating_mul(2);
+                    } else if let Err(e) = sent {
                         #[cfg(debug_assertions)]
                         println!("[session {session_id}] PTO probe send error: {e:?}");
                     }
                 }
+                // The deadline just fired: re-arm from now while ack-eliciting
+                // packets remain in flight (disarmed once they are all acked).
+                let session = session.lock().await;
+                pto_deadline = pto_deadline_at(&session, pto_multiplier);
             }
         }
         // Give the carrier's background writer a window to flush before the
         // next recv takes the stream lock (carriers/tcp.md).
         tokio::time::sleep(FLUSH_INTERVAL).await;
-        // Re-arm the PTO deadline from the session's in-flight state.
+        // Arm when nothing is armed (a new ack-eliciting send without an
+        // armed deadline, e.g. from the session writer); keep an armed
+        // deadline untouched and clear it once nothing remains in flight.
+        // Inbound processing never extends an armed deadline here.
         {
             let session = session.lock().await;
-            pto_deadline = pto_deadline_at(&session, pto_multiplier);
+            pto_deadline = pto_deadline_after(&session, pto_multiplier, pto_deadline);
         }
     }
     ended.store(true, Ordering::Relaxed);
@@ -401,29 +438,37 @@ async fn process_inbound_packet(
                 return false;
             }
         };
-        // Loss detection (session.md §14): an ACK of a packet at least three
-        // numbers higher declares older ack-eliciting packets lost; their
-        // retained payloads are re-sent under fresh packet numbers.
-        if let Some(largest_acked) = frames.as_ref().and_then(|fs| {
-            fs.iter()
-                .filter_map(|f| match f {
-                    Frame::Ack(ack) => Some(ack.largest_acknowledged),
-                    _ => None,
-                })
-                .max()
-        }) {
-            let rtt = session.rtt().clone();
-            let detector = session.loss_detector().clone();
-            let lost = detect_lost_packets(
-                session.sent_state_mut(),
-                &rtt,
-                now,
-                largest_acked,
-                &detector,
-            );
-            for pn in lost {
-                if let Ok(Some(bytes)) = session.retransmit(pn, now) {
-                    retransmits.push(bytes);
+        // Loss detection (session.md §14) runs only for the session data
+        // space: an ACK of a packet at least three numbers higher declares
+        // older packets lost; their retained payloads are re-sent under
+        // fresh packet numbers. Every lost packet leaves the sent queue;
+        // non-ack-eliciting ones only have their retained payload pruned.
+        if let Some((space, control_frames)) = frames.as_ref() {
+            if *space == ShortPacketSpace::SessionData {
+                if let Some(largest_acked) = control_frames
+                    .iter()
+                    .filter_map(|f| match f {
+                        Frame::Ack(ack) => Some(ack.largest_acknowledged),
+                        _ => None,
+                    })
+                    .max()
+                {
+                    let rtt = session.rtt().clone();
+                    let detector = session.loss_detector().clone();
+                    let lost = detect_lost_packets(
+                        session.sent_state_mut(),
+                        &rtt,
+                        now,
+                        largest_acked,
+                        &detector,
+                    );
+                    for pn in lost {
+                        if let Ok(Some(bytes)) = session.retransmit(pn, now) {
+                            retransmits.push(bytes);
+                        } else {
+                            session.prune_retransmit_payload(pn);
+                        }
+                    }
                 }
             }
         }
@@ -437,9 +482,9 @@ async fn process_inbound_packet(
         }
         if frames.is_some() || sweep_due || rotation_due {
             let mut state = runtime.lock().expect("runtime state");
-            if let Some(frames) = &frames {
+            if let Some((_space, control_frames)) = &frames {
                 if let Some(payload) =
-                    handle_control_frames(&mut state, session_id, &mut session, frames, now)
+                    handle_control_frames(&mut state, session_id, &mut session, control_frames, now)
                 {
                     combined.extend_from_slice(&payload);
                 }
@@ -537,19 +582,24 @@ async fn process_inbound_packet(
             println!("[session {session_id}] retransmit send error: {e:?}");
         }
     }
-    frames.is_some_and(|fs| fs.iter().any(|f| matches!(f, Frame::Ack(_))))
+    frames
+        .as_ref()
+        .is_some_and(|(_space, fs)| fs.iter().any(|f| matches!(f, Frame::Ack(_))))
 }
 
 /// Parse the control frames out of an inbound protected packet with the
 /// daemon's copy of the peer's traffic keys. The session layer applies
 /// stream/datagram/ACK frames itself; this read-only parse (with the same
-/// keys, so it never disturbs session state) exposes the relay, bundle,
-/// routing, and key-update frames for daemon dispatch.
-fn parse_control_frames(remote_keys: &PacketKeys, bytes: &[u8]) -> Option<Vec<Frame>> {
+/// keys, so it never disturbs session state) exposes the packet's space and
+/// the relay, bundle, routing, and key-update frames for daemon dispatch.
+fn parse_control_frames(
+    remote_keys: &PacketKeys,
+    bytes: &[u8],
+) -> Option<(ShortPacketSpace, Vec<Frame>)> {
     let (space, _dcid, _path, _pn, payload) =
         umc_session::packet::parse_protected_packet(remote_keys, bytes).ok()?;
     let parsed = parse_payload(&PacketContext::Protected(space), &payload).ok()?;
-    Some(parsed.frames)
+    Some((space, parsed.frames))
 }
 
 /// Dispatch the control frames of one inbound packet to the runtime
@@ -1542,9 +1592,8 @@ mod tests {
                 "lost packet leaves the sent state"
             );
             assert!(
-                sent.iter()
-                    .any(|p| p.packet_number == 4 && p.payload == ping),
-                "retransmitted packet queued with the stored PING payload"
+                sent.iter().any(|p| p.packet_number == 4 && p.ack_eliciting),
+                "retransmitted packet queued under a fresh packet number"
             );
         }
         // The retransmit travels after the ACK reply on the link.
@@ -1581,5 +1630,43 @@ mod tests {
             pto_deadline_at(&session, 1).is_some(),
             "deadline armed while ack-eliciting packets are in flight"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pto_deadline_not_extended_by_inbound_traffic() {
+        let mut session = test_session();
+        let ping = umc_wire::varint::encode(umc_types::frame::FrameType::PING.0).unwrap();
+        session
+            .build_outbound(&crate::runtime_adapters::OsClock, Instant(0), &ping)
+            .unwrap()
+            .unwrap();
+        let armed = pto_deadline_at(&session, 1).expect("deadline armed");
+        // Inbound processing that sends nothing must not extend the armed
+        // deadline: the stale deadline fires on schedule instead of being
+        // pushed back, so the PTO probe cannot be starved by traffic.
+        assert_eq!(pto_deadline_after(&session, 1, Some(armed)), Some(armed));
+        // No deadline armed with in-flight: the deadline is armed.
+        let mut fresh = test_session();
+        fresh
+            .build_outbound(&crate::runtime_adapters::OsClock, Instant(0), &ping)
+            .unwrap()
+            .unwrap();
+        assert!(pto_deadline_after(&fresh, 1, None).is_some());
+        // Acking every in-flight packet clears the deadline.
+        let ack = umc_wire::frame::AckFrame {
+            largest_acknowledged: 0,
+            ack_delay: 0,
+            first_ack_range: 1,
+            additional_ranges: Vec::new(),
+        };
+        fresh.apply_peer_ack(&ack, Instant(1)).unwrap();
+        assert_eq!(
+            pto_deadline_after(&fresh, 1, Some(armed)),
+            None,
+            "no in-flight packets means no deadline"
+        );
+        // Nothing in flight, nothing armed: stays disarmed.
+        let idle = test_session();
+        assert!(pto_deadline_after(&idle, 1, None).is_none());
     }
 }

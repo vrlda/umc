@@ -66,14 +66,15 @@ impl Stream {
         }
     }
 
-    /// Buffer a received segment at `offset`.
+    /// Buffer a received segment at `offset`. Returns the number of new bytes
+    /// buffered (0 for a fully duplicated segment, which is dropped silently).
     ///
     /// # Errors
     ///
     /// Returns `StreamError` when the segment conflicts with the final size,
-    /// overlaps buffered data, exceeds flow-control or out-of-order budgets,
-    /// or arrives with offsets out of order.
-    pub fn receive(&mut self, offset: u64, data: &[u8], fin: bool) -> Result<(), StreamError> {
+    /// partially overlaps buffered or delivered data, exceeds flow-control or
+    /// out-of-order budgets, or arrives with offsets out of order.
+    pub fn receive(&mut self, offset: u64, data: &[u8], fin: bool) -> Result<usize, StreamError> {
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or(StreamError::DataBeyondFinalSize)?;
@@ -93,6 +94,20 @@ impl Stream {
         }
         if offset > self.max_stream_data_local {
             return Err(StreamError::OffsetsOutOfOrder);
+        }
+        // Idempotent dedup (QUIC-style): a segment fully inside already-
+        // delivered bytes, or inside an existing buffered range, carries no
+        // new data — a delayed original arriving after its retransmit was
+        // delivered must not error the whole packet. Partial conflicts (the
+        // segment straddles the boundary of existing data) still error below.
+        if end <= self.next_deliver_offset {
+            return Ok(0);
+        }
+        if let Some((&key, value)) = self.buffered.range(..=offset).next_back() {
+            let range_end = key.saturating_add(value.len() as u64);
+            if key <= offset && end <= range_end {
+                return Ok(0);
+            }
         }
         if offset < self.next_deliver_offset {
             return Err(StreamError::OffsetsOutOfOrder);
@@ -114,7 +129,7 @@ impl Stream {
             return Err(StreamError::OutOfOrderBudgetExceeded);
         }
         self.buffered.insert(offset, data.to_vec());
-        Ok(())
+        Ok(data.len())
     }
 
     /// Deliver contiguous bytes from `next_deliver_offset`.
@@ -202,10 +217,50 @@ mod tests {
     fn overlapping_conflict_rejected() {
         let mut s = Stream::new(0, Vec::new(), 1_000_000);
         s.receive(0, b"abc", false).unwrap();
+        // A segment that straddles the boundary of buffered data — new bytes
+        // beyond the existing range — is a partial conflict, not a duplicate.
         assert_eq!(
-            s.receive(1, b"x", false),
+            s.receive(2, b"xyz", false),
             Err(StreamError::OverlappingDataConflict)
         );
+    }
+
+    #[test]
+    fn partial_overlap_of_delivered_region_rejected() {
+        let mut s = Stream::new(0, Vec::new(), 1_000_000);
+        s.receive(0, b"abc", false).unwrap();
+        let (data, _eof) = s.read_available();
+        assert_eq!(data, b"abc");
+        // Starts inside the delivered region but carries new bytes past it:
+        // a partial conflict, not a silent duplicate.
+        assert_eq!(
+            s.receive(2, b"xyz", false),
+            Err(StreamError::OffsetsOutOfOrder)
+        );
+    }
+
+    #[test]
+    fn duplicate_segment_after_delivery_is_idempotent() {
+        let mut s = Stream::new(0, Vec::new(), 1_000_000);
+        s.receive(0, b"hel", false).unwrap();
+        s.receive(3, b"lo", true).unwrap();
+        let (data, eof) = s.read_available();
+        assert_eq!(data, b"hello");
+        assert!(eof);
+        // A delayed original arriving after the retransmit was delivered must
+        // not error (QUIC-style silent dedup): it carries no new bytes.
+        assert!(s.receive(0, b"hel", false).is_ok());
+        let (data, _eof) = s.read_available();
+        assert!(data.is_empty(), "duplicate must not be delivered again");
+    }
+
+    #[test]
+    fn duplicate_of_buffered_range_is_idempotent() {
+        let mut s = Stream::new(0, Vec::new(), 1_000_000);
+        s.receive(3, b"lo", false).unwrap();
+        assert_eq!(s.buffered.len(), 1);
+        assert!(s.receive(3, b"lo", false).is_ok());
+        assert_eq!(s.buffered.len(), 1, "duplicate must not be re-buffered");
     }
 
     #[test]

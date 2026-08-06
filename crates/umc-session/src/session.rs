@@ -274,7 +274,6 @@ impl Session {
             payload.len() + 64,
             true,
             0,
-            payload.to_vec(),
         );
         self.retransmit_payloads.insert(pn, payload.to_vec());
         self.sent.record_sent(sent);
@@ -392,11 +391,13 @@ impl Session {
         ) {
             return Err(SessionError::StreamClosed);
         }
-        stream
+        let new_bytes = stream
             .receive(f.offset, &f.data, f.fin)
             .map_err(SessionError::Stream)?;
+        // A fully duplicated segment consumes no flow credit: it was already
+        // accounted when first received.
         self.flow
-            .consume(f.offset + f.data.len() as u64)
+            .consume(new_bytes as u64)
             .map_err(SessionError::Flow)
     }
 
@@ -477,10 +478,10 @@ impl Session {
     }
 
     /// Re-send the payload of packet `pn` under a fresh packet number
-    /// (session.md §14.3): loss detection drops the lost packet from the sent
-    /// queue, so the payload is looked up first in the outstanding packets and
-    /// then in the retained-payload table. Returns the freshly built packet
-    /// bytes, or `None` when `pn` is neither outstanding nor retained.
+    /// (session.md §14.3): loss detection drops every lost packet from the
+    /// sent queue, so the retained-payload table is the only source. Returns
+    /// the freshly built packet bytes, or `None` when `pn` has no retained
+    /// payload (never built, already acked, or already retransmitted).
     ///
     /// # Errors
     ///
@@ -488,19 +489,19 @@ impl Session {
     /// missing, [`SessionError::Space`] if packet numbers are exhausted, and
     /// [`SessionError::Packet`] if packet assembly fails.
     pub fn retransmit(&mut self, pn: u64, now: Instant) -> Result<Option<Vec<u8>>, SessionError> {
-        let payload = self
-            .sent
-            .sent()
-            .iter()
-            .find(|p| p.packet_number == pn)
-            .map(|p| p.payload.clone())
-            .or_else(|| self.retransmit_payloads.get(&pn).cloned());
-        let Some(payload) = payload else {
+        let Some(payload) = self.retransmit_payloads.get(&pn).cloned() else {
             return Ok(None);
         };
         let bytes = self.build_outbound_inner(now, &payload)?;
         self.retransmit_payloads.remove(&pn);
         Ok(bytes)
+    }
+
+    /// Drop the retained payload of a lost packet that must not be
+    /// retransmitted (e.g. a non-ack-eliciting packet). The table is keyed
+    /// by packet number, so pruning an absent entry is a no-op.
+    pub fn prune_retransmit_payload(&mut self, pn: u64) {
+        self.retransmit_payloads.remove(&pn);
     }
 
     /// Replay-window footprint in bytes for `space` (session.md §8.2): a
@@ -829,7 +830,6 @@ mod tests {
             64,
             true,
             0,
-            Vec::new(),
         ));
         let ack = umc_wire::frame::AckFrame {
             largest_acknowledged: 1,
@@ -853,7 +853,6 @@ mod tests {
             64,
             true,
             0,
-            Vec::new(),
         ));
         s.sent.record_sent(SentPacket::new(
             2,
@@ -862,7 +861,6 @@ mod tests {
             64,
             true,
             0,
-            Vec::new(),
         ));
         let ack = umc_wire::frame::AckFrame {
             largest_acknowledged: 2,

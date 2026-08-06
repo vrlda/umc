@@ -79,7 +79,10 @@ pub fn detect_lost_packets(
         let pn = p.packet_number;
         let packet_lost = loss_detector.packet_threshold_lost(pn, largest_acked)
             || loss_detector.time_threshold_lost(rtt, p.sent_at, now, largest_acked > pn);
-        if packet_lost && p.ack_eliciting {
+        if packet_lost {
+            // Every lost packet leaves the queue and is reported; the caller
+            // decides what to retransmit (only ack-eliciting payloads are
+            // retained for re-sending) and prunes the rest (session.md §14).
             lost.push(pn);
         } else {
             keep.push_back(p);
@@ -145,7 +148,6 @@ mod tests {
                 64,
                 true,
                 0,
-                Vec::new(),
             ));
         }
         let mut rtt = RttEstimator::new();
@@ -157,5 +159,38 @@ mod tests {
         assert!(lost.contains(&0) && lost.contains(&1) && lost.contains(&2));
         assert!(!lost.contains(&3) && !lost.contains(&4) && !lost.contains(&5));
         assert_eq!(sent.sent().len(), 3);
+    }
+
+    #[test]
+    fn non_ack_eliciting_lost_packet_leaves_queue() {
+        let mut sent = AckSendState::new();
+        sent.record_sent(SentPacket::new(
+            0,
+            PacketSpace::SessionData,
+            Instant(0),
+            64,
+            true,
+            0,
+        ));
+        sent.record_sent(SentPacket::new(
+            1,
+            PacketSpace::SessionData,
+            Instant(0),
+            64,
+            false,
+            0,
+        ));
+        let mut rtt = RttEstimator::new();
+        rtt.sample(100);
+        let d = LossDetector::new(25);
+        let lost = detect_lost_packets(&mut sent, &rtt, Instant(50), 4, &d);
+        assert!(
+            lost.contains(&0) && lost.contains(&1),
+            "all lost packet numbers are reported, ack-eliciting or not"
+        );
+        assert!(
+            sent.sent().is_empty(),
+            "a lost non-ack-eliciting packet leaves the sent queue"
+        );
     }
 }
