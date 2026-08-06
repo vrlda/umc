@@ -385,29 +385,6 @@ impl Session {
             .map_err(SessionError::Flow)
     }
 
-    /// Apply a peer ACK to the sent-packet state.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SessionError::Ack`] if the ACK acknowledges unsent packets.
-    pub fn on_peer_ack(
-        &mut self,
-        now: Instant,
-        largest: u64,
-        first_len: u64,
-        ranges: &[(u64, u64)],
-    ) -> Result<(), SessionError> {
-        let _ = now;
-        let mut flat = Vec::new();
-        flat.push((first_len, 0));
-        flat.extend_from_slice(ranges);
-        let _ = self
-            .sent
-            .apply_ack(largest, &flat)
-            .map_err(SessionError::Ack)?;
-        Ok(())
-    }
-
     /// Apply a peer ACK to the sent-packet state and sample RTT
     /// (congestion.md §8): each newly acknowledged packet yields a sample of
     /// `now - sent_at` minus the peer's reported ack delay; non-positive
@@ -434,14 +411,30 @@ impl Session {
             .sent
             .apply_ack(ack.largest_acknowledged, &flat)
             .map_err(SessionError::Ack)?;
+        // RFC 9002 §5.3: latest_rtt is sampled only from the newest acked
+        // packet (the acked list is ascending by packet number); min_rtt and
+        // smoothed_rtt still sample every packet below.
+        let newest_sample = acked
+            .last()
+            .and_then(|pn| sent_at_by_pn.get(pn))
+            .map(|sent_at| {
+                now.duration_since(*sent_at)
+                    .as_millis()
+                    .saturating_sub(ack.ack_delay)
+            });
         for pn in &acked {
             if let Some(sent_at) = sent_at_by_pn.get(pn) {
-                let sample_ms = now.duration_since(*sent_at).as_millis();
-                let sample = sample_ms.saturating_sub(ack.ack_delay);
+                let sample = now
+                    .duration_since(*sent_at)
+                    .as_millis()
+                    .saturating_sub(ack.ack_delay);
                 if sample > 0 {
                     self.rtt.sample(sample);
                 }
             }
+        }
+        if let Some(sample) = newest_sample.filter(|s| *s > 0) {
+            self.rtt.latest_rtt = sample;
         }
         Ok(acked)
     }
@@ -765,5 +758,61 @@ mod tests {
         // The oldest ids were evicted; the newest survive.
         assert!(!registry.contains(0));
         assert!(registry.contains(MAX_CLOSED_STREAM_IDS as u64));
+    }
+
+    #[test]
+    fn apply_peer_ack_rejects_zero_first_range() {
+        let mut s = session();
+        s.sent.record_sent(SentPacket::new(
+            1,
+            PacketSpace::SessionData,
+            Instant(0),
+            64,
+            true,
+            0,
+        ));
+        let ack = umc_wire::frame::AckFrame {
+            largest_acknowledged: 1,
+            ack_delay: 0,
+            first_ack_range: 0,
+            additional_ranges: Vec::new(),
+        };
+        assert_eq!(
+            s.apply_peer_ack(&ack, Instant(5)),
+            Err(SessionError::Ack(crate::ack::AckError::EmptyRange))
+        );
+    }
+
+    #[test]
+    fn latest_rtt_comes_from_newest_acked_packet() {
+        let mut s = session();
+        s.sent.record_sent(SentPacket::new(
+            1,
+            PacketSpace::SessionData,
+            Instant(10),
+            64,
+            true,
+            0,
+        ));
+        s.sent.record_sent(SentPacket::new(
+            2,
+            PacketSpace::SessionData,
+            Instant(40),
+            64,
+            true,
+            0,
+        ));
+        let ack = umc_wire::frame::AckFrame {
+            largest_acknowledged: 2,
+            ack_delay: 0,
+            first_ack_range: 2,
+            additional_ranges: Vec::new(),
+        };
+        let acked = s.apply_peer_ack(&ack, Instant(50)).unwrap();
+        assert_eq!(acked, vec![1, 2]);
+        // latest_rtt samples only the newest acked packet (RFC 9002 §5.3);
+        // min_rtt still reflects every packet.
+        assert_eq!(s.rtt().latest_rtt, 10);
+        assert_eq!(s.rtt().min_rtt, 10);
     }
 }

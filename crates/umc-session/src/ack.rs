@@ -126,9 +126,14 @@ impl AckSendState {
     ///
     /// # Errors
     ///
-    /// Returns [`AckError::AcknowledgesUnsent`] when `largest` exceeds the highest
+    /// Returns [`AckError::EmptyRange`] when the first range length is zero,
+    /// and [`AckError::AcknowledgesUnsent`] when `largest` exceeds the highest
     /// packet number recorded as sent.
     pub fn apply_ack(&mut self, largest: u64, ranges: &[(u64, u64)]) -> Result<Vec<u64>, AckError> {
+        let first_len = ranges.first().map_or(0, |r| r.0);
+        if first_len == 0 {
+            return Err(AckError::EmptyRange);
+        }
         let max_sent = self.sent.back().map_or(0, |p| p.packet_number);
         if largest > max_sent {
             return Err(AckError::AcknowledgesUnsent);
@@ -151,7 +156,6 @@ impl AckSendState {
             }
             false
         };
-        let first_len = ranges.first().map_or(0, |r| r.0);
         let extra = ranges
             .iter()
             .skip(1)
@@ -180,6 +184,7 @@ impl Default for AckSendState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckError {
     AcknowledgesUnsent,
+    EmptyRange,
 }
 
 #[cfg(test)]
@@ -211,7 +216,15 @@ mod tests {
         let mut s = AckSendState::new();
         s.record_sent(sent(1));
         s.record_sent(sent(2));
-        assert_eq!(s.apply_ack(5, &[(0, 1)]), Err(AckError::AcknowledgesUnsent));
+        assert_eq!(s.apply_ack(5, &[(1, 0)]), Err(AckError::AcknowledgesUnsent));
+    }
+
+    #[test]
+    fn apply_ack_rejects_empty_first_range() {
+        let mut s = AckSendState::new();
+        s.record_sent(sent(1));
+        s.record_sent(sent(2));
+        assert_eq!(s.apply_ack(2, &[(0, 0)]), Err(AckError::EmptyRange));
     }
 
     #[test]
