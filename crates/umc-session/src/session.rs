@@ -17,6 +17,39 @@ pub const DEFAULT_DCID_LEN: usize = 8;
 pub const INITIAL_STREAMS: u64 = 16;
 pub const DEFAULT_INITIAL_MAX_DATA: u64 = 4 * 1024 * 1024;
 pub const DEFAULT_INITIAL_MAX_STREAM_DATA: u64 = 256 * 1024;
+/// Cap on remembered closed stream ids (session.md §29): ids are kept only
+/// to reject reuse, so the set is bounded with FIFO eviction.
+pub const MAX_CLOSED_STREAM_IDS: usize = 1_024;
+
+/// Bounded set of stream ids that reached EOF and were read: re-opening
+/// (or delivering to) a closed id is a protocol violation (session.md §29).
+#[derive(Debug, Default)]
+struct ClosedStreamRegistry {
+    ids: std::collections::HashSet<u64>,
+    order: std::collections::VecDeque<u64>,
+}
+
+impl ClosedStreamRegistry {
+    fn contains(&self, stream_id: u64) -> bool {
+        self.ids.contains(&stream_id)
+    }
+
+    fn insert(&mut self, stream_id: u64) {
+        if self.ids.insert(stream_id) {
+            self.order.push_back(stream_id);
+            if self.order.len() > MAX_CLOSED_STREAM_IDS {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.ids.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -56,6 +89,7 @@ pub struct Session {
     loss: LossDetector,
     pub streams: HashMap<u64, Stream>,
     next_outgoing_stream: u64,
+    closed_streams: ClosedStreamRegistry,
     flow: FlowControl,
     datagrams: DatagramQueue,
     dcid: Vec<u8>,
@@ -103,6 +137,7 @@ impl Session {
             loss: LossDetector::new(config.max_ack_delay_ms),
             streams: HashMap::new(),
             next_outgoing_stream: 0,
+            closed_streams: ClosedStreamRegistry::default(),
             flow: FlowControl::new(config.initial_max_data, INITIAL_STREAMS, INITIAL_STREAMS),
             datagrams: DatagramQueue::new(),
             dcid: config.dcid,
@@ -186,7 +221,13 @@ impl Session {
             .streams
             .get_mut(&stream_id)
             .ok_or(SessionError::StreamNotFound)?;
-        Ok(stream.read_available())
+        let (data, eof) = stream.read_available();
+        if eof {
+            // The final size was reached and read: the id is closed and any
+            // further delivery on it is a protocol violation (session.md §29).
+            self.closed_streams.insert(stream_id);
+        }
+        Ok((data, eof))
     }
 
     /// Build the next outbound protected packet (control or data).
@@ -318,9 +359,22 @@ impl Session {
         &mut self,
         f: &umc_wire::frames::stream::StreamFrame,
     ) -> Result<(), SessionError> {
+        // A stream id that was closed (final size reached, read to EOF) or
+        // reset MUST NOT receive more data (session.md §29).
+        if self.closed_streams.contains(f.stream_id) {
+            return Err(SessionError::StreamClosed);
+        }
         let stream = self.streams.entry(f.stream_id).or_insert_with(|| {
             Stream::new(f.stream_id, f.protocol_id.clone(), self.flow.max_data_local)
         });
+        if matches!(
+            stream.recv_state,
+            super::stream::RecvState::DataRead
+                | super::stream::RecvState::ResetRead
+                | super::stream::RecvState::ResetRecvd
+        ) {
+            return Err(SessionError::StreamClosed);
+        }
         stream
             .receive(f.offset, &f.data, f.fin)
             .map_err(SessionError::Stream)?;
@@ -564,6 +618,9 @@ pub enum SessionError {
     Datagram(super::datagram::DatagramError),
     Encode,
     StreamNotFound,
+    /// Delivery on a stream id that was already closed (final size reached
+    /// and read, or reset): stream ids MUST NOT be reused (session.md §29).
+    StreamClosed,
     Ack(super::ack::AckError),
     KeyUpdate,
     PathBudget,
@@ -575,5 +632,98 @@ pub enum SessionError {
 impl From<StreamError> for SessionError {
     fn from(e: StreamError) -> Self {
         SessionError::Stream(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestClock;
+
+    impl Clock for TestClock {
+        fn now(&self) -> Instant {
+            Instant(0)
+        }
+    }
+
+    fn session() -> Session {
+        Session::new(
+            SessionConfig {
+                role: Role::Server,
+                dcid: vec![0u8; DEFAULT_DCID_LEN],
+                local_traffic_secret: [1u8; 32],
+                remote_traffic_secret: [2u8; 32],
+                initial_max_data: 1_000_000,
+                initial_max_stream_data: DEFAULT_INITIAL_MAX_STREAM_DATA,
+                max_ack_delay_ms: 25,
+            },
+            &TestClock,
+        )
+        .expect("session")
+    }
+
+    fn stream_frame(
+        stream_id: u64,
+        offset: u64,
+        data: &[u8],
+        fin: bool,
+    ) -> umc_wire::frames::stream::StreamFrame {
+        umc_wire::frames::stream::StreamFrame {
+            stream_id,
+            fin,
+            offset_present: true,
+            len_present: true,
+            open: offset == 0,
+            unidirectional: false,
+            offset,
+            data: data.to_vec(),
+            protocol_id: vec![],
+            metadata: vec![],
+        }
+    }
+
+    #[test]
+    fn closed_stream_id_rejects_further_delivery() {
+        let mut s = session();
+        // Deliver the full stream (fin at offset 3), read it to EOF.
+        s.apply_stream_frame(&stream_frame(0, 0, b"abc", true))
+            .unwrap();
+        let (data, eof) = s.read_stream(0).unwrap();
+        assert_eq!(data, b"abc");
+        assert!(eof);
+        // The id is closed: more data (even at a valid next offset) fails.
+        assert_eq!(
+            s.apply_stream_frame(&stream_frame(0, 3, b"x", false)),
+            Err(SessionError::StreamClosed)
+        );
+        // Re-opening the id with OPEN also fails.
+        assert_eq!(
+            s.apply_stream_frame(&stream_frame(0, 0, b"new", true)),
+            Err(SessionError::StreamClosed)
+        );
+    }
+
+    #[test]
+    fn unread_final_size_is_not_closed() {
+        let mut s = session();
+        // FIN received but never read: not yet closed, delivery continues.
+        s.apply_stream_frame(&stream_frame(4, 0, b"abc", true))
+            .unwrap();
+        assert!(s
+            .apply_stream_frame(&stream_frame(4, 0, b"abc", true))
+            .is_ok());
+    }
+
+    #[test]
+    fn closed_stream_registry_evicts_fifo() {
+        let mut registry = ClosedStreamRegistry::default();
+        for id in 0..MAX_CLOSED_STREAM_IDS as u64 * 2 {
+            registry.insert(id);
+        }
+        assert_eq!(registry.len(), MAX_CLOSED_STREAM_IDS);
+        // The oldest ids were evicted; the newest survive.
+        assert!(!registry.contains(0));
+        assert!(registry.contains(MAX_CLOSED_STREAM_IDS as u64));
     }
 }

@@ -1,5 +1,7 @@
 //! Deterministic pseudo-fuzzing: feed seeded random buffers through the parser.
 //! Runs on stable; never panics on malformed input.
+use umc_wire::frame::{decode_frames, Frame, FrameError};
+use umc_wire::header::ShortPacketSpace;
 use umc_wire::packet::{parse_payload, PacketContext};
 use umc_wire::varint::decode as decode_varint;
 
@@ -62,9 +64,87 @@ fn parser_never_panics_on_corpus_edges() {
     ];
     for buf in corpus {
         let _ = parse_payload(
-            &PacketContext::Protected(umc_wire::header::ShortPacketSpace::SessionData),
+            &PacketContext::Protected(ShortPacketSpace::SessionData),
             buf,
         );
         let _ = parse_payload(&PacketContext::Initial, buf);
     }
+}
+
+/// Hostile inputs aimed at length-driven slicing: a multi-byte type varint
+/// whose body is missing, length-delimited types declaring bodies that are
+/// absent, and truncated bodies of every fixed-layout frame that slices by
+/// declared length (wire-format §20-22, resource-limits.md §49). Every case
+/// must be an `Err` — a panic here is a parser regression.
+#[test]
+fn hostile_length_inputs_return_errors_never_panic() {
+    // BUNDLE (0x60): 2-byte type varint, then a continuation-bit varint
+    // where the declared length exceeds every limit.
+    assert!(decode_frames(&[0x60, 0xFF, 0xFF]).is_err());
+    // Unknown length-delimited types (0x3E critical, 0x3F optional) with a
+    // declared body that is not present in the buffer.
+    assert_eq!(
+        decode_frames(&[0x3E, 0x40, 0x40]),
+        Err(FrameError::Truncated)
+    );
+    assert_eq!(
+        decode_frames(&[0x3F, 0x40, 0x40]),
+        Err(FrameError::Truncated)
+    );
+    // Declared-but-absent length of 1 MiB (4-byte varint 0x80 0x10 0x00 0x00).
+    assert_eq!(
+        decode_frames(&[0x3E, 0x80, 0x10, 0x00, 0x00]),
+        Err(FrameError::Truncated)
+    );
+    // STREAM (0x10) with a declared data length beyond the buffer.
+    assert!(decode_frames(&[0x10, 0x00, 0x40, 0x00, 0x40, 0x01]).is_err());
+    // ACK (0x08) with a range count far beyond the buffer.
+    assert!(decode_frames(&[0x08, 0x00, 0x00, 0x40, 0x40, 0x00]).is_err());
+    // DATAGRAM (0x28) with a declared payload length beyond the buffer.
+    assert!(decode_frames(&[0x28, 0x00, 0x00, 0x40, 0x40, 0x01]).is_err());
+    // The same hostile bodies must never panic at the packet layer either.
+    for buf in [
+        &[0x60, 0xFF, 0xFF][..],
+        &[0x3E, 0x40, 0x40][..],
+        &[0x10, 0x00, 0x40, 0x00, 0x40, 0x01][..],
+        &[0x08, 0x00, 0x00, 0x40, 0x40, 0x00][..],
+        &[0x28, 0x00, 0x00, 0x40, 0x40, 0x01][..],
+    ] {
+        assert!(parse_payload(
+            &PacketContext::Protected(ShortPacketSpace::SessionData),
+            buf
+        )
+        .is_err());
+    }
+}
+
+/// A packet that is pure padding is always acceptable, in any context
+/// (wire-format §22): every 0x00 type byte is one PADDING frame.
+#[test]
+fn pure_padding_packet_accepted() {
+    for context in [
+        PacketContext::Initial,
+        PacketContext::Handshake,
+        PacketContext::Protected(ShortPacketSpace::SessionData),
+    ] {
+        let parsed = parse_payload(&context, &[0x00; 100]).expect("pure padding parses");
+        assert!(parsed.frames.iter().all(|f| matches!(f, Frame::Padding)));
+    }
+}
+
+/// An unknown length-delimited frame is self-delimiting: its declared length
+/// is consumed and the frames after it still parse (wire-format §21).
+#[test]
+fn unknown_length_delimited_is_skipped_with_length_consumed() {
+    // 0x3E (unknown critical length-delimited), declared body 2 bytes, then
+    // 0x04 = PING. The skip must consume exactly the declared body.
+    assert_eq!(
+        decode_frames(&[0x3E, 0x02, 0xAA, 0xBB, 0x04]).unwrap(),
+        vec![Frame::Ping]
+    );
+    // Two unknown frames back to back, then a known one.
+    assert_eq!(
+        decode_frames(&[0x3E, 0x01, 0xAA, 0x3F, 0x00, 0x04]).unwrap(),
+        vec![Frame::Ping]
+    );
 }
