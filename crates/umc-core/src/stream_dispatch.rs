@@ -71,11 +71,15 @@ mod tests {
         let registry = AppRegistry::new();
         assert_eq!(
             dispatcher.dispatch(&registry, 0, crate::well_known::WELL_KNOWN_APP),
-            Ok(DispatchTarget::WellKnown(crate::well_known::WELL_KNOWN_APP.to_vec()))
+            Ok(DispatchTarget::WellKnown(
+                crate::well_known::WELL_KNOWN_APP.to_vec()
+            ))
         );
         assert_eq!(
             dispatcher.dispatch(&registry, 1, crate::well_known::WELL_KNOWN_RELAY),
-            Ok(DispatchTarget::WellKnown(crate::well_known::WELL_KNOWN_RELAY.to_vec()))
+            Ok(DispatchTarget::WellKnown(
+                crate::well_known::WELL_KNOWN_RELAY.to_vec()
+            ))
         );
     }
 

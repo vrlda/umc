@@ -9,8 +9,9 @@ use tokio::sync::mpsc;
 /// the stream ID the data arrived on and the bytes.
 pub type StreamData = (u64, Vec<u8>);
 
-/// Sender side of a per-application stream channel.
-#[derive(Debug)]
+/// Sender side of a per-application stream channel; cloneable so several
+/// session tasks can forward into the same application.
+#[derive(Debug, Clone)]
 pub struct AppTx {
     tx: mpsc::Sender<StreamData>,
 }
@@ -125,7 +126,8 @@ mod tests {
     #[test]
     fn bounded_channel_backpressures() {
         let (tx, rx) = spawn_app_channel(1);
-        tx.try_send_stream_frame(0, b"first".to_vec()).expect("slot 1");
+        tx.try_send_stream_frame(0, b"first".to_vec())
+            .expect("slot 1");
         assert!(
             tx.try_send_stream_frame(0, b"second".to_vec()).is_err(),
             "full channel must reject a second frame"

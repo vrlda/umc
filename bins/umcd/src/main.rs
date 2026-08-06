@@ -1,3 +1,4 @@
+mod app_layer;
 mod bundle_service;
 mod carriers;
 mod config;
@@ -73,6 +74,9 @@ fn main() {
 async fn run(config: NodeConfig) {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     let mut state = state::RuntimeState::new(config, shutdown_tx).expect("runtime state");
+    // The echo application's channels and task are installed at startup
+    // (core.md §9.6); registration happened inside the runtime state.
+    app_layer::install_echo_app(&mut state);
     println!(
         "data directory: {}",
         state.config.resolved_data_dir().display()
@@ -252,9 +256,10 @@ fn handle_inbound_link_locked(
         .map_err(|e| format!("handshake rejected: {e}"))?;
 
     // The client's static handshake key arrives in CLIENT_AUTH (handshake.md
-    // §18); until Task 20+ parses it, session secrets are provisional (the
+    // §18); until Task 20+ parses it, the client's ephemeral stands in for
+    // it so the DH chain (es/se/ss) stays symmetric on both sides (the
     // SERVER_HELLO itself binds only DH_ee and the transcript).
-    let client_static = StaticHandshakePublicKey([0u8; 32]);
+    let client_static = StaticHandshakePublicKey(hello.client_ephemeral_public_key);
     let (server_hello_bytes, secrets) = handshake_responder::respond_hello(
         state,
         carrier_type.as_bytes(),
@@ -296,6 +301,8 @@ fn handle_inbound_link_locked(
         link,
         session,
         session_id,
+        state.app_channels.clone(),
+        state.app_echo_rx.clone(),
     );
     // The session task's JoinHandle moves into a watcher that records
     // `session_closed` when the wire loop exits; the registry keeps an
