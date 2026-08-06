@@ -23,4 +23,4 @@ Specifications are licensed under Creative Commons Attribution 4.0 International
 - [x] Phase 4: mobility — paths, migration, connection IDs, key update, resumption
 - [x] Phase 5: local mesh — LAN discovery, local preference, disconnected tests
 - [x] Phase 6: store-and-forward — experimental bundles, one-hop delayed delivery
-- [ ] Phase 7: adversarial resilience
+- [x] Phase 7: adversarial resilience — enumeration, trust, rate limits, blocklist, abuse
