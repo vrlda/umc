@@ -25,3 +25,4 @@ Specifications are licensed under Creative Commons Attribution 4.0 International
 - [x] Phase 6: store-and-forward — experimental bundles, one-hop delayed delivery
 - [x] Phase 7: adversarial resilience — enumeration, trust, rate limits, blocklist, abuse
 - [x] Phase 8: daemon loop — sessions, handshake responder, services, control API
+- [x] Phase 9: application layer — application registry, well-known protocol IDs, stream dispatch, echo application over live sessions
