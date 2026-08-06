@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn too_many_hints_rejected() {
         let mut candidates = Vec::new();
-        for i in 0..MAX_HINTS_PER_FRAME + 1 {
+        for i in 0..=MAX_HINTS_PER_FRAME {
             candidates.push(candidate(i as u64, SharingPolicy::ShareGeneral, u64::MAX));
         }
         assert_eq!(build_peer_hint(&candidates), Err(HintError::TooManyHints));
