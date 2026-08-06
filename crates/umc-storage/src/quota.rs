@@ -23,7 +23,7 @@ impl Profile {
         match self {
             Profile::Constrained => 0,
             Profile::Standard => 1024 * 1024 * 1024,
-            Profile::Relay => 10 * 1024 * 1024 * 1024,
+            Profile::Relay => 10_737_418_240,
         }
     }
 }
