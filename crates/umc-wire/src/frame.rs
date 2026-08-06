@@ -125,6 +125,9 @@ impl AckFrame {
             return Err(FrameError::TooManyAckRanges);
         }
         let first = read_varint(&mut pos)?;
+        if first == 0 {
+            return Err(FrameError::AckRangeUnderflow);
+        }
         let mut ranges = Vec::new();
         for _ in 1..range_count {
             let gap = read_varint(&mut pos)?;
@@ -460,6 +463,13 @@ mod tests {
     #[test]
     fn ack_rejects_zero_length_range() {
         let enc = [0x08, 0x40, 0x64, 0x05, 0x02, 0x03, 0x02, 0x00];
+        assert_eq!(decode_frames(&enc), Err(FrameError::AckRangeUnderflow));
+    }
+
+    #[test]
+    fn ack_rejects_zero_first_range() {
+        // ACK(0x08): largest=5, delay=0, range_count=1, first_ack_range=0.
+        let enc = [0x08, 0x05, 0x00, 0x01, 0x00];
         assert_eq!(decode_frames(&enc), Err(FrameError::AckRangeUnderflow));
     }
 
