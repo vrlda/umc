@@ -1,0 +1,15 @@
+[package]
+name = "phase7-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+umc-core = { path = "../../crates/umc-core" }
+umc-discovery = { path = "../../crates/umc-discovery" }
+umc-storage = { path = "../../crates/umc-storage" }
+umc-types = { path = "../../crates/umc-types" }
+
+[lints]
+workspace = true
