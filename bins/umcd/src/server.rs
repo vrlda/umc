@@ -238,14 +238,14 @@ fn dispatch_request(
         ("NodeAdmin", "GetStatus") => get_status(state),
         ("PeerService" | "DiscoveryService", "ListCandidates") => list_candidates(state),
         ("BundleService", "GetBundles" | "ListBundles") => list_bundles(state),
+        ("BundleService", "CreateBundle") => create_bundle(state, request),
         ("RelayService", "OpenCircuit") => open_circuit(state, request),
         ("RelayService", "CloseCircuit") => close_circuit(state, request),
         ("NodeAdmin" | "ConfigService", "GetConfig") => get_config(state),
         ("NodeAdmin", "GetEvents") => get_events(state),
         ("DiagnosticsService" | "NodeAdmin", "RunDoctor" | "Doctor") => run_doctor(state),
-        // Configuration mutation persists in Phase 12.
         ("ConfigService", "SetConfig") | ("NodeAdmin", "UpdateConfig") => {
-            (api::StatusCode::Unimplemented as i32, None)
+            set_config(state, request)
         }
         _ => (api::StatusCode::Unimplemented as i32, None),
     };
@@ -352,7 +352,21 @@ fn bundle_state(status: &BundleStatus) -> api::BundleState {
 /// `NodeAdmin.GetConfig`: the current node configuration as `ConfigEntry`s
 /// (control-api.md §24). The development token is never exposed.
 fn get_config(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
-    let config = &state.config;
+    let config = node_config_message(&state.config);
+    let mut payload = Vec::new();
+    Message::encode(
+        &api::GetConfigResponse {
+            config: Some(config),
+        },
+        &mut payload,
+    )
+    .expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// The current configuration as the control-surface `NodeConfig` message
+/// (control-api.md §24). The development token is never exposed.
+fn node_config_message(config: &NodeConfig) -> api::NodeConfig {
     let entries = vec![
         api::ConfigEntry {
             key: "profile".into(),
@@ -380,18 +394,116 @@ fn get_config(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
             sensitive_present: false,
         },
     ];
-    let response = api::GetConfigResponse {
-        config: Some(api::NodeConfig {
-            resource_profile: config.profile.clone(),
-            telemetry_enabled: config.telemetry,
-            public_relay_enabled: config.public_relay,
-            entries,
-            ..Default::default()
-        }),
+    api::NodeConfig {
+        resource_profile: config.profile.clone(),
+        telemetry_enabled: config.telemetry,
+        public_relay_enabled: config.public_relay,
+        entries,
+        ..Default::default()
+    }
+}
+
+/// `ConfigService.SetConfig`: validate the mutation, persist the config file,
+/// and update the in-memory config (control-api.md §24). Only `set_value`
+/// mutations of the documented keys are accepted; unsupported keys and
+/// secret mutations are `InvalidArgument`. The mutations apply atomically:
+/// a failing entry leaves the daemon config untouched.
+fn set_config(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(mutation) = api::UpdateConfigRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
     };
+    let mut updated = state.config.clone();
+    for change in &mutation.mutations {
+        let Some(value) = (match &change.operation {
+            Some(api::config_mutation::Operation::SetValue(value)) => Some(value.clone()),
+            Some(
+                api::config_mutation::Operation::SetSecret(_)
+                | api::config_mutation::Operation::Clear(_),
+            )
+            | None => None,
+        }) else {
+            return (api::StatusCode::InvalidArgument as i32, None);
+        };
+        if let Err(e) = updated.set_entry(&change.key, &value) {
+            println!("[config] set {}/{} rejected: {e}", change.key, value);
+            return (api::StatusCode::InvalidArgument as i32, None);
+        }
+    }
+    if let Err(e) = updated.persist() {
+        println!("[config] persist failed: {e}");
+        return (api::StatusCode::Internal as i32, None);
+    }
+    state.config = updated;
+    let config = node_config_message(&state.config);
     let mut payload = Vec::new();
-    Message::encode(&response, &mut payload).expect("encode");
+    Message::encode(
+        &api::UpdateConfigResponse {
+            config: Some(config),
+            effects: Vec::new(),
+        },
+        &mut payload,
+    )
+    .expect("encode");
     (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `BundleService.CreateBundle`: admit a bundle over the control surface
+/// (bundles.md §8.1) and return its id. The chunk upload is treated as the
+/// complete bundle payload for now.
+fn create_bundle(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(create) = api::CreateBundleRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let now = state.node.clock.as_ref().now();
+    let sender = create
+        .application_handle
+        .as_ref()
+        .map(|handle| handle.value.clone())
+        .unwrap_or_default();
+    let expires_at_ms = u64::try_from(create.expires_at_unix_ms).unwrap_or(now.0);
+    let lifetime_ms = expires_at_ms.saturating_sub(now.0).max(1_000);
+    match state.bundle.admit(
+        &create.payload_chunk,
+        &sender,
+        &create.destination_hint,
+        u64::from(create.priority),
+        lifetime_ms,
+        umc_bundle::manager::DEFAULT_MAX_REPLICATION,
+        false,
+        now,
+    ) {
+        Ok(id) => {
+            let record = state.bundle.record(&id).expect("just admitted");
+            let summary = api::BundleSummary {
+                bundle_id: id.to_vec(),
+                owner_endpoint_id: record.sender.clone(),
+                destination_hint_hash: umc_bundle::id::bundle_id(
+                    &umc_bundle::envelope::BundleEnvelope {
+                        sender_ephemeral_public_key: [0u8; 32],
+                        encrypted_payload: create.payload_chunk.clone(),
+                    },
+                    &record.destination_hint,
+                )
+                .to_vec(),
+                state: api::BundleState::Stored as i32,
+                payload_size: record.size as u64,
+                priority: u32::try_from(record.priority).unwrap_or(u32::MAX),
+                created_at_unix_ms: i64::try_from(record.created_at.0).unwrap_or(i64::MAX),
+                expires_at_unix_ms: i64::try_from(record.expires_at.0).unwrap_or(i64::MAX),
+            };
+            let response = api::CreateBundleResponse {
+                bundle: Some(summary),
+                upload_handle: None,
+            };
+            let mut payload = Vec::new();
+            Message::encode(&response, &mut payload).expect("encode");
+            (api::StatusCode::Ok as i32, Some(payload))
+        }
+        Err(e) => {
+            println!("[bundle] create rejected: {e:?}");
+            (api::StatusCode::InvalidArgument as i32, None)
+        }
+    }
 }
 
 /// `NodeAdmin.GetEvents`: the bounded recent event log, newest first
@@ -672,17 +784,152 @@ mod tests {
     }
 
     #[test]
-    fn set_config_is_unimplemented_until_phase_12() {
+    fn set_config_validates_persists_and_applies() {
         let (mut state, _tx) = test_state();
+        // A malformed payload is not a valid mutation set.
         let bytes = dispatch_request(
             &mut state,
-            &request("ConfigService", "SetConfig", vec![]),
+            &request("ConfigService", "SetConfig", b"not-prost".to_vec()),
             None,
         );
         assert_eq!(
             decode_response(&bytes).status.unwrap().code,
-            api::StatusCode::Unimplemented as i32
+            api::StatusCode::InvalidArgument as i32
         );
+
+        let mutations = api::UpdateConfigRequest {
+            mutations: vec![
+                api::ConfigMutation {
+                    key: "profile".into(),
+                    operation: Some(api::config_mutation::Operation::SetValue("relay".into())),
+                },
+                api::ConfigMutation {
+                    key: "mesh".into(),
+                    operation: Some(api::config_mutation::Operation::SetValue("true".into())),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut payload = Vec::new();
+        Message::encode(&mutations, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("ConfigService", "SetConfig", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let updated = api::UpdateConfigResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .config
+            .expect("config");
+        assert_eq!(updated.resource_profile, "relay");
+
+        // The in-memory config updated and the file persists: a fresh load
+        // sees the same values.
+        assert_eq!(state.config.profile, "relay");
+        assert!(state.config.mesh);
+        let reloaded = NodeConfig::load(Some(&state.config.resolved_config_path())).unwrap();
+        assert_eq!(reloaded.profile, "relay");
+        assert!(reloaded.mesh);
+    }
+
+    #[test]
+    fn set_config_rejects_bad_values_atomically() {
+        let (mut state, _tx) = test_state();
+        let mutations = api::UpdateConfigRequest {
+            mutations: vec![api::ConfigMutation {
+                key: "profile".into(),
+                operation: Some(api::config_mutation::Operation::SetValue("bogus".into())),
+            }],
+            ..Default::default()
+        };
+        let mut payload = Vec::new();
+        Message::encode(&mutations, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("ConfigService", "SetConfig", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::InvalidArgument as i32
+        );
+        assert_eq!(
+            state.config.profile, "standard",
+            "rejected set leaves config untouched"
+        );
+
+        // Unsupported keys are InvalidArgument too.
+        let mutations = api::UpdateConfigRequest {
+            mutations: vec![api::ConfigMutation {
+                key: "no_such_key".into(),
+                operation: Some(api::config_mutation::Operation::SetValue("1".into())),
+            }],
+            ..Default::default()
+        };
+        let mut payload = Vec::new();
+        Message::encode(&mutations, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("ConfigService", "SetConfig", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::InvalidArgument as i32
+        );
+    }
+
+    #[test]
+    fn create_bundle_round_trips_through_list() {
+        let (mut state, _tx) = test_state();
+        let now_ms = state.node.clock.as_ref().now().0;
+        let create = api::CreateBundleRequest {
+            application_handle: Some(api::OpaqueHandle {
+                value: b"sender-a".to_vec(),
+            }),
+            destination_hint: b"dest-token".to_vec(),
+            priority: 1,
+            // The node clock is monotonic; the handler compares against it.
+            expires_at_unix_ms: i64::try_from(now_ms + 60_000).unwrap(),
+            payload_chunk: b"ciphertext".to_vec(),
+            payload_complete: true,
+            upload_handle: None,
+        };
+        let mut payload = Vec::new();
+        Message::encode(&create, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("BundleService", "CreateBundle", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let created = api::CreateBundleResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .bundle
+            .expect("bundle");
+        assert_eq!(created.payload_size, 10);
+        assert_eq!(created.bundle_id.len(), 32);
+
+        // The id round-trips through ListBundles.
+        let bytes = dispatch_request(
+            &mut state,
+            &request("BundleService", "ListBundles", vec![]),
+            None,
+        );
+        let listing = api::ListBundlesResponse::decode(decode_response(&bytes).payload.as_slice())
+            .expect("payload")
+            .bundles;
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0].bundle_id, created.bundle_id);
     }
 
     #[test]

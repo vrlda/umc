@@ -368,15 +368,21 @@ impl Session {
             .key_update
             .initiate()
             .map_err(|_| SessionError::KeyUpdate)?;
-        let mut payload = Vec::new();
-        umc_wire::varint::encode_into(&mut payload, umc_types::frame::FrameType::KEY_UPDATE.0)
-            .map_err(|_| SessionError::Encode)?;
         let frame = umc_wire::frames::path::KeyUpdateFrame {
             update_sequence: sequence,
             request_peer_update: false,
         };
         let enc = frame.encode().map_err(|_| SessionError::Encode)?;
-        payload.extend_from_slice(&enc[1..]);
+        // The frame's own encoding includes its type varint, which is 2 bytes
+        // for KEY_UPDATE (0x44 > 63); strip it by width, not by one byte, and
+        // re-prefix the frame payload with the type.
+        let type_len = umc_wire::varint::encode(umc_types::frame::FrameType::KEY_UPDATE.0)
+            .map_err(|_| SessionError::Encode)?
+            .len();
+        let mut payload = Vec::with_capacity(enc.len());
+        umc_wire::varint::encode_into(&mut payload, umc_types::frame::FrameType::KEY_UPDATE.0)
+            .map_err(|_| SessionError::Encode)?;
+        payload.extend_from_slice(&enc[type_len..]);
         Ok(payload)
     }
 
