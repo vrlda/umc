@@ -5,6 +5,7 @@ use std::path::Path;
 
 use crate::contract::{Plugin, PluginContext, PluginError, PluginManifest};
 use crate::loader;
+use crate::security::{CapabilitySet, CapsContext};
 
 /// Registered plugins, keyed by manifest id.
 #[derive(Default)]
@@ -33,14 +34,17 @@ impl PluginRegistry {
     /// # Errors
     ///
     /// Returns [`PluginError::Manifest`] when the file is missing, not valid
-    /// JSON, or fails validation, and [`PluginError::Duplicate`] when the
-    /// manifest id is already registered.
+    /// JSON, or fails validation (including unknown permissions), and
+    /// [`PluginError::Duplicate`] when the manifest id is already registered.
     pub fn load_manifest(
         &mut self,
         path: &Path,
         plugin: Box<dyn Plugin>,
     ) -> Result<(), PluginError> {
         let manifest = loader::load_manifest(path)?;
+        manifest
+            .validate()
+            .map_err(|e| PluginError::Manifest(e.to_string()))?;
         if self.manifests.contains_key(&manifest.id) {
             return Err(PluginError::Duplicate(manifest.id));
         }
@@ -56,18 +60,32 @@ impl PluginRegistry {
         self.manifests.values().collect()
     }
 
-    /// Runs the plugin's `init` with the given context.
+    /// Runs the plugin's `init` with the given context, wrapped in the
+    /// capability grant from the plugin's manifest.
     ///
     /// # Errors
     ///
     /// Returns [`PluginError::NotFound`] when no plugin is registered under
-    /// `id`, and the plugin's own error when `init` fails.
+    /// `id`, [`PluginError::PermissionDenied`] when the plugin calls a
+    /// context method its manifest did not grant, and the plugin's own error
+    /// when `init` fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registered manifest does not pass validation; manifests
+    /// are validated at load time, so this is an invariant violation.
     pub fn invoke_init(&mut self, id: &str, ctx: &dyn PluginContext) -> Result<(), PluginError> {
         let plugin = self
             .plugins
             .get_mut(id)
             .ok_or_else(|| PluginError::NotFound(id.to_string()))?;
-        plugin.init(ctx)
+        let manifest = self
+            .manifests
+            .get(id)
+            .ok_or_else(|| PluginError::NotFound(id.to_string()))?;
+        let caps = CapabilitySet::from_manifest(&manifest.permissions)
+            .expect("manifests are validated at load time");
+        plugin.init(&CapsContext::new(caps, ctx))
     }
 
     /// Runs the plugin's `shutdown`.
@@ -168,7 +186,7 @@ mod tests {
 
     fn manifest_json(id: &str) -> String {
         format!(
-            r#"{{"id":"{id}","version":[1,0,0],"entry_point":"dummy::entry","permissions":["app.register"]}}"#
+            r#"{{"id":"{id}","version":[1,0,0],"entry_point":"dummy::entry","permissions":["app.register","config.read"]}}"#
         )
     }
 
@@ -308,5 +326,60 @@ mod tests {
                 "protocol id already registered: org.example.taken/1".into()
             ))
         );
+    }
+
+    #[test]
+    fn load_manifest_rejects_unknown_permission() {
+        let path = temp_manifest(
+            "unknown-cap",
+            r#"{"id":"org.example.bad","version":[1,0,0],"entry_point":"dummy::entry","permissions":["app.own"]}"#,
+        );
+        let mut registry = PluginRegistry::new();
+        let (plugin, _) = DummyPlugin::new();
+        let result = registry.load_manifest(&path, Box::new(plugin));
+        let _ = fs::remove_file(&path);
+        assert_eq!(
+            result,
+            Err(PluginError::Manifest(
+                "unknown permission in manifest: app.own".into()
+            ))
+        );
+        assert!(
+            registry.list().is_empty(),
+            "rejected manifest must not register"
+        );
+    }
+
+    #[test]
+    fn load_manifest_rejects_zero_version() {
+        let path = temp_manifest(
+            "zero-version",
+            r#"{"id":"org.example.bad","version":[0,0,0],"entry_point":"dummy::entry","permissions":[]}"#,
+        );
+        let mut registry = PluginRegistry::new();
+        let (plugin, _) = DummyPlugin::new();
+        let result = registry.load_manifest(&path, Box::new(plugin));
+        let _ = fs::remove_file(&path);
+        assert!(matches!(result, Err(PluginError::Manifest(_))));
+    }
+
+    #[test]
+    fn invoke_init_denies_call_without_capability() {
+        let path = temp_manifest(
+            "no-register-cap",
+            r#"{"id":"org.example.limited","version":[1,0,0],"entry_point":"dummy::entry","permissions":["config.read"]}"#,
+        );
+        let mut registry = PluginRegistry::new();
+        let _ = load_with_state(&mut registry, &path);
+        let _ = fs::remove_file(&path);
+        let ctx = TestContext::default();
+        assert_eq!(
+            registry.invoke_init("org.example.limited", &ctx),
+            Err(PluginError::PermissionDenied {
+                capability: crate::contract::Capability::AppRegister,
+                operation: "register_app",
+            })
+        );
+        registry.shutdown("org.example.limited").expect("shutdown");
     }
 }
