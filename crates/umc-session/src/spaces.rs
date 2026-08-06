@@ -69,6 +69,14 @@ impl PacketSpaceState {
     pub fn largest_received(&self) -> u64 {
         self.largest_received
     }
+
+    /// Bytes of internal replay state (session.md §8.2): the window is a
+    /// fixed ring of `DEFAULT_REPLAY_WINDOW` bits (512 bytes), independent of
+    /// traffic volume.
+    #[must_use]
+    pub fn replay_bytes(&self) -> usize {
+        self.replay.bits.len()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
