@@ -24,6 +24,7 @@ use umc_carrier::types::OutboundPacket;
 use umc_carrier::BoxLink;
 use umc_core::app_io::{AppRx, AppTx};
 use umc_crypto::aead::PacketKeys;
+use umc_session::loss::detect_lost_packets;
 use umc_session::session::Session;
 use umc_types::runtime::{Clock, Instant};
 use umc_wire::frame::Frame;
@@ -61,6 +62,35 @@ pub const BUNDLE_PACKET_HEADROOM: usize = 256;
 /// `RELAY_STATUS` result codes (relay.md §12.2).
 pub const RELAY_STATUS_ACCEPTED: u64 = 1;
 pub const RELAY_STATUS_REFUSED: u64 = 2;
+
+/// Sleep until the PTO deadline, or forever when no deadline is armed.
+async fn pto_sleep(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// PTO deadline from the session's in-flight state (session.md §14.3): a
+/// probe fires `pto * multiplier` after the last arming while any
+/// ack-eliciting packet is outstanding; no deadline when nothing is in
+/// flight.
+fn pto_deadline_at(session: &Session, multiplier: u32) -> Option<tokio::time::Instant> {
+    let in_flight = session
+        .sent_state()
+        .sent()
+        .iter()
+        .any(|p| p.ack_eliciting && p.in_flight);
+    if !in_flight {
+        return None;
+    }
+    let ms = session
+        .loss_detector()
+        .pto(session.rtt())
+        .as_millis()
+        .saturating_mul(u64::from(multiplier));
+    Some(tokio::time::Instant::now() + Duration::from_millis(ms))
+}
 
 /// Spawn the per-session wire loop. The tasks exit when `link.recv` errors
 /// or the daemon's shutdown flag is set.
@@ -209,6 +239,12 @@ async fn reader_loop(
     mut bus_outbound_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
     let mut sweep = SweepState::default();
+    // PTO probe schedule (session.md §14.3): the deadline is re-armed after
+    // every processed packet while ack-eliciting packets are in flight, and
+    // the backoff doubles on each consecutive expiry and resets to 1x when
+    // any ACK arrives.
+    let mut pto_deadline: Option<tokio::time::Instant> = None;
+    let mut pto_multiplier: u32 = 1;
     loop {
         if shutdown_flag.load(Ordering::Relaxed) {
             break;
@@ -216,35 +252,45 @@ async fn reader_loop(
         tokio::select! {
             recv = packet_rx.recv() => {
                 match recv {
-                    Some(bytes) => process_inbound_packet(
-                        link,
-                        session,
-                        clock,
-                        app_channels,
-                        runtime,
-                        remote_keys,
-                        session_id,
-                        &bytes,
-                        &mut sweep,
-                    )
-                    .await,
+                    Some(bytes) => {
+                        if process_inbound_packet(
+                            link,
+                            session,
+                            clock,
+                            app_channels,
+                            runtime,
+                            remote_keys,
+                            session_id,
+                            &bytes,
+                            &mut sweep,
+                        )
+                        .await
+                        {
+                            pto_multiplier = 1;
+                        }
+                    }
                     None => break,
                 }
             }
             recv = bus_inbound_rx.recv() => {
                 match recv {
-                    Some(bytes) => process_inbound_packet(
-                        link,
-                        session,
-                        clock,
-                        app_channels,
-                        runtime,
-                        remote_keys,
-                        session_id,
-                        &bytes,
-                        &mut sweep,
-                    )
-                    .await,
+                    Some(bytes) => {
+                        if process_inbound_packet(
+                            link,
+                            session,
+                            clock,
+                            app_channels,
+                            runtime,
+                            remote_keys,
+                            session_id,
+                            &bytes,
+                            &mut sweep,
+                        )
+                        .await
+                        {
+                            pto_multiplier = 1;
+                        }
+                    }
                     None => break,
                 }
             }
@@ -266,10 +312,50 @@ async fn reader_loop(
                     None => break,
                 }
             }
+            () = pto_sleep(pto_deadline) => {
+                pto_multiplier = pto_multiplier.saturating_mul(2);
+                let now = clock.now();
+                let probe = {
+                    let mut session = session.lock().await;
+                    let in_flight = session
+                        .sent_state()
+                        .sent()
+                        .iter()
+                        .any(|p| p.ack_eliciting && p.in_flight);
+                    if in_flight {
+                        let ping = umc_wire::varint::encode(umc_types::frame::FrameType::PING.0)
+                            .unwrap_or_default();
+                        match session.build_outbound(clock.as_ref(), now, &ping) {
+                            Ok(Some(bytes)) => Some(bytes),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some(bytes) = probe {
+                    let sent = tokio::task::block_in_place(|| {
+                        link.send(OutboundPacket {
+                            bytes,
+                            control: false,
+                            deadline_ms: None,
+                        })
+                    });
+                    if let Err(e) = sent {
+                        #[cfg(debug_assertions)]
+                        println!("[session {session_id}] PTO probe send error: {e:?}");
+                    }
+                }
+            }
         }
         // Give the carrier's background writer a window to flush before the
         // next recv takes the stream lock (carriers/tcp.md).
         tokio::time::sleep(FLUSH_INTERVAL).await;
+        // Re-arm the PTO deadline from the session's in-flight state.
+        {
+            let session = session.lock().await;
+            pto_deadline = pto_deadline_at(&session, pto_multiplier);
+        }
     }
     ended.store(true, Ordering::Relaxed);
     runtime
@@ -284,7 +370,8 @@ async fn reader_loop(
 /// Process one inbound byte buffer — from the carrier pump or the session
 /// bus — as a carrier packet: feed the session state machine, send the ACK
 /// payloads it produces, dispatch control frames, and forward matching
-/// stream data to registered applications.
+/// stream data to registered applications. Returns whether the packet
+/// carried an ACK frame (the reader resets the PTO backoff on ACKs).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn process_inbound_packet(
     link: &Arc<BoxLink>,
@@ -296,12 +383,13 @@ async fn process_inbound_packet(
     session_id: u64,
     bytes: &[u8],
     sweep: &mut SweepState,
-) {
+) -> bool {
     let now = clock.now();
     // The control frames the session layer does not expose: relay,
     // bundle, routing, and key updates.
     let frames = parse_control_frames(remote_keys, bytes);
     let mut outbound = None;
+    let mut retransmits: Vec<Vec<u8>> = Vec::new();
     let mut pending: Vec<(Vec<u8>, u64, Vec<u8>)> = Vec::new();
     {
         let mut session = session.lock().await;
@@ -310,9 +398,35 @@ async fn process_inbound_packet(
             Err(e) => {
                 #[cfg(debug_assertions)]
                 println!("[session {session_id}] inbound error: {e:?}");
-                return;
+                return false;
             }
         };
+        // Loss detection (session.md §14): an ACK of a packet at least three
+        // numbers higher declares older ack-eliciting packets lost; their
+        // retained payloads are re-sent under fresh packet numbers.
+        if let Some(largest_acked) = frames.as_ref().and_then(|fs| {
+            fs.iter()
+                .filter_map(|f| match f {
+                    Frame::Ack(ack) => Some(ack.largest_acknowledged),
+                    _ => None,
+                })
+                .max()
+        }) {
+            let rtt = session.rtt().clone();
+            let detector = session.loss_detector().clone();
+            let lost = detect_lost_packets(
+                session.sent_state_mut(),
+                &rtt,
+                now,
+                largest_acked,
+                &detector,
+            );
+            for pn in lost {
+                if let Ok(Some(bytes)) = session.retransmit(pn, now) {
+                    retransmits.push(bytes);
+                }
+            }
+        }
         let mut combined = ack_payload;
         let sweep_due = bundle_flush_due(now, sweep.last_bundle_flush);
         let rotation_due = sweep
@@ -410,6 +524,20 @@ async fn process_inbound_packet(
             println!("[session {session_id}] send error: {e:?}");
         }
     }
+    for bytes in retransmits {
+        let sent = tokio::task::block_in_place(|| {
+            link.send(OutboundPacket {
+                bytes,
+                control: false,
+                deadline_ms: None,
+            })
+        });
+        if let Err(e) = sent {
+            #[cfg(debug_assertions)]
+            println!("[session {session_id}] retransmit send error: {e:?}");
+        }
+    }
+    frames.is_some_and(|fs| fs.iter().any(|f| matches!(f, Frame::Ack(_))))
 }
 
 /// Parse the control frames out of an inbound protected packet with the
@@ -992,6 +1120,83 @@ mod tests {
         .expect("session")
     }
 
+    /// Peer session with swapped traffic secrets so the two can exchange
+    /// protected packets (the client builds with `[1u8; 32]`, the peer
+    /// parses with the same key).
+    fn peer_session() -> Session {
+        Session::new(
+            SessionConfig {
+                role: Role::Server,
+                dcid: vec![3u8; 8],
+                local_traffic_secret: [2u8; 32],
+                remote_traffic_secret: [1u8; 32],
+                initial_max_data: umc_session::session::DEFAULT_INITIAL_MAX_DATA,
+                initial_max_stream_data: umc_session::session::DEFAULT_INITIAL_MAX_STREAM_DATA,
+                max_ack_delay_ms: 25,
+            },
+            &crate::runtime_adapters::OsClock,
+        )
+        .expect("peer session")
+    }
+
+    /// Deterministic clock for loss-detection timing.
+    struct FixedClock(u64);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> Instant {
+            Instant(self.0)
+        }
+    }
+
+    /// Link that records every outbound packet.
+    #[derive(Default)]
+    struct RecordingLink {
+        sent: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl umc_carrier::Link for RecordingLink {
+        fn properties(&self) -> umc_carrier::types::LinkProperties {
+            umc_carrier::types::LinkProperties {
+                reliability: umc_carrier::types::Reliability::ReliableUntilLinkFailure,
+                ordering: umc_carrier::types::Ordering::Ordered,
+                current_mtu: 65_535,
+                queue_bytes: 0,
+                queue_capacity: 2 * 1024 * 1024,
+                estimated_rtt_ms: None,
+                estimated_loss: None,
+                metered: false,
+            }
+        }
+        fn send(
+            &self,
+            p: umc_carrier::types::OutboundPacket,
+        ) -> Result<umc_carrier::types::SendResult, umc_carrier::error::CarrierError> {
+            self.sent.lock().expect("link sent").push(p.bytes);
+            Ok(umc_carrier::types::SendResult::Accepted {
+                queue_state: umc_carrier::types::QueueState::SentToMedium,
+            })
+        }
+        fn recv(
+            &self,
+        ) -> Result<umc_carrier::types::InboundPacket, umc_carrier::error::CarrierError> {
+            Err(umc_carrier::error::CarrierError::new(
+                umc_carrier::error::CarrierErrorKind::WouldBlock,
+                "recv",
+            ))
+        }
+        fn events(
+            &self,
+        ) -> Result<umc_carrier::types::LinkEvent, umc_carrier::error::CarrierError> {
+            Err(umc_carrier::error::CarrierError::new(
+                umc_carrier::error::CarrierErrorKind::WouldBlock,
+                "events",
+            ))
+        }
+        fn close(&self, _reason: &str) -> Result<(), umc_carrier::error::CarrierError> {
+            Ok(())
+        }
+    }
+
     /// Decode a combined outbound payload into its frames.
     fn decode_outbound(payload: &[u8]) -> Vec<WireFrame> {
         umc_wire::frame::decode_frames(payload).expect("frames")
@@ -1273,5 +1478,108 @@ mod tests {
         assert_eq!(hash_destination(b"hop-a"), hash_destination(b"hop-a"));
         assert_ne!(hash_destination(b"hop-a"), hash_destination(b"hop-b"));
         assert_ne!(hash_destination(b"hop-a"), [0u8; 32]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ack_triggers_loss_detection_and_retransmit() {
+        let (state, _tx) = test_state();
+        let runtime = Arc::new(std::sync::Mutex::new(state));
+        let now = Instant(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(now.0));
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let link: Arc<BoxLink> = Arc::new(Box::new(RecordingLink {
+            sent: recorded.clone(),
+        }));
+        let remote_keys =
+            umc_crypto::aead::PacketKeys::from_traffic_secret(&[2u8; 32]).expect("remote keys");
+
+        // The daemon's session sends four PING packets (pn 0..3).
+        let mut client = test_session();
+        let ping = umc_wire::varint::encode(umc_types::frame::FrameType::PING.0).unwrap();
+        let mut packets = Vec::new();
+        for _ in 0..4 {
+            let pkt = client
+                .build_outbound(clock.as_ref(), now, &ping)
+                .unwrap()
+                .unwrap();
+            packets.push(pkt);
+        }
+
+        // The peer receives only the newest packet and ACKs it: pn 0 is then
+        // packet-threshold lost (acked three numbers higher, session.md §14.1)
+        // while pn 1/2 stay inside the 9/8 RTT time threshold.
+        let mut peer = peer_session();
+        let ack_payload = peer
+            .on_inbound(Instant(1_000_010), &packets[3])
+            .expect("peer recv");
+        let ack_pkt = peer
+            .build_outbound(clock.as_ref(), Instant(1_000_010), &ack_payload)
+            .unwrap()
+            .unwrap();
+
+        let session = Arc::new(tokio::sync::Mutex::new(client));
+        let app_channels: Arc<std::sync::Mutex<HashMap<Vec<u8>, AppTx>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut sweep = SweepState::default();
+        process_inbound_packet(
+            &link,
+            &session,
+            &clock,
+            &app_channels,
+            &runtime,
+            &remote_keys,
+            1,
+            &ack_pkt,
+            &mut sweep,
+        )
+        .await;
+
+        {
+            let session = session.lock().await;
+            let sent = session.sent_state().sent();
+            assert!(
+                !sent.iter().any(|p| p.packet_number == 0),
+                "lost packet leaves the sent state"
+            );
+            assert!(
+                sent.iter()
+                    .any(|p| p.packet_number == 4 && p.payload == ping),
+                "retransmitted packet queued with the stored PING payload"
+            );
+        }
+        // The retransmit travels after the ACK reply on the link.
+        let sent = recorded.lock().expect("link sent");
+        assert!(sent.len() >= 2, "ACK reply plus retransmit");
+        let retransmitted = sent.last().expect("retransmit bytes");
+        let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[1u8; 32]).unwrap();
+        let (space, _dcid, _path, _pn, payload) =
+            umc_session::packet::parse_protected_packet(&keys, retransmitted).unwrap();
+        let parsed = umc_wire::packet::parse_payload(
+            &umc_wire::packet::PacketContext::Protected(space),
+            &payload,
+        )
+        .unwrap();
+        assert!(
+            parsed.frames.iter().any(|f| matches!(f, WireFrame::Ping)),
+            "retransmitted packet carries PING"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pto_deadline_arms_only_with_in_flight_packets() {
+        let mut session = test_session();
+        assert!(
+            pto_deadline_at(&session, 1).is_none(),
+            "no deadline with nothing in flight"
+        );
+        let ping = umc_wire::varint::encode(umc_types::frame::FrameType::PING.0).unwrap();
+        session
+            .build_outbound(&crate::runtime_adapters::OsClock, Instant(0), &ping)
+            .unwrap()
+            .unwrap();
+        assert!(
+            pto_deadline_at(&session, 1).is_some(),
+            "deadline armed while ack-eliciting packets are in flight"
+        );
     }
 }

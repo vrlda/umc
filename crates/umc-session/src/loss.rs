@@ -145,6 +145,7 @@ mod tests {
                 64,
                 true,
                 0,
+                Vec::new(),
             ));
         }
         let mut rtt = RttEstimator::new();

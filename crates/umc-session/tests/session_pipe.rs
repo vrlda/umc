@@ -236,3 +236,74 @@ fn ack_sampling_initializes_rtt() {
     assert!(client.rtt().initialized);
     assert_eq!(client.rtt().latest_rtt, 100);
 }
+
+#[test]
+fn lost_packet_payload_retransmitted() {
+    let (client_secrets, _server_secrets) = run_xx_handshake(
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &TestEntropy,
+        b"ump.udp/1",
+        0,
+    )
+    .expect("handshake");
+    let mut client = Session::new(
+        SessionConfig {
+            role: Role::Client,
+            dcid: vec![9u8; 8],
+            local_traffic_secret: client_secrets.client,
+            remote_traffic_secret: client_secrets.server,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("client session");
+
+    let ping = umc_wire::varint::encode(umc_types::frame::FrameType::PING.0).unwrap();
+    let _pkt = client
+        .build_outbound(&TestClock, Instant(1_000_000), &ping)
+        .unwrap()
+        .unwrap();
+
+    // The peer ACKed a packet three numbers higher, so pn 0 is
+    // packet-threshold lost (session.md §14.1) and leaves the sent queue.
+    let rtt = client.rtt().clone();
+    let detector = client.loss_detector().clone();
+    let lost = umc_session::loss::detect_lost_packets(
+        client.sent_state_mut(),
+        &rtt,
+        Instant(1_000_000),
+        3,
+        &detector,
+    );
+    assert_eq!(lost, vec![0]);
+    assert!(client.sent_state().sent().is_empty());
+
+    // Retransmission re-sends the stored payload under a fresh packet number.
+    let retransmitted = client
+        .retransmit(0, Instant(1_000_000))
+        .unwrap()
+        .expect("retransmit bytes");
+    let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&client_secrets.client).unwrap();
+    let (space, _dcid, _path, _pn, payload) =
+        umc_session::packet::parse_protected_packet(&keys, &retransmitted).unwrap();
+    let parsed = umc_wire::packet::parse_payload(
+        &umc_wire::packet::PacketContext::Protected(space),
+        &payload,
+    )
+    .unwrap();
+    assert!(
+        parsed
+            .frames
+            .iter()
+            .any(|f| matches!(f, umc_wire::frame::Frame::Ping)),
+        "retransmission carries the PING frame again"
+    );
+    // The fresh packet's payload is retained for a future retransmission.
+    let fresh = client.sent_state().sent().back().expect("fresh packet");
+    assert_eq!(fresh.payload, ping);
+}

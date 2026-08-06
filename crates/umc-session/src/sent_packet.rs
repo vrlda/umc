@@ -10,6 +10,9 @@ pub struct SentPacket {
     pub ack_eliciting: bool,
     pub in_flight: bool,
     pub key_phase: u8,
+    /// Frame payload carried by the packet, retained so a lost packet can be
+    /// retransmitted under a fresh packet number (session.md §14.3).
+    pub payload: Vec<u8>,
 }
 
 impl SentPacket {
@@ -21,6 +24,7 @@ impl SentPacket {
         size: usize,
         ack_eliciting: bool,
         key_phase: u8,
+        payload: Vec<u8>,
     ) -> Self {
         Self {
             packet_number,
@@ -30,6 +34,7 @@ impl SentPacket {
             ack_eliciting,
             in_flight: ack_eliciting,
             key_phase,
+            payload,
         }
     }
 
@@ -44,13 +49,29 @@ mod tests {
 
     #[test]
     fn non_ack_eliciting_packets_are_not_in_flight() {
-        let p = SentPacket::new(0, PacketSpace::SessionData, Instant(0), 64, false, 0);
+        let p = SentPacket::new(
+            0,
+            PacketSpace::SessionData,
+            Instant(0),
+            64,
+            false,
+            0,
+            Vec::new(),
+        );
         assert!(!p.in_flight);
     }
 
     #[test]
     fn ack_eliciting_packets_are_in_flight() {
-        let p = SentPacket::new(0, PacketSpace::SessionData, Instant(0), 64, true, 0);
+        let p = SentPacket::new(
+            0,
+            PacketSpace::SessionData,
+            Instant(0),
+            64,
+            true,
+            0,
+            Vec::new(),
+        );
         assert!(p.in_flight);
         let mut p = p;
         p.mark_acked();

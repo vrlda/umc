@@ -126,12 +126,17 @@ impl AckSendState {
     ///
     /// # Errors
     ///
-    /// Returns [`AckError::EmptyRange`] when the first range length is zero,
-    /// and [`AckError::AcknowledgesUnsent`] when `largest` exceeds the highest
+    /// Returns [`AckError::EmptyRange`] when the first range length is zero or
+    /// an additional range declares a zero length (the encoder never emits
+    /// one, but a hand-built ACK could underflow the range walk), and
+    /// [`AckError::AcknowledgesUnsent`] when `largest` exceeds the highest
     /// packet number recorded as sent.
     pub fn apply_ack(&mut self, largest: u64, ranges: &[(u64, u64)]) -> Result<Vec<u64>, AckError> {
         let first_len = ranges.first().map_or(0, |r| r.0);
         if first_len == 0 {
+            return Err(AckError::EmptyRange);
+        }
+        if ranges.iter().skip(1).any(|r| r.1 == 0) {
             return Err(AckError::EmptyRange);
         }
         let max_sent = self.sent.back().map_or(0, |p| p.packet_number);
@@ -194,7 +199,15 @@ mod tests {
     use umc_types::runtime::Instant;
 
     fn sent(pn: u64) -> SentPacket {
-        SentPacket::new(pn, PacketSpace::SessionData, Instant(0), 64, true, 0)
+        SentPacket::new(
+            pn,
+            PacketSpace::SessionData,
+            Instant(0),
+            64,
+            true,
+            0,
+            Vec::new(),
+        )
     }
 
     #[test]
@@ -225,6 +238,16 @@ mod tests {
         s.record_sent(sent(1));
         s.record_sent(sent(2));
         assert_eq!(s.apply_ack(2, &[(0, 0)]), Err(AckError::EmptyRange));
+    }
+
+    #[test]
+    fn apply_ack_rejects_zero_length_additional_range() {
+        let mut s = AckSendState::new();
+        s.record_sent(sent(1));
+        s.record_sent(sent(2));
+        // A hand-built ACK with a zero-length additional range must be
+        // rejected instead of underflowing the range walk below.
+        assert_eq!(s.apply_ack(2, &[(1, 0), (1, 0)]), Err(AckError::EmptyRange));
     }
 
     #[test]
