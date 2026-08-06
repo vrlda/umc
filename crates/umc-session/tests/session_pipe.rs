@@ -174,3 +174,65 @@ fn datagrams_flow_both_ways() {
     let d = server.recv_datagram().expect("datagram");
     assert_eq!(d.data, b"ping");
 }
+
+#[test]
+fn ack_sampling_initializes_rtt() {
+    let (client_secrets, server_secrets) = run_xx_handshake(
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &TestEntropy,
+        b"ump.udp/1",
+        0,
+    )
+    .expect("handshake");
+    let dcid = vec![9u8; 8];
+    let mut client = Session::new(
+        SessionConfig {
+            role: Role::Client,
+            dcid: dcid.clone(),
+            local_traffic_secret: client_secrets.client,
+            remote_traffic_secret: client_secrets.server,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("client session");
+    let mut server = Session::new(
+        SessionConfig {
+            role: Role::Server,
+            dcid,
+            local_traffic_secret: server_secrets.server,
+            remote_traffic_secret: server_secrets.client,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("server session");
+
+    // 1. client sends a PING packet at Instant(1_000_000)
+    let ping = umc_wire::varint::encode(umc_types::frame::FrameType::PING.0).unwrap();
+    let pkt = client
+        .build_outbound(&TestClock, Instant(1_000_000), &ping)
+        .unwrap()
+        .unwrap();
+    // 2. server processes it and returns an ack payload
+    let ack_payload = server.on_inbound(Instant(1_000_000), &pkt).unwrap();
+    assert!(!ack_payload.is_empty());
+    // 3. client receives the ack at Instant(1_000_100): the ack travels inside
+    //    a protected packet, so build the server's reply exactly as the server
+    //    would: server.build_outbound(now, &ack_payload)
+    let reply = server
+        .build_outbound(&TestClock, Instant(1_000_000), &ack_payload)
+        .unwrap()
+        .unwrap();
+    let _ = client.on_inbound(Instant(1_000_100), &reply).unwrap();
+    // 4. RTT is now sampled: latest_rtt == 100 (minus ack delay 0)
+    assert!(client.rtt().initialized);
+    assert_eq!(client.rtt().latest_rtt, 100);
+}
