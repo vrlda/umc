@@ -160,6 +160,11 @@ impl RelayService {
             now,
             None,
         );
+        self.events.lock().expect("event log").push(DaemonEvent {
+            kind: "circuit_closed".into(),
+            at_ms: now.0,
+            detail: format!("circuit {circuit_id}"),
+        });
         Ok(())
     }
 
@@ -278,5 +283,20 @@ mod tests {
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].kind, "circuit_opened");
         assert_eq!(recent[0].at_ms, 5);
+    }
+
+    #[test]
+    fn close_pushes_event() {
+        let events = Arc::new(Mutex::new(DaemonEvents::new(200)));
+        let mut relay = RelayService::new(events.clone());
+        let id = relay
+            .open_circuit(&open_request(), Instant(5))
+            .unwrap()
+            .circuit_id;
+        relay.close_circuit(id, 0, Instant(20)).unwrap();
+        let recent = events.lock().unwrap().recent(10);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].kind, "circuit_closed");
+        assert_eq!(recent[0].at_ms, 20);
     }
 }

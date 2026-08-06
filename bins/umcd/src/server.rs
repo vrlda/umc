@@ -1,6 +1,7 @@
 //! Control socket server: Unix stream socket, framing, connection handling,
 //! and the service-backed envelope dispatcher (control-api.md §16-24).
 use crate::config::NodeConfig;
+use crate::doctor;
 use crate::relay_service::CircuitOpenRequest;
 use crate::state::RuntimeState;
 use prost::Message;
@@ -79,6 +80,25 @@ struct CandidateSummary {
     public: bool,
 }
 
+/// Wire response for `NodeAdmin.GetEvents` (control-api.md §38-41): the
+/// bounded recent event log. No proto message exists yet; the shape mirrors
+/// the daemon's `DaemonEvent`.
+#[derive(Clone, PartialEq, prost::Message)]
+struct EventRecord {
+    #[prost(uint64, tag = "1")]
+    at_ms: u64,
+    #[prost(string, tag = "2")]
+    kind: String,
+    #[prost(string, tag = "3")]
+    detail: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GetEventsResponse {
+    #[prost(message, repeated, tag = "1")]
+    events: Vec<EventRecord>,
+}
+
 pub async fn run(state: Arc<Mutex<RuntimeState>>) {
     let data_dir = {
         let state = state.lock().expect("runtime state");
@@ -128,6 +148,9 @@ pub async fn run(state: Arc<Mutex<RuntimeState>>) {
 async fn handle_connection(mut stream: UnixStream, state: Arc<Mutex<RuntimeState>>) {
     let mut decoder = EnvelopeDecoder::new(DEFAULT_ENVELOPE_MAX);
     let mut buf = [0u8; 8 * 1024];
+    // The credential presented at hello time gates every request on this
+    // connection (control-api.md §11, §23).
+    let mut presented_token: Option<Vec<u8>> = None;
     loop {
         let Ok(n) = stream.read(&mut buf).await else {
             break;
@@ -146,10 +169,11 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<Mutex<RuntimeState
                 let mut state = state.lock().expect("runtime state");
                 match msg.body {
                     Some(api::envelope::Body::ClientHello(hello)) => {
+                        presented_token = hello_token(&hello);
                         handle_hello(&hello, &state.store)
                     }
                     Some(api::envelope::Body::Request(request)) => {
-                        dispatch_request(&mut state, &request)
+                        dispatch_request(&mut state, &request, presented_token.as_deref())
                     }
                     _ => continue,
                 }
@@ -159,6 +183,17 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<Mutex<RuntimeState
                 let _ = stream.write_all(&out).await;
             }
         }
+    }
+}
+
+/// The credential a client presented in `ClientHello`: the bearer or
+/// development token bytes when the hello carried either (control-api.md
+/// §11.2-11.3).
+fn hello_token(hello: &api::ClientHello) -> Option<Vec<u8>> {
+    match &hello.authentication.as_ref()?.method {
+        Some(api::client_authentication::Method::Development(auth)) => Some(auth.token.clone()),
+        Some(api::client_authentication::Method::Bearer(auth)) => Some(auth.token.clone()),
+        _ => None,
     }
 }
 
@@ -184,15 +219,41 @@ fn handle_hello(hello: &api::ClientHello, store: &SqliteStore) -> Vec<u8> {
 
 /// Service-backed envelope dispatch (control-api.md §16-24). Methods without
 /// a service implementation return `Unimplemented`.
-fn dispatch_request(state: &mut RuntimeState, request: &api::Request) -> Vec<u8> {
+///
+/// When the daemon is configured with a development token, requests whose
+/// connection did not present that exact token at hello time are rejected
+/// with `Unauthenticated` before dispatch (control-api.md §11.3).
+fn dispatch_request(
+    state: &mut RuntimeState,
+    request: &api::Request,
+    presented_token: Option<&[u8]>,
+) -> Vec<u8> {
+    if let Some(configured) = &state.development_token {
+        let matches = presented_token.is_some_and(|token| token == configured.as_slice());
+        if !matches {
+            return response_envelope(request, api::StatusCode::Unauthenticated as i32, None);
+        }
+    }
     let (code, payload) = match (request.service.as_str(), request.method.as_str()) {
         ("NodeAdmin", "GetStatus") => get_status(state),
-        ("PeerService", "ListCandidates") => list_candidates(state),
+        ("PeerService" | "DiscoveryService", "ListCandidates") => list_candidates(state),
         ("BundleService", "GetBundles" | "ListBundles") => list_bundles(state),
         ("RelayService", "OpenCircuit") => open_circuit(state, request),
         ("RelayService", "CloseCircuit") => close_circuit(state, request),
+        ("NodeAdmin" | "ConfigService", "GetConfig") => get_config(state),
+        ("NodeAdmin", "GetEvents") => get_events(state),
+        ("DiagnosticsService" | "NodeAdmin", "RunDoctor" | "Doctor") => run_doctor(state),
+        // Configuration mutation persists in Phase 12.
+        ("ConfigService", "SetConfig") | ("NodeAdmin", "UpdateConfig") => {
+            (api::StatusCode::Unimplemented as i32, None)
+        }
         _ => (api::StatusCode::Unimplemented as i32, None),
     };
+    response_envelope(request, code, payload)
+}
+
+/// Frame one response envelope for `request`.
+fn response_envelope(request: &api::Request, code: i32, payload: Option<Vec<u8>>) -> Vec<u8> {
     let envelope = api::Envelope {
         api_version: Some(api::ApiVersion { major: 1, minor: 0 }),
         sequence: 1,
@@ -286,6 +347,103 @@ fn bundle_state(status: &BundleStatus) -> api::BundleState {
         BundleStatus::Evicted => api::BundleState::Evicted,
         BundleStatus::Rejected => api::BundleState::Rejected,
     }
+}
+
+/// `NodeAdmin.GetConfig`: the current node configuration as `ConfigEntry`s
+/// (control-api.md §24). The development token is never exposed.
+fn get_config(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
+    let config = &state.config;
+    let entries = vec![
+        api::ConfigEntry {
+            key: "profile".into(),
+            value: config.profile.clone(),
+            sensitive_present: false,
+        },
+        api::ConfigEntry {
+            key: "public_relay".into(),
+            value: config.public_relay.to_string(),
+            sensitive_present: false,
+        },
+        api::ConfigEntry {
+            key: "mesh".into(),
+            value: config.mesh.to_string(),
+            sensitive_present: false,
+        },
+        api::ConfigEntry {
+            key: "telemetry".into(),
+            value: config.telemetry.to_string(),
+            sensitive_present: false,
+        },
+        api::ConfigEntry {
+            key: "carriers".into(),
+            value: config.carriers.join(","),
+            sensitive_present: false,
+        },
+    ];
+    let response = api::GetConfigResponse {
+        config: Some(api::NodeConfig {
+            resource_profile: config.profile.clone(),
+            telemetry_enabled: config.telemetry,
+            public_relay_enabled: config.public_relay,
+            entries,
+            ..Default::default()
+        }),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `NodeAdmin.GetEvents`: the bounded recent event log, newest first
+/// (core.md §8, control-api.md §38-41).
+fn get_events(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
+    let events = state
+        .events
+        .lock()
+        .expect("event log")
+        .recent(100)
+        .into_iter()
+        .map(|event| EventRecord {
+            at_ms: event.at_ms,
+            kind: event.kind,
+            detail: event.detail,
+        })
+        .collect();
+    let response = GetEventsResponse { events };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `DiagnosticsService.RunDoctor`: the doctor check suite (core.md §43),
+/// mapped onto `DiagnosticResult`s.
+fn run_doctor(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
+    let results = doctor::run_doctor(&state.config)
+        .checks
+        .into_iter()
+        .map(|check| api::DiagnosticResult {
+            check_id: check.name.to_string(),
+            severity: if check.passed {
+                api::DiagnosticSeverity::Info as i32
+            } else {
+                api::DiagnosticSeverity::Error as i32
+            },
+            summary: if check.passed {
+                "ok".into()
+            } else {
+                "failed".into()
+            },
+            detail: check.detail,
+            remediation: Vec::new(),
+        })
+        .collect();
+    let response = api::RunDoctorResponse {
+        operation_handle: None,
+        results,
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
 }
 
 /// `RelayService.OpenCircuit`: relay admission + circuit allocation.
@@ -408,7 +566,7 @@ mod tests {
     #[tokio::test]
     async fn get_status_reports_real_counts() {
         let (mut state, _tx) = test_state();
-        let bytes = dispatch_request(&mut state, &request("NodeAdmin", "GetStatus", vec![]));
+        let bytes = dispatch_request(&mut state, &request("NodeAdmin", "GetStatus", vec![]), None);
         let response = decode_response(&bytes);
         assert_eq!(
             response.status.as_ref().unwrap().code,
@@ -426,10 +584,11 @@ mod tests {
             crate::session_manager::SessionEntry {
                 peer_endpoint_id: [1u8; 32],
                 carrier_type: "ump.tcp/1".into(),
-                task: tokio::spawn(async {}),
+                task: tokio::spawn(async {}).abort_handle(),
+                established_at_ms: 0,
             },
         );
-        let bytes = dispatch_request(&mut state, &request("NodeAdmin", "GetStatus", vec![]));
+        let bytes = dispatch_request(&mut state, &request("NodeAdmin", "GetStatus", vec![]), None);
         let response = decode_response(&bytes);
         let status = api::GetStatusResponse::decode(response.payload.as_slice())
             .expect("payload")
@@ -451,7 +610,11 @@ mod tests {
         };
         let mut payload = Vec::new();
         Message::encode(&open, &mut payload).unwrap();
-        let bytes = dispatch_request(&mut state, &request("RelayService", "OpenCircuit", payload));
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RelayService", "OpenCircuit", payload),
+            None,
+        );
         let response = decode_response(&bytes);
         assert_eq!(
             response.status.as_ref().unwrap().code,
@@ -469,6 +632,7 @@ mod tests {
         let bytes = dispatch_request(
             &mut state,
             &request("RelayService", "CloseCircuit", payload),
+            None,
         );
         assert_eq!(
             decode_response(&bytes).status.unwrap().code,
@@ -485,6 +649,7 @@ mod tests {
         let bytes = dispatch_request(
             &mut state,
             &request("RelayService", "CloseCircuit", payload),
+            None,
         );
         assert_eq!(
             decode_response(&bytes).status.unwrap().code,
@@ -495,7 +660,25 @@ mod tests {
     #[test]
     fn unknown_methods_are_unimplemented() {
         let (mut state, _tx) = test_state();
-        let bytes = dispatch_request(&mut state, &request("NodeAdmin", "GetConfig", vec![]));
+        let bytes = dispatch_request(
+            &mut state,
+            &request("NodeAdmin", "NoSuchMethod", vec![]),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::Unimplemented as i32
+        );
+    }
+
+    #[test]
+    fn set_config_is_unimplemented_until_phase_12() {
+        let (mut state, _tx) = test_state();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("ConfigService", "SetConfig", vec![]),
+            None,
+        );
         assert_eq!(
             decode_response(&bytes).status.unwrap().code,
             api::StatusCode::Unimplemented as i32
@@ -519,7 +702,11 @@ mod tests {
                 now,
             )
             .unwrap();
-        let bytes = dispatch_request(&mut state, &request("BundleService", "ListBundles", vec![]));
+        let bytes = dispatch_request(
+            &mut state,
+            &request("BundleService", "ListBundles", vec![]),
+            None,
+        );
         let response = decode_response(&bytes);
         assert_eq!(
             response.status.as_ref().unwrap().code,
@@ -555,6 +742,7 @@ mod tests {
         let bytes = dispatch_request(
             &mut state,
             &request("PeerService", "ListCandidates", vec![]),
+            None,
         );
         let response = decode_response(&bytes);
         assert_eq!(
@@ -605,5 +793,135 @@ mod tests {
         let (profile, carriers) = load_node_state(&reopened).unwrap();
         assert_eq!(profile, "relay");
         assert_eq!(carriers, vec!["ump.udp/1"]);
+    }
+
+    #[test]
+    fn get_config_reports_current_entries() {
+        let (mut state, _tx) = test_state();
+        state.config.profile = "relay".into();
+        state.config.carriers = vec!["ump.udp/1".into()];
+        let bytes = dispatch_request(&mut state, &request("NodeAdmin", "GetConfig", vec![]), None);
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let config = api::GetConfigResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .config
+            .expect("config");
+        assert_eq!(config.resource_profile, "relay");
+        assert!(config
+            .entries
+            .iter()
+            .any(|e| e.key == "profile" && e.value == "relay"));
+        assert!(config
+            .entries
+            .iter()
+            .any(|e| e.key == "carriers" && e.value == "ump.udp/1"));
+        assert!(config.entries.iter().any(|e| e.key == "public_relay"));
+    }
+
+    #[test]
+    fn get_events_returns_recent_log() {
+        let (mut state, _tx) = test_state();
+        state
+            .events
+            .lock()
+            .expect("event log")
+            .push(crate::event_log::DaemonEvent {
+                kind: "session_active".into(),
+                at_ms: 7,
+                detail: "session 1".into(),
+            });
+        let bytes = dispatch_request(&mut state, &request("NodeAdmin", "GetEvents", vec![]), None);
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let events = GetEventsResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .events;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "session_active");
+        assert_eq!(events[0].at_ms, 7);
+    }
+
+    #[test]
+    fn discovery_alias_and_doctor_round_trip() {
+        let (mut state, _tx) = test_state();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("DiscoveryService", "ListCandidates", vec![]),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        assert!(ListCandidatesResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .candidates
+            .is_empty());
+
+        let bytes = dispatch_request(
+            &mut state,
+            &request("DiagnosticsService", "RunDoctor", vec![]),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let results = api::RunDoctorResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .results;
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|r| r.check_id == "database"));
+    }
+
+    #[test]
+    fn development_token_gates_requests() {
+        let (mut state, _tx) = test_state();
+        state.development_token = Some(b"dev-token".to_vec());
+        // No credential presented: rejected before dispatch.
+        let bytes = dispatch_request(&mut state, &request("NodeAdmin", "GetStatus", vec![]), None);
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::Unauthenticated as i32
+        );
+        // Wrong credential: rejected.
+        let bytes = dispatch_request(
+            &mut state,
+            &request("NodeAdmin", "GetStatus", vec![]),
+            Some(b"wrong".as_slice()),
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::Unauthenticated as i32
+        );
+        // Matching credential: dispatched.
+        let bytes = dispatch_request(
+            &mut state,
+            &request("NodeAdmin", "GetStatus", vec![]),
+            Some(b"dev-token".as_slice()),
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+    }
+
+    #[test]
+    fn no_token_configured_accepts_anonymous_requests() {
+        let (mut state, _tx) = test_state();
+        let bytes = dispatch_request(&mut state, &request("NodeAdmin", "GetStatus", vec![]), None);
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::Ok as i32
+        );
     }
 }
