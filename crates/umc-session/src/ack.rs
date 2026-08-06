@@ -199,15 +199,7 @@ mod tests {
     use umc_types::runtime::Instant;
 
     fn sent(pn: u64) -> SentPacket {
-        SentPacket::new(
-            pn,
-            PacketSpace::SessionData,
-            Instant(0),
-            64,
-            true,
-            0,
-            Vec::new(),
-        )
+        SentPacket::new(pn, PacketSpace::SessionData, Instant(0), 64, true, 0)
     }
 
     #[test]
