@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod duplicate;
 pub mod failure;
+pub mod local;
 pub mod paths;
 pub mod request;
 pub mod response;
