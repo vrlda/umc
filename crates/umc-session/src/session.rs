@@ -357,6 +357,13 @@ impl Session {
         &self.rtt
     }
 
+    /// Replay-window footprint in bytes for `space` (session.md §8.2): a
+    /// fixed 512 bytes no matter how many packets were received.
+    #[must_use]
+    pub fn replay_bytes(&self, space: PacketSpace) -> Option<usize> {
+        self.spaces.get(&space).map(PacketSpaceState::replay_bytes)
+    }
+
     /// Initiate a key update; returns the `KEY_UPDATE` frame payload.
     ///
     /// # Errors

@@ -200,12 +200,15 @@ impl ConnectionCloseFrame {
 
 /// Parse frames from a decrypted payload (wire-format §20-22).
 ///
+/// Unknown length-delimited frame types are skipped: they carry their body
+/// length and are self-delimiting, so an unrecognized extension never aborts
+/// the packet (wire-format §21).
+///
 /// # Errors
 ///
 /// Returns `UnknownCriticalFrame` for unrecognized critical fixed frames,
 /// `UnknownOptionalFixedFrame` for unrecognized optional fixed frames,
-/// `UnsupportedLengthDelimited` for length-delimited frames, and the frame
-/// body's decode error for malformed or truncated frames.
+/// and the frame body's decode error for malformed or truncated frames.
 #[allow(clippy::too_many_lines)]
 pub fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, FrameError> {
     let mut out = Vec::new();
@@ -389,7 +392,16 @@ pub fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, FrameError> {
             }
             ExtensionBehavior::CriticalLengthDelimited
             | ExtensionBehavior::OptionalLengthDelimited => {
-                return Err(FrameError::UnsupportedLengthDelimited);
+                // Unknown length-delimited frames are self-delimiting: skip
+                // the declared body instead of aborting the whole packet.
+                let (len, used) =
+                    crate::varint::decode(&payload[pos..]).map_err(FrameError::Varint)?;
+                pos += used;
+                let len = usize::try_from(len).map_err(|_| FrameError::LengthExceedsLimit)?;
+                pos = pos.checked_add(len).ok_or(FrameError::LengthExceedsLimit)?;
+                if pos > payload.len() {
+                    return Err(FrameError::Truncated);
+                }
             }
         }
     }

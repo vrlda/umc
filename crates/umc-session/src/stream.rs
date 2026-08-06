@@ -108,6 +108,9 @@ impl Stream {
         if self.buffered_bytes > MAX_OUT_OF_ORDER_BYTES
             || self.buffered.len() >= MAX_OUT_OF_ORDER_RANGES
         {
+            // Rejected input must not mutate state: roll back the tentative
+            // byte count so the budget reflects only buffered ranges.
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(data.len());
             return Err(StreamError::OutOfOrderBudgetExceeded);
         }
         self.buffered.insert(offset, data.to_vec());
