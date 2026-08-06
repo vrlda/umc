@@ -28,3 +28,4 @@ Specifications are licensed under Creative Commons Attribution 4.0 International
 - [x] Phase 9: application layer — application registry, well-known protocol IDs, stream dispatch, echo application over live sessions
 - [x] Phase 10: SDK bindings — daemon, config, and status clients; CLI config get/set and events commands
 - [x] Phase 11: plugin contract — manifest, registry, and in-process plugin lifecycle (dynamic loading deferred until the security model is spec-frozen)
+- [x] Phase 12: protocol completion over sessions — relay, bundle store/forward, and route requests over live sessions; config persistence; key rotation; CLIENT_AUTH continuation; two-daemon integration
