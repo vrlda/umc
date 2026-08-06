@@ -83,9 +83,13 @@ pub struct Session {
     remote_keys: PacketKeys,
     spaces: HashMap<PacketSpace, PacketSpaceState>,
     sent: AckSendState,
+    /// Payloads of built packets keyed by packet number. Lost packets leave
+    /// the sent queue (their `SentPacket` is dropped by loss detection), so
+    /// the payload is retained here until acknowledged or retransmitted
+    /// (session.md §14.3).
+    retransmit_payloads: HashMap<u64, Vec<u8>>,
     recv_acks: HashMap<PacketSpace, AckReceiveState>,
     rtt: RttEstimator,
-    #[allow(dead_code)]
     loss: LossDetector,
     pub streams: HashMap<u64, Stream>,
     next_outgoing_stream: u64,
@@ -132,6 +136,7 @@ impl Session {
                 .map_err(|_| SessionError::BadKeys)?,
             spaces,
             sent: AckSendState::new(),
+            retransmit_payloads: HashMap::new(),
             recv_acks: HashMap::new(),
             rtt: RttEstimator::new(),
             loss: LossDetector::new(config.max_ack_delay_ms),
@@ -244,6 +249,14 @@ impl Session {
         payload: &[u8],
     ) -> Result<Option<Vec<u8>>, SessionError> {
         let _ = clock;
+        self.build_outbound_inner(now, payload)
+    }
+
+    fn build_outbound_inner(
+        &mut self,
+        now: Instant,
+        payload: &[u8],
+    ) -> Result<Option<Vec<u8>>, SessionError> {
         if self.state != SessionState::Active {
             return Ok(None);
         }
@@ -261,7 +274,9 @@ impl Session {
             payload.len() + 64,
             true,
             0,
+            payload.to_vec(),
         );
+        self.retransmit_payloads.insert(pn, payload.to_vec());
         self.sent.record_sent(sent);
         let keys = &self.local_keys;
         let pkt = build_protected_packet(
@@ -411,6 +426,9 @@ impl Session {
             .sent
             .apply_ack(ack.largest_acknowledged, &flat)
             .map_err(SessionError::Ack)?;
+        for pn in &acked {
+            self.retransmit_payloads.remove(pn);
+        }
         // RFC 9002 §5.3: latest_rtt is sampled only from the newest acked
         // packet (the acked list is ascending by packet number); min_rtt and
         // smoothed_rtt still sample every packet below.
@@ -442,6 +460,47 @@ impl Session {
     #[must_use]
     pub fn rtt(&self) -> &RttEstimator {
         &self.rtt
+    }
+
+    #[must_use]
+    pub fn sent_state(&self) -> &AckSendState {
+        &self.sent
+    }
+
+    pub fn sent_state_mut(&mut self) -> &mut AckSendState {
+        &mut self.sent
+    }
+
+    #[must_use]
+    pub fn loss_detector(&self) -> &LossDetector {
+        &self.loss
+    }
+
+    /// Re-send the payload of packet `pn` under a fresh packet number
+    /// (session.md §14.3): loss detection drops the lost packet from the sent
+    /// queue, so the payload is looked up first in the outstanding packets and
+    /// then in the retained-payload table. Returns the freshly built packet
+    /// bytes, or `None` when `pn` is neither outstanding nor retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NoSpace`] if the session data space is
+    /// missing, [`SessionError::Space`] if packet numbers are exhausted, and
+    /// [`SessionError::Packet`] if packet assembly fails.
+    pub fn retransmit(&mut self, pn: u64, now: Instant) -> Result<Option<Vec<u8>>, SessionError> {
+        let payload = self
+            .sent
+            .sent()
+            .iter()
+            .find(|p| p.packet_number == pn)
+            .map(|p| p.payload.clone())
+            .or_else(|| self.retransmit_payloads.get(&pn).cloned());
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let bytes = self.build_outbound_inner(now, &payload)?;
+        self.retransmit_payloads.remove(&pn);
+        Ok(bytes)
     }
 
     /// Replay-window footprint in bytes for `space` (session.md §8.2): a
@@ -770,6 +829,7 @@ mod tests {
             64,
             true,
             0,
+            Vec::new(),
         ));
         let ack = umc_wire::frame::AckFrame {
             largest_acknowledged: 1,
@@ -793,6 +853,7 @@ mod tests {
             64,
             true,
             0,
+            Vec::new(),
         ));
         s.sent.record_sent(SentPacket::new(
             2,
@@ -801,6 +862,7 @@ mod tests {
             64,
             true,
             0,
+            Vec::new(),
         ));
         let ack = umc_wire::frame::AckFrame {
             largest_acknowledged: 2,
