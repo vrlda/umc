@@ -14,6 +14,9 @@ struct Args {
     /// Run an initialization pass and exit (core.md §19).
     #[arg(long)]
     init: bool,
+    /// Override the control socket path (layering: CLI beats config file).
+    #[arg(long)]
+    socket: Option<String>,
     /// Run diagnostics and exit.
     #[arg(long)]
     doctor: bool,
@@ -21,7 +24,10 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let config = NodeConfig::load(args.config.as_ref()).expect("valid config");
+    let mut config = NodeConfig::load(args.config.as_ref()).expect("valid config");
+    if let Some(socket) = args.socket {
+        config.control_socket = socket.into();
+    }
     if args.init {
         init_node(&config);
         return;
