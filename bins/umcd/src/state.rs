@@ -260,6 +260,14 @@ impl RuntimeState {
             Ok(count) => println!("[bundle] restored {count} bundle(s) from metadata"),
             Err(e) => eprintln!("[bundle] metadata restore failed: {e}"),
         }
+        // The event log persists under the api namespace (core.md §15
+        // audit logging): prior history is restored into the ring so the
+        // control surface still sees it after a restart.
+        {
+            let mut events_guard = events.lock().expect("event log");
+            events_guard.attach_store(store.clone());
+            events_guard.restore_persisted(store.as_ref());
+        }
 
         Ok(Self {
             control_socket: config.resolved_socket(),
@@ -372,5 +380,30 @@ mod tests {
         assert!(a > 1_700_000_000_000, "wall now must be epoch ms, got {a}");
         let b = wall_now().0;
         assert!(b >= a);
+    }
+
+    #[test]
+    fn events_survive_restart() {
+        with_password("test-password", || {
+            let config = fresh_config();
+            let first = build(config.clone());
+            first
+                .events
+                .lock()
+                .unwrap()
+                .push(crate::event_log::DaemonEvent {
+                    kind: "session_active".into(),
+                    at_ms: 42,
+                    detail: "restart check".into(),
+                });
+            drop(first);
+            // A fresh daemon over the same data dir restores the event from
+            // the api namespace (core.md §15 audit logging).
+            let second = build(config);
+            let recent = second.events.lock().unwrap().recent(10);
+            assert_eq!(recent.len(), 1);
+            assert_eq!(recent[0].kind, "session_active");
+            assert_eq!(recent[0].at_ms, 42);
+        });
     }
 }
