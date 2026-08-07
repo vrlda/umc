@@ -27,6 +27,198 @@ impl Clock for TestClock {
     }
 }
 
+/// Driver handshake + fresh client/server sessions (pipe pattern).
+fn pipe_pair() -> (Session, Session) {
+    let (client_secrets, server_secrets) = run_xx_handshake(
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &TestEntropy,
+        b"ump.udp/1",
+        0,
+    )
+    .expect("handshake");
+    let dcid = vec![9u8; 8];
+    let client = Session::new(
+        SessionConfig {
+            role: Role::Client,
+            dcid: dcid.clone(),
+            local_traffic_secret: client_secrets.client,
+            remote_traffic_secret: client_secrets.server,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("client session");
+    let server = Session::new(
+        SessionConfig {
+            role: Role::Server,
+            dcid: dcid.clone(),
+            local_traffic_secret: server_secrets.server,
+            remote_traffic_secret: server_secrets.client,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("server session");
+    (client, server)
+}
+
+/// Build a client-side protected packet carrying the given frame payload.
+fn client_packet(client: &mut Session, payload: &[u8]) -> Vec<u8> {
+    client
+        .build_outbound(&TestClock, Instant(0), payload)
+        .expect("build")
+        .expect("some")
+}
+
+/// Deliver one encoded frame (type byte included) from client to server.
+fn deliver_frame(client: &mut Session, server: &mut Session, frame_bytes: &[u8]) {
+    let pkt = client_packet(client, frame_bytes);
+    server.on_inbound(Instant(0), &pkt).expect("inbound");
+}
+
+#[test]
+fn reset_final_size_consumed_once() {
+    let (mut client, mut server) = pipe_pair();
+    let sid = client.open_stream().expect("stream");
+    // The server must know the stream: deliver 10 bytes first.
+    let stream = umc_wire::frames::stream::StreamFrame {
+        stream_id: sid,
+        fin: false,
+        offset_present: false,
+        len_present: true,
+        open: true,
+        unidirectional: false,
+        offset: 0,
+        data: vec![0xAA; 10],
+        protocol_id: Vec::new(),
+        metadata: Vec::new(),
+    };
+    deliver_frame(&mut client, &mut server, &stream.encode().unwrap());
+    assert_eq!(server.flow_consumed(), 10);
+    let reset = umc_wire::frames::stream::ResetStreamFrame {
+        stream_id: sid,
+        app_error_code: 0,
+        final_size: 50,
+    };
+    deliver_frame(&mut client, &mut server, &reset.encode().unwrap());
+    // The reset's final size is accounted once: 10 (stream) + 50 (reset).
+    assert_eq!(server.flow_consumed(), 60);
+    // A retransmitted RESET must not double-consume.
+    deliver_frame(&mut client, &mut server, &reset.encode().unwrap());
+    assert_eq!(server.flow_consumed(), 60);
+}
+
+#[test]
+fn reset_final_size_below_received_rejected() {
+    let (mut client, mut server) = pipe_pair();
+    let sid = client.open_stream().expect("stream");
+    // Deliver 100 bytes of stream data first (offset 0, len 100).
+    let stream = umc_wire::frames::stream::StreamFrame {
+        stream_id: sid,
+        fin: false,
+        offset_present: false,
+        len_present: true,
+        open: true,
+        unidirectional: false,
+        offset: 0,
+        data: vec![0xAB; 100],
+        protocol_id: Vec::new(),
+        metadata: Vec::new(),
+    };
+    deliver_frame(&mut client, &mut server, &stream.encode().unwrap());
+    // RESET with final_size 50 < received 100 must fail the packet.
+    let reset = umc_wire::frames::stream::ResetStreamFrame {
+        stream_id: sid,
+        app_error_code: 0,
+        final_size: 50,
+    };
+    let pkt = client_packet(&mut client, &reset.encode().unwrap());
+    assert!(server.on_inbound(Instant(0), &pkt).is_err());
+}
+
+#[test]
+fn credit_emitted_on_app_consumption() {
+    let (mut client, mut server) = pipe_pair();
+    let sid = client.open_stream().expect("stream");
+    // Stream credit is 256 KiB. Deliver 200 KiB at real offsets WITHOUT
+    // reading: the received-not-delivered delta (200 KiB) exceeds half the
+    // limit, so MAX_STREAM_DATA fires (grant -> 512 KiB).
+    // 200 KiB in 25 chunks of 8 KiB (single-frame packets cap at 65 535 B).
+    let chunk = vec![0xCD; 8_000];
+    for i in 0..25u64 {
+        let frame = umc_wire::frames::stream::StreamFrame {
+            stream_id: sid,
+            fin: false,
+            offset_present: i != 0,
+            len_present: true,
+            open: true,
+            unidirectional: false,
+            offset: i * 8_000,
+            data: chunk.clone(),
+            protocol_id: Vec::new(),
+            metadata: Vec::new(),
+        };
+        deliver_frame(&mut client, &mut server, &frame.encode().unwrap());
+    }
+    let frames = server.flow_control_frames(Instant(0));
+    assert!(
+        frames
+            .iter()
+            .any(|f| umc_wire::varint::decode(f).map(|(t, _)| t)
+                == Ok(umc_types::frame::FrameType::MAX_STREAM_DATA.0)),
+        "MAX_STREAM_DATA emitted when the unread delta crosses half the limit"
+    );
+    // Read everything: the delta drops to zero.
+    let (data, _) = server.read_stream(sid).expect("read");
+    assert_eq!(data.len(), 200_000);
+    // Deliver another 200 KiB (offsets 200_000..400_000): the delta is again
+    // 200 KiB, but the NEW limit is 512 KiB and half of it is 256 KiB —
+    // 200 KiB < 256 KiB, so NO re-emission. (Received-total accounting would
+    // have fired here: 400 KiB total vs the old 256 KiB limit.)
+    // Another 200 KiB (offsets 200_000..400_000), chunked.
+    for i in 0..25u64 {
+        let frame = umc_wire::frames::stream::StreamFrame {
+            stream_id: sid,
+            fin: false,
+            offset_present: true,
+            len_present: true,
+            open: true,
+            unidirectional: false,
+            offset: 200_000 + i * 8_000,
+            data: chunk.clone(),
+            protocol_id: Vec::new(),
+            metadata: Vec::new(),
+        };
+        deliver_frame(&mut client, &mut server, &frame.encode().unwrap());
+    }
+    let frames = server.flow_control_frames(Instant(0));
+    assert!(
+        !frames
+            .iter()
+            .any(|f| umc_wire::varint::decode(f).map(|(t, _)| t)
+                == Ok(umc_types::frame::FrameType::MAX_STREAM_DATA.0)),
+        "no re-emission while the unread delta stays under half the new limit"
+    );
+}
+
+#[test]
+fn unknown_id_reset_is_noop() {
+    let (mut client, mut server) = pipe_pair();
+    let reset = umc_wire::frames::stream::ResetStreamFrame {
+        stream_id: 999,
+        app_error_code: 0,
+        final_size: 10,
+    };
+    deliver_frame(&mut client, &mut server, &reset.encode().unwrap());
+}
+
 #[test]
 fn stream_echo_through_two_sessions() {
     let (client_secrets, server_secrets) = run_xx_handshake(
@@ -789,7 +981,7 @@ fn flow_credit_emitted_at_half_consumption() {
             dcid,
             local_traffic_secret: server_secrets.server,
             remote_traffic_secret: server_secrets.client,
-            initial_max_data: 100_000,
+            initial_max_data: 300_000,
             initial_max_stream_data: 256 * 1024,
             max_ack_delay_ms: 25,
         },
@@ -802,7 +994,9 @@ fn flow_credit_emitted_at_half_consumption() {
     // grants a new inbound stream (session.md §20: credit is re-granted at
     // the half-consumed watermark, doubling the limit). Each segment fits a
     // 65 535-byte packet (MAX_PACKET_SIZE).
-    for offset in [0u64, 40_000] {
+    // Consume past half of BOTH limits: the connection limit is 100 000
+    // (half 50 000) and the per-stream limit is 256 KiB (half 128 000).
+    for offset in [0u64, 40_000, 80_000, 120_000] {
         let payload = stream_payload_at(0, offset, &vec![0x61; 40_000]);
         let pkt = client
             .build_outbound(&TestClock, t0, &payload)
@@ -821,7 +1015,7 @@ fn flow_credit_emitted_at_half_consumption() {
         .collect();
     assert!(
         decoded.iter().any(
-            |f| matches!(f, umc_wire::frame::Frame::MaxData(md) if md.maximum_data == 200_000)
+            |f| matches!(f, umc_wire::frame::Frame::MaxData(md) if md.maximum_data == 600_000)
         ),
         "MAX_DATA must double the connection limit"
     );
@@ -829,7 +1023,7 @@ fn flow_credit_emitted_at_half_consumption() {
         decoded.iter().any(|f| matches!(
             f,
             umc_wire::frame::Frame::MaxStreamData(msd)
-                if msd.stream_id == 0 && msd.maximum_stream_data == 200_000
+                if msd.stream_id == 0 && msd.maximum_stream_data == 512 * 1024
         )),
         "MAX_STREAM_DATA must double the per-stream limit"
     );
@@ -889,7 +1083,7 @@ fn reset_stream_marks_recv_reset() {
     server.on_inbound(t0, &pkt).unwrap();
     // The peer resets its send side (session.md §18.5): our recv side is
     // reset, buffered data becomes unreachable, and reading reports it.
-    let reset = reset_stream_payload(0, 0);
+    let reset = reset_stream_payload(0, 7);
     let pkt = client
         .build_outbound(&TestClock, t0, &reset)
         .unwrap()
