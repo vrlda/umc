@@ -286,7 +286,7 @@ fn handle_inbound_link_locked(
         .expect("handshake tracker")
         .record(&dcid, now);
 
-    let session = umc_session::session::Session::new(
+    let mut session = umc_session::session::Session::new(
         umc_session::session::SessionConfig {
             role: umc_session::session::Role::Server,
             dcid,
