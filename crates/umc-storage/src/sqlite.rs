@@ -79,6 +79,21 @@ impl SqliteStore {
     ///
     /// # Panics
     /// Panics if the connection mutex is poisoned.
+    /// Opens a database READ-ONLY and returns its schema version without
+    /// running init/migrations (storage.md §21.1: restore validation must
+    /// not mutate the backup).
+    pub fn read_only_schema_version(path: &Path) -> Result<i64, StoreError> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .map_err(|e| StoreError::Corrupt(e.to_string()))
+    }
+
     pub fn schema_version(&self) -> Result<i64, StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {

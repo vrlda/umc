@@ -43,6 +43,17 @@ pub fn backup(config: &NodeConfig, out_dir: &Path) -> Result<(), String> {
     if !ks_path.exists() {
         return Err(format!("backup: no keystore at {}", ks_path.display()));
     }
+    // Refuse an output that aliases or contains the data dir: clearing it
+    // would destroy the live database before the copy starts.
+    let out_abs = out_dir
+        .canonicalize()
+        .unwrap_or_else(|_| out_dir.to_path_buf());
+    let data_abs = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
+    if out_abs == data_abs || data_abs.starts_with(&out_abs) {
+        return Err("backup: output dir must not be the data dir or its ancestor".into());
+    }
     // The output is a fresh directory; an existing one is replaced
     // (the operator names the destination, so an overwrite is the
     // point of the flag).
@@ -170,10 +181,10 @@ fn read_manifest(in_dir: &Path) -> Result<Manifest, String> {
 /// # Errors
 /// Returns a message when the file cannot be opened or has a future schema.
 fn open_schema(path: &Path, what: &str) -> Result<i64, String> {
-    match SqliteStore::open(path) {
-        Ok(store) => store
-            .schema_version()
-            .map_err(|e| format!("restore refused: {what}: {e:?}")),
+    // Read-only probe: init/migrations must never touch the backup or the
+    // target during validation (storage.md §21.1).
+    match SqliteStore::read_only_schema_version(path) {
+        Ok(version) => Ok(version),
         Err(StoreError::Corrupt(msg)) if msg.contains("schema") => Err(format!(
             "restore refused: {what} has an unsupported (newer) schema version: {msg}"
         )),
@@ -648,4 +659,35 @@ mod tests {
         let routes = list_routes(&copied).unwrap();
         assert_eq!(routes.len(), 1);
     }
+}
+
+#[test]
+fn schema_probe_is_read_only() {
+    // A schema-v1 database must NOT be migrated by the probe: validation
+    // never mutates the backup (storage.md §21.1).
+    let dir = std::env::temp_dir().join(format!(
+        "umcd-backup-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("node.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version (version) VALUES (1);",
+    )
+    .unwrap();
+    drop(conn);
+    let version = umc_storage::sqlite::SqliteStore::read_only_schema_version(&path).unwrap();
+    assert_eq!(version, 1);
+    // Still v1 afterwards: no migrations ran.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let v: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 1);
 }
