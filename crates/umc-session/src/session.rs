@@ -299,7 +299,14 @@ impl Session {
             0,
         );
         self.retransmit_payloads.insert(pn, payload.to_vec());
-        self.sent.record_sent(sent);
+        if let Some(lost_pn) = self.sent.record_sent(sent) {
+            // Cap eviction (MAX_OUTSTANDING_PACKETS): the evicted packet is
+            // beyond recovery, so drop its retained payload. The daemon's
+            // loss handling does not need to know about cap evictions — the
+            // packet number is gone from both structures (resource-limits.md
+            // §24).
+            self.retransmit_payloads.remove(&lost_pn);
+        }
         let keys = &self.local_keys;
         let pkt = build_protected_packet(
             keys,
@@ -992,5 +999,20 @@ mod tests {
         // min_rtt still reflects every packet.
         assert_eq!(s.rtt().latest_rtt, 10);
         assert_eq!(s.rtt().min_rtt, 10);
+    }
+
+    #[test]
+    fn cap_eviction_prunes_retransmit_payload() {
+        let mut s = session();
+        // Fill the outstanding queue to the cap, then one more build
+        // evicts the oldest ack-eliciting packet (pn 0).
+        for i in 0..=crate::ack::MAX_OUTSTANDING_PACKETS as u64 {
+            s.build_outbound(&TestClock, Instant(i), b"x")
+                .unwrap()
+                .expect("built packet");
+        }
+        // The evicted packet is beyond recovery: its payload was pruned, so
+        // retransmission finds nothing.
+        assert_eq!(s.retransmit(0, Instant(0)).unwrap(), None);
     }
 }
