@@ -74,6 +74,13 @@ impl RoutingService {
             }
         };
         for snapshot in snapshots {
+            // Persisted routes already past their evidence lifetime are
+            // dropped at restore (storage.md §15.2): revalidation cannot
+            // resurrect them.
+            if Instant(snapshot.learned_at_ms) + Duration::from_millis(snapshot.lifetime_ms) <= now
+            {
+                continue;
+            }
             let Ok(hash) = <[u8; 32]>::try_from(snapshot.key_hash) else {
                 eprintln!("[routing] skipping persisted route with a non-32-byte key hash");
                 continue;

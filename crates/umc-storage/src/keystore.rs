@@ -188,7 +188,8 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> Result<(), KeystoreErro
             .map_err(|e| KeystoreError::Io(e.to_string()))?;
         file.write_all(data)
             .map_err(|e| KeystoreError::Io(e.to_string()))?;
-        file.sync_all().map_err(|e| KeystoreError::Io(e.to_string()))?;
+        file.sync_all()
+            .map_err(|e| KeystoreError::Io(e.to_string()))?;
         drop(file);
         std::fs::rename(&tmp, path).map_err(|e| KeystoreError::Io(e.to_string()))?;
         // Tighten permissions even when the file pre-existed (mode(0o600)
