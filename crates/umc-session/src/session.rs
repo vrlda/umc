@@ -540,9 +540,11 @@ impl Session {
                     // §18.5 MUST: account the reset's final size against
                     // connection flow control exactly once, and reject a
                     // final size below any received offset or conflicting
-                    // with a known final size.
-                    let received = *self.stream_consumed.get(&f.stream_id).unwrap_or(&0);
-                    if f.final_size < received {
+                    // with a known final size. The max received offset comes
+                    // from the stream's own reassembly state (delivered
+                    // prefix plus the highest buffered end).
+                    let max_received = stream.max_received_offset();
+                    if f.final_size < max_received {
                         return Err(SessionError::Flow(super::flow::FlowError::ExceedsCredit));
                     }
                     if let Some(known) = stream.final_size {

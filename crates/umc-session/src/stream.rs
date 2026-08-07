@@ -163,6 +163,16 @@ impl Stream {
     ///
     /// Returns `StreamError::AlreadyClosed` when the send side is fully acked,
     /// reset, or stopped by the peer (`STOP_SENDING`, session.md §18.5).
+    /// Highest byte offset received on this stream (delivered prefix plus
+    /// the highest buffered end). Used for RESET final-size validation.
+    #[must_use]
+    pub fn max_received_offset(&self) -> u64 {
+        if let Some((&key, value)) = self.buffered.last_key_value() {
+            return key.saturating_add(value.len() as u64);
+        }
+        self.next_deliver_offset
+    }
+
     pub fn send_ready(&mut self, data: &[u8]) -> Result<(u64, Vec<u8>), StreamError> {
         if self.send_state == SendState::DataAcked
             || self.send_state == SendState::ResetAcked
