@@ -2,6 +2,7 @@
 //! metadata, encrypted with a memory-hard KDF when password-protected.
 //! Phase 2 uses a file-backed store with Argon2id-style derivation via
 //! the `argon2` crate.
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyClass {
@@ -168,6 +169,22 @@ impl Keystore {
     pub fn lock(&mut self) {
         self.master = None;
     }
+
+    /// Reports whether the file at `path` is a v2 keystore: its header must
+    /// carry the v2 magic. Password verification is deliberately NOT done
+    /// here — restore/backup flows run without the password, and the
+    /// daemon verifies the check blob at boot (storage.md §21.1: format
+    /// validation only, no secret handling).
+    ///
+    /// Returns `false` when the file is missing, unreadable, or not a v2
+    /// keystore.
+    #[must_use]
+    pub fn is_valid_format(path: &Path) -> bool {
+        let Ok(file) = std::fs::read(path) else {
+            return false;
+        };
+        file.get(..HEADER_LEN) == Some(FILE_HEADER)
+    }
 }
 
 /// Writes `data` to `path`, creating the file with owner-only permissions
@@ -332,5 +349,20 @@ mod tests {
             ks.load(KeyClass::Recovery, b"r"),
             Err(KeystoreError::NotUnlocked)
         );
+    }
+
+    #[test]
+    fn is_valid_format_checks_the_header_only() {
+        let path = temp_path();
+        let _ = std::fs::remove_file(&path);
+        let ks = Keystore::open(path.clone(), b"pw").unwrap();
+        ks.store(KeyClass::IdentitySigning, b"node-identity", &[1u8; 64])
+            .unwrap();
+        drop(ks);
+        // A real keystore passes; garbage and missing files do not.
+        assert!(Keystore::is_valid_format(&path));
+        std::fs::write(&path, b"not a keystore").unwrap();
+        assert!(!Keystore::is_valid_format(&path));
+        assert!(!Keystore::is_valid_format(&path.with_extension("missing")));
     }
 }
