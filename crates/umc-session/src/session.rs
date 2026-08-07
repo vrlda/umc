@@ -413,25 +413,33 @@ impl Session {
             return Ok(None);
         }
         // Anti-amplification (congestion.md §18): before validation a path
-        // may send at most 3x the bytes it has received. ACKs are exempt —
-        // the peer can only answer with small ack frames, and refusing them
+        // may send at most 3x the bytes it has received. Control payloads
+        // are exempt — ACKs and PINGs are a few bytes, and refusing them
         // would stall the protocol (session.md §26). The gate only applies
         // when a path record exists: sessions without path accounting send
         // unrestricted.
         if let Some(path) = self.paths.get(&super::packet::DEFAULT_PATH_ID) {
             if !path.validated
-                && !is_ack_payload(payload)
+                && !is_exempt_payload(payload)
                 && payload.len() as u64 > path.send_allowance()
             {
                 return Err(SessionError::AmplificationLimit);
             }
         }
         // Congestion window (congestion.md §7.1): sends are bounded by the
-        // controller's allowance — cwnd minus in-flight bytes. ACK
+        // controller's allowance — cwnd minus in-flight bytes. ACK and PING
         // payloads carry the same exemption as the anti-amplification gate
-        // (congestion.md §7.3 control reserve): they are small and
-        // refusing them would break the acknowledgment loop.
-        if !is_ack_payload(payload) && payload.len() > self.congestion.send_allowance() {
+        // (congestion.md §7.3 control reserve): they are small and refusing
+        // them would break the acknowledgment loop or stall the PTO probe
+        // with a full window.
+        //
+        // The gate must run before packet assembly, so the protected size is
+        // bounded by `payload.len() + PROTECTED_OVERHEAD_ESTIMATE` — the
+        // wire bytes (which charge in-flight) always include the header,
+        // dcid, path id, packet number, and the AEAD tag beyond the payload.
+        if !is_exempt_payload(payload)
+            && payload.len() + PROTECTED_OVERHEAD_ESTIMATE > self.congestion.send_allowance()
+        {
             return Err(SessionError::CongestionLimited);
         }
         // NOTE: this builder serves retransmits and PTO probes too, so it
@@ -457,13 +465,16 @@ impl Session {
         .map_err(SessionError::Packet)?;
         let sent = SentPacket::new(pn, PacketSpace::SessionData, now, pkt.len(), true, 0);
         self.retransmit_payloads.insert(pn, payload.to_vec());
-        if let Some(lost_pn) = self.sent.record_sent(sent) {
+        if let Some((lost_pn, lost_size)) = self.sent.record_sent(sent) {
             // Cap eviction (MAX_OUTSTANDING_PACKETS): the evicted packet is
-            // beyond recovery, so drop its retained payload. The daemon's
-            // loss handling does not need to know about cap evictions — the
-            // packet number is gone from both structures (resource-limits.md
-            // §24).
+            // beyond recovery, so drop its retained payload. Its bytes are
+            // released from the congestion controller's in-flight count as
+            // if acknowledged — they are gone from the sent queue and would
+            // otherwise leak the window forever (resource-limits.md §24).
+            // This is NOT a loss event: the controller's loss counter must
+            // not trip.
             self.retransmit_payloads.remove(&lost_pn);
+            self.congestion.on_packet_acknowledged(lost_size);
         }
         // Charge the budget for the actual wire bytes (congestion.md §18);
         // only unvalidated paths carry a budget.
@@ -1094,13 +1105,24 @@ impl Session {
     }
 }
 
-/// Whether `payload`'s first frame is an ACK: such payloads are exempt from
-/// the anti-amplification gate (congestion.md §18). An ACK is small — at most
-/// a few bytes per packet — so it can never exceed 3x what the peer just
-/// sent, and refusing it would break the acknowledgment loop.
-fn is_ack_payload(payload: &[u8]) -> bool {
-    umc_wire::varint::decode(payload)
-        .is_ok_and(|(frame_type, _)| frame_type == umc_types::frame::FrameType::ACK.0)
+/// Upper bound on the protected-packet overhead beyond the payload (short
+/// header byte, 8-byte dcid, path varint, 2-byte packet number, 16-byte
+/// AEAD tag): the congestion gate runs before packet assembly, so the wire
+/// size is estimated as `payload.len() + 64`.
+const PROTECTED_OVERHEAD_ESTIMATE: usize = 64;
+
+/// Whether `payload`'s first frame is exempt from the send gates (ACK or
+/// PING): the control reserve (congestion.md §7.3). Such payloads are a few
+/// bytes at most, so refusing them would stall the acknowledgment loop
+/// (ACK) or the PTO recovery probe (PING) instead of protecting the
+/// network; the anti-amplification gate (congestion.md §18) shares the same
+/// rationale.
+fn is_exempt_payload(payload: &[u8]) -> bool {
+    umc_wire::varint::decode(payload).is_ok_and(|(frame_type, _)| {
+        let frame_type = umc_types::frame::FrameType(frame_type);
+        frame_type == umc_types::frame::FrameType::ACK
+            || frame_type == umc_types::frame::FrameType::PING
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

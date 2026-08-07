@@ -118,18 +118,19 @@ impl AckSendState {
 
     /// Record a sent packet, bounded by [`MAX_OUTSTANDING_PACKETS`]. When
     /// the queue is at the cap, the oldest entry is evicted regardless of
-    /// its type; its packet number is returned only when it was
+    /// its type; its packet number and size are returned only when it was
     /// ack-eliciting, so the caller can drop the retransmit payload of a
-    /// packet beyond recovery. Non-ack-eliciting packets carry no
+    /// packet beyond recovery and release its bytes from the congestion
+    /// controller's in-flight count. Non-ack-eliciting packets carry no
     /// retransmittable payload, so their silent eviction is harmless.
-    /// Returns `Some(lost_pn)` when an ack-eliciting eviction happened,
-    /// `None` otherwise.
-    pub fn record_sent(&mut self, p: SentPacket) -> Option<u64> {
+    /// Returns `Some((lost_pn, lost_size))` when an ack-eliciting eviction
+    /// happened, `None` otherwise.
+    pub fn record_sent(&mut self, p: SentPacket) -> Option<(u64, usize)> {
         let mut evicted = None;
         if self.sent.len() >= MAX_OUTSTANDING_PACKETS {
             if let Some(oldest) = self.sent.pop_front() {
                 if oldest.ack_eliciting {
-                    evicted = Some(oldest.packet_number);
+                    evicted = Some((oldest.packet_number, oldest.size));
                 }
             }
         }
@@ -280,8 +281,12 @@ mod tests {
         }
         assert_eq!(s.sent().len(), MAX_OUTSTANDING_PACKETS);
         // One more record: the oldest ack-eliciting packet (pn 0) is
-        // evicted and reported lost; the queue stays at the cap.
-        assert_eq!(s.record_sent(sent(MAX_OUTSTANDING_PACKETS as u64)), Some(0));
+        // evicted and reported lost with its size; the queue stays at the
+        // cap.
+        assert_eq!(
+            s.record_sent(sent(MAX_OUTSTANDING_PACKETS as u64)),
+            Some((0, 64))
+        );
         assert_eq!(s.sent().len(), MAX_OUTSTANDING_PACKETS);
         assert_eq!(s.sent().front().unwrap().packet_number, 1);
         assert_eq!(
@@ -317,7 +322,7 @@ mod tests {
         assert!(s.sent().front().unwrap().ack_eliciting);
         assert_eq!(
             s.record_sent(non_ack(pn)),
-            Some((MAX_OUTSTANDING_PACKETS - 1) as u64)
+            Some(((MAX_OUTSTANDING_PACKETS - 1) as u64, 64))
         );
     }
 }

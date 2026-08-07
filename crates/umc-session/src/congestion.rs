@@ -46,6 +46,13 @@ pub const MIN_CWND: u64 = 2 * SMSS;
 /// Consecutive lost packets before the per-packet feed triggers the Reno
 /// halving: isolated single losses (e.g. one reordered packet) must not
 /// cut the window.
+///
+/// Note: congestion.md §14.4 defines the loss response without a streak
+/// threshold. The three-strike heuristic is a deliberate, conservative
+/// deviation — the spec's immediate halving on any single loss is harsher
+/// than `NewReno` practice and would cut the window on reordering — and the
+/// streak resets on every ACK and on every aggregate loss event, so it only
+/// accumulates for genuinely consecutive loss.
 const LOSS_THRESHOLD: u32 = 3;
 
 /// NewReno-style loss-based controller (congestion.md §14): slow start
@@ -93,6 +100,10 @@ impl Default for RenoCongestionController {
 impl CongestionController for RenoCongestionController {
     fn on_ack(&mut self, newly_acked_bytes: usize) {
         let acked = newly_acked_bytes as u64;
+        // An ACK breaks any loss streak: packets declared lost that turn out
+        // acknowledged were reordered, not lost (congestion.md §14.4 — see
+        // the LOSS_THRESHOLD note on the conservative deviation).
+        self.consecutive_losses = 0;
         if self.cwnd < self.ssthresh {
             // Slow start (congestion.md §14.2): the window grows by the
             // acknowledged bytes — one maximum packet per acked packet.
@@ -108,6 +119,10 @@ impl CongestionController for RenoCongestionController {
 
     fn on_loss(&mut self, lost_bytes: usize) {
         self.in_flight = self.in_flight.saturating_sub(lost_bytes as u64);
+        // An aggregate loss event already reduced the window: the streak
+        // counter starts fresh so the per-packet feed cannot stack a second
+        // reduction on top of it.
+        self.consecutive_losses = 0;
         self.reduce_window();
     }
 

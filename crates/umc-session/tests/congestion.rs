@@ -4,6 +4,7 @@
 // The controller counts in `SMSS` u64 units; the tests build usize values
 // from it, which is lossless on every supported platform (64-bit).
 #![allow(clippy::cast_possible_truncation)]
+use umc_session::ack::MAX_OUTSTANDING_PACKETS;
 use umc_session::congestion::{CongestionController, RenoCongestionController, SMSS};
 use umc_session::session::{Role, Session, SessionConfig, SessionError, DEFAULT_DCID_LEN};
 use umc_types::runtime::{Clock, Instant};
@@ -51,6 +52,45 @@ fn session() -> Session {
         &TestClock,
     )
     .expect("session")
+}
+
+/// Mock controller that tracks in-flight accounting, for the cap-eviction
+/// test: the session's accounting is under test, not the window math.
+#[derive(Default)]
+struct TrackingCongestion {
+    in_flight: usize,
+}
+
+impl CongestionController for TrackingCongestion {
+    fn on_ack(&mut self, _newly_acked_bytes: usize) {}
+    fn on_loss(&mut self, _lost_bytes: usize) {}
+    fn on_packet_sent(&mut self, bytes: usize) {
+        self.in_flight += bytes;
+    }
+    fn on_packet_acknowledged(&mut self, bytes: usize) {
+        self.in_flight = self.in_flight.saturating_sub(bytes);
+    }
+    fn on_packet_lost(&mut self, bytes: usize) {
+        self.in_flight = self.in_flight.saturating_sub(bytes);
+    }
+    fn send_allowance(&self) -> usize {
+        usize::MAX
+    }
+    fn cwnd(&self) -> usize {
+        usize::MAX
+    }
+    fn in_flight(&self) -> usize {
+        self.in_flight
+    }
+    fn reset(&mut self) {
+        self.in_flight = 0;
+    }
+}
+
+/// The encoded STREAM-frame payload for `n` data bytes on a fresh offset.
+fn stream_payload(s: &mut Session, sid: u64, n: usize) -> Vec<u8> {
+    let data = vec![0xAB; n];
+    s.send_stream_data(sid, &data, false).expect("data payload")
 }
 
 #[test]
@@ -157,15 +197,24 @@ fn congestion_gate_blocks_above_allowance() {
         s.build_outbound(&TestClock, Instant(0), &payload),
         Err(SessionError::CongestionLimited)
     );
-    // Within the allowance the same data path builds fine.
-    let small = s
-        .send_stream_data(sid, &[0xAB; 50], false)
-        .expect("data payload");
-    assert!(small.len() <= 100);
+    // Within the allowance — counting the protected packet overhead — the
+    // same data path builds fine.
+    let small = stream_payload(&mut s, sid, 20);
+    assert!(small.len() + 64 <= 100, "payload plus overhead fits");
     assert!(s
         .build_outbound(&TestClock, Instant(0), &small)
         .expect("build")
         .is_some());
+    // The gate measures the protected packet size, not the raw payload: a
+    // payload that fits by itself but not with its packet overhead is
+    // refused (the wire bytes charge in-flight, so they must fit).
+    let near = stream_payload(&mut s, sid, 40);
+    assert!(near.len() <= 100, "payload alone fits the allowance");
+    assert!(near.len() + 64 > 100, "payload plus overhead does not");
+    assert_eq!(
+        s.build_outbound(&TestClock, Instant(0), &near),
+        Err(SessionError::CongestionLimited)
+    );
     // ACK payloads are exempt, with the same exemption as the
     // anti-amplification gate (congestion.md §7.3 control reserve).
     let ack = ack_payload();
@@ -173,4 +222,105 @@ fn congestion_gate_blocks_above_allowance() {
         .build_outbound(&TestClock, Instant(0), &ack)
         .expect("build")
         .is_some());
+}
+
+#[test]
+fn pto_probe_bypasses_congestion_gate() {
+    let mut s = session();
+    // Zero allowance: the send gate is fully shut (congestion.md §7.1)...
+    s.set_congestion_controller(Box::new(FixedAllowance(0)));
+    // ...but the PTO probe PING is control traffic (congestion.md §7.3
+    // control reserve): with in_flight == cwnd nothing else may be sent, so
+    // refusing the probe would stall recovery permanently.
+    let ping = umc_wire::varint::encode(umc_types::frame::FrameType::PING.0).unwrap();
+    assert!(s
+        .build_outbound(&TestClock, Instant(0), &ping)
+        .expect("probe build")
+        .is_some());
+}
+
+#[test]
+fn isolated_losses_separated_by_acks_do_not_halve() {
+    let mut c = RenoCongestionController::new();
+    // Three isolated losses, each broken by an ACK, must not trip the
+    // three-strike halving (congestion.md §14.4): an ACK in between proves
+    // the streak was reordering, not loss.
+    c.on_packet_lost(SMSS as usize);
+    c.on_ack(SMSS as usize);
+    c.on_packet_lost(SMSS as usize);
+    c.on_ack(SMSS as usize);
+    c.on_packet_lost(SMSS as usize);
+    // No halving: the window only grew by the two slow-start acks.
+    assert_eq!(c.cwnd(), 10 * SMSS as usize + 2 * SMSS as usize);
+}
+
+#[test]
+fn cap_eviction_releases_in_flight_bytes() {
+    let mut s = session();
+    s.set_congestion_controller(Box::new(TrackingCongestion::default()));
+    // Fill the outstanding queue to the cap, then one more build evicts the
+    // oldest packet (pn 0); the cap test fills beyond any Reno window, so
+    // the tracking controller never limits.
+    let mut charged = 0usize;
+    let mut evicted_size = 0usize;
+    for i in 0..=MAX_OUTSTANDING_PACKETS as u64 {
+        let pkt = s
+            .build_outbound(&TestClock, Instant(i), b"x")
+            .unwrap()
+            .expect("built packet");
+        charged += pkt.len();
+        if i == 0 {
+            evicted_size = pkt.len();
+        }
+    }
+    // The cap eviction (resource-limits.md §24) releases the evicted
+    // packet's bytes from in-flight: the packet is gone from the sent queue,
+    // so keeping its bytes charged would leak the window forever.
+    assert_eq!(s.congestion_mut().in_flight(), charged - evicted_size);
+    // A full cycle nets zero: acknowledging every surviving packet releases
+    // the rest, and in-flight returns to 0.
+    let ack = umc_wire::frame::AckFrame {
+        largest_acknowledged: MAX_OUTSTANDING_PACKETS as u64,
+        ack_delay: 0,
+        first_ack_range: MAX_OUTSTANDING_PACKETS as u64,
+        additional_ranges: Vec::new(),
+    };
+    s.apply_peer_ack(&ack, Instant(0)).unwrap();
+    assert_eq!(s.congestion_mut().in_flight(), 0);
+}
+
+#[test]
+fn retransmit_gated_keeps_payload() {
+    let mut s = session();
+    let sid = s.open_stream().expect("stream");
+    // Fill the window: in-flight reaches the initial 10 × SMSS cwnd and the
+    // gate shuts.
+    let mut pkt_len = 0;
+    loop {
+        let payload = stream_payload(&mut s, sid, 25);
+        match s.build_outbound(&TestClock, Instant(0), &payload) {
+            Ok(Some(pkt)) => pkt_len = pkt.len(),
+            Err(SessionError::CongestionLimited) => break,
+            other => panic!("unexpected build result: {other:?}"),
+        }
+    }
+    // Three consecutive losses halve the window (LOSS_THRESHOLD = 3); the
+    // gate stays shut: in-flight still exceeds the halved cwnd.
+    for _ in 0..3 {
+        s.congestion_mut().on_packet_lost(pkt_len);
+    }
+    assert_eq!(s.congestion_mut().send_allowance(), 0);
+    // The gate is shut: retransmitting the first packet is refused...
+    assert_eq!(
+        s.retransmit(0, Instant(0)),
+        Err(SessionError::CongestionLimited)
+    );
+    // ...and the payload must SURVIVE the refused attempt (session.md
+    // §14.3): once the controller recovers, the same packet number
+    // retransmits fine.
+    s.congestion_mut().on_packet_acknowledged(5 * SMSS as usize);
+    assert!(
+        s.retransmit(0, Instant(0)).expect("retransmit").is_some(),
+        "payload survives a gated retransmit"
+    );
 }
