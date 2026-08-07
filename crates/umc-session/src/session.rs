@@ -547,6 +547,14 @@ impl Session {
         self.last_activity = Some(now);
     }
 
+    /// The most recent activity instant (session.md §22), or `None` before
+    /// the first authenticated packet. Read-only: the daemon's keepalive
+    /// sweep measures idle time without mutating the session.
+    #[must_use]
+    pub fn last_activity(&self) -> Option<Instant> {
+        self.last_activity
+    }
+
     /// Whether the idle timeout elapsed since the last activity (session.md
     /// §22). A session with no activity yet (`None`) is never idle: the
     /// timer cannot fire before the first packet.

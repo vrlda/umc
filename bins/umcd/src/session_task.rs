@@ -25,7 +25,7 @@ use umc_carrier::BoxLink;
 use umc_core::app_io::{AppRx, AppTx};
 use umc_crypto::aead::PacketKeys;
 use umc_session::loss::detect_lost_packets;
-use umc_session::session::{Session, SessionState};
+use umc_session::session::{Session, SessionState, IDLE_TIMEOUT_MS};
 use umc_types::runtime::{Clock, Instant};
 use umc_wire::frame::Frame;
 use umc_wire::frames::bundle::BundleFrame;
@@ -125,29 +125,50 @@ fn pto_deadline_after(
 /// §6.4, §22): when the session has been idle past the timeout while still
 /// `Active`, build a `CONNECTION_CLOSE` packet and enter draining; once the
 /// draining deadline has passed, finalize the close. Returns the built idle
-/// close packet (the caller sends it after dropping the session guard) and
-/// whether the reader loop should exit (the draining period ended).
+/// close packet and the built keepalive ping (the caller sends them after
+/// dropping the session guard) and whether the reader loop should exit (the
+/// draining period ended).
 ///
-/// The idle branch is gated on `SessionState::Active`: draining is never
-/// re-extended by later sweeps, and a peer-initiated close cannot transition
-/// backward.
+/// When the session is `Active` but not yet idle-expired, an idle time of at
+/// least half the timeout builds a `PING` keepalive (session.md §22) and
+/// resets the idle timer, so a quiet-but-live circuit is never closed by
+/// the sweep. The close path takes precedence: an idle-expired session is
+/// closed, not kept alive.
 fn handle_idle_timers(
     session: &mut Session,
     clock: &dyn Clock,
     now: Instant,
-) -> (Option<Vec<u8>>, bool) {
+) -> (Option<Vec<u8>>, Option<Vec<u8>>, bool) {
     if session.draining_expired(now) {
         session.finalize_close();
-        return (None, true);
+        return (None, None, true);
     }
     if session.state == SessionState::Active && session.idle_expired(now) {
         let built = session
             .build_idle_close(now)
             .and_then(|payload| session.build_outbound(clock, now, &payload).ok().flatten());
         session.close(now);
-        return (built, false);
+        return (built, None, false);
     }
-    (None, false)
+    // Keepalive (session.md §22): half the idle timeout into a quiet Active
+    // session, build a PING and reset the idle timer. The touch suppresses
+    // the idle close for another full timeout.
+    if session.state == SessionState::Active {
+        let half_idle = IDLE_TIMEOUT_MS / 2;
+        let idle_since = session
+            .last_activity()
+            .map(|activity| now.duration_since(activity).as_millis());
+        if idle_since.is_some_and(|idle| idle >= half_idle) {
+            let ping =
+                umc_wire::varint::encode(umc_types::frame::FrameType::PING.0).unwrap_or_default();
+            let built = session.build_outbound(clock, now, &ping).ok().flatten();
+            if built.is_some() {
+                session.touch(now);
+            }
+            return (None, built, false);
+        }
+    }
+    (None, None, false)
 }
 
 /// Spawn the per-session wire loop. The tasks exit when `link.recv` errors
@@ -360,6 +381,7 @@ async fn reader_loop(
             recv = bus_outbound_rx.recv() => {
                 match recv {
                     Some(bytes) => {
+                        let now = clock.now();
                         let sent = tokio::task::block_in_place(|| {
                             link.send(OutboundPacket {
                                 bytes,
@@ -367,7 +389,15 @@ async fn reader_loop(
                                 deadline_ms: None,
                             })
                         });
-                        if let Err(e) = sent {
+                        if sent.is_ok() {
+                            // Bus-outbound traffic is app-originated (relay
+                            // forwarding, bundle delivery): resets the idle
+                            // timer (session.md §22) so a one-way relay flow
+                            // keeps the destination session from idle-closing
+                            // a live circuit.
+                            let mut session = session.lock().await;
+                            session.touch(now);
+                        } else if let Err(e) = sent {
                             #[cfg(debug_assertions)]
                             println!("[session {session_id}] send error: {e:?}");
                         }
@@ -377,9 +407,10 @@ async fn reader_loop(
             }
             _ = idle_sweep.tick() => {
                 let now = clock.now();
-                // Build the idle close (if any) under the guard; the send
-                // happens after it is dropped — the carrier API is blocking.
-                let (built_close, done) = {
+                // Build the idle close / keepalive (if any) under the guard;
+                // the sends happen after it is dropped — the carrier API is
+                // blocking.
+                let (built_close, built_keepalive, done) = {
                     let mut session = session.lock().await;
                     handle_idle_timers(&mut session, clock.as_ref(), now)
                 };
@@ -394,6 +425,19 @@ async fn reader_loop(
                     if let Err(e) = sent {
                         #[cfg(debug_assertions)]
                         println!("[session {session_id}] idle close send error: {e:?}");
+                    }
+                }
+                if let Some(bytes) = built_keepalive {
+                    let sent = tokio::task::block_in_place(|| {
+                        link.send(OutboundPacket {
+                            bytes,
+                            control: false,
+                            deadline_ms: None,
+                        })
+                    });
+                    if let Err(e) = sent {
+                        #[cfg(debug_assertions)]
+                        println!("[session {session_id}] keepalive send error: {e:?}");
                     }
                 }
                 if done {
@@ -1770,13 +1814,14 @@ mod tests {
         session.touch(t0);
 
         // Before the timeout the interval sweep is a no-op.
-        let (built, done) = handle_idle_timers(
+        let (built, keepalive, done) = handle_idle_timers(
             &mut session,
             &clock,
-            Instant(1_000_000 + IDLE_TIMEOUT_MS - 1),
+            Instant(1_000_000 + IDLE_TIMEOUT_MS / 2 - 1),
         );
         assert!(!done);
         assert!(built.is_none());
+        assert!(keepalive.is_none(), "no keepalive before half idle");
         assert_eq!(session.state, SessionState::Active);
         assert!(recorded.lock().unwrap().is_empty());
 
@@ -1784,8 +1829,12 @@ mod tests {
         // enters draining; the caller sends the bytes and the loop keeps
         // running.
         let now = Instant(1_000_000 + IDLE_TIMEOUT_MS);
-        let (built, done) = handle_idle_timers(&mut session, &clock, now);
+        let (built, keepalive, done) = handle_idle_timers(&mut session, &clock, now);
         assert!(!done);
+        assert!(
+            keepalive.is_none(),
+            "close path takes precedence over keepalive"
+        );
         assert_eq!(session.state, SessionState::Draining);
         let close_bytes = built.expect("idle close built");
         link.send(OutboundPacket {
@@ -1816,7 +1865,8 @@ mod tests {
         assert!(!session.draining_expired(Instant(now.0 + 3 * 1_000 - 1)));
         // ...and once draining expires the loop must exit with the session
         // finalized as closed.
-        let (built, done) = handle_idle_timers(&mut session, &clock, Instant(now.0 + 3 * 1_000));
+        let (built, _keepalive, done) =
+            handle_idle_timers(&mut session, &clock, Instant(now.0 + 3 * 1_000));
         assert!(built.is_none());
         assert!(done);
         assert_eq!(session.state, SessionState::Closed);
@@ -1859,7 +1909,7 @@ mod tests {
         // A later sweep, inside the drain window with the idle timer expired
         // (close sends do not touch): must not re-send the close or re-extend
         // the draining deadline.
-        let (built, done) = handle_idle_timers(&mut session, &clock, t0 + ms(30_000));
+        let (built, _keepalive, done) = handle_idle_timers(&mut session, &clock, t0 + ms(30_000));
         assert!(built.is_none(), "no second idle close while draining");
         assert!(!done);
         assert!(
@@ -1867,7 +1917,7 @@ mod tests {
             "draining deadline must not be re-extended by an idle sweep"
         );
         // Finalization still happens at the original deadline.
-        let (built, done) = handle_idle_timers(&mut session, &clock, d);
+        let (built, _keepalive, done) = handle_idle_timers(&mut session, &clock, d);
         assert!(built.is_none());
         assert!(
             done,
@@ -1942,5 +1992,157 @@ mod tests {
         peer.on_inbound(t0 + ms(29_000), &pkt)
             .expect("padding packet parses");
         assert!(peer.idle_expired(t0 + ms(30_000)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keepalive_ping_sent_at_half_idle() {
+        let t0 = Instant(1_000_000);
+        let clock = FixedClock(t0.0);
+        let mut session = test_session();
+        session.touch(t0);
+
+        // At half the idle timeout the sweep builds a PING keepalive packet
+        // for the caller to send (same drop-guard pattern as the close);
+        // the session stays Active and no close is produced.
+        let (close, keepalive, done) =
+            handle_idle_timers(&mut session, &clock, t0 + ms(IDLE_TIMEOUT_MS / 2));
+        assert!(!done);
+        assert!(close.is_none(), "no close while idle not expired");
+        let bytes = keepalive.expect("keepalive built at half idle");
+        let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[1u8; 32]).unwrap();
+        let (space, _dcid, _path, _pn, payload) =
+            umc_session::packet::parse_protected_packet(&keys, &bytes).unwrap();
+        let parsed = umc_wire::packet::parse_payload(
+            &umc_wire::packet::PacketContext::Protected(space),
+            &payload,
+        )
+        .unwrap();
+        assert!(
+            parsed.frames.iter().any(|f| matches!(f, WireFrame::Ping)),
+            "keepalive packet carries PING"
+        );
+        assert_eq!(session.state, SessionState::Active);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keepalive_extends_idle_deadline() {
+        let t0 = Instant(1_000_000);
+        let clock = FixedClock(t0.0);
+        let mut session = test_session();
+        session.touch(t0);
+
+        // The keepalive at half idle touches the session: the idle deadline
+        // moves out by another full timeout, suppressing the idle close.
+        let (close, keepalive, done) =
+            handle_idle_timers(&mut session, &clock, t0 + ms(IDLE_TIMEOUT_MS / 2));
+        assert!(close.is_none());
+        assert!(keepalive.is_some(), "keepalive built at half idle");
+        assert!(!done);
+        assert!(
+            !session.idle_expired(t0 + ms(IDLE_TIMEOUT_MS)),
+            "keepalive suppresses the idle close"
+        );
+        // A full timeout after the keepalive the session is idle again and
+        // the close path runs; no further keepalive.
+        let (close, keepalive, done) = handle_idle_timers(
+            &mut session,
+            &clock,
+            t0 + ms(IDLE_TIMEOUT_MS + IDLE_TIMEOUT_MS / 2),
+        );
+        assert!(close.is_some(), "idle close after a full timeout");
+        assert!(
+            keepalive.is_none(),
+            "close path takes precedence over keepalive"
+        );
+        assert!(!done);
+        assert_eq!(session.state, SessionState::Draining);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_keepalive_when_idle_expired() {
+        let t0 = Instant(1_000_000);
+        let clock = FixedClock(t0.0);
+        let mut session = test_session();
+        session.touch(t0);
+
+        // Idle-expired at the timeout: the close path runs and no keepalive
+        // is produced — the keepalive branch only fires while not
+        // idle-expired.
+        let (close, keepalive, done) =
+            handle_idle_timers(&mut session, &clock, t0 + ms(IDLE_TIMEOUT_MS));
+        assert!(!done);
+        assert!(close.is_some(), "close path runs at the idle timeout");
+        assert!(keepalive.is_none(), "no keepalive when idle expired");
+        assert_eq!(session.state, SessionState::Draining);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bus_outbound_touches_idle() {
+        let (state, _tx) = test_state();
+        let runtime = Arc::new(std::sync::Mutex::new(state));
+        let t0 = Instant(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(t0.0 + 1_000));
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let link: Arc<BoxLink> = Arc::new(Box::new(RecordingLink {
+            sent: recorded.clone(),
+        }));
+        let session = Arc::new(tokio::sync::Mutex::new(test_session()));
+        {
+            let mut session = session.lock().await;
+            session.touch(t0);
+        }
+        let remote_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[2u8; 32]).unwrap();
+
+        // The reader loop's bus-outbound arm receives one relay payload; the
+        // packet and inbound channels stay open (empty) so the select cannot
+        // break before the send, and the outbound sender is dropped after
+        // the item so the loop exits after processing it.
+        let (_packet_tx, packet_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (_inbound_tx, bus_inbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (outbound_tx, bus_outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        outbound_tx
+            .send(b"relay-bytes".to_vec())
+            .expect("queue bus outbound");
+        drop(outbound_tx);
+
+        let app_channels: Arc<std::sync::Mutex<HashMap<Vec<u8>, AppTx>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicBool::new(false));
+        reader_loop(
+            &link,
+            &session,
+            &clock,
+            &shutdown_flag,
+            &ended,
+            &app_channels,
+            &runtime,
+            &remote_keys,
+            1,
+            packet_rx,
+            bus_inbound_rx,
+            bus_outbound_rx,
+        )
+        .await;
+
+        // The relay bytes reached the link...
+        {
+            let sent = recorded.lock().expect("link sent");
+            assert_eq!(sent.len(), 1, "bus-outbound bytes sent once");
+            assert_eq!(sent[0], b"relay-bytes");
+        }
+        // ...and the successful send reset the idle timer: a session last
+        // active at t0 would be idle at the close instant, but the relay
+        // send at t0+1s keeps it alive (session.md §22).
+        let session = session.lock().await;
+        assert_eq!(
+            session.last_activity(),
+            Some(Instant(t0.0 + 1_000)),
+            "bus outbound resets the idle timer"
+        );
+        assert!(
+            !session.idle_expired(Instant(t0.0 + 1_000 + IDLE_TIMEOUT_MS - 1)),
+            "bus outbound traffic keeps the destination session alive"
+        );
     }
 }
