@@ -173,6 +173,12 @@ impl Stream {
         self.next_deliver_offset
     }
 
+    /// Returns the offset and the credit-bounded data chunk to send.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamError::AlreadyClosed`] when the stream's send side is
+    /// closed or reset.
     pub fn send_ready(&mut self, data: &[u8]) -> Result<(u64, Vec<u8>), StreamError> {
         if self.send_state == SendState::DataAcked
             || self.send_state == SendState::ResetAcked
