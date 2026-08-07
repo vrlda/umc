@@ -109,9 +109,12 @@ pub struct Session {
     pub paths: HashMap<u64, crate::path::Path>,
     #[allow(dead_code)]
     cids: crate::cid::ConnectionIdManager,
-    /// When the idle timer was last reset (session.md §22): every processed
-    /// inbound packet and every built outbound packet touches it. `None`
-    /// until the first activity, so a fresh session is never idle.
+    /// When the idle timer was last reset (session.md §22): every inbound
+    /// packet carrying at least one real frame resets it, and the daemon
+    /// touches it at app-originated send sites. Probes, retransmits,
+    /// duplicates, and padding-only packets must NOT reset it — a dead peer
+    /// replaying bytes must not keep the session alive. `None` until the
+    /// first activity, so a fresh session is never idle.
     last_activity: Option<Instant>,
     /// Absolute deadline of the draining period (session.md §6.4), set by
     /// [`Session::close`]; `None` until the session starts draining.
@@ -277,8 +280,9 @@ impl Session {
         if self.state != SessionState::Active {
             return Ok(None);
         }
-        // A built outbound packet resets the idle timer (session.md §22).
-        self.last_activity = Some(now);
+        // NOTE: this builder serves retransmits and PTO probes too, so it
+        // must NOT touch the idle timer (session.md §22 resets on receives
+        // and daemon app-originated sends only; see `Session::touch`).
         let space = self
             .spaces
             .get_mut(&PacketSpace::SessionData)
@@ -323,14 +327,15 @@ impl Session {
         let (space_kind, _dcid, _path, truncated_pn, payload) =
             super::packet::parse_protected_packet(&self.remote_keys, bytes)
                 .map_err(SessionError::Packet)?;
-        // An authenticated packet resets the idle timer (session.md §22).
-        self.last_activity = Some(now);
         let space = match space_kind {
             ShortPacketSpace::SessionData => PacketSpace::SessionData,
             ShortPacketSpace::PathControl => PacketSpace::PathControl,
             ShortPacketSpace::RelayData => PacketSpace::RelayData,
         };
         let space_state = self.spaces.get_mut(&space).ok_or(SessionError::NoSpace)?;
+        // Reject duplicates/stale packets BEFORE touching the idle timer: a
+        // replayed packet must not keep a zombie session alive (session.md
+        // §22).
         let pn = space_state
             .admit_received(truncated_pn, 16)
             .map_err(SessionError::Space)?;
@@ -338,6 +343,15 @@ impl Session {
         let parsed =
             umc_wire::packet::parse_payload(&PacketContext::Protected(space_kind), &payload)
                 .map_err(SessionError::WirePacket)?;
+        // A new authenticated packet carrying at least one real frame resets
+        // the idle timer (session.md §22); padding-only packets do not.
+        if parsed
+            .frames
+            .iter()
+            .any(|f| !matches!(f, umc_wire::frame::Frame::Padding))
+        {
+            self.last_activity = Some(now);
+        }
         for frame in parsed.frames {
             match frame {
                 umc_wire::frame::Frame::Stream(f) => {
@@ -525,9 +539,10 @@ impl Session {
         self.retransmit_payloads.remove(&pn);
     }
 
-    /// Reset the idle timer (session.md §22): called on inbound packets and
-    /// built outbound packets, and by the daemon for traffic the session
-    /// layer cannot observe itself.
+    /// Reset the idle timer (session.md §22): called by the daemon at
+    /// app-originated send sites (echo writer, outbound arm, control
+    /// frames) for traffic the session layer cannot observe itself. Probes
+    /// and retransmits must NOT call this.
     pub fn touch(&mut self, now: Instant) {
         self.last_activity = Some(now);
     }
@@ -572,8 +587,13 @@ impl Session {
     /// receiving `CONNECTION_CLOSE` the endpoint stops opening streams,
     /// sending application data, and migrating paths. The draining deadline
     /// is at least three times the current probe timeout with a 1-second
-    /// minimum.
+    /// minimum. Re-entry is a no-op: an already-draining session never
+    /// extends its deadline, and a closed session never transitions
+    /// backward.
     pub fn close(&mut self, now: Instant) {
+        if self.state != SessionState::Active {
+            return;
+        }
         self.state = SessionState::Draining;
         let pto_ms = self.loss.pto(&self.rtt).as_millis();
         let drain_ms = (3 * pto_ms).max(MIN_DRAIN_MS);
