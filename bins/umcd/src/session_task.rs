@@ -603,7 +603,7 @@ async fn process_inbound_packet(
                 }
             }
             if sweep_due {
-                let payload = flush_pending_bundles(&mut state, now);
+                let payload = flush_pending_bundles(&mut state, crate::state::wall_now());
                 combined.extend_from_slice(&payload);
                 sweep.last_bundle_flush = Some(now);
             }
