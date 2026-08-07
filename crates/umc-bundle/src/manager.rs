@@ -230,7 +230,17 @@ impl BundleManager {
         expired.sort_unstable();
         let mut ids = Vec::with_capacity(expired.len());
         for (id, object_id) in expired {
-            let _ = self.objects.delete(&object_id);
+            // Content-addressed objects may be shared by identical payloads
+            // under different destinations: only delete when no OTHER live
+            // record references the object.
+            let still_referenced = self
+                .records_iter()
+                .any(|r| r.id != id && r.object_id == object_id);
+            if !still_referenced {
+                if let Err(e) = self.objects.delete(&object_id) {
+                    println!("[bundle] evict: object delete failed: {e:?}");
+                }
+            }
             self.remove(&id);
             ids.push(id);
         }
