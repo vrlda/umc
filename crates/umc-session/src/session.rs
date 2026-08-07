@@ -107,6 +107,12 @@ pub struct Session {
     next_outgoing_stream: u64,
     closed_streams: ClosedStreamRegistry,
     flow: FlowControl,
+    /// New bytes received per open stream id (session.md §20): drives
+    /// `MAX_STREAM_DATA` emission at the half-consumed watermark.
+    stream_consumed: HashMap<u64, u64>,
+    /// Highest `MAX_STREAMS` limit offered so far; the initial transport
+    /// parameter already granted [`INITIAL_STREAMS`].
+    max_streams_sent: u64,
     datagrams: DatagramQueue,
     dcid: Vec<u8>,
     key_update: crate::key_update::KeyUpdateState,
@@ -166,6 +172,8 @@ impl Session {
             next_outgoing_stream: 0,
             closed_streams: ClosedStreamRegistry::default(),
             flow: FlowControl::new(config.initial_max_data, INITIAL_STREAMS, INITIAL_STREAMS),
+            stream_consumed: HashMap::new(),
+            max_streams_sent: INITIAL_STREAMS,
             datagrams: DatagramQueue::new(),
             dcid: config.dcid,
             key_update: crate::key_update::KeyUpdateState::new(
@@ -260,13 +268,92 @@ impl Session {
             .streams
             .get_mut(&stream_id)
             .ok_or(SessionError::StreamNotFound)?;
+        if stream.recv_state == super::stream::RecvState::ResetRecvd {
+            // The peer reset its send side: the buffered data is unreachable
+            // (session.md §18.5).
+            return Err(SessionError::Stream(StreamError::ResetByPeer));
+        }
         let (data, eof) = stream.read_available();
         if eof {
             // The final size was reached and read: the id is closed and any
             // further delivery on it is a protocol violation (session.md §29).
             self.closed_streams.insert(stream_id);
+            self.stream_consumed.remove(&stream_id);
         }
         Ok((data, eof))
+    }
+
+    /// Build `MAX_DATA` / `MAX_STREAM_DATA` / `MAX_STREAMS` payloads when a
+    /// local credit watermark is crossed (session.md §20): each limit is
+    /// doubled when more than half of it has been consumed. Grants never
+    /// decrease, so a watermark re-arms only after the doubled limit is half
+    /// consumed again. Payloads include the frame type byte, matching
+    /// [`Session::send_stream_data`]. The daemon appends the returned
+    /// payloads to its combined outbound packet.
+    #[must_use]
+    pub fn flow_control_frames(&mut self, now: Instant) -> Vec<Vec<u8>> {
+        let _ = now;
+        let mut frames = Vec::new();
+        // Connection-level credit: more than half consumed.
+        if self.flow.credit_remaining_local() < self.flow.max_data_local / 2 {
+            let new_max = self.flow.max_data_local.saturating_mul(2);
+            if new_max > self.flow.max_data_local {
+                self.flow.grant_more(new_max);
+                if let Ok(enc) = (umc_wire::frames::flow::MaxDataFrame {
+                    maximum_data: new_max,
+                })
+                .encode()
+                {
+                    frames.push(enc);
+                }
+            }
+        }
+        // Per-stream credit: more than half of the stream's limit consumed.
+        let consumed_snapshot: Vec<(u64, u64)> = self
+            .stream_consumed
+            .iter()
+            .map(|(id, bytes)| (*id, *bytes))
+            .collect();
+        for (stream_id, consumed) in consumed_snapshot {
+            let Some(stream) = self.streams.get_mut(&stream_id) else {
+                continue;
+            };
+            if stream.max_stream_data_local.saturating_sub(consumed)
+                < stream.max_stream_data_local / 2
+            {
+                let new_max = stream.max_stream_data_local.saturating_mul(2);
+                if new_max > stream.max_stream_data_local {
+                    stream.max_stream_data_local = new_max;
+                    if let Ok(enc) = (umc_wire::frames::flow::MaxStreamDataFrame {
+                        stream_id,
+                        maximum_stream_data: new_max,
+                    })
+                    .encode()
+                    {
+                        frames.push(enc);
+                    }
+                }
+            }
+        }
+        // Stream count: the peer's initial grant is INITIAL_STREAMS; double
+        // it once open streams exceed that, then again when the doubled
+        // grant is exceeded in turn.
+        if (self.streams.len() as u64) > INITIAL_STREAMS
+            && (self.streams.len() as u64).saturating_mul(2) > self.max_streams_sent
+        {
+            let new_count = (self.streams.len() as u64).saturating_mul(2);
+            self.max_streams_sent = new_count;
+            self.flow.max_bidirectional_streams_local = new_count;
+            if let Ok(enc) = (umc_wire::frames::flow::MaxStreamsFrame {
+                bidirectional: true,
+                maximum_streams: new_count,
+            })
+            .encode()
+            {
+                frames.push(enc);
+            }
+        }
+        frames
     }
 
     /// Build the next outbound protected packet (control or data).
@@ -421,6 +508,31 @@ impl Session {
                         })
                         .map_err(SessionError::Datagram)?;
                 }
+                umc_wire::frame::Frame::ResetStream(f) => {
+                    // The peer reset its send side (session.md §18.5): our
+                    // recv side is reset — buffered data becomes unreachable
+                    // and reading reports the reset. Reuse of a closed id is
+                    // a protocol violation (session.md §29).
+                    if self.closed_streams.contains(f.stream_id) {
+                        return Err(SessionError::StreamClosed);
+                    }
+                    let stream = self
+                        .streams
+                        .get_mut(&f.stream_id)
+                        .ok_or(SessionError::StreamNotFound)?;
+                    stream.recv_state = super::stream::RecvState::ResetRecvd;
+                    self.stream_consumed.remove(&f.stream_id);
+                }
+                umc_wire::frame::Frame::StopSending(f) => {
+                    // The peer stopped reading our send side (session.md
+                    // §18.5): the send side is stopped and `send_ready`
+                    // refuses further data.
+                    let stream = self
+                        .streams
+                        .get_mut(&f.stream_id)
+                        .ok_or(SessionError::StreamNotFound)?;
+                    stream.send_state = super::stream::SendState::ResetSent;
+                }
                 umc_wire::frame::Frame::ConnectionClose(_) => {
                     self.state = SessionState::Closed;
                 }
@@ -493,7 +605,11 @@ impl Session {
         // accounted when first received.
         self.flow
             .consume(new_bytes as u64)
-            .map_err(SessionError::Flow)
+            .map_err(SessionError::Flow)?;
+        // Per-stream consumption drives MAX_STREAM_DATA emission (session.md
+        // §20): only new bytes count, mirroring the connection accounting.
+        *self.stream_consumed.entry(f.stream_id).or_insert(0) += new_bytes as u64;
+        Ok(())
     }
 
     /// Apply a peer ACK to the sent-packet state and sample RTT

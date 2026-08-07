@@ -41,6 +41,9 @@ pub struct Stream {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamError {
     AlreadyClosed,
+    /// The peer reset its send side (`RESET_STREAM`): the buffered receive
+    /// data is unreachable and reading reports this error (session.md §18.5).
+    ResetByPeer,
     FinalSizeConflict,
     DataBeyondFinalSize,
     OverlappingDataConflict,
@@ -158,10 +161,13 @@ impl Stream {
     ///
     /// # Errors
     ///
-    /// Returns `StreamError::AlreadyClosed` when the send side is fully acked
-    /// or reset.
+    /// Returns `StreamError::AlreadyClosed` when the send side is fully acked,
+    /// reset, or stopped by the peer (`STOP_SENDING`, session.md §18.5).
     pub fn send_ready(&mut self, data: &[u8]) -> Result<(u64, Vec<u8>), StreamError> {
-        if self.send_state == SendState::DataAcked || self.send_state == SendState::ResetAcked {
+        if self.send_state == SendState::DataAcked
+            || self.send_state == SendState::ResetAcked
+            || self.send_state == SendState::ResetSent
+        {
             return Err(StreamError::AlreadyClosed);
         }
         let offset = self.next_send_offset;
