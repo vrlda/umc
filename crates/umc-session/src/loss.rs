@@ -5,6 +5,52 @@ use umc_types::runtime::{Duration, Instant};
 pub const TIMER_GRANULARITY_MS: u64 = 1;
 pub const DEFAULT_PTO_MS: u64 = 1_000;
 pub const PACKET_THRESHOLD: u64 = 3;
+/// Probe timeout backoff cap: 6 doublings (congestion.md §10.3).
+pub const MAX_PTO_BACKOFF: u32 = 64;
+const MAX_PTO_BACKOFF_EXPONENT: u32 = 6;
+
+/// Probe timeout backoff state (congestion.md §10.3): each consecutive PTO
+/// expiry doubles the probe deadline, capped at 64x the base PTO; any ACK
+/// resets the count. Pure math, testable without the daemon loop.
+#[derive(Debug, Clone, Default)]
+pub struct PtoState {
+    /// Consecutive PTO expiries since the last ACK (capped at 6).
+    consecutive: u32,
+    /// Effective deadline multiplier: `2^consecutive`, capped at
+    /// `MAX_PTO_BACKOFF`. Mirrors `consecutive`; the derived default is 0,
+    /// which the accessor reads as 1x.
+    multiplier: u32,
+}
+
+impl PtoState {
+    /// Deadline `now + pto * 2^consecutive`, capped at `now + pto * 64`.
+    #[must_use]
+    pub fn next_deadline(&self, pto: Duration, now: Instant) -> Instant {
+        now + Duration::from_millis(
+            pto.as_millis()
+                .saturating_mul(u64::from(self.multiplier().min(MAX_PTO_BACKOFF))),
+        )
+    }
+
+    /// A PTO expiry: consecutive expiries double the deadline until the
+    /// 64x cap.
+    pub fn on_expiry(&mut self) {
+        self.consecutive = (self.consecutive + 1).min(MAX_PTO_BACKOFF_EXPONENT);
+        self.multiplier = 1 << self.consecutive;
+    }
+
+    /// An ACK-bearing inbound resets the backoff to 1x.
+    pub fn on_ack(&mut self) {
+        self.consecutive = 0;
+        self.multiplier = 1;
+    }
+
+    /// The effective deadline multiplier (1x while no expiry has occurred).
+    #[must_use]
+    pub fn multiplier(&self) -> u32 {
+        self.multiplier.max(1)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LossDetector {
@@ -159,6 +205,57 @@ mod tests {
         assert!(lost.contains(&0) && lost.contains(&1) && lost.contains(&2));
         assert!(!lost.contains(&3) && !lost.contains(&4) && !lost.contains(&5));
         assert_eq!(sent.sent().len(), 3);
+    }
+
+    #[test]
+    fn backoff_doubles_per_expiry() {
+        let mut pto = PtoState::default();
+        let now = Instant(0);
+        let base = Duration::from_millis(100);
+        // 0 expiries: the deadline is 1x the base PTO.
+        assert_eq!(pto.next_deadline(base, now), Instant(100));
+        assert_eq!(pto.multiplier(), 1);
+        // Each consecutive expiry doubles the deadline: 2x, 4x, ..., 64x.
+        let mut expect = 100u64;
+        for _ in 0..6 {
+            pto.on_expiry();
+            expect *= 2;
+            assert_eq!(pto.next_deadline(base, now), Instant(expect));
+            assert_eq!(u64::from(pto.multiplier()), expect / 100);
+        }
+        // The 7th expiry stays capped at 64x.
+        pto.on_expiry();
+        assert_eq!(pto.multiplier(), 64);
+        assert_eq!(pto.next_deadline(base, now), Instant(6_400));
+    }
+
+    #[test]
+    fn ack_resets_backoff() {
+        let mut pto = PtoState::default();
+        for _ in 0..4 {
+            pto.on_expiry();
+        }
+        assert_eq!(pto.multiplier(), 16);
+        // Any ACK-bearing inbound resets the count: the next deadline is
+        // back at 1x (congestion.md §10.3).
+        pto.on_ack();
+        assert_eq!(pto.multiplier(), 1);
+        assert_eq!(
+            pto.next_deadline(Duration::from_millis(100), Instant(0)),
+            Instant(100)
+        );
+    }
+
+    #[test]
+    fn deadline_capped_at_64x() {
+        let mut pto = PtoState::default();
+        let now = Instant(5_000);
+        let base = Duration::from_millis(1_000);
+        for _ in 0..10 {
+            pto.on_expiry();
+        }
+        assert_eq!(pto.multiplier(), 64);
+        assert_eq!(pto.next_deadline(base, now), Instant(5_000 + 64_000));
     }
 
     #[test]
