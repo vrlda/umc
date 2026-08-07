@@ -617,6 +617,56 @@ fn ack_payloads_exempt() {
         .is_some());
 }
 
+/// A `RESET_STREAM` payload for a protected packet (wire-format.md §18.5).
+fn reset_stream_payload(stream_id: u64, final_size: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    umc_wire::varint::encode_into(&mut payload, umc_types::frame::FrameType::RESET_STREAM.0)
+        .unwrap();
+    let frame = umc_wire::frames::stream::ResetStreamFrame {
+        stream_id,
+        app_error_code: 0,
+        final_size,
+    };
+    let enc = frame.encode().unwrap();
+    payload.extend_from_slice(&enc[1..]);
+    payload
+}
+
+/// A `STOP_SENDING` payload for a protected packet (wire-format.md §18.5).
+fn stop_sending_payload(stream_id: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    umc_wire::varint::encode_into(&mut payload, umc_types::frame::FrameType::STOP_SENDING.0)
+        .unwrap();
+    let frame = umc_wire::frames::stream::StopSendingFrame {
+        stream_id,
+        app_error_code: 0,
+    };
+    let enc = frame.encode().unwrap();
+    payload.extend_from_slice(&enc[1..]);
+    payload
+}
+
+/// A `STREAM` payload for a protected packet, at an explicit offset.
+fn stream_payload_at(stream_id: u64, offset: u64, data: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    umc_wire::varint::encode_into(&mut payload, umc_types::frame::FrameType::STREAM.0).unwrap();
+    let frame = umc_wire::frames::stream::StreamFrame {
+        stream_id,
+        fin: false,
+        offset_present: true,
+        len_present: true,
+        open: offset == 0,
+        unidirectional: false,
+        offset,
+        data: data.to_vec(),
+        protocol_id: vec![],
+        metadata: vec![],
+    };
+    let enc = frame.encode().unwrap();
+    payload.extend_from_slice(&enc[1..]);
+    payload
+}
+
 fn stream_payload(stream_id: u64, data: &[u8]) -> Vec<u8> {
     let mut payload = Vec::new();
     umc_wire::varint::encode_into(&mut payload, umc_types::frame::FrameType::STREAM.0).unwrap();
@@ -705,4 +755,232 @@ fn idle_timeout_triggers_close() {
     // Draining expiry transitions to CLOSED.
     client.finalize_close();
     assert_eq!(client.state, SessionState::Closed);
+}
+
+#[test]
+fn flow_credit_emitted_at_half_consumption() {
+    let (client_secrets, server_secrets) = run_xx_handshake(
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &TestEntropy,
+        b"ump.udp/1",
+        0,
+    )
+    .expect("handshake");
+    let dcid = vec![9u8; 8];
+    let mut client = Session::new(
+        SessionConfig {
+            role: Role::Client,
+            dcid: dcid.clone(),
+            local_traffic_secret: client_secrets.client,
+            remote_traffic_secret: client_secrets.server,
+            initial_max_data: 100_000,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("client session");
+    let mut server = Session::new(
+        SessionConfig {
+            role: Role::Server,
+            dcid,
+            local_traffic_secret: server_secrets.server,
+            remote_traffic_secret: server_secrets.client,
+            initial_max_data: 100_000,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("server session");
+    let t0 = Instant(8_000_000);
+    // Deliver two 40 KiB segments: 80 KiB consumed of the 100 KiB
+    // connection credit, and of the 100 KiB per-stream limit the server
+    // grants a new inbound stream (session.md §20: credit is re-granted at
+    // the half-consumed watermark, doubling the limit). Each segment fits a
+    // 65 535-byte packet (MAX_PACKET_SIZE).
+    for offset in [0u64, 40_000] {
+        let payload = stream_payload_at(0, offset, &vec![0x61; 40_000]);
+        let pkt = client
+            .build_outbound(&TestClock, t0, &payload)
+            .unwrap()
+            .unwrap();
+        server.on_inbound(t0, &pkt).unwrap();
+    }
+    let frames = server.flow_control_frames(t0);
+    assert!(
+        !frames.is_empty(),
+        "credit exhausted past half: frames expected"
+    );
+    let decoded: Vec<umc_wire::frame::Frame> = frames
+        .iter()
+        .flat_map(|f| umc_wire::frame::decode_frames(f).unwrap())
+        .collect();
+    assert!(
+        decoded.iter().any(
+            |f| matches!(f, umc_wire::frame::Frame::MaxData(md) if md.maximum_data == 200_000)
+        ),
+        "MAX_DATA must double the connection limit"
+    );
+    assert!(
+        decoded.iter().any(|f| matches!(
+            f,
+            umc_wire::frame::Frame::MaxStreamData(msd)
+                if msd.stream_id == 0 && msd.maximum_stream_data == 200_000
+        )),
+        "MAX_STREAM_DATA must double the per-stream limit"
+    );
+    // Nothing is emitted again until the next half is consumed.
+    assert!(
+        server.flow_control_frames(t0).is_empty(),
+        "granted credit is not re-emitted"
+    );
+}
+
+#[test]
+fn reset_stream_marks_recv_reset() {
+    let (client_secrets, server_secrets) = run_xx_handshake(
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &TestEntropy,
+        b"ump.udp/1",
+        0,
+    )
+    .expect("handshake");
+    let dcid = vec![9u8; 8];
+    let mut client = Session::new(
+        SessionConfig {
+            role: Role::Client,
+            dcid: dcid.clone(),
+            local_traffic_secret: client_secrets.client,
+            remote_traffic_secret: client_secrets.server,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("client session");
+    let mut server = Session::new(
+        SessionConfig {
+            role: Role::Server,
+            dcid,
+            local_traffic_secret: server_secrets.server,
+            remote_traffic_secret: server_secrets.client,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("server session");
+    let t0 = Instant(8_100_000);
+    // Stream 0 carries data the server has not read yet.
+    let payload = stream_payload(0, b"partial");
+    let pkt = client
+        .build_outbound(&TestClock, t0, &payload)
+        .unwrap()
+        .unwrap();
+    server.on_inbound(t0, &pkt).unwrap();
+    // The peer resets its send side (session.md §18.5): our recv side is
+    // reset, buffered data becomes unreachable, and reading reports it.
+    let reset = reset_stream_payload(0, 0);
+    let pkt = client
+        .build_outbound(&TestClock, t0, &reset)
+        .unwrap()
+        .unwrap();
+    server.on_inbound(t0, &pkt).unwrap();
+    assert_eq!(
+        server.read_stream(0),
+        Err(umc_session::session::SessionError::Stream(
+            umc_session::stream::StreamError::ResetByPeer
+        ))
+    );
+    // No further data is accepted on the reset stream.
+    let payload = stream_payload(0, b"more");
+    let pkt = client
+        .build_outbound(&TestClock, t0, &payload)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        server.on_inbound(t0, &pkt),
+        Err(umc_session::session::SessionError::StreamClosed)
+    );
+    // A retransmitted RESET_STREAM is idempotent.
+    let pkt = client
+        .build_outbound(&TestClock, t0, &reset)
+        .unwrap()
+        .unwrap();
+    assert!(server.on_inbound(t0, &pkt).is_ok());
+}
+
+#[test]
+fn stop_sending_marks_send_stopped() {
+    let (client_secrets, server_secrets) = run_xx_handshake(
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &TestEntropy,
+        b"ump.udp/1",
+        0,
+    )
+    .expect("handshake");
+    let dcid = vec![9u8; 8];
+    let mut client = Session::new(
+        SessionConfig {
+            role: Role::Client,
+            dcid: dcid.clone(),
+            local_traffic_secret: client_secrets.client,
+            remote_traffic_secret: client_secrets.server,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("client session");
+    let mut server = Session::new(
+        SessionConfig {
+            role: Role::Server,
+            dcid,
+            local_traffic_secret: server_secrets.server,
+            remote_traffic_secret: server_secrets.client,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("server session");
+    let t0 = Instant(8_200_000);
+    let sid = client.open_stream().expect("stream");
+    let payload = client.send_stream_data(sid, b"hello", false).expect("send");
+    assert!(client
+        .build_outbound(&TestClock, t0, &payload)
+        .unwrap()
+        .is_some());
+    // The peer stops reading our send side (session.md §18.5): sending more
+    // data is refused from then on.
+    let stop = stop_sending_payload(sid);
+    let pkt = server
+        .build_outbound(&TestClock, t0, &stop)
+        .unwrap()
+        .unwrap();
+    client.on_inbound(t0, &pkt).unwrap();
+    assert_eq!(
+        client.streams[&sid].send_state,
+        umc_session::stream::SendState::ResetSent
+    );
+    assert_eq!(
+        client.send_stream_data(sid, b"more", false),
+        Err(umc_session::session::SessionError::Stream(
+            umc_session::stream::StreamError::AlreadyClosed
+        ))
+    );
 }

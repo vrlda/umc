@@ -581,6 +581,11 @@ async fn process_inbound_packet(
             }
         }
         let mut combined = ack_payload;
+        // Flow-control credit (session.md §20): MAX_DATA / MAX_STREAM_DATA /
+        // MAX_STREAMS payloads are emitted when a local watermark is crossed.
+        for credit in session.flow_control_frames(now) {
+            combined.extend_from_slice(&credit);
+        }
         let sweep_due = bundle_flush_due(now, sweep.last_bundle_flush);
         let rotation_due = sweep
             .established
