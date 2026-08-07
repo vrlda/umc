@@ -584,10 +584,20 @@ async fn process_inbound_packet(
                         if let Some(size) = sizes_by_pn.get(&pn) {
                             session.congestion_mut().on_packet_lost(*size);
                         }
-                        if let Ok(Some(bytes)) = session.retransmit(pn, now) {
-                            retransmits.push(bytes);
-                        } else {
-                            session.prune_retransmit_payload(pn);
+                        match session.retransmit(pn, now) {
+                            Ok(Some(bytes)) => retransmits.push(bytes),
+                            Ok(None) => session.prune_retransmit_payload(pn),
+                            Err(e) => {
+                                // A gated retransmit (CongestionLimited) is a
+                                // transient condition: the payload must
+                                // survive for the next detection pass or PTO
+                                // (session.md §14.3). Pruning here would
+                                // destroy the only copy of the data.
+                                #[cfg(debug_assertions)]
+                                println!(
+                                    "[session {session_id}] retransmit of pn {pn} deferred ({e:?}); payload kept"
+                                );
+                            }
                         }
                     }
                 }
@@ -1264,10 +1274,11 @@ mod tests {
     use crate::config::NodeConfig;
     use crate::session_manager::SessionEntry;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use umc_session::congestion::SMSS;
     use umc_session::sent_packet::SentPacket;
     use umc_session::session::{
-        Role, Session, SessionConfig, SessionState, CLOSE_REASON_IDLE_TIMEOUT, IDLE_TIMEOUT_MS,
-        MIN_DRAIN_MS,
+        Role, Session, SessionConfig, SessionError, SessionState, CLOSE_REASON_IDLE_TIMEOUT,
+        IDLE_TIMEOUT_MS, MIN_DRAIN_MS,
     };
     use umc_session::spaces::PacketSpace;
     use umc_wire::frame::Frame as WireFrame;
@@ -1810,6 +1821,105 @@ mod tests {
             parsed.frames.iter().any(|f| matches!(f, WireFrame::Ping)),
             "retransmitted packet carries PING"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gated_loss_keeps_payload_for_retry() {
+        let (state, _tx) = test_state();
+        let runtime = Arc::new(std::sync::Mutex::new(state));
+        let t0 = Instant(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(t0.0));
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let link: Arc<BoxLink> = Arc::new(Box::new(RecordingLink {
+            sent: recorded.clone(),
+        }));
+        let remote_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[2u8; 32]).unwrap();
+
+        // Fill the send window with stream data: in-flight reaches the
+        // 10 × SMSS cwnd and the gate shuts.
+        let mut client = test_session();
+        let sid = client.open_stream().expect("stream");
+        let mut packets = Vec::new();
+        loop {
+            let payload = client
+                .send_stream_data(sid, &[0xAB; 25], false)
+                .expect("data payload");
+            match client.build_outbound(clock.as_ref(), t0, &payload) {
+                Ok(Some(pkt)) => packets.push(pkt),
+                Err(SessionError::CongestionLimited) => break,
+                other => panic!("unexpected build result: {other:?}"),
+            }
+        }
+        assert_eq!(
+            client.congestion_mut().cwnd(),
+            10 * usize::try_from(SMSS).expect("SMSS fits usize")
+        );
+        let newest = packets.last().expect("window filled");
+
+        // The peer ACKs only the newest packet: everything at least three
+        // numbers lower is packet-threshold lost (session.md §14.1); the
+        // elapsed time stays below the 9/8 RTT time threshold.
+        let mut peer = peer_session();
+        let ack_payload = peer.on_inbound(t0 + ms(10), newest).expect("peer recv");
+        let ack_pkt = peer
+            .build_outbound(clock.as_ref(), t0 + ms(10), &ack_payload)
+            .unwrap()
+            .unwrap();
+
+        let session = Arc::new(tokio::sync::Mutex::new(client));
+        let app_channels: Arc<std::sync::Mutex<HashMap<Vec<u8>, AppTx>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut sweep = SweepState::default();
+        process_inbound_packet(
+            &link,
+            &session,
+            &clock,
+            &app_channels,
+            &runtime,
+            &remote_keys,
+            1,
+            &ack_pkt,
+            &mut sweep,
+        )
+        .await;
+
+        {
+            let mut session = session.lock().await;
+            // The three-strike loss response halved the window — repeatedly,
+            // the loss count here is far past the threshold — down to the
+            // 2 × SMSS floor.
+            assert_eq!(
+                session.congestion_mut().cwnd(),
+                2 * usize::try_from(SMSS).expect("SMSS fits usize")
+            );
+            // The gate was shut when the loss pass retransmitted: the
+            // payload of a gated lost packet must survive for the next
+            // detection pass / PTO (session.md §14.3). Once the controller
+            // recovers — the peer acks the retransmitted packets and the
+            // in-flight bytes drain — the same packet number retransmits
+            // fine.
+            let largest = session
+                .sent_state()
+                .sent()
+                .back()
+                .expect("retransmitted packets in flight")
+                .packet_number;
+            session
+                .apply_peer_ack(
+                    &umc_wire::frame::AckFrame {
+                        largest_acknowledged: largest,
+                        ack_delay: 0,
+                        first_ack_range: largest + 1,
+                        additional_ranges: Vec::new(),
+                    },
+                    t0 + ms(20),
+                )
+                .expect("recovery ack");
+            assert!(
+                session.retransmit(2, t0).expect("retransmit").is_some(),
+                "gated retransmit keeps the payload for a later attempt"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
