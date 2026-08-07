@@ -43,9 +43,16 @@ pub(crate) const NODE_IDENTITY_RECORD: &[u8] = b"node-identity";
 /// storage.md §10; never prompted).
 #[must_use]
 pub(crate) fn keystore_password() -> Vec<u8> {
-    std::env::var("UMC_KEYSTORE_PASSWORD")
-        .map(String::into_bytes)
-        .unwrap_or_default()
+    match std::env::var("UMC_KEYSTORE_PASSWORD") {
+        Ok(pw) => pw.into_bytes(),
+        Err(_) => {
+            // Dev default: the keystore then protects identity with file
+            // permissions only (storage.md §10.1 requires a strong secret
+            // before production use).
+            eprintln!("[keystore] warning: UMC_KEYSTORE_PASSWORD unset — using the dev default (no password protection)");
+            Vec::new()
+        }
+    }
 }
 
 /// Loads the node identity from the keystore, or generates a fresh one

@@ -38,7 +38,7 @@ pub enum KeystoreError {
     InvalidPassword,
 }
 
-const FILE_HEADER: &[u8] = b"UMC-KEYSTORE-v1\0";
+const FILE_HEADER: &[u8] = b"UMC-KEYSTORE-v2\0";
 const HEADER_LEN: usize = FILE_HEADER.len();
 /// The check blob is the seal of `b"check"`: 5 bytes payload + 16-byte tag.
 const CHECK_BLOB: &[u8] = b"check";
@@ -95,6 +95,9 @@ impl Keystore {
     /// payload comparison.
     fn verify_integrity(&self) -> Result<(), KeystoreError> {
         let file = std::fs::read(&self.path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+        if file.get(..HEADER_LEN) != Some(FILE_HEADER) {
+            return Err(KeystoreError::Integrity);
+        }
         let check = file
             .get(HEADER_LEN..CHECK_END)
             .ok_or(KeystoreError::Integrity)?;
@@ -174,13 +177,23 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> Result<(), KeystoreErro
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        // Atomic replace: write a temp file, fsync, rename over the target.
+        // A crash mid-write must not corrupt the keystore (identity is the
+        // node's single point of truth).
+        let tmp = path.with_extension("tmp");
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true).write(true).truncate(true).mode(0o600);
         let mut file = opts
-            .open(path)
+            .open(&tmp)
             .map_err(|e| KeystoreError::Io(e.to_string()))?;
         file.write_all(data)
             .map_err(|e| KeystoreError::Io(e.to_string()))?;
+        file.sync_all().map_err(|e| KeystoreError::Io(e.to_string()))?;
+        drop(file);
+        std::fs::rename(&tmp, path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+        // Tighten permissions even when the file pre-existed (mode(0o600)
+        // only applies at creation).
+        let _ = std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600));
         Ok(())
     }
     #[cfg(not(unix))]
@@ -209,7 +222,9 @@ fn derive_master(password: &[u8], salt: &[u8; 16]) -> [u8; 32] {
     let params = Params::new(19 * 1024, 2, 1, Some(32)).expect("params");
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = [0u8; 32];
-    let _ = argon2.hash_password_into(password, salt, &mut out);
+    argon2
+        .hash_password_into(password, salt, &mut out)
+        .expect("argon2 parameters are valid");
     out
 }
 
@@ -230,7 +245,7 @@ fn umc_crypto_seal(master: &[u8; 32], payload: &[u8]) -> Vec<u8> {
             &nonce.into(),
             Payload {
                 msg: payload,
-                aad: b"UMC-KEYSTORE-v1",
+                aad: b"UMC-KEYSTORE-v2",
             },
         )
         .expect("seal")
@@ -247,7 +262,7 @@ fn umc_crypto_open(master: &[u8; 32], sealed: &[u8]) -> Option<Vec<u8>> {
             &nonce.into(),
             Payload {
                 msg: sealed,
-                aad: b"UMC-KEYSTORE-v1",
+                aad: b"UMC-KEYSTORE-v2",
             },
         )
         .ok()
