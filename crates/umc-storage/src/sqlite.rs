@@ -82,6 +82,15 @@ impl SqliteStore {
     /// Opens a database READ-ONLY and returns its schema version without
     /// running init/migrations (storage.md §21.1: restore validation must
     /// not mutate the backup).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Corrupt`] when the file cannot be opened as
+    /// SQLite or the version row is absent.
+    ///
+    /// # Panics
+    ///
+    /// Never panics; all failure modes map to [`StoreError::Corrupt`].
     pub fn read_only_schema_version(path: &Path) -> Result<i64, StoreError> {
         let conn = Connection::open_with_flags(
             path,
