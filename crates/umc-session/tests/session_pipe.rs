@@ -1,6 +1,7 @@
 //! Two sessions exchanging a stream over an in-memory pipe with loss injection.
 use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
 use umc_handshake::xx::run_xx_handshake;
+use umc_session::congestion::CongestionController;
 use umc_session::datagram::Datagram;
 use umc_session::session::{
     Role, Session, SessionConfig, SessionState, CLOSE_REASON_IDLE_TIMEOUT, IDLE_TIMEOUT_MS,
@@ -67,6 +68,29 @@ fn pipe_pair() -> (Session, Session) {
     )
     .expect("server session");
     (client, server)
+}
+
+/// Controller that never limits sends, for pipe tests that push bulk
+/// un-acked data beyond the Reno window while exercising other session
+/// mechanics (flow credit, stream limits).
+struct UnlimitedCongestion;
+
+impl CongestionController for UnlimitedCongestion {
+    fn on_ack(&mut self, _newly_acked_bytes: usize) {}
+    fn on_loss(&mut self, _lost_bytes: usize) {}
+    fn on_packet_sent(&mut self, _bytes: usize) {}
+    fn on_packet_acknowledged(&mut self, _bytes: usize) {}
+    fn on_packet_lost(&mut self, _bytes: usize) {}
+    fn send_allowance(&self) -> usize {
+        usize::MAX
+    }
+    fn cwnd(&self) -> usize {
+        usize::MAX
+    }
+    fn in_flight(&self) -> usize {
+        0
+    }
+    fn reset(&mut self) {}
 }
 
 /// Build a client-side protected packet carrying the given frame payload.
@@ -146,6 +170,9 @@ fn reset_final_size_below_received_rejected() {
 #[test]
 fn credit_emitted_on_app_consumption() {
     let (mut client, mut server) = pipe_pair();
+    // The test pushes 200 KiB un-acked through the client: flow control,
+    // not congestion, is under test, so bypass the Reno window.
+    client.set_congestion_controller(Box::new(UnlimitedCongestion));
     let sid = client.open_stream().expect("stream");
     // Stream credit is 256 KiB. Deliver 200 KiB at real offsets WITHOUT
     // reading: the received-not-delivered delta (200 KiB) exceeds half the
@@ -584,6 +611,9 @@ fn stream_limit_enforced_on_inbound() {
     // Deliver one distinct inbound stream per protected packet. The client
     // only builds packets here; the frames carry fresh ids the server has
     // never seen, so the server creates each stream on arrival.
+    // The client pushes 1 024 un-acked packets: bypass the Reno window —
+    // stream limits, not congestion, are under test.
+    client.set_congestion_controller(Box::new(UnlimitedCongestion));
     let t0 = Instant(4_000_000);
     for i in 0..MAX_STREAMS_PER_SESSION {
         let payload = stream_payload((i * 2) as u64, b"x");
@@ -996,6 +1026,9 @@ fn flow_credit_emitted_at_half_consumption() {
     // 65 535-byte packet (MAX_PACKET_SIZE).
     // Consume past half of BOTH limits: the connection limit is 100 000
     // (half 50 000) and the per-stream limit is 256 KiB (half 128 000).
+    // The client pushes 160 KiB un-acked: bypass the Reno window — flow
+    // credit, not congestion, is under test.
+    client.set_congestion_controller(Box::new(UnlimitedCongestion));
     for offset in [0u64, 40_000, 80_000, 120_000] {
         let payload = stream_payload_at(0, offset, &vec![0x61; 40_000]);
         let pkt = client

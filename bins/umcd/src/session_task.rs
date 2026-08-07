@@ -563,6 +563,16 @@ async fn process_inbound_packet(
                 {
                     let rtt = session.rtt().clone();
                     let detector = session.loss_detector().clone();
+                    // Congestion feedback (congestion.md §14.4): every lost
+                    // packet releases its bytes from in-flight.
+                    // `detect_lost_packets` drops the lost packets from the
+                    // sent queue, so their sizes are captured beforehand.
+                    let sizes_by_pn: HashMap<u64, usize> = session
+                        .sent_state()
+                        .sent()
+                        .iter()
+                        .map(|p| (p.packet_number, p.size))
+                        .collect();
                     let lost = detect_lost_packets(
                         session.sent_state_mut(),
                         &rtt,
@@ -571,6 +581,9 @@ async fn process_inbound_packet(
                         &detector,
                     );
                     for pn in lost {
+                        if let Some(size) = sizes_by_pn.get(&pn) {
+                            session.congestion_mut().on_packet_lost(*size);
+                        }
                         if let Ok(Some(bytes)) = session.retransmit(pn, now) {
                             retransmits.push(bytes);
                         } else {
