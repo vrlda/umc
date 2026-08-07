@@ -1,4 +1,5 @@
 use super::ack::{AckReceiveState, AckSendState};
+use super::congestion::{CongestionController, RenoCongestionController};
 use super::datagram::{Datagram, DatagramQueue};
 use super::flow::FlowControl;
 use super::loss::LossDetector;
@@ -87,7 +88,6 @@ pub struct SessionConfig {
     pub max_ack_delay_ms: u64,
 }
 
-#[derive(Debug)]
 pub struct Session {
     pub role: Role,
     pub state: SessionState,
@@ -95,6 +95,10 @@ pub struct Session {
     remote_keys: PacketKeys,
     spaces: HashMap<PacketSpace, PacketSpaceState>,
     sent: AckSendState,
+    /// Congestion controller (congestion.md §7): bounds in-flight bytes
+    /// and gates sends in [`Session::build_outbound`]. Defaults to Reno;
+    /// the daemon keeps the default, tests may inject a mock.
+    congestion: Box<dyn CongestionController>,
     /// Payloads of built packets keyed by packet number. Lost packets leave
     /// the sent queue (their `SentPacket` is dropped by loss detection), so
     /// the payload is retained here until acknowledged or retransmitted
@@ -134,6 +138,17 @@ pub struct Session {
     draining_deadline: Option<Instant>,
 }
 
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The congestion controller is opaque (a `Box<dyn ...>`), so the
+        // dump reports the session identity fields only.
+        f.debug_struct("Session")
+            .field("role", &self.role)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Session {
     /// Create a session with negotiated traffic secrets.
     ///
@@ -167,6 +182,7 @@ impl Session {
                 .map_err(|_| SessionError::BadKeys)?,
             spaces,
             sent: AckSendState::new(),
+            congestion: Box::new(RenoCongestionController::new()),
             retransmit_payloads: HashMap::new(),
             recv_acks: HashMap::new(),
             rtt: RttEstimator::new(),
@@ -410,6 +426,14 @@ impl Session {
                 return Err(SessionError::AmplificationLimit);
             }
         }
+        // Congestion window (congestion.md §7.1): sends are bounded by the
+        // controller's allowance — cwnd minus in-flight bytes. ACK
+        // payloads carry the same exemption as the anti-amplification gate
+        // (congestion.md §7.3 control reserve): they are small and
+        // refusing them would break the acknowledgment loop.
+        if !is_ack_payload(payload) && payload.len() > self.congestion.send_allowance() {
+            return Err(SessionError::CongestionLimited);
+        }
         // NOTE: this builder serves retransmits and PTO probes too, so it
         // must NOT touch the idle timer (session.md §22 resets on receives
         // and daemon app-originated sends only; see `Session::touch`).
@@ -420,23 +444,6 @@ impl Session {
         let pn = space
             .allocate_packet_number()
             .map_err(SessionError::Space)?;
-        let sent = SentPacket::new(
-            pn,
-            PacketSpace::SessionData,
-            now,
-            payload.len() + 64,
-            true,
-            0,
-        );
-        self.retransmit_payloads.insert(pn, payload.to_vec());
-        if let Some(lost_pn) = self.sent.record_sent(sent) {
-            // Cap eviction (MAX_OUTSTANDING_PACKETS): the evicted packet is
-            // beyond recovery, so drop its retained payload. The daemon's
-            // loss handling does not need to know about cap evictions — the
-            // packet number is gone from both structures (resource-limits.md
-            // §24).
-            self.retransmit_payloads.remove(&lost_pn);
-        }
         let keys = &self.local_keys;
         let pkt = build_protected_packet(
             keys,
@@ -448,6 +455,16 @@ impl Session {
             payload,
         )
         .map_err(SessionError::Packet)?;
+        let sent = SentPacket::new(pn, PacketSpace::SessionData, now, pkt.len(), true, 0);
+        self.retransmit_payloads.insert(pn, payload.to_vec());
+        if let Some(lost_pn) = self.sent.record_sent(sent) {
+            // Cap eviction (MAX_OUTSTANDING_PACKETS): the evicted packet is
+            // beyond recovery, so drop its retained payload. The daemon's
+            // loss handling does not need to know about cap evictions — the
+            // packet number is gone from both structures (resource-limits.md
+            // §24).
+            self.retransmit_payloads.remove(&lost_pn);
+        }
         // Charge the budget for the actual wire bytes (congestion.md §18);
         // only unvalidated paths carry a budget.
         if let Some(path) = self.paths.get_mut(&super::packet::DEFAULT_PATH_ID) {
@@ -455,6 +472,9 @@ impl Session {
                 path.record_sent(pkt.len() as u64);
             }
         }
+        // Congestion accounting (congestion.md §7.2): the wire bytes are
+        // in flight until acknowledged or declared lost.
+        self.congestion.on_packet_sent(pkt.len());
         Ok(Some(pkt))
     }
 
@@ -678,12 +698,31 @@ impl Session {
             .iter()
             .map(|p| (p.packet_number, p.sent_at))
             .collect();
+        let size_by_pn: HashMap<u64, usize> = self
+            .sent
+            .sent()
+            .iter()
+            .map(|p| (p.packet_number, p.size))
+            .collect();
         let acked = self
             .sent
             .apply_ack(ack.largest_acknowledged, &flat)
             .map_err(SessionError::Ack)?;
         for pn in &acked {
             self.retransmit_payloads.remove(pn);
+        }
+        // Congestion feedback (congestion.md §14.2/§14.3): every acked
+        // packet releases its bytes from in-flight, and the aggregate
+        // drives window growth (slow start or congestion avoidance).
+        let mut acked_bytes = 0usize;
+        for pn in &acked {
+            if let Some(size) = size_by_pn.get(pn) {
+                self.congestion.on_packet_acknowledged(*size);
+                acked_bytes += *size;
+            }
+        }
+        if acked_bytes > 0 {
+            self.congestion.on_ack(acked_bytes);
         }
         // RFC 9002 §5.3: latest_rtt is sampled only from the newest acked
         // packet (the acked list is ascending by packet number); min_rtt and
@@ -732,6 +771,18 @@ impl Session {
 
     pub fn sent_state_mut(&mut self) -> &mut AckSendState {
         &mut self.sent
+    }
+
+    /// Replace the congestion controller (tests inject mocks; the daemon
+    /// keeps the Reno default).
+    pub fn set_congestion_controller(&mut self, controller: Box<dyn CongestionController>) {
+        self.congestion = controller;
+    }
+
+    /// Mutable access to the congestion controller: the daemon's loss path
+    /// feeds [`CongestionController::on_packet_lost`].
+    pub fn congestion_mut(&mut self) -> &mut dyn CongestionController {
+        self.congestion.as_mut()
     }
 
     #[must_use]
@@ -1081,6 +1132,10 @@ pub enum SessionError {
     /// the send would exceed 3x the bytes received on that path
     /// (congestion.md §18). ACK payloads are exempt.
     AmplificationLimit,
+    /// The congestion controller's allowance (cwnd minus in-flight) is
+    /// exhausted: the send would exceed it (congestion.md §7.1). ACK
+    /// payloads are exempt.
+    CongestionLimited,
 }
 
 impl From<StreamError> for SessionError {
@@ -1115,6 +1170,29 @@ mod tests {
             &TestClock,
         )
         .expect("session")
+    }
+
+    /// Test controller that never limits sends: for tests exercising other
+    /// session mechanics (e.g. the outstanding-packet cap) beyond the Reno
+    /// window.
+    struct UnlimitedCongestion;
+
+    impl CongestionController for UnlimitedCongestion {
+        fn on_ack(&mut self, _newly_acked_bytes: usize) {}
+        fn on_loss(&mut self, _lost_bytes: usize) {}
+        fn on_packet_sent(&mut self, _bytes: usize) {}
+        fn on_packet_acknowledged(&mut self, _bytes: usize) {}
+        fn on_packet_lost(&mut self, _bytes: usize) {}
+        fn send_allowance(&self) -> usize {
+            usize::MAX
+        }
+        fn cwnd(&self) -> usize {
+            usize::MAX
+        }
+        fn in_flight(&self) -> usize {
+            0
+        }
+        fn reset(&mut self) {}
     }
 
     fn stream_frame(
@@ -1240,6 +1318,10 @@ mod tests {
     #[test]
     fn cap_eviction_prunes_retransmit_payload() {
         let mut s = session();
+        // The cap test fills the outstanding queue far beyond the Reno
+        // window, so the congestion gate must not interfere: inject a
+        // controller that never limits sends.
+        s.set_congestion_controller(Box::new(UnlimitedCongestion));
         // Fill the outstanding queue to the cap, then one more build
         // evicts the oldest ack-eliciting packet (pn 0).
         for i in 0..=crate::ack::MAX_OUTSTANDING_PACKETS as u64 {
