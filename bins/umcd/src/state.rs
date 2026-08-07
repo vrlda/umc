@@ -228,14 +228,25 @@ impl RuntimeState {
         let started_at = OsClock.now();
         // Services bound to the node database restore persisted state at
         // startup: routes as candidates (storage.md §15.2), candidates as
-        // operational hints (§16.4). Restore failures are logged, never
-        // fatal.
+        // operational hints (§16.4), bundle metadata (§6.3). Restore
+        // failures are logged, never fatal.
         let mut discovery = DiscoveryService::new(umc_discovery::table::DEFAULT_TABLE_CAP);
         discovery.attach_store(store.clone());
         discovery.restore_candidates(store.as_ref(), started_at);
         let mut routing = RoutingService::new();
         routing.attach_store(store.clone());
         routing.restore(store.as_ref(), started_at);
+        let mut bundle = BundleService::new(bundle_objects, bundle_quota, events.clone());
+        bundle.attach_store(store.clone());
+        // Expiry comparison uses the node clock: the daemon's bundle
+        // admission path (`CreateBundle`) stamps `created_at`/`expires_at`
+        // from `node.clock`, so restore must compare against the same
+        // clock family or every persisted bundle would look expired.
+        let bundle_now = node.clock.as_ref().now();
+        match bundle.restore(store.as_ref(), bundle_now) {
+            Ok(count) => println!("[bundle] restored {count} bundle(s) from metadata"),
+            Err(e) => eprintln!("[bundle] metadata restore failed: {e}"),
+        }
 
         Ok(Self {
             control_socket: config.resolved_socket(),
@@ -253,7 +264,7 @@ impl RuntimeState {
             bus: Arc::new(Mutex::new(SessionBus::new())),
             discovery,
             relay: RelayService::new(events.clone()),
-            bundle: BundleService::new(bundle_objects, bundle_quota, events.clone()),
+            bundle,
             routing,
             events,
             apps,

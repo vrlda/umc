@@ -6,6 +6,7 @@ use umc_bundle::manager::BundleStatus;
 use umc_bundle::manager::{BundleError, BundleManager, BundleRecord};
 use umc_storage::objects::ObjectStore;
 use umc_storage::quota::QuotaAccount;
+use umc_storage::store::Store;
 use umc_types::runtime::Instant;
 
 /// Upper bound for control-surface bundle listings.
@@ -30,6 +31,23 @@ impl BundleService {
             manager: BundleManager::new(objects, quota),
             events,
         }
+    }
+
+    /// Attaches the node database so bundle metadata persists
+    /// (storage.md §6.3): admits save metas, removals delete them.
+    pub fn attach_store(&mut self, store: Arc<dyn Store + Send + Sync>) {
+        self.manager.set_persistence(Some(store));
+    }
+
+    /// Restores persisted bundles after a restart (storage.md §6.3):
+    /// ciphertext payloads survive in the object store and are read back
+    /// through the persisted content address. Returns the number restored.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the persisted metadata cannot be scanned.
+    pub fn restore(&mut self, store: &dyn Store, now: Instant) -> Result<usize, String> {
+        self.manager.restore(store, now)
     }
 
     /// Admit a bundle (bundles.md §8.1), recording a `bundle_admitted` event.

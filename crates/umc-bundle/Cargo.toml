@@ -10,6 +10,8 @@ umc-crypto = { path = "../umc-crypto" }
 umc-storage = { path = "../umc-storage" }
 umc-wire = { path = "../umc-wire" }
 blake2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lints]
 workspace = true
