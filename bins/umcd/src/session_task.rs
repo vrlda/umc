@@ -603,6 +603,12 @@ async fn process_inbound_packet(
                 }
             }
         }
+        // Pacing (congestion.md §12): feed the controller the session's
+        // smoothed RTT so the pacing rate tracks the measured round trip.
+        // Until the first RTT sample the rate stays 0 = unlimited, so
+        // pacing changes nothing (the default controller runs un-paced).
+        let smoothed_rtt = session.rtt().smoothed_rtt;
+        session.congestion_mut().set_smoothed_rtt(smoothed_rtt);
         let mut combined = ack_payload;
         // Flow-control credit (session.md §20): MAX_DATA / MAX_STREAM_DATA /
         // MAX_STREAMS payloads are emitted when a local watermark is crossed.
@@ -1186,6 +1192,13 @@ fn push_event(state: &mut RuntimeState, kind: &str, now: Instant, detail: String
 /// Session writer: drain the applications' outbound channels and send the
 /// echoed frames back on the same streams. Runs independently of the link
 /// recv so echoes reach the peer without further inbound traffic.
+///
+/// This is the only paced send arm (congestion.md §12): the echo path
+/// carries the bulk app data, so it waits for the controller's pacing
+/// schedule before the wire and consumes the pacing tokens at the real
+/// send time. The reader's ACK/control tail, the bus arm, keepalives, PTO
+/// probes, and retransmits all send immediately — control and recovery
+/// traffic must not be delayed (congestion.md §12.2).
 async fn writer_loop(
     link: &Arc<BoxLink>,
     session: &Arc<tokio::sync::Mutex<Session>>,
@@ -1237,23 +1250,39 @@ async fn writer_loop(
                 }
             }
         };
-        let outbound = {
+        let (outbound, pace_wait) = {
             let mut session = session.lock().await;
             match session.build_outbound(clock.as_ref(), now, &payload) {
                 Ok(Some(outbound)) => {
                     // App-originated echo traffic: resets the idle timer
                     // (session.md §22).
                     session.touch(now);
-                    outbound
+                    // Pacing (congestion.md §12): the echo send is the main
+                    // data path, so it waits for the pacing bucket before
+                    // the wire. The reader's ACK/control tail, the bus arm,
+                    // keepalives, probes, and retransmits skip pacing —
+                    // control and recovery traffic must not be delayed.
+                    let pace_wait = session.congestion_mut().next_send_time(now, outbound.len());
+                    (outbound, pace_wait)
                 }
                 _ => continue,
             }
         };
+        // Sleep out the spacing interval (congestion.md §12.1): the wait is
+        // `deficit / rate` past `now`, so the send lands on the pacing
+        // schedule. Pacing is off until the session's RTT has a sample.
+        if let Some(wait) = pace_wait {
+            let delay_ms = wait.duration_since(clock.now()).as_millis();
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
         #[cfg(debug_assertions)]
         println!(
             "[session {session_id}] echo stream {stream_id} ({} bytes)",
             data.len()
         );
+        let wire_bytes = outbound.len();
         let sent = tokio::task::block_in_place(|| {
             link.send(OutboundPacket {
                 bytes: outbound,
@@ -1261,7 +1290,14 @@ async fn writer_loop(
                 deadline_ms: None,
             })
         });
-        if let Err(e) = sent {
+        if sent.is_ok() {
+            // Consume the pacing tokens at the real send time, so the token
+            // clock never drifts across the paced sleep (congestion.md §12).
+            let mut session = session.lock().await;
+            session
+                .congestion_mut()
+                .consume_pacing(wire_bytes, clock.now());
+        } else if let Err(e) = sent {
             #[cfg(debug_assertions)]
             println!("[session {session_id}] echo send error: {e:?}");
         }
@@ -2319,6 +2355,66 @@ mod tests {
         assert!(
             !session.idle_expired(Instant(t0.0 + 1_000 + IDLE_TIMEOUT_MS - 1)),
             "bus outbound traffic keeps the destination session alive"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paced_send_respects_interval() {
+        let t0 = Instant(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(t0.0));
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let link: Arc<BoxLink> = Arc::new(Box::new(RecordingLink {
+            sent: recorded.clone(),
+        }));
+        let mut client = test_session();
+        let sid = client.open_stream().expect("stream");
+        // A sampled RTT activates pacing (congestion.md §12): the 12,000-
+        // byte window over a 100 ms RTT paces at 960,000 bits/s with a
+        // 6,000-byte burst.
+        client.congestion_mut().set_smoothed_rtt(100);
+        assert_eq!(client.congestion_mut().pacing_rate_bps(), 960_000);
+        // Exhaust the bucket: the next echo send must wait out its spacing
+        // interval (~8 ms for a ~1 KB packet) instead of going out at once.
+        client.congestion_mut().consume_pacing(6_000, t0);
+        let session = Arc::new(tokio::sync::Mutex::new(client));
+        let echo_rx: Arc<std::sync::Mutex<HashMap<Vec<u8>, AppRx>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (tx, rx) = umc_core::app_io::spawn_app_channel(1);
+        tx.send_stream_frame(sid, vec![0xCD; 1_000])
+            .await
+            .expect("queue echo");
+        drop(tx);
+        echo_rx.lock().expect("echo map").insert(vec![], rx);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicBool::new(false));
+
+        // The writer loop exits once the only echo receiver disconnects.
+        let start = tokio::time::Instant::now();
+        writer_loop(&link, &session, &clock, &shutdown_flag, &ended, &echo_rx, 1).await;
+        let elapsed = start.elapsed();
+
+        // The echo reached the link, held back by the pacing interval: a
+        // 1,000-byte payload builds to ~1,036 wire bytes and the empty
+        // bucket computes 1036 × 8000 / 960000 ≈ 8 ms of spacing.
+        assert!(
+            !recorded.lock().expect("link sent").is_empty(),
+            "paced echo reaches the link"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(8),
+            "paced send waits out its spacing interval (elapsed {elapsed:?})"
+        );
+        // The tokens were consumed at the real send time: a follow-up send
+        // must wait again — the accessor reports the full delay.
+        let mut session = session.lock().await;
+        let next = session
+            .congestion_mut()
+            .next_send_time(t0, 1_200)
+            .expect("pacing active after a sample");
+        assert_eq!(
+            next.duration_since(t0).as_millis(),
+            10,
+            "empty bucket spaces a 1200-byte packet at 960,000 bits/s"
         );
     }
 }

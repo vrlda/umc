@@ -290,6 +290,101 @@ fn cap_eviction_releases_in_flight_bytes() {
 }
 
 #[test]
+fn pacing_rate_matches_cwnd_over_rtt() {
+    let mut c = RenoCongestionController::new();
+    assert_eq!(c.cwnd(), 10 * SMSS as usize);
+    // Uninitialized RTT: no pacing (congestion.md §12.2) — the rate is 0,
+    // which means unlimited, and every send is immediate.
+    assert_eq!(c.pacing_rate_bps(), 0);
+    assert_eq!(c.next_send_time(Instant(0), SMSS as usize), None);
+    // A 12,000-byte window over a 100 ms RTT: cwnd × 8 × 1000 / rtt =
+    // 12000 × 8000 / 100 = 960,000 bits/s. The burst is capped at
+    // min(cwnd / 2, 10 × SMSS) = min(6000, 12000) = 6000 bytes and the
+    // freshly enabled bucket starts full at that cap.
+    c.set_smoothed_rtt(100);
+    assert_eq!(c.pacing_rate_bps(), 960_000);
+    assert_eq!(c.pacing_burst_bytes(), 6_000);
+    assert_eq!(c.pacing_tokens(), 6_000);
+}
+
+#[test]
+fn burst_cap_limits_tokens() {
+    let mut c = RenoCongestionController::new();
+    c.set_smoothed_rtt(100);
+    // Drain the bucket completely.
+    c.consume_pacing(6_000, Instant(0));
+    assert_eq!(c.pacing_tokens(), 0);
+    // A long idle (an hour) refills the bucket, but only up to the burst
+    // allowance (congestion.md §12.2 "limit bursts"): the effective tokens
+    // are exactly 6000, so a 12,000-byte packet waits for the remaining
+    // 6000 × 8000 / 960000 = 50 ms. An uncapped bucket would have refilled
+    // 43 GB and sent instantly.
+    let now = Instant(3_600_000);
+    let wait = c
+        .next_send_time(now, 12_000)
+        .expect("pacing active after a sample");
+    assert_eq!(wait.duration_since(now).as_millis(), 50);
+}
+
+#[test]
+fn next_send_time_delays_when_tokens_insufficient() {
+    let mut c = RenoCongestionController::new();
+    c.set_smoothed_rtt(100);
+    c.consume_pacing(6_000, Instant(0));
+    assert_eq!(c.pacing_tokens(), 0);
+    // With an empty bucket a 1200-byte packet waits 1200 × 8000 / 960000 =
+    // 10 ms — the deficit is refilled at the pacing rate.
+    let now = Instant(0);
+    let wait = c
+        .next_send_time(now, 1_200)
+        .expect("pacing active after a sample");
+    assert_eq!(wait.duration_since(now).as_millis(), 10);
+}
+
+#[test]
+fn no_pacing_without_rtt() {
+    let mut c = RenoCongestionController::new();
+    // Sent traffic without any RTT sample: the rate stays 0 (unlimited)
+    // and no send is ever delayed, whatever the window or the bucket.
+    c.on_packet_sent(SMSS as usize);
+    assert_eq!(c.pacing_rate_bps(), 0);
+    assert_eq!(c.next_send_time(Instant(5), 1_200), None);
+    // An explicit zero RTT (the session estimator before its first sample)
+    // behaves identically.
+    c.set_smoothed_rtt(0);
+    assert_eq!(c.pacing_rate_bps(), 0);
+    assert_eq!(c.next_send_time(Instant(5), 1_200), None);
+}
+
+#[test]
+fn pacing_rate_tracks_window_changes() {
+    let mut c = RenoCongestionController::new();
+    c.set_smoothed_rtt(100);
+    assert_eq!(c.pacing_rate_bps(), 960_000);
+    // A loss halves the window: the pacing rate and burst follow the new
+    // window (congestion.md §12): 6000 × 8000 / 100 = 480,000 bits/s and
+    // min(3000, 12000) = 3000 bytes.
+    c.on_loss(0);
+    assert_eq!(c.cwnd(), 5 * SMSS as usize);
+    assert_eq!(c.pacing_rate_bps(), 480_000);
+    assert_eq!(c.pacing_burst_bytes(), 3_000);
+    // The existing tokens are clamped to the shrunken burst.
+    assert!(c.pacing_tokens() <= 3_000);
+}
+
+#[test]
+fn reset_clears_pacing() {
+    let mut c = RenoCongestionController::new();
+    c.set_smoothed_rtt(100);
+    assert_eq!(c.pacing_rate_bps(), 960_000);
+    // Restart clears congestion state (congestion.md §24.21): the pacing
+    // rate resets to 0 (unlimited) until a fresh RTT sample arrives.
+    c.reset();
+    assert_eq!(c.pacing_rate_bps(), 0);
+    assert_eq!(c.next_send_time(Instant(0), 1_200), None);
+}
+
+#[test]
 fn retransmit_gated_keeps_payload() {
     let mut s = session();
     let sid = s.open_stream().expect("stream");
