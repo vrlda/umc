@@ -86,7 +86,7 @@ impl SqliteStore {
     /// # Errors
     ///
     /// Returns [`StoreError::Corrupt`] when the file cannot be opened as
-    /// SQLite or the version row is absent.
+    /// `SQLite` or the version row is absent.
     ///
     /// # Panics
     ///
@@ -103,6 +103,15 @@ impl SqliteStore {
         .map_err(|e| StoreError::Corrupt(e.to_string()))
     }
 
+    /// Current schema version of the opened store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Corrupt`] when the version row is missing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the internal connection mutex is poisoned.
     pub fn schema_version(&self) -> Result<i64, StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
