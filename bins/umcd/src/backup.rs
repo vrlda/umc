@@ -48,7 +48,7 @@ pub fn backup(config: &NodeConfig, out_dir: &Path) -> Result<(), String> {
     let out_abs = out_dir
         .canonicalize()
         .unwrap_or_else(|_| out_dir.to_path_buf());
-    let data_abs = data_dir.canonicalize().unwrap_or_else(|| data_dir.clone());
+    let data_abs = data_dir.canonicalize().unwrap_or_else(|_| data_dir.clone());
     if out_abs == data_abs || data_abs.starts_with(&out_abs) {
         return Err("backup: output dir must not be the data dir or its ancestor".into());
     }
