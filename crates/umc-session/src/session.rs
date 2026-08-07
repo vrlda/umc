@@ -294,6 +294,20 @@ impl Session {
         if self.state != SessionState::Active {
             return Ok(None);
         }
+        // Anti-amplification (congestion.md §18): before validation a path
+        // may send at most 3x the bytes it has received. ACKs are exempt —
+        // the peer can only answer with small ack frames, and refusing them
+        // would stall the protocol (session.md §26). The gate only applies
+        // when a path record exists: sessions without path accounting send
+        // unrestricted.
+        if let Some(path) = self.paths.get(&super::packet::DEFAULT_PATH_ID) {
+            if !path.validated
+                && !is_ack_payload(payload)
+                && payload.len() as u64 > path.send_allowance()
+            {
+                return Err(SessionError::AmplificationLimit);
+            }
+        }
         // NOTE: this builder serves retransmits and PTO probes too, so it
         // must NOT touch the idle timer (session.md §22 resets on receives
         // and daemon app-originated sends only; see `Session::touch`).
@@ -332,6 +346,13 @@ impl Session {
             payload,
         )
         .map_err(SessionError::Packet)?;
+        // Charge the budget for the actual wire bytes (congestion.md §18);
+        // only unvalidated paths carry a budget.
+        if let Some(path) = self.paths.get_mut(&super::packet::DEFAULT_PATH_ID) {
+            if !path.validated {
+                path.record_sent(pkt.len() as u64);
+            }
+        }
         Ok(Some(pkt))
     }
 
@@ -345,7 +366,7 @@ impl Session {
     /// [`SessionError::Datagram`] if a frame cannot be applied, and
     /// [`SessionError::Encode`] if ACK encoding fails.
     pub fn on_inbound(&mut self, now: Instant, bytes: &[u8]) -> Result<Vec<u8>, SessionError> {
-        let (space_kind, _dcid, _path, truncated_pn, payload) =
+        let (space_kind, _dcid, path_id, truncated_pn, payload) =
             super::packet::parse_protected_packet(&self.remote_keys, bytes)
                 .map_err(SessionError::Packet)?;
         let space = match space_kind {
@@ -361,6 +382,18 @@ impl Session {
             .admit_received(truncated_pn, 16)
             .map_err(SessionError::Space)?;
         self.recv_acks.entry(space).or_default().record(pn);
+        // Anti-amplification accounting (congestion.md §18): every admitted
+        // packet grows the 3x send budget of the path it arrived on. A path
+        // id not in the map falls back to the default path; with no path
+        // record at all there is nothing to account.
+        let budget_path = if self.paths.contains_key(&path_id) {
+            path_id
+        } else {
+            super::packet::DEFAULT_PATH_ID
+        };
+        if let Some(path) = self.paths.get_mut(&budget_path) {
+            path.record_received(bytes.len() as u64, now);
+        }
         let parsed =
             umc_wire::packet::parse_payload(&PacketContext::Protected(space_kind), &payload)
                 .map_err(SessionError::WirePacket)?;
@@ -843,6 +876,15 @@ impl Session {
     }
 }
 
+/// Whether `payload`'s first frame is an ACK: such payloads are exempt from
+/// the anti-amplification gate (congestion.md §18). An ACK is small — at most
+/// a few bytes per packet — so it can never exceed 3x what the peer just
+/// sent, and refusing it would break the acknowledgment loop.
+fn is_ack_payload(payload: &[u8]) -> bool {
+    umc_wire::varint::decode(payload)
+        .is_ok_and(|(frame_type, _)| frame_type == umc_types::frame::FrameType::ACK.0)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
     BadConnectionId,
@@ -868,6 +910,10 @@ pub enum SessionError {
     PathNotFound,
     PathNotValidated,
     PathValidation,
+    /// The anti-amplification budget of the unvalidated path is exhausted:
+    /// the send would exceed 3x the bytes received on that path
+    /// (congestion.md §18). ACK payloads are exempt.
+    AmplificationLimit,
 }
 
 impl From<StreamError> for SessionError {
