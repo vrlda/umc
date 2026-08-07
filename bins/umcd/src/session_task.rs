@@ -995,11 +995,15 @@ fn handle_control_frames(
     }
 }
 
-/// Wrapper for a pending-bundle delivery sweep: wrap the stored ciphertext
-/// of the next undelivered bundle in a `BUNDLE` frame (bundles.md §10.1).
-/// One frame per sweep: bundle payloads can approach the packet-size cap.
+/// Wrapper for a pending-bundle delivery sweep: evict expired bundles, then
+/// wrap the stored ciphertext of the next undelivered bundle in a `BUNDLE`
+/// frame (bundles.md §10.1). One frame per sweep: bundle payloads can
+/// approach the packet-size cap.
 fn flush_pending_bundles(state: &mut RuntimeState, now: Instant) -> Vec<u8> {
     let mut outbound = Vec::new();
+    // Evict expired bundles FIRST (bundles.md §11): they are removed (records
+    // + object store) and never selected for delivery.
+    let _ = state.bundle.expire_old(now);
     let pending = state.bundle.pending_delivery(now);
     for id in pending.into_iter().take(BUNDLES_PER_FLUSH) {
         let Some(record) = state.bundle.record(&id) else {
@@ -1497,6 +1501,50 @@ mod tests {
         ));
         // Nothing left to deliver.
         assert!(flush_pending_bundles(&mut state, Instant(5_000)).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expired_bundles_evicted_by_sweep() {
+        let (mut state, _tx) = test_state();
+        let expired_id = state
+            .bundle
+            .admit(
+                b"expired-payload",
+                b"sender-a",
+                b"dest",
+                1,
+                1_000,
+                3,
+                false,
+                Instant(0),
+            )
+            .unwrap();
+        let live_id = state
+            .bundle
+            .admit(
+                b"live-payload",
+                b"sender-b",
+                b"dest",
+                1,
+                umc_bundle::manager::DEFAULT_LIFETIME_MS,
+                3,
+                false,
+                Instant(0),
+            )
+            .unwrap();
+        assert_eq!(state.bundle.count(), 2);
+
+        // The sweep evicts expired bundles BEFORE delivery selection
+        // (bundles.md §11): the expired bundle is removed (records + object
+        // store) and never wrapped; the live bundle survives.
+        let swept = flush_pending_bundles(&mut state, Instant(1_001));
+        assert!(!swept.is_empty(), "live bundle still swept");
+        assert!(state.bundle.find(&expired_id).is_none());
+        assert!(state.bundle.payload(&expired_id).is_none());
+        assert_eq!(state.bundle.count(), 1);
+        assert!(state.bundle.find(&live_id).is_some());
+        let recent = state.events.lock().unwrap().recent(10);
+        assert!(recent.iter().any(|e| e.kind == "bundle_expired"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

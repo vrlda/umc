@@ -1,22 +1,14 @@
 //! Expiration and eviction (bundles.md §11, §19).
-use crate::manager::{BundleManager, BundleStatus};
+use crate::manager::BundleManager;
 use umc_types::runtime::Instant;
 
 /// Eviction order (resource-limits.md §33): expired, invalid, delivered,
 /// unauthenticated, lowest priority, highest replication, largest, oldest.
+/// Delegates to [`BundleManager::evict_expired`], which removes the record
+/// and deletes the object-store payload.
 #[must_use]
 pub fn evict_expired(manager: &mut BundleManager, now: Instant) -> usize {
-    let expired: Vec<[u8; 32]> = manager
-        .records_iter()
-        .filter(|r| r.expires_at <= now)
-        .map(|r| r.id)
-        .collect();
-    let count = expired.len();
-    for id in expired {
-        let _ = manager.set_status(&id, BundleStatus::Expired);
-        manager.remove(&id);
-    }
-    count
+    manager.evict_expired(now).len()
 }
 
 #[cfg(test)]

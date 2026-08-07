@@ -215,6 +215,27 @@ impl BundleManager {
             }
         }
     }
+
+    /// Evicts expired bundles (bundles.md §11): each expired record is
+    /// removed and its object-store payload deleted, releasing the quota
+    /// reservation and sender count via [`BundleManager::remove`]. Returns
+    /// the evicted ids, sorted for deterministic ordering.
+    #[must_use]
+    pub fn evict_expired(&mut self, now: Instant) -> Vec<[u8; BUNDLE_ID_LEN]> {
+        let mut expired: Vec<([u8; BUNDLE_ID_LEN], [u8; 32])> = self
+            .records_iter()
+            .filter(|r| r.expires_at <= now)
+            .map(|r| (r.id, r.object_id))
+            .collect();
+        expired.sort_unstable();
+        let mut ids = Vec::with_capacity(expired.len());
+        for (id, object_id) in expired {
+            let _ = self.objects.delete(&object_id);
+            self.remove(&id);
+            ids.push(id);
+        }
+        ids
+    }
 }
 
 #[cfg(test)]
@@ -368,5 +389,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(m.record(&id).unwrap().status, BundleStatus::CustodyAccepted);
+    }
+
+    #[test]
+    fn evict_expired_removes_records_objects_and_accounting() {
+        let mut m = manager();
+        let id = m
+            .admit(b"a", b"s", b"d", 1, 1_000, 3, false, Instant(0))
+            .unwrap();
+        let object_id = m.records[&id].object_id;
+        assert!(m.objects.exists(&object_id));
+        assert_eq!(m.quota.used(), 1);
+        assert_eq!(m.evict_expired(Instant(1_000)), vec![id]);
+        assert!(m.records.is_empty());
+        assert!(!m.objects.exists(&object_id));
+        assert_eq!(m.quota.used(), 0);
     }
 }
