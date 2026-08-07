@@ -25,7 +25,7 @@ use umc_carrier::BoxLink;
 use umc_core::app_io::{AppRx, AppTx};
 use umc_crypto::aead::PacketKeys;
 use umc_session::loss::detect_lost_packets;
-use umc_session::session::Session;
+use umc_session::session::{Session, SessionState};
 use umc_types::runtime::{Clock, Instant};
 use umc_wire::frame::Frame;
 use umc_wire::frames::bundle::BundleFrame;
@@ -122,37 +122,32 @@ fn pto_deadline_after(
 }
 
 /// One idle/draining sweep on the reader's 1 s interval arm (session.md
-/// §6.4, §22): when the session has been idle past the timeout, send a
-/// `CONNECTION_CLOSE` and enter draining; once the draining deadline has
-/// passed, finalize the close. Returns whether the reader loop should exit
-/// (the draining period ended).
+/// §6.4, §22): when the session has been idle past the timeout while still
+/// `Active`, build a `CONNECTION_CLOSE` packet and enter draining; once the
+/// draining deadline has passed, finalize the close. Returns the built idle
+/// close packet (the caller sends it after dropping the session guard) and
+/// whether the reader loop should exit (the draining period ended).
+///
+/// The idle branch is gated on `SessionState::Active`: draining is never
+/// re-extended by later sweeps, and a peer-initiated close cannot transition
+/// backward.
 fn handle_idle_timers(
     session: &mut Session,
     clock: &dyn Clock,
     now: Instant,
-    link: &Arc<BoxLink>,
-    session_id: u64,
-) -> bool {
+) -> (Option<Vec<u8>>, bool) {
     if session.draining_expired(now) {
         session.finalize_close();
-        return true;
+        return (None, true);
     }
-    if session.idle_expired(now) {
-        if let Some(payload) = session.build_idle_close(now) {
-            if let Ok(Some(bytes)) = session.build_outbound(clock, now, &payload) {
-                if let Err(e) = link.send(OutboundPacket {
-                    bytes,
-                    control: false,
-                    deadline_ms: None,
-                }) {
-                    #[cfg(debug_assertions)]
-                    println!("[session {session_id}] idle close send error: {e:?}");
-                }
-            }
-        }
+    if session.state == SessionState::Active && session.idle_expired(now) {
+        let built = session
+            .build_idle_close(now)
+            .and_then(|payload| session.build_outbound(clock, now, &payload).ok().flatten());
         session.close(now);
+        return (built, false);
     }
-    false
+    (None, false)
 }
 
 /// Spawn the per-session wire loop. The tasks exit when `link.recv` errors
@@ -382,14 +377,25 @@ async fn reader_loop(
             }
             _ = idle_sweep.tick() => {
                 let now = clock.now();
-                let done = {
+                // Build the idle close (if any) under the guard; the send
+                // happens after it is dropped — the carrier API is blocking.
+                let (built_close, done) = {
                     let mut session = session.lock().await;
-                    // The carrier API is blocking; run the sweep on a worker
-                    // like the other send sites.
-                    tokio::task::block_in_place(|| {
-                        handle_idle_timers(&mut session, clock.as_ref(), now, link, session_id)
-                    })
+                    handle_idle_timers(&mut session, clock.as_ref(), now)
                 };
+                if let Some(bytes) = built_close {
+                    let sent = tokio::task::block_in_place(|| {
+                        link.send(OutboundPacket {
+                            bytes,
+                            control: false,
+                            deadline_ms: None,
+                        })
+                    });
+                    if let Err(e) = sent {
+                        #[cfg(debug_assertions)]
+                        println!("[session {session_id}] idle close send error: {e:?}");
+                    }
+                }
                 if done {
                     #[cfg(debug_assertions)]
                     println!("[session {session_id}] draining period ended, closing session");
@@ -565,7 +571,15 @@ async fn process_inbound_packet(
         if !combined.is_empty() {
             let built = session.build_outbound(clock.as_ref(), now, &combined);
             outbound = match built {
-                Ok(outbound) => outbound,
+                Ok(outbound) => {
+                    if outbound.is_some() {
+                        // App-originated traffic (ACK/control replies, bundle
+                        // sweeps, key rotation): resets the idle timer
+                        // (session.md §22). Probes and retransmits do not.
+                        session.touch(now);
+                    }
+                    outbound
+                }
                 Err(e) => {
                     #[cfg(debug_assertions)]
                     println!("[session {session_id}] ack build error: {e:?}");
@@ -1150,7 +1164,12 @@ async fn writer_loop(
         let outbound = {
             let mut session = session.lock().await;
             match session.build_outbound(clock.as_ref(), now, &payload) {
-                Ok(Some(outbound)) => outbound,
+                Ok(Some(outbound)) => {
+                    // App-originated echo traffic: resets the idle timer
+                    // (session.md §22).
+                    session.touch(now);
+                    outbound
+                }
                 _ => continue,
             }
         };
@@ -1179,9 +1198,12 @@ mod tests {
     use crate::config::NodeConfig;
     use crate::session_manager::SessionEntry;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use umc_session::sent_packet::SentPacket;
     use umc_session::session::{
         Role, Session, SessionConfig, SessionState, CLOSE_REASON_IDLE_TIMEOUT, IDLE_TIMEOUT_MS,
+        MIN_DRAIN_MS,
     };
+    use umc_session::spaces::PacketSpace;
     use umc_wire::frame::Frame as WireFrame;
     use umc_wire::frames::path::KeyUpdateFrame;
     use umc_wire::frames::relay::RelayOpenFrame;
@@ -1256,6 +1278,12 @@ mod tests {
         fn now(&self) -> Instant {
             Instant(self.0)
         }
+    }
+
+    /// Runtime duration (the `Duration` in scope at module level is the std
+    /// one for tokio timers; `Instant` arithmetic needs the runtime type).
+    fn ms(millis: u64) -> umc_types::runtime::Duration {
+        umc_types::runtime::Duration::from_millis(millis)
     }
 
     /// Link that records every outbound packet.
@@ -1742,21 +1770,30 @@ mod tests {
         session.touch(t0);
 
         // Before the timeout the interval sweep is a no-op.
-        assert!(!handle_idle_timers(
+        let (built, done) = handle_idle_timers(
             &mut session,
             &clock,
             Instant(1_000_000 + IDLE_TIMEOUT_MS - 1),
-            &link,
-            1,
-        ));
+        );
+        assert!(!done);
+        assert!(built.is_none());
         assert_eq!(session.state, SessionState::Active);
         assert!(recorded.lock().unwrap().is_empty());
 
-        // Past the idle timeout: a CONNECTION_CLOSE is sent and the session
-        // enters draining; the loop keeps running.
+        // Past the idle timeout: a CONNECTION_CLOSE is built and the session
+        // enters draining; the caller sends the bytes and the loop keeps
+        // running.
         let now = Instant(1_000_000 + IDLE_TIMEOUT_MS);
-        assert!(!handle_idle_timers(&mut session, &clock, now, &link, 1));
+        let (built, done) = handle_idle_timers(&mut session, &clock, now);
+        assert!(!done);
         assert_eq!(session.state, SessionState::Draining);
+        let close_bytes = built.expect("idle close built");
+        link.send(OutboundPacket {
+            bytes: close_bytes,
+            control: false,
+            deadline_ms: None,
+        })
+        .expect("recording link accepts");
         let sent = recorded.lock().expect("link sent");
         assert_eq!(sent.len(), 1, "exactly one idle close packet");
         let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[1u8; 32]).unwrap();
@@ -1779,13 +1816,131 @@ mod tests {
         assert!(!session.draining_expired(Instant(now.0 + 3 * 1_000 - 1)));
         // ...and once draining expires the loop must exit with the session
         // finalized as closed.
-        assert!(handle_idle_timers(
-            &mut session,
-            &clock,
-            Instant(now.0 + 3 * 1_000),
-            &link,
-            1,
-        ));
+        let (built, done) = handle_idle_timers(&mut session, &clock, Instant(now.0 + 3 * 1_000));
+        assert!(built.is_none());
+        assert!(done);
         assert_eq!(session.state, SessionState::Closed);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn draining_not_extended_by_idle_sweep() {
+        let t0 = Instant(1_000_000);
+        let clock = FixedClock(t0.0);
+        let mut session = test_session();
+        // Inflate the probe timeout so the draining window outlives the idle
+        // timeout: the idle branch can then fire while still draining.
+        session.sent_state_mut().record_sent(SentPacket::new(
+            0,
+            PacketSpace::SessionData,
+            Instant(0),
+            64,
+            true,
+            0,
+        ));
+        session
+            .apply_peer_ack(
+                &umc_wire::frame::AckFrame {
+                    largest_acknowledged: 0,
+                    ack_delay: 0,
+                    first_ack_range: 1,
+                    additional_ranges: Vec::new(),
+                },
+                Instant(100_000),
+            )
+            .expect("rtt sample");
+        let pto = session.loss_detector().pto(session.rtt()).as_millis();
+        let drain_ms = (3 * pto).max(MIN_DRAIN_MS);
+        let d = t0 + ms(drain_ms);
+
+        session.touch(t0);
+        session.close(t0);
+        assert_eq!(session.state, SessionState::Draining);
+
+        // A later sweep, inside the drain window with the idle timer expired
+        // (close sends do not touch): must not re-send the close or re-extend
+        // the draining deadline.
+        let (built, done) = handle_idle_timers(&mut session, &clock, t0 + ms(30_000));
+        assert!(built.is_none(), "no second idle close while draining");
+        assert!(!done);
+        assert!(
+            session.draining_expired(d),
+            "draining deadline must not be re-extended by an idle sweep"
+        );
+        // Finalization still happens at the original deadline.
+        let (built, done) = handle_idle_timers(&mut session, &clock, d);
+        assert!(built.is_none());
+        assert!(
+            done,
+            "draining expires and finalizes at the original deadline"
+        );
+        assert_eq!(session.state, SessionState::Closed);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_probe_does_not_extend_idle_deadline() {
+        let t0 = Instant(1_000_000);
+        let clock = FixedClock(t0.0);
+        let mut session = test_session();
+        session.touch(t0);
+        let ping = umc_wire::varint::encode(umc_types::frame::FrameType::PING.0).unwrap();
+        // The PTO probe builder (reader loop) sends through build_outbound:
+        // a probe to a possibly-dead peer must not re-arm the idle timer
+        // (session.md §22 resets on receives, not on sends).
+        session
+            .build_outbound(&clock, t0 + ms(10_000), &ping)
+            .expect("probe build")
+            .expect("probe bytes");
+        // The retransmit path re-sends a lost payload under a fresh packet
+        // number (session.md §14.3): also not new traffic, so no re-arm.
+        session
+            .retransmit(0, t0 + ms(10_000))
+            .expect("retransmit build")
+            .expect("retransmit bytes");
+        assert!(
+            session.idle_expired(t0 + ms(30_000)),
+            "PTO probes and retransmits must not extend the idle deadline"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicate_replay_does_not_extend_idle() {
+        let t0 = Instant(1_000_000);
+        let clock = FixedClock(t0.0);
+        let mut client = test_session();
+        let ping = umc_wire::varint::encode(umc_types::frame::FrameType::PING.0).unwrap();
+        let pkt = client
+            .build_outbound(&clock, t0, &ping)
+            .expect("build")
+            .expect("bytes");
+        let mut peer = peer_session();
+        // First delivery anchors the peer's idle timer at t0.
+        peer.on_inbound(t0, &pkt).expect("first delivery");
+        // A replayed packet (same packet number) is rejected; it must not
+        // re-arm the idle timer (session.md §22) or a zombie replaying the
+        // same bytes would keep the session alive forever.
+        assert!(
+            peer.on_inbound(t0 + ms(29_000), &pkt).is_err(),
+            "duplicate packet number must be rejected"
+        );
+        assert!(peer.idle_expired(t0 + ms(30_000)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn padding_only_packet_does_not_extend_idle() {
+        let t0 = Instant(1_000_000);
+        let clock = FixedClock(t0.0);
+        let mut client = test_session();
+        let padding = umc_wire::varint::encode(umc_types::frame::FrameType::PADDING.0).unwrap();
+        let pkt = client
+            .build_outbound(&clock, t0, &padding)
+            .expect("build")
+            .expect("bytes");
+        let mut peer = peer_session();
+        peer.touch(t0);
+        // A padding-only packet carries no real frames: it must not reset the
+        // idle timer (session.md §22 — only ack-eliciting/ACKed packets do).
+        peer.on_inbound(t0 + ms(29_000), &pkt)
+            .expect("padding packet parses");
+        assert!(peer.idle_expired(t0 + ms(30_000)));
     }
 }
