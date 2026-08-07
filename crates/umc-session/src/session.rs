@@ -20,6 +20,10 @@ pub const DEFAULT_INITIAL_MAX_STREAM_DATA: u64 = 256 * 1024;
 /// Cap on remembered closed stream ids (session.md §29): ids are kept only
 /// to reject reuse, so the set is bounded with FIFO eviction.
 pub const MAX_CLOSED_STREAM_IDS: usize = 1_024;
+/// Hard cap on concurrent open streams per session (resource-limits.md §20):
+/// exceeding it is a [`SessionError::StreamLimit`] on both the outbound and
+/// inbound paths.
+pub const MAX_STREAMS_PER_SESSION: usize = 1_024;
 /// Idle timeout (session.md §22): a session that has not touched its idle
 /// timer for this long is closed locally with an `IDLE_TIMEOUT` close.
 pub const IDLE_TIMEOUT_MS: u64 = 30_000;
@@ -175,13 +179,23 @@ impl Session {
         })
     }
 
-    pub fn open_stream(&mut self) -> u64 {
+    /// Open a new initiator-bidirectional stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::StreamLimit`] when the session already holds
+    /// [`MAX_STREAMS_PER_SESSION`] concurrent streams (resource-limits.md
+    /// §20).
+    pub fn open_stream(&mut self) -> Result<u64, SessionError> {
+        if self.streams.len() >= MAX_STREAMS_PER_SESSION {
+            return Err(SessionError::StreamLimit);
+        }
         let id = self.next_outgoing_stream;
         self.next_outgoing_stream += 2; // initiator bidirectional: low bits 00
         let max_data = self.flow.max_data_remote;
         self.streams
             .insert(id, Stream::new(id, Vec::new(), max_data));
-        id
+        Ok(id)
     }
 
     /// Build the payload for a STREAM frame carrying `data`.
@@ -421,6 +435,12 @@ impl Session {
         // reset MUST NOT receive more data (session.md §29).
         if self.closed_streams.contains(f.stream_id) {
             return Err(SessionError::StreamClosed);
+        }
+        // A new inbound stream is subject to the hard cap (resource-limits.md
+        // §20); existing streams keep receiving within their limits.
+        if !self.streams.contains_key(&f.stream_id) && self.streams.len() >= MAX_STREAMS_PER_SESSION
+        {
+            return Err(SessionError::StreamLimit);
         }
         let stream = self.streams.entry(f.stream_id).or_insert_with(|| {
             Stream::new(f.stream_id, f.protocol_id.clone(), self.flow.max_data_local)
@@ -839,6 +859,9 @@ pub enum SessionError {
     /// Delivery on a stream id that was already closed (final size reached
     /// and read, or reset): stream ids MUST NOT be reused (session.md §29).
     StreamClosed,
+    /// The session already holds [`MAX_STREAMS_PER_SESSION`] concurrent
+    /// streams: opening a new one is refused (resource-limits.md §20).
+    StreamLimit,
     Ack(super::ack::AckError),
     KeyUpdate,
     PathBudget,

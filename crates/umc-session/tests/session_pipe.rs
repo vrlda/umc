@@ -4,6 +4,7 @@ use umc_handshake::xx::run_xx_handshake;
 use umc_session::datagram::Datagram;
 use umc_session::session::{
     Role, Session, SessionConfig, SessionState, CLOSE_REASON_IDLE_TIMEOUT, IDLE_TIMEOUT_MS,
+    MAX_STREAMS_PER_SESSION,
 };
 use umc_types::runtime::{Clock, Duration, EntropySource, Instant};
 
@@ -68,7 +69,7 @@ fn stream_echo_through_two_sessions() {
     )
     .expect("server session");
 
-    let sid = client.open_stream();
+    let sid = client.open_stream().expect("stream");
     let payload = client.send_stream_data(sid, b"hello", true).expect("send");
     let pkt = client
         .build_outbound(&TestClock, Instant(1_000_000), &payload)
@@ -87,7 +88,7 @@ fn stream_echo_through_two_sessions() {
     assert!(eof);
 
     // Echo back on a new stream from the server.
-    let echo_sid = server.open_stream();
+    let echo_sid = server.open_stream().expect("stream");
     let echo_payload = server
         .send_stream_data(echo_sid, &data, true)
         .expect("echo send");
@@ -310,6 +311,127 @@ fn lost_packet_payload_retransmitted() {
     let fresh = client.sent_state().sent().back().expect("fresh packet");
     assert!(fresh.ack_eliciting);
     assert!(fresh.in_flight);
+}
+
+#[test]
+fn stream_limit_enforced_on_outbound() {
+    let (client_secrets, _) = run_xx_handshake(
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &TestEntropy,
+        b"ump.udp/1",
+        0,
+    )
+    .expect("handshake");
+    let mut client = Session::new(
+        SessionConfig {
+            role: Role::Client,
+            dcid: vec![9u8; 8],
+            local_traffic_secret: client_secrets.client,
+            remote_traffic_secret: client_secrets.server,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("client session");
+
+    for _ in 0..MAX_STREAMS_PER_SESSION {
+        client.open_stream().expect("stream within cap");
+    }
+    // The 1,025th concurrent stream is refused (resource-limits.md §20).
+    assert_eq!(
+        client.open_stream(),
+        Err(umc_session::session::SessionError::StreamLimit)
+    );
+}
+
+#[test]
+fn stream_limit_enforced_on_inbound() {
+    let (client_secrets, server_secrets) = run_xx_handshake(
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &TestEntropy,
+        b"ump.udp/1",
+        0,
+    )
+    .expect("handshake");
+    let dcid = vec![9u8; 8];
+    let mut client = Session::new(
+        SessionConfig {
+            role: Role::Client,
+            dcid: dcid.clone(),
+            local_traffic_secret: client_secrets.client,
+            remote_traffic_secret: client_secrets.server,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("client session");
+    let mut server = Session::new(
+        SessionConfig {
+            role: Role::Server,
+            dcid,
+            local_traffic_secret: server_secrets.server,
+            remote_traffic_secret: server_secrets.client,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("server session");
+
+    // Deliver one distinct inbound stream per protected packet. The client
+    // only builds packets here; the frames carry fresh ids the server has
+    // never seen, so the server creates each stream on arrival.
+    let t0 = Instant(4_000_000);
+    for i in 0..MAX_STREAMS_PER_SESSION {
+        let payload = stream_payload((i * 2) as u64, b"x");
+        let pkt = client
+            .build_outbound(&TestClock, t0, &payload)
+            .unwrap()
+            .unwrap();
+        server.on_inbound(t0, &pkt).unwrap();
+    }
+    // One more distinct inbound id: the packet is rejected with the stream
+    // limit error (resource-limits.md §20).
+    let payload = stream_payload((MAX_STREAMS_PER_SESSION * 2) as u64, b"y");
+    let pkt = client
+        .build_outbound(&TestClock, t0, &payload)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        server.on_inbound(t0, &pkt),
+        Err(umc_session::session::SessionError::StreamLimit)
+    );
+}
+
+fn stream_payload(stream_id: u64, data: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    umc_wire::varint::encode_into(&mut payload, umc_types::frame::FrameType::STREAM.0).unwrap();
+    let frame = umc_wire::frames::stream::StreamFrame {
+        stream_id,
+        fin: false,
+        offset_present: true,
+        len_present: true,
+        open: true,
+        unidirectional: false,
+        offset: 0,
+        data: data.to_vec(),
+        protocol_id: vec![],
+        metadata: vec![],
+    };
+    let enc = frame.encode().unwrap();
+    payload.extend_from_slice(&enc[1..]);
+    payload
 }
 
 #[test]
