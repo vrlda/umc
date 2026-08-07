@@ -1,10 +1,12 @@
 //! Bundle manager (bundles.md §9-10, §12): validate policy before allocation,
 //! store payloads as content-addressed objects, deduplicate by Bundle ID.
 use crate::id::{bundle_id, BUNDLE_ID_LEN};
+use crate::persist::{delete_meta, load_all_metas, save_meta, BundleMeta};
 use std::collections::HashMap;
+use std::sync::Arc;
 use umc_storage::objects::{blake2s, ObjectStore};
 use umc_storage::quota::QuotaAccount;
-use umc_storage::store::StoreError;
+use umc_storage::store::{Store, StoreError};
 use umc_types::runtime::{Duration, Instant};
 
 pub const DEFAULT_MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
@@ -52,12 +54,24 @@ pub enum BundleError {
     Storage(StoreError),
 }
 
-#[derive(Debug)]
 pub struct BundleManager {
     objects: ObjectStore,
     quota: QuotaAccount,
     records: HashMap<[u8; BUNDLE_ID_LEN], BundleRecord>,
     bundles_per_sender: HashMap<Vec<u8>, u64>,
+    /// Persistence backend for bundle metadata (storage.md §6.3). Attached
+    /// by the daemon at startup; `None` keeps the manager in-memory-only.
+    store: Option<Arc<dyn Store + Send + Sync>>,
+}
+
+impl std::fmt::Debug for BundleManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BundleManager")
+            .field("records", &self.records)
+            .field("bundles_per_sender", &self.bundles_per_sender)
+            .field("persisted", &self.store.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl BundleManager {
@@ -68,7 +82,64 @@ impl BundleManager {
             quota,
             records: HashMap::new(),
             bundles_per_sender: HashMap::new(),
+            store: None,
         }
+    }
+
+    /// Attaches (or detaches, with `None`) the metadata persistence
+    /// backend: admits then save metas, removals and evictions delete them.
+    pub fn set_persistence(&mut self, store: Option<Arc<dyn Store + Send + Sync>>) {
+        self.store = store;
+    }
+
+    /// Restores persisted bundle records (storage.md §6.3): metadata is
+    /// loaded from `store` and records are reconstructed for bundles whose
+    /// ciphertext object still exists and whose expiry has not passed.
+    /// Expired or orphaned metas are deleted. Quota reservations and
+    /// per-sender counts are rebuilt so post-restart admission stays
+    /// correctly accounted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the metadata cannot be scanned.
+    pub fn restore(&mut self, store: &dyn Store, now: Instant) -> Result<usize, String> {
+        let metas = load_all_metas(store).map_err(|e| format!("bundle meta scan: {e:?}"))?;
+        let mut restored = 0;
+        for meta in metas {
+            let Some(record) = meta.to_record() else {
+                eprintln!("[bundle] restore: skipping corrupt bundle meta");
+                continue;
+            };
+            if record.expires_at <= now {
+                if let Err(e) = delete_meta(store, &record.id) {
+                    eprintln!("[bundle] restore: expired meta delete failed: {e:?}");
+                }
+                continue;
+            }
+            if !self.objects.exists(&record.object_id) {
+                eprintln!(
+                    "[bundle] restore: dropping meta {:02x?}, payload object missing",
+                    record.id
+                );
+                let _ = delete_meta(store, &record.id);
+                continue;
+            }
+            if let Err(e) = self.quota.reserve(record.size as u64) {
+                eprintln!(
+                    "[bundle] restore: quota exceeded, dropping {:02x?}: {e:?}",
+                    record.id
+                );
+                let _ = delete_meta(store, &record.id);
+                continue;
+            }
+            *self
+                .bundles_per_sender
+                .entry(record.sender.clone())
+                .or_insert(0) += 1;
+            self.records.insert(record.id, record);
+            restored += 1;
+        }
+        Ok(restored)
     }
 
     /// Admission (bundles.md §8.1): policy before allocation. Size, lifetime,
@@ -150,6 +221,16 @@ impl BundleManager {
             },
         );
         *self.bundles_per_sender.entry(sender.to_vec()).or_insert(0) += 1;
+        // Persistence is best-effort: a failed meta write never fails the
+        // admission; the record lives on in memory and the next restart
+        // simply loses it (storage.md §6.3).
+        if let Some(store) = &self.store {
+            if let Some(record) = self.records.get(&id) {
+                if let Err(e) = save_meta(store.as_ref(), &BundleMeta::from_record(record)) {
+                    println!("[bundle] admit: meta persist failed: {e:?}");
+                }
+            }
+        }
         Ok(id)
     }
 
@@ -212,6 +293,11 @@ impl BundleManager {
             self.quota.release(record.size as u64);
             if let Some(count) = self.bundles_per_sender.get_mut(&record.sender) {
                 *count = count.saturating_sub(1);
+            }
+            if let Some(store) = &self.store {
+                if let Err(e) = delete_meta(store.as_ref(), id) {
+                    println!("[bundle] remove: meta delete failed: {e:?}");
+                }
             }
         }
     }

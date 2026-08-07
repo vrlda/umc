@@ -4,4 +4,5 @@ pub mod expiry;
 pub mod forward;
 pub mod id;
 pub mod manager;
+pub mod persist;
 pub mod replicate;

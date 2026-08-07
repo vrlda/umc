@@ -945,6 +945,67 @@ mod tests {
         assert_eq!(listing[0].bundle_id, created.bundle_id);
     }
 
+    #[tokio::test]
+    async fn bundles_survive_state_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "umcd-bundle-reopen-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = NodeConfig {
+            data_dir: dir,
+            ..NodeConfig::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
+        let mut state = RuntimeState::new(config.clone(), tx).expect("runtime state");
+        let now_ms = state.node.clock.as_ref().now().0;
+        let create = api::CreateBundleRequest {
+            application_handle: Some(api::OpaqueHandle {
+                value: b"sender-a".to_vec(),
+            }),
+            destination_hint: b"dest-token".to_vec(),
+            priority: 1,
+            expires_at_unix_ms: i64::try_from(now_ms + 60_000).unwrap(),
+            payload_chunk: b"ciphertext".to_vec(),
+            payload_complete: true,
+            upload_handle: None,
+        };
+        let mut payload = Vec::new();
+        Message::encode(&create, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("BundleService", "CreateBundle", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let created = api::CreateBundleResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .bundle
+            .expect("bundle");
+        drop(state);
+
+        // A fresh daemon over the same data dir restores the bundle from
+        // persisted metadata (storage.md §6.3): the listing round-trips.
+        let (tx2, _rx2) = tokio::sync::mpsc::channel::<()>(1);
+        let mut reopened = RuntimeState::new(config, tx2).expect("reopened runtime state");
+        let bytes = dispatch_request(
+            &mut reopened,
+            &request("BundleService", "ListBundles", vec![]),
+            None,
+        );
+        let listing = api::ListBundlesResponse::decode(decode_response(&bytes).payload.as_slice())
+            .expect("payload")
+            .bundles;
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0].bundle_id, created.bundle_id);
+        assert_eq!(listing[0].payload_size, 10);
+    }
+
     #[test]
     fn list_bundles_round_trip() {
         let (mut state, _tx) = test_state();
