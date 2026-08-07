@@ -38,6 +38,13 @@ pub enum KeystoreError {
     InvalidPassword,
 }
 
+const FILE_HEADER: &[u8] = b"UMC-KEYSTORE-v1\0";
+const HEADER_LEN: usize = FILE_HEADER.len();
+/// The check blob is the seal of `b"check"`: 5 bytes payload + 16-byte tag.
+const CHECK_BLOB: &[u8] = b"check";
+const CHECK_BLOB_LEN: usize = CHECK_BLOB.len() + 16;
+const CHECK_END: usize = HEADER_LEN + CHECK_BLOB_LEN;
+
 /// A keystore that stores opaque encrypted blobs keyed by (class, name).
 /// The encryption layer is swappable; Phase 2 defaults to a ChaCha20-Poly1305
 /// envelope keyed by a master key derived from a user secret with Argon2id.
@@ -49,18 +56,24 @@ pub struct Keystore {
 
 impl Keystore {
     /// Opens the keystore file at `path`, creating it with a new master key
-    /// derived from `password` if it does not exist.
+    /// derived from `password` if it does not exist. When the file already
+    /// exists, the master-key check blob is verified so a wrong password
+    /// fails here instead of at the first `load`.
     ///
     /// # Errors
-    /// Returns [`KeystoreError::Io`] if the file cannot be created or read.
+    /// Returns [`KeystoreError::Io`] if the file cannot be created or read,
+    /// [`KeystoreError::Integrity`] if the file is malformed, or
+    /// [`KeystoreError::InvalidPassword`] if the check blob does not
+    /// decrypt with the password-derived master key.
     pub fn open(path: std::path::PathBuf, password: &[u8]) -> Result<Self, KeystoreError> {
-        let salt = derive_salt(&path);
+        let salt = derive_salt(password);
         let master = derive_master(password, &salt);
         let ks = Self {
             master: Some(master),
             path,
         };
         ks.ensure_file()?;
+        ks.verify_integrity()?;
         Ok(ks)
     }
 
@@ -68,13 +81,29 @@ impl Keystore {
         if self.path.exists() {
             return Ok(());
         }
-        let header = b"UMC-KEYSTORE-v1\0";
         let mut data = Vec::new();
-        data.extend_from_slice(header);
-        // Master key check blob so corruption is detected at open.
+        data.extend_from_slice(FILE_HEADER);
+        // Master key check blob so corruption and wrong passwords are
+        // detected at open.
         let check = seal_check(self.master.as_ref().expect("unlocked"));
         data.extend_from_slice(&check);
-        std::fs::write(&self.path, data).map_err(|e| KeystoreError::Io(e.to_string()))
+        write_private(&self.path, &data)
+    }
+
+    /// Decrypts the creation-time check blob with the derived master key.
+    /// A wrong password makes the decrypt fail; tampered files fail the
+    /// payload comparison.
+    fn verify_integrity(&self) -> Result<(), KeystoreError> {
+        let file = std::fs::read(&self.path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+        let check = file
+            .get(HEADER_LEN..CHECK_END)
+            .ok_or(KeystoreError::Integrity)?;
+        let master = self.master.as_ref().ok_or(KeystoreError::NotUnlocked)?;
+        let plain = umc_crypto_open(master, check).ok_or(KeystoreError::InvalidPassword)?;
+        if plain != CHECK_BLOB {
+            return Err(KeystoreError::Integrity);
+        }
+        Ok(())
     }
 
     /// Stores `secret` under `(class, name)`, appending a sealed record.
@@ -98,7 +127,7 @@ impl Keystore {
         let len = u32::try_from(sealed.len()).expect("sealed record fits u32");
         file.extend_from_slice(&len.to_be_bytes());
         file.extend_from_slice(&sealed);
-        std::fs::write(&self.path, file).map_err(|e| KeystoreError::Io(e.to_string()))
+        write_private(&self.path, &file)
     }
 
     /// Loads the secret stored under `(class, name)`.
@@ -113,8 +142,8 @@ impl Keystore {
     pub fn load(&self, class: KeyClass, name: &[u8]) -> Result<Vec<u8>, KeystoreError> {
         let master = self.master.as_ref().ok_or(KeystoreError::NotUnlocked)?;
         let file = std::fs::read(&self.path).map_err(|e| KeystoreError::Io(e.to_string()))?;
-        // Header: 16-byte magic + 21-byte check blob (seal of b"check" = 5 + 16-byte tag).
-        let mut pos = 37usize;
+        // Header + check blob precede the records.
+        let mut pos = CHECK_END;
         while pos + 4 <= file.len() {
             let len = u32::from_be_bytes(file[pos..pos + 4].try_into().expect("4 bytes")) as usize;
             pos += 4;
@@ -138,12 +167,39 @@ impl Keystore {
     }
 }
 
-fn derive_salt(path: &std::path::Path) -> [u8; 16] {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.to_string_lossy().hash(&mut hasher);
+/// Writes `data` to `path`, creating the file with owner-only permissions
+/// (0600 on unix). Secret key material must never be world-readable.
+fn write_private(path: &std::path::Path, data: &[u8]) -> Result<(), KeystoreError> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true).mode(0o600);
+        let mut file = opts
+            .open(path)
+            .map_err(|e| KeystoreError::Io(e.to_string()))?;
+        file.write_all(data)
+            .map_err(|e| KeystoreError::Io(e.to_string()))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data).map_err(|e| KeystoreError::Io(e.to_string()))
+    }
+}
+
+/// Domain-separated, keyed salt: `blake2s("UMP-KEYSTORE-SALT-v1" || password)`.
+/// Keyed by the password (not the file path), so the same password derives
+/// the same master key across machines and relocations of the file.
+fn derive_salt(password: &[u8]) -> [u8; 16] {
+    use blake2::{Blake2s256, Digest};
+    let mut hasher = Blake2s256::new();
+    hasher.update(b"UMP-KEYSTORE-SALT-v1");
+    hasher.update(password);
+    let digest = hasher.finalize();
     let mut salt = [0u8; 16];
-    salt[..8].copy_from_slice(&hasher.finish().to_be_bytes());
+    salt.copy_from_slice(&digest[..16]);
     salt
 }
 
@@ -221,19 +277,32 @@ mod tests {
     }
 
     #[test]
-    fn wrong_password_fails_validation() {
+    fn wrong_password_fails_at_open() {
         let path = temp_path();
         let _ = std::fs::remove_file(&path);
         let ks = Keystore::open(path.clone(), b"password-a").unwrap();
         ks.store(KeyClass::Ticket, b"t", &[1u8; 16]).unwrap();
         drop(ks);
-        // Reopen with the wrong password: the check blob will not decrypt.
-        let ks2 = Keystore::open(path.clone(), b"password-b").unwrap();
-        // The check blob is fixed-size; loading any record with a wrong master fails integrity.
-        assert_eq!(
-            ks2.load(KeyClass::Ticket, b"t"),
-            Err(KeystoreError::Integrity)
-        );
+        // Reopen with the wrong password: the check blob does not decrypt,
+        // so the failure is detected at open, not lazily at the first load.
+        assert!(matches!(
+            Keystore::open(path.clone(), b"password-b"),
+            Err(KeystoreError::InvalidPassword)
+        ));
+    }
+
+    #[test]
+    fn keystore_file_is_owner_only() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = temp_path();
+            let _ = std::fs::remove_file(&path);
+            let ks = Keystore::open(path.clone(), b"pw").unwrap();
+            ks.store(KeyClass::Retry, b"k", &[7u8; 8]).unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "keystore file must be owner-only");
+        }
     }
 
     #[test]

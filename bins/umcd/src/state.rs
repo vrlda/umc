@@ -24,10 +24,65 @@ use umc_core::node::{Node, NodeConfig as NodeRuntimeConfig, NodeIdentity};
 use umc_core::rate_limiter::RateLimiter;
 use umc_core::trust::{TrustLevel, TrustStore};
 use umc_core::well_known::WELL_KNOWN_APP;
+use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
+use umc_storage::keystore::{KeyClass, Keystore, KeystoreError};
 use umc_storage::objects::ObjectStore;
 use umc_storage::quota::{Profile, QuotaAccount};
 use umc_storage::sqlite::SqliteStore;
 use umc_types::runtime::{Clock, Instant};
+
+/// Keystore file name inside the keystore directory (core.md §19).
+pub(crate) const KEYSTORE_FILE: &str = "keystore.ks";
+/// Record name for the node identity: one 64-byte record
+/// `[identity_seed || static_seed]` under [`KeyClass::IdentitySigning`].
+pub(crate) const NODE_IDENTITY_RECORD: &[u8] = b"node-identity";
+
+/// Password for the node keystore (core.md §63). Read from the
+/// `UMC_KEYSTORE_PASSWORD` environment variable; when unset, the
+/// development default of an empty password is used (documented in
+/// storage.md §10; never prompted).
+#[must_use]
+pub(crate) fn keystore_password() -> Vec<u8> {
+    std::env::var("UMC_KEYSTORE_PASSWORD")
+        .map(String::into_bytes)
+        .unwrap_or_default()
+}
+
+/// Loads the node identity from the keystore, or generates a fresh one
+/// and persists it (core.md §19/§63 — persistent endpoint identity).
+/// Two runs against the same keystore with the same password produce the
+/// same endpoint id; a wrong password fails loudly.
+///
+/// # Errors
+/// Returns a message when the keystore cannot be opened, the identity
+/// record is malformed, or the password is wrong.
+pub(crate) fn load_or_create_identity(config: &NodeConfig) -> Result<NodeIdentity, String> {
+    let path = config.resolved_keystore_dir().join(KEYSTORE_FILE);
+    let ks = Keystore::open(path, &keystore_password()).map_err(|e| format!("keystore: {e:?}"))?;
+    match ks.load(KeyClass::IdentitySigning, NODE_IDENTITY_RECORD) {
+        Ok(seeds) if seeds.len() == 64 => Ok(identity_from_seeds(&seeds)),
+        Ok(_) => Err("keystore: malformed node-identity record (expected 64 bytes)".into()),
+        Err(KeystoreError::UnsupportedClass) => {
+            let identity = NodeIdentity::generate(&OsEntropy);
+            let mut seeds = Vec::with_capacity(64);
+            seeds.extend_from_slice(&identity.identity.to_seed());
+            seeds.extend_from_slice(&identity.static_handshake.to_seed());
+            ks.store(KeyClass::IdentitySigning, NODE_IDENTITY_RECORD, &seeds)
+                .map_err(|e| format!("keystore store: {e:?}"))?;
+            Ok(identity)
+        }
+        Err(e) => Err(format!("keystore load: {e:?}")),
+    }
+}
+
+fn identity_from_seeds(seeds: &[u8]) -> NodeIdentity {
+    let identity_seed: [u8; 32] = seeds[..32].try_into().expect("32-byte identity seed");
+    let static_seed: [u8; 32] = seeds[32..].try_into().expect("32-byte static seed");
+    NodeIdentity {
+        identity: IdentityKeyPair::from_seed(identity_seed),
+        static_handshake: StaticHandshakeKeyPair::from_seed(static_seed),
+    }
+}
 
 /// The daemon's shared runtime context.
 pub struct RuntimeState {
@@ -49,8 +104,9 @@ pub struct RuntimeState {
     /// Task 20+.
     #[allow(dead_code)]
     pub rate_limiter: RateLimiter,
-    /// Node identity. Placeholder: loaded from the keystore once keystore
-    /// loading lands; a fresh identity is generated per process for now.
+    /// Node identity. Loaded from the keystore (core.md §19/§63), so the
+    /// endpoint id survives restarts; a fresh identity is generated and
+    /// persisted on first boot.
     pub node_identity: NodeIdentity,
     /// Operating mode profile (local mesh vs endpoint).
     pub mesh: MeshConfig,
@@ -105,12 +161,15 @@ impl std::fmt::Debug for RuntimeState {
 
 impl RuntimeState {
     /// Builds the runtime state: data dir + keystore dir, node database,
-    /// identity, security primitives, and the shutdown channel.
+    /// identity (persisted in the keystore), security primitives, and the
+    /// shutdown channel.
     ///
     /// # Errors
     ///
     /// Returns an error when the data or keystore directory cannot be
-    /// created or the node database cannot be opened.
+    /// created, the node database cannot be opened, or the keystore cannot
+    /// be opened with the configured password
+    /// ([`UMC_KEYSTORE_PASSWORD`](keystore_password)).
     pub fn new(config: NodeConfig, shutdown_channel: mpsc::Sender<()>) -> Result<Self, String> {
         let data_dir = config.resolved_data_dir();
         std::fs::create_dir_all(&data_dir).map_err(|e| format!("data dir: {e}"))?;
@@ -120,7 +179,7 @@ impl RuntimeState {
             SqliteStore::open(&data_dir.join("node.db")).map_err(|e| format!("store: {e:?}"))?,
         );
 
-        let node_identity = NodeIdentity::generate(&OsEntropy);
+        let node_identity = load_or_create_identity(&config)?;
         // The runtime node and the state share the same key material.
         let state_identity = NodeIdentity {
             identity: node_identity.identity.clone(),
@@ -195,5 +254,74 @@ impl RuntimeState {
     #[allow(dead_code)]
     pub fn trust_store(&self) -> TrustStore<'_> {
         TrustStore::new(self.store.as_ref(), self.trust_default_level)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::NodeConfig;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn fresh_config() -> NodeConfig {
+        let dir = std::env::temp_dir().join(format!(
+            "umcd-state-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        NodeConfig {
+            data_dir: dir,
+            ..NodeConfig::default()
+        }
+    }
+
+    /// Runs `f` with `UMC_KEYSTORE_PASSWORD` set; env mutation is
+    /// serialized so parallel tests cannot observe each other's password.
+    fn with_password(password: &str, f: impl FnOnce()) {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("UMC_KEYSTORE_PASSWORD", password);
+        f();
+        std::env::remove_var("UMC_KEYSTORE_PASSWORD");
+    }
+
+    fn build(config: NodeConfig) -> RuntimeState {
+        let (tx, _rx) = mpsc::channel(1);
+        RuntimeState::new(config, tx).expect("runtime state")
+    }
+
+    #[test]
+    fn identity_is_persistent_across_restarts() {
+        with_password("test-password", || {
+            let config = fresh_config();
+            let first = build(config.clone());
+            let endpoint_id = first.node_identity.endpoint_id();
+            drop(first);
+            let second = build(config);
+            assert_eq!(endpoint_id, second.node_identity.endpoint_id());
+        });
+    }
+
+    #[test]
+    fn fresh_dir_generates_a_new_identity_and_persists_it() {
+        with_password("test-password", || {
+            let a = fresh_config();
+            let b = fresh_config();
+            let sa = build(a.clone());
+            let id_a = sa.node_identity.endpoint_id();
+            drop(sa);
+            // The same dir reloads the persisted identity...
+            let sa2 = build(a);
+            assert_eq!(id_a, sa2.node_identity.endpoint_id());
+            // ...while a fresh dir derives a different one.
+            let sb = build(b);
+            assert_ne!(id_a, sb.node_identity.endpoint_id());
+        });
     }
 }
