@@ -1,4 +1,5 @@
 mod app_layer;
+mod backup;
 mod bundle_service;
 mod carriers;
 mod config;
@@ -42,6 +43,12 @@ struct Args {
     /// Run diagnostics and exit.
     #[arg(long)]
     doctor: bool,
+    /// Back up the node data dir (database, keystore, objects) to a directory and exit.
+    #[arg(long)]
+    backup: Option<PathBuf>,
+    /// Restore the node data dir from a backup directory and exit.
+    #[arg(long)]
+    restore: Option<PathBuf>,
 }
 
 fn main() {
@@ -64,6 +71,20 @@ fn main() {
                 check.detail
             );
         }
+        return;
+    }
+    if args.backup.is_some() && args.restore.is_some() {
+        eprintln!("--backup and --restore are mutually exclusive");
+        std::process::exit(2);
+    }
+    if let Some(out_dir) = args.backup {
+        backup::backup(&config, &out_dir).expect("backup failed");
+        println!("backup written to {}", out_dir.display());
+        return;
+    }
+    if let Some(in_dir) = args.restore {
+        backup::restore(&config, &in_dir).expect("restore failed");
+        println!("restore complete from {}", in_dir.display());
         return;
     }
     let rt = tokio::runtime::Runtime::new().expect("runtime");
