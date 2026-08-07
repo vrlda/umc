@@ -299,6 +299,17 @@ fn handle_inbound_link_locked(
         state.node.clock.as_ref(),
     )
     .map_err(|e| format!("session: {e:?}"))?;
+    // Register the default data path so the anti-amplification budget is
+    // active on the session's primary path (session.md §26).
+    session
+        .add_path(
+            umc_session::packet::DEFAULT_PATH_ID,
+            carrier_type.to_string(),
+            Vec::new(),
+            Vec::new(),
+            now,
+        )
+        .map_err(|e| format!("add path 0: {e:?}"))?;
     let session_id = state.sessions.next_id();
     let remote_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&secrets.client)
         .map_err(|e| format!("remote keys: {e:?}"))?;
