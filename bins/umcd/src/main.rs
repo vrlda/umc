@@ -399,6 +399,10 @@ fn init_node(config: &NodeConfig, config_path: Option<&PathBuf>) {
     std::fs::create_dir_all(data_dir.join("objects")).expect("create data dir");
     let keystore_dir = config.resolved_keystore_dir();
     std::fs::create_dir_all(&keystore_dir).expect("create keystore dir");
+    // Seed the keystore with the node identity (core.md §19): generated on
+    // first init, reused on subsequent passes so the endpoint id stays
+    // stable. `UMC_KEYSTORE_PASSWORD` guards the keystore when set.
+    let identity = state::load_or_create_identity(config).expect("node identity");
     let config_file = config_path
         .cloned()
         .unwrap_or_else(|| data_dir.join("node.json"));
@@ -407,6 +411,7 @@ fn init_node(config: &NodeConfig, config_path: Option<&PathBuf>) {
     println!("node data directory: {}", data_dir.display());
     println!("keystore directory: {}", keystore_dir.display());
     println!("config file: {}", config_file.display());
+    println!("node endpoint: {:02x?}", identity.endpoint_id());
     println!("public relay: disabled (default)");
     println!("telemetry: disabled (default)");
 }

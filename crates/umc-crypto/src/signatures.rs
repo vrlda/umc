@@ -20,6 +20,21 @@ impl IdentityKeyPair {
         }
     }
 
+    /// The 32-byte signing seed: reconstructs an identical keypair via
+    /// [`Self::from_seed`] (used for keystore persistence).
+    #[must_use]
+    pub fn to_seed(&self) -> [u8; 32] {
+        self.signing.to_bytes()
+    }
+
+    /// Reconstructs the keypair from its 32-byte seed.
+    #[must_use]
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        Self {
+            signing: SigningKey::from_bytes(&seed),
+        }
+    }
+
     #[must_use]
     pub fn public(&self) -> IdentityPublicKey {
         IdentityPublicKey(self.signing.verifying_key().to_bytes())
@@ -73,6 +88,21 @@ impl StaticHandshakeKeyPair {
         }
     }
 
+    /// The 32-byte static secret: reconstructs an identical keypair via
+    /// [`Self::from_seed`] (used for keystore persistence).
+    #[must_use]
+    pub fn to_seed(&self) -> [u8; 32] {
+        self.secret.to_bytes()
+    }
+
+    /// Reconstructs the keypair from its 32-byte static secret.
+    #[must_use]
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        Self {
+            secret: x25519_dalek::StaticSecret::from(seed),
+        }
+    }
+
     #[must_use]
     pub fn public(&self) -> StaticHandshakePublicKey {
         StaticHandshakePublicKey(x25519_dalek::PublicKey::from(&self.secret).to_bytes())
@@ -112,5 +142,37 @@ mod tests {
         let ab = a.diffie_hellman(&b.public());
         let ba = b.diffie_hellman(&a.public());
         assert_eq!(ab, ba);
+    }
+
+    #[test]
+    fn identity_seed_round_trip_preserves_key_and_signatures() {
+        let pair = IdentityKeyPair::generate();
+        let restored = IdentityKeyPair::from_seed(pair.to_seed());
+        assert_eq!(pair.public(), restored.public());
+        let sig = pair.sign(b"message");
+        assert!(restored.public().verify(b"message", &sig));
+        assert_eq!(sig, restored.sign(b"message"));
+    }
+
+    #[test]
+    fn static_seed_round_trip_preserves_key_and_dh() {
+        let pair = StaticHandshakeKeyPair::generate();
+        let restored = StaticHandshakeKeyPair::from_seed(pair.to_seed());
+        assert_eq!(pair.public(), restored.public());
+        let peer = StaticHandshakeKeyPair::generate();
+        assert_eq!(
+            pair.diffie_hellman(&peer.public()),
+            restored.diffie_hellman(&peer.public())
+        );
+    }
+
+    #[test]
+    fn different_seeds_produce_different_keys() {
+        let a = IdentityKeyPair::from_seed([0u8; 32]);
+        let b = IdentityKeyPair::from_seed([1u8; 32]);
+        assert_ne!(a.public(), b.public());
+        let sa = StaticHandshakeKeyPair::from_seed([0u8; 32]);
+        let sb = StaticHandshakeKeyPair::from_seed([1u8; 32]);
+        assert_ne!(sa.public(), sb.public());
     }
 }
