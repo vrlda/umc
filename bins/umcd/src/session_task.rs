@@ -24,7 +24,7 @@ use umc_carrier::types::OutboundPacket;
 use umc_carrier::BoxLink;
 use umc_core::app_io::{AppRx, AppTx};
 use umc_crypto::aead::PacketKeys;
-use umc_session::loss::detect_lost_packets;
+use umc_session::loss::{detect_lost_packets, PtoState};
 use umc_session::session::{Session, SessionState, IDLE_TIMEOUT_MS};
 use umc_types::runtime::{Clock, Instant};
 use umc_wire::frame::Frame;
@@ -76,11 +76,11 @@ async fn pto_sleep(deadline: Option<tokio::time::Instant>) {
     }
 }
 
-/// PTO deadline from the session's in-flight state (session.md §14.3): a
-/// probe fires `pto * multiplier` after the last arming while any
-/// ack-eliciting packet is outstanding; no deadline when nothing is in
-/// flight.
-fn pto_deadline_at(session: &Session, multiplier: u32) -> Option<tokio::time::Instant> {
+/// PTO deadline offset from the session's in-flight state and backoff state
+/// (session.md §14.3, congestion.md §10.3): a probe fires `pto * multiplier`
+/// ms after the last arming while any ack-eliciting packet is outstanding;
+/// no deadline when nothing is in flight.
+fn pto_deadline_ms(session: &Session, pto_state: &PtoState) -> Option<u64> {
     let in_flight = session
         .sent_state()
         .sent()
@@ -89,12 +89,16 @@ fn pto_deadline_at(session: &Session, multiplier: u32) -> Option<tokio::time::In
     if !in_flight {
         return None;
     }
-    let ms = session
-        .loss_detector()
-        .pto(session.rtt())
-        .as_millis()
-        .saturating_mul(u64::from(multiplier));
-    Some(tokio::time::Instant::now() + Duration::from_millis(ms))
+    let pto = session.loss_detector().pto(session.rtt());
+    Some(pto_state.next_deadline(pto, Instant(0)).0)
+}
+
+/// PTO deadline from the session's in-flight state (session.md §14.3): a
+/// probe fires `pto * multiplier` after the last arming while any
+/// ack-eliciting packet is outstanding; no deadline when nothing is in
+/// flight.
+fn pto_deadline_at(session: &Session, pto_state: &PtoState) -> Option<tokio::time::Instant> {
+    Some(tokio::time::Instant::now() + Duration::from_millis(pto_deadline_ms(session, pto_state)?))
 }
 
 /// PTO deadline for the next loop iteration. An armed deadline is kept while
@@ -107,7 +111,7 @@ fn pto_deadline_at(session: &Session, multiplier: u32) -> Option<tokio::time::In
 /// timer only when it is not already set).
 fn pto_deadline_after(
     session: &Session,
-    multiplier: u32,
+    pto_state: &PtoState,
     armed: Option<tokio::time::Instant>,
 ) -> Option<tokio::time::Instant> {
     let in_flight = session
@@ -118,7 +122,7 @@ fn pto_deadline_after(
     if !in_flight {
         return None;
     }
-    armed.or_else(|| pto_deadline_at(session, multiplier))
+    armed.or_else(|| pto_deadline_at(session, pto_state))
 }
 
 /// One idle/draining sweep on the reader's 1 s interval arm (session.md
@@ -320,11 +324,11 @@ async fn reader_loop(
     let mut sweep = SweepState::default();
     // PTO probe schedule (session.md §14.3): the deadline is armed when
     // nothing is armed and ack-eliciting packets are in flight, re-armed
-    // (with a doubled multiplier) when it fires and a probe was sent, and
+    // (with a doubled backoff) when it fires and a probe was sent, and
     // cleared once everything is acknowledged. An armed deadline is never
     // extended by inbound traffic, so the probe cannot be starved.
     let mut pto_deadline: Option<tokio::time::Instant> = None;
-    let mut pto_multiplier: u32 = 1;
+    let mut pto_state = PtoState::default();
     // Idle/draining sweep (session.md §6.4, §22): checks the session's idle
     // timer and draining deadline; it must not interfere with the PTO
     // schedule (an armed PTO deadline is never extended by this arm).
@@ -350,7 +354,7 @@ async fn reader_loop(
                         )
                         .await
                         {
-                            pto_multiplier = 1;
+                            pto_state.on_ack();
                         }
                     }
                     None => break,
@@ -372,7 +376,7 @@ async fn reader_loop(
                         )
                         .await
                         {
-                            pto_multiplier = 1;
+                            pto_state.on_ack();
                         }
                     }
                     None => break,
@@ -477,8 +481,8 @@ async fn reader_loop(
                     if sent.is_ok() {
                         // The backoff doubles only when a probe was actually
                         // sent (session.md §14.3); a failed send leaves the
-                        // multiplier unchanged.
-                        pto_multiplier = pto_multiplier.saturating_mul(2);
+                        // state unchanged.
+                        pto_state.on_expiry();
                     } else if let Err(e) = sent {
                         #[cfg(debug_assertions)]
                         println!("[session {session_id}] PTO probe send error: {e:?}");
@@ -487,7 +491,7 @@ async fn reader_loop(
                 // The deadline just fired: re-arm from now while ack-eliciting
                 // packets remain in flight (disarmed once they are all acked).
                 let session = session.lock().await;
-                pto_deadline = pto_deadline_at(&session, pto_multiplier);
+                pto_deadline = pto_deadline_at(&session, &pto_state);
             }
         }
         // Give the carrier's background writer a window to flush before the
@@ -499,7 +503,7 @@ async fn reader_loop(
         // Inbound processing never extends an armed deadline here.
         {
             let session = session.lock().await;
-            pto_deadline = pto_deadline_after(&session, pto_multiplier, pto_deadline);
+            pto_deadline = pto_deadline_after(&session, &pto_state, pto_deadline);
         }
     }
     ended.store(true, Ordering::Relaxed);
@@ -1961,8 +1965,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pto_deadline_arms_only_with_in_flight_packets() {
         let mut session = test_session();
+        let pto_state = PtoState::default();
         assert!(
-            pto_deadline_at(&session, 1).is_none(),
+            pto_deadline_at(&session, &pto_state).is_none(),
             "no deadline with nothing in flight"
         );
         let ping = umc_wire::varint::encode(umc_types::frame::FrameType::PING.0).unwrap();
@@ -1971,7 +1976,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            pto_deadline_at(&session, 1).is_some(),
+            pto_deadline_at(&session, &pto_state).is_some(),
             "deadline armed while ack-eliciting packets are in flight"
         );
     }
@@ -1984,18 +1989,22 @@ mod tests {
             .build_outbound(&crate::runtime_adapters::OsClock, Instant(0), &ping)
             .unwrap()
             .unwrap();
-        let armed = pto_deadline_at(&session, 1).expect("deadline armed");
+        let pto_state = PtoState::default();
+        let armed = pto_deadline_at(&session, &pto_state).expect("deadline armed");
         // Inbound processing that sends nothing must not extend the armed
         // deadline: the stale deadline fires on schedule instead of being
         // pushed back, so the PTO probe cannot be starved by traffic.
-        assert_eq!(pto_deadline_after(&session, 1, Some(armed)), Some(armed));
+        assert_eq!(
+            pto_deadline_after(&session, &pto_state, Some(armed)),
+            Some(armed)
+        );
         // No deadline armed with in-flight: the deadline is armed.
         let mut fresh = test_session();
         fresh
             .build_outbound(&crate::runtime_adapters::OsClock, Instant(0), &ping)
             .unwrap()
             .unwrap();
-        assert!(pto_deadline_after(&fresh, 1, None).is_some());
+        assert!(pto_deadline_after(&fresh, &PtoState::default(), None).is_some());
         // Acking every in-flight packet clears the deadline.
         let ack = umc_wire::frame::AckFrame {
             largest_acknowledged: 0,
@@ -2005,13 +2014,64 @@ mod tests {
         };
         fresh.apply_peer_ack(&ack, Instant(1)).unwrap();
         assert_eq!(
-            pto_deadline_after(&fresh, 1, Some(armed)),
+            pto_deadline_after(&fresh, &PtoState::default(), Some(armed)),
             None,
             "no in-flight packets means no deadline"
         );
         // Nothing in flight, nothing armed: stays disarmed.
         let idle = test_session();
-        assert!(pto_deadline_after(&idle, 1, None).is_none());
+        assert!(pto_deadline_after(&idle, &PtoState::default(), None).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pto_backoff_doubles_until_capped() {
+        let mut session = test_session();
+        let ping = umc_wire::varint::encode(umc_types::frame::FrameType::PING.0).unwrap();
+        session
+            .build_outbound(&crate::runtime_adapters::OsClock, Instant(0), &ping)
+            .unwrap()
+            .unwrap();
+        let mut pto = PtoState::default();
+        let base = pto_deadline_ms(&session, &pto).expect("deadline armed");
+        // Each consecutive PTO expiry doubles the armed deadline (1x, 2x,
+        // 4x, ...) until the 64x cap (congestion.md §10.3).
+        let mut expect = base;
+        for _ in 0..6 {
+            pto.on_expiry();
+            expect *= 2;
+            assert_eq!(
+                pto_deadline_ms(&session, &pto).expect("deadline armed"),
+                expect
+            );
+        }
+        assert_eq!(pto.multiplier(), 64, "6 doublings cap the multiplier");
+        pto.on_expiry();
+        assert_eq!(
+            pto_deadline_ms(&session, &pto).expect("deadline armed"),
+            base * 64,
+            "deadline capped at 64x the base PTO"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pto_backoff_resets_on_ack() {
+        let mut session = test_session();
+        let ping = umc_wire::varint::encode(umc_types::frame::FrameType::PING.0).unwrap();
+        session
+            .build_outbound(&crate::runtime_adapters::OsClock, Instant(0), &ping)
+            .unwrap()
+            .unwrap();
+        let mut pto = PtoState::default();
+        let base = pto_deadline_ms(&session, &pto).expect("deadline armed");
+        for _ in 0..4 {
+            pto.on_expiry();
+        }
+        assert_eq!(pto_deadline_ms(&session, &pto).unwrap(), base * 16);
+        // An ACK-bearing inbound resets the backoff: the next deadline is
+        // back at 1x the base PTO.
+        pto.on_ack();
+        assert_eq!(pto.multiplier(), 1);
+        assert_eq!(pto_deadline_ms(&session, &pto).unwrap(), base);
     }
 
     #[tokio::test(flavor = "multi_thread")]
