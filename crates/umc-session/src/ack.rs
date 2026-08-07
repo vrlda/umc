@@ -4,6 +4,9 @@ use std::collections::VecDeque;
 pub const MAX_ACK_RANGES: usize = 64;
 pub const MAX_STORED_RANGES: usize = 256;
 pub const DEFAULT_MAX_ACK_DELAY_MS: u64 = 25;
+/// Cap on outstanding sent-packet metadata (resource-limits.md §24,
+/// congestion.md §22): beyond this, the oldest entry is evicted.
+pub const MAX_OUTSTANDING_PACKETS: usize = 16_384;
 
 /// Received packet numbers per space, used to build ACK frames (session.md §11).
 #[derive(Debug, Clone)]
@@ -113,8 +116,25 @@ impl AckSendState {
         }
     }
 
-    pub fn record_sent(&mut self, p: SentPacket) {
+    /// Record a sent packet, bounded by [`MAX_OUTSTANDING_PACKETS`]. When
+    /// the queue is at the cap, the oldest entry is evicted regardless of
+    /// its type; its packet number is returned only when it was
+    /// ack-eliciting, so the caller can drop the retransmit payload of a
+    /// packet beyond recovery. Non-ack-eliciting packets carry no
+    /// retransmittable payload, so their silent eviction is harmless.
+    /// Returns `Some(lost_pn)` when an ack-eliciting eviction happened,
+    /// `None` otherwise.
+    pub fn record_sent(&mut self, p: SentPacket) -> Option<u64> {
+        let mut evicted = None;
+        if self.sent.len() >= MAX_OUTSTANDING_PACKETS {
+            if let Some(oldest) = self.sent.pop_front() {
+                if oldest.ack_eliciting {
+                    evicted = Some(oldest.packet_number);
+                }
+            }
+        }
         self.sent.push_back(p);
+        evicted
     }
 
     #[must_use]
@@ -250,5 +270,54 @@ mod tests {
         }
         let acked = s.apply_ack(9, &[(3, 0)]).unwrap(); // first range covers 9,8,7
         assert_eq!(acked, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn record_sent_cap_evicts_oldest() {
+        let mut s = AckSendState::new();
+        for pn in 0..MAX_OUTSTANDING_PACKETS as u64 {
+            assert_eq!(s.record_sent(sent(pn)), None);
+        }
+        assert_eq!(s.sent().len(), MAX_OUTSTANDING_PACKETS);
+        // One more record: the oldest ack-eliciting packet (pn 0) is
+        // evicted and reported lost; the queue stays at the cap.
+        assert_eq!(s.record_sent(sent(MAX_OUTSTANDING_PACKETS as u64)), Some(0));
+        assert_eq!(s.sent().len(), MAX_OUTSTANDING_PACKETS);
+        assert_eq!(s.sent().front().unwrap().packet_number, 1);
+        assert_eq!(
+            s.sent().back().unwrap().packet_number,
+            MAX_OUTSTANDING_PACKETS as u64
+        );
+    }
+
+    #[test]
+    fn evicted_non_ack_eliciting_not_reported_as_lost() {
+        fn non_ack(pn: u64) -> SentPacket {
+            SentPacket::new(pn, PacketSpace::SessionData, Instant(0), 64, false, 0)
+        }
+        let mut s = AckSendState::new();
+        // Fill with non-ack-eliciting packets, then a single ack-eliciting
+        // one at the back (pn = MAX_OUTSTANDING_PACKETS - 1).
+        for pn in 0..(MAX_OUTSTANDING_PACKETS - 1) as u64 {
+            assert_eq!(s.record_sent(non_ack(pn)), None);
+        }
+        assert_eq!(
+            s.record_sent(sent((MAX_OUTSTANDING_PACKETS - 1) as u64)),
+            None
+        );
+        assert_eq!(s.sent().len(), MAX_OUTSTANDING_PACKETS);
+        // Evict past every non-ack-eliciting entry: each eviction is silent
+        // (no loss reported).
+        let mut pn = MAX_OUTSTANDING_PACKETS as u64;
+        for _ in 0..(MAX_OUTSTANDING_PACKETS - 1) {
+            assert_eq!(s.record_sent(non_ack(pn)), None);
+            pn += 1;
+        }
+        // The ack-eliciting entry is now the front: evicting it reports it.
+        assert!(s.sent().front().unwrap().ack_eliciting);
+        assert_eq!(
+            s.record_sent(non_ack(pn)),
+            Some((MAX_OUTSTANDING_PACKETS - 1) as u64)
+        );
     }
 }
