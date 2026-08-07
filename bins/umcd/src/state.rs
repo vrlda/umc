@@ -42,6 +42,19 @@ pub(crate) const NODE_IDENTITY_RECORD: &[u8] = b"node-identity";
 /// development default of an empty password is used (documented in
 /// storage.md §10; never prompted).
 #[must_use]
+/// Wall-clock epoch milliseconds as an `Instant`. Bundle timestamps are
+/// persisted and compared across restarts, so they MUST be epoch-relative,
+/// not process-relative (the monotonic node clock re-baselines per boot).
+pub(crate) fn wall_now() -> Instant {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0);
+    Instant(millis)
+}
+
 pub(crate) fn keystore_password() -> Vec<u8> {
     let Ok(pw) = std::env::var("UMC_KEYSTORE_PASSWORD") else {
         // Dev default: the keystore then protects identity with file
@@ -242,7 +255,7 @@ impl RuntimeState {
         // admission path (`CreateBundle`) stamps `created_at`/`expires_at`
         // from `node.clock`, so restore must compare against the same
         // clock family or every persisted bundle would look expired.
-        let bundle_now = node.clock.as_ref().now();
+        let bundle_now = wall_now();
         match bundle.restore(store.as_ref(), bundle_now) {
             Ok(count) => println!("[bundle] restored {count} bundle(s) from metadata"),
             Err(e) => eprintln!("[bundle] metadata restore failed: {e}"),
@@ -351,5 +364,13 @@ mod tests {
             let sb = build(b);
             assert_ne!(id_a, sb.node_identity.endpoint_id());
         });
+    }
+
+    #[test]
+    fn wall_now_is_epoch_relative_and_monotonic() {
+        let a = wall_now().0;
+        assert!(a > 1_700_000_000_000, "wall now must be epoch ms, got {a}");
+        let b = wall_now().0;
+        assert!(b >= a);
     }
 }

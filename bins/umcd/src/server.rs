@@ -464,7 +464,7 @@ fn create_bundle(state: &mut RuntimeState, request: &api::Request) -> (i32, Opti
     let Ok(create) = api::CreateBundleRequest::decode(request.payload.as_slice()) else {
         return (api::StatusCode::InvalidArgument as i32, None);
     };
-    let now = state.node.clock.as_ref().now();
+    let now = crate::state::wall_now();
     let sender = create
         .application_handle
         .as_ref()
@@ -900,7 +900,9 @@ mod tests {
     #[test]
     fn create_bundle_round_trips_through_list() {
         let (mut state, _tx) = test_state();
-        let now_ms = state.node.clock.as_ref().now().0;
+        // Bundle times are wall-clock epoch ms (restart-safe): the request
+        // must be stamped against the same clock the restore compares with.
+        let now_ms = crate::state::wall_now().0;
         let create = api::CreateBundleRequest {
             application_handle: Some(api::OpaqueHandle {
                 value: b"sender-a".to_vec(),
@@ -959,7 +961,9 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
         let mut state = RuntimeState::new(config.clone(), tx).expect("runtime state");
-        let now_ms = state.node.clock.as_ref().now().0;
+        // Bundle times are wall-clock epoch ms (restart-safe): the request
+        // must be stamped against the same clock the restore compares with.
+        let now_ms = crate::state::wall_now().0;
         let create = api::CreateBundleRequest {
             application_handle: Some(api::OpaqueHandle {
                 value: b"sender-a".to_vec(),

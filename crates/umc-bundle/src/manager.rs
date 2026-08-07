@@ -269,6 +269,12 @@ impl BundleManager {
     ) -> Result<(), BundleError> {
         let record = self.records.get_mut(id).ok_or(BundleError::NotFound)?;
         record.status = status;
+        // Status changes must survive restarts: re-persist the metadata
+        // (best-effort, like admit).
+        if let Some(store) = self.store.as_deref() {
+            let meta = crate::persist::BundleMeta::from_record(record);
+            let _ = crate::persist::save_meta(store, &meta);
+        }
         Ok(())
     }
 

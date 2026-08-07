@@ -134,7 +134,12 @@ pub fn load_all_metas(store: &dyn Store) -> Result<Vec<BundleMeta>, StoreError> 
     for entry in store.scan(Namespace::Bundle)? {
         match serde_json::from_slice::<BundleMeta>(&entry.value) {
             Ok(meta) => metas.push(meta),
-            Err(e) => eprintln!("[bundle] skipping corrupt bundle meta: {e}"),
+            Err(e) => {
+                eprintln!("[bundle] skipping corrupt bundle meta: {e}");
+                // Corrupt rows are dead weight: drop them so they are not
+                // re-read at every startup.
+                let _ = store.delete(Namespace::Bundle, &entry.key);
+            }
         }
     }
     Ok(metas)
