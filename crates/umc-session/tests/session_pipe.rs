@@ -414,6 +414,209 @@ fn stream_limit_enforced_on_inbound() {
     );
 }
 
+/// A protected packet whose wire length is exactly `len`: the fixed
+/// overhead (header byte, 8-byte DCID, path varint, 2-byte PN, 16-byte AEAD
+/// tag) is 28 bytes, so the payload is `len - 28` bytes of PING + padding
+/// frames (which decode cleanly on receipt).
+fn sized_protected_packet(s: &mut Session, len: usize, now: Instant) -> Vec<u8> {
+    let mut payload = umc_wire::varint::encode(umc_types::frame::FrameType::PING.0).unwrap();
+    payload.extend(std::iter::repeat(0x00).take(len - 28 - payload.len()));
+    s.build_outbound(&TestClock, now, &payload)
+        .unwrap()
+        .expect("built packet")
+}
+
+#[test]
+fn amplification_budget_enforced_on_unvalidated_path() {
+    let (client_secrets, server_secrets) = run_xx_handshake(
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &TestEntropy,
+        b"ump.udp/1",
+        0,
+    )
+    .expect("handshake");
+    let dcid = vec![9u8; 8];
+    let mut client = Session::new(
+        SessionConfig {
+            role: Role::Client,
+            dcid: dcid.clone(),
+            local_traffic_secret: client_secrets.client,
+            remote_traffic_secret: client_secrets.server,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("client session");
+    let mut server = Session::new(
+        SessionConfig {
+            role: Role::Server,
+            dcid,
+            local_traffic_secret: server_secrets.server,
+            remote_traffic_secret: server_secrets.client,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("server session");
+    let t0 = Instant(6_000_000);
+    // Path 0 exists and is UNVALIDATED (congestion.md §18: budget applies).
+    server.paths.insert(
+        0,
+        umc_session::path::Path::new(0, "ump.udp/1".into(), vec![], vec![], t0),
+    );
+
+    // Deliver a 100-byte protected packet: 3x budget = 300 bytes.
+    let pkt = sized_protected_packet(&mut client, 100, t0);
+    server.on_inbound(t0, &pkt).expect("server recv");
+    assert_eq!(server.path(0).expect("path 0").send_allowance(), 300);
+
+    // 400 payload bytes exceed the 300-byte budget: refused.
+    assert_eq!(
+        server.build_outbound(&TestClock, t0, &vec![0u8; 400]),
+        Err(umc_session::session::SessionError::AmplificationLimit)
+    );
+    // 300 payload bytes fit the budget exactly: allowed.
+    assert!(server
+        .build_outbound(&TestClock, t0, &vec![0u8; 300])
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn validated_path_has_no_limit() {
+    let (client_secrets, server_secrets) = run_xx_handshake(
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &TestEntropy,
+        b"ump.udp/1",
+        0,
+    )
+    .expect("handshake");
+    let dcid = vec![9u8; 8];
+    let mut client = Session::new(
+        SessionConfig {
+            role: Role::Client,
+            dcid: dcid.clone(),
+            local_traffic_secret: client_secrets.client,
+            remote_traffic_secret: client_secrets.server,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("client session");
+    let mut server = Session::new(
+        SessionConfig {
+            role: Role::Server,
+            dcid,
+            local_traffic_secret: server_secrets.server,
+            remote_traffic_secret: server_secrets.client,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("server session");
+    let t0 = Instant(6_100_000);
+    server.paths.insert(
+        0,
+        umc_session::path::Path::new(0, "ump.udp/1".into(), vec![], vec![], t0),
+    );
+    // Receiving 100 bytes then confirming the path: validation removes the
+    // budget (session.md §26 — the 3x rule applies only before validation).
+    let pkt = sized_protected_packet(&mut client, 100, t0);
+    server.on_inbound(t0, &pkt).expect("server recv");
+    server.force_validate(0);
+
+    assert!(server
+        .build_outbound(&TestClock, t0, &vec![0u8; 400])
+        .unwrap()
+        .is_some());
+    assert!(server
+        .build_outbound(&TestClock, t0, &vec![0u8; 2_000])
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn ack_payloads_exempt() {
+    let (client_secrets, server_secrets) = run_xx_handshake(
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &IdentityKeyPair::generate(),
+        &StaticHandshakeKeyPair::generate(),
+        &TestEntropy,
+        b"ump.udp/1",
+        0,
+    )
+    .expect("handshake");
+    let dcid = vec![9u8; 8];
+    let mut client = Session::new(
+        SessionConfig {
+            role: Role::Client,
+            dcid: dcid.clone(),
+            local_traffic_secret: client_secrets.client,
+            remote_traffic_secret: client_secrets.server,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("client session");
+    let mut server = Session::new(
+        SessionConfig {
+            role: Role::Server,
+            dcid,
+            local_traffic_secret: server_secrets.server,
+            remote_traffic_secret: server_secrets.client,
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("server session");
+    let t0 = Instant(6_200_000);
+    server.paths.insert(
+        0,
+        umc_session::path::Path::new(0, "ump.udp/1".into(), vec![], vec![], t0),
+    );
+
+    // The ACK payload comes from the normal on_inbound ack path.
+    let pkt = sized_protected_packet(&mut client, 100, t0);
+    let ack_payload = server.on_inbound(t0, &pkt).expect("server recv");
+    assert!(!ack_payload.is_empty(), "server must ACK");
+
+    // Exhaust the 300-byte budget with two 300-byte data sends (the first
+    // also charges ~28 bytes of wire overhead, so the budget is empty).
+    assert!(server
+        .build_outbound(&TestClock, t0, &vec![0u8; 300])
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        server.build_outbound(&TestClock, t0, &vec![0u8; 300]),
+        Err(umc_session::session::SessionError::AmplificationLimit)
+    );
+    // A data build is refused, but the ACK still goes out (congestion.md
+    // §18: refusing an ACK would stall the protocol).
+    assert!(server
+        .build_outbound(&TestClock, t0, &ack_payload)
+        .unwrap()
+        .is_some());
+}
+
 fn stream_payload(stream_id: u64, data: &[u8]) -> Vec<u8> {
     let mut payload = Vec::new();
     umc_wire::varint::encode_into(&mut payload, umc_types::frame::FrameType::STREAM.0).unwrap();
