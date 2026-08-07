@@ -62,7 +62,7 @@ fn stream_echo_with_protected_packets() {
     )
     .unwrap();
 
-    let sid = client_session.open_stream();
+    let sid = client_session.open_stream().expect("stream");
     let payload = client_session
         .send_stream_data(sid, b"hello", true)
         .unwrap();
@@ -79,7 +79,7 @@ fn stream_echo_with_protected_packets() {
     assert!(eof);
 
     // Echo back on a new stream.
-    let echo_sid = server_session.open_stream();
+    let echo_sid = server_session.open_stream().expect("stream");
     let echo_payload = server_session
         .send_stream_data(echo_sid, &data, true)
         .unwrap();

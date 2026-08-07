@@ -60,7 +60,7 @@ fn full_mobility_cycle() {
     .unwrap();
 
     // 1. Data over path 0.
-    let sid = client.open_stream();
+    let sid = client.open_stream().expect("stream");
     let payload = client.send_stream_data(sid, b"first", true).unwrap();
     let pkt = client
         .build_outbound(&C, Instant(42_000_000), &payload)

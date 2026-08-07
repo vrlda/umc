@@ -50,7 +50,7 @@ fn migration_preserves_streams_and_numbers() {
     let mut server = session(Role::Server, ss.server, ss.client, dcid);
 
     // Send data over path 0.
-    let sid = client.open_stream();
+    let sid = client.open_stream().expect("stream");
     let payload = client
         .send_stream_data(sid, b"before-migration", true)
         .unwrap();

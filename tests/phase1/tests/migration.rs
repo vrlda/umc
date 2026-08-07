@@ -58,7 +58,7 @@ fn session_survives_carrier_swap() {
     )
     .unwrap();
 
-    let sid = client.open_stream();
+    let sid = client.open_stream().expect("stream");
     let payload = client
         .send_stream_data(sid, b"across-carriers", true)
         .unwrap();
