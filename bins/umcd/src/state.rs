@@ -43,16 +43,14 @@ pub(crate) const NODE_IDENTITY_RECORD: &[u8] = b"node-identity";
 /// storage.md §10; never prompted).
 #[must_use]
 pub(crate) fn keystore_password() -> Vec<u8> {
-    match std::env::var("UMC_KEYSTORE_PASSWORD") {
-        Ok(pw) => pw.into_bytes(),
-        Err(_) => {
-            // Dev default: the keystore then protects identity with file
-            // permissions only (storage.md §10.1 requires a strong secret
-            // before production use).
-            eprintln!("[keystore] warning: UMC_KEYSTORE_PASSWORD unset — using the dev default (no password protection)");
-            Vec::new()
-        }
-    }
+    let Ok(pw) = std::env::var("UMC_KEYSTORE_PASSWORD") else {
+        // Dev default: the keystore then protects identity with file
+        // permissions only (storage.md §10.1 requires a strong secret
+        // before production use).
+        eprintln!("[keystore] warning: UMC_KEYSTORE_PASSWORD unset — using the dev default (no password protection)");
+        return Vec::new();
+    };
+    pw.into_bytes()
 }
 
 /// Loads the node identity from the keystore, or generates a fresh one
@@ -227,9 +225,21 @@ impl RuntimeState {
         )
         .map_err(|e| format!("echo app registration: {e:?}"))?;
 
+        let started_at = OsClock.now();
+        // Services bound to the node database restore persisted state at
+        // startup: routes as candidates (storage.md §15.2), candidates as
+        // operational hints (§16.4). Restore failures are logged, never
+        // fatal.
+        let mut discovery = DiscoveryService::new(umc_discovery::table::DEFAULT_TABLE_CAP);
+        discovery.attach_store(store.clone());
+        discovery.restore_candidates(store.as_ref(), started_at);
+        let mut routing = RoutingService::new();
+        routing.attach_store(store.clone());
+        routing.restore(store.as_ref(), started_at);
+
         Ok(Self {
             control_socket: config.resolved_socket(),
-            started_at: OsClock.now(),
+            started_at,
             config,
             store,
             trust_default_level: TrustLevel::Unknown,
@@ -241,10 +251,10 @@ impl RuntimeState {
             listeners: Vec::new(),
             sessions: Arc::new(SessionManager::new()),
             bus: Arc::new(Mutex::new(SessionBus::new())),
-            discovery: DiscoveryService::new(umc_discovery::table::DEFAULT_TABLE_CAP),
+            discovery,
             relay: RelayService::new(events.clone()),
             bundle: BundleService::new(bundle_objects, bundle_quota, events.clone()),
-            routing: RoutingService::new(),
+            routing,
             events,
             apps,
             app_channels: Arc::new(Mutex::new(HashMap::new())),
