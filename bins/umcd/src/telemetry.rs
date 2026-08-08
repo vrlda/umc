@@ -179,7 +179,8 @@ mod tests {
 
     /// The spawned task waits the interval, then appends the snapshot.
     /// Real-time with a short interval: paused-clock tests cannot rely on
-    /// tokio waking spawned tasks (the driver races under `time::advance`).
+    /// tokio waking spawned tasks under `time::advance` (flaky driver
+    /// races), so the cadence test drives the real task on real time.
     #[tokio::test]
     async fn spawned_task_dumps_on_the_interval() {
         let dir = fresh_dir();
