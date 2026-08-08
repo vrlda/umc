@@ -1,0 +1,12 @@
+[package]
+name = "umc-simulation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+umc-types = { path = "../../crates/umc-types" }
+
+[lints]
+workspace = true
