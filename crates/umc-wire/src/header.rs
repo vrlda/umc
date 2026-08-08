@@ -190,6 +190,11 @@ impl LongHeader {
             LongPacketType::Initial => HeaderByte::LONG_INITIAL,
             LongPacketType::Retry => HeaderByte::LONG_RETRY,
             LongPacketType::Handshake => HeaderByte::LONG_HANDSHAKE,
+            // Version-Negotiation is intentionally NOT supported by the
+            // wire crate's LongHeader builder: its layout (no token/payload
+            // length, versions as BE u32 list) differs from the normal long
+            // header, and umc-handshake owns the minimal VN builder/parser
+            // pair (xx.rs build_version_negotiation/parse_version_negotiation).
             LongPacketType::VersionNegotiation => HeaderByte::LONG_VERSION_NEGOTIATION,
         };
         out.push(hb.encode());

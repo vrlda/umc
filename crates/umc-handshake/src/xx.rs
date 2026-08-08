@@ -373,7 +373,7 @@ pub fn build_version_negotiation(dcid: &[u8], scid: &[u8], supported: &[u32]) ->
 /// malformed. VN packets carry no AEAD (no keys exist before version
 /// agreement), so this is a plain header + list parse.
 #[must_use]
-pub fn parse_version_negotiation(bytes: &[u8]) -> Option<Vec<u32>> {
+pub fn parse_version_negotiation(bytes: &[u8]) -> Option<(Vec<u32>, Vec<u8>)> {
     let hb = HeaderByte::decode(*bytes.first()?).ok()?;
     if !hb.long || hb.long_type()? != LongPacketType::VersionNegotiation {
         return None;
@@ -382,6 +382,7 @@ pub fn parse_version_negotiation(bytes: &[u8]) -> Option<Vec<u32>> {
         return None;
     }
     let dcid_len = usize::from(*bytes.get(5)?);
+    let dcid = bytes.get(6..6 + dcid_len)?.to_vec();
     let scid_len = usize::from(*bytes.get(6 + dcid_len)?);
     let mut pos = 7 + dcid_len + scid_len;
     let (count, n) = umc_wire::varint::decode(bytes.get(pos..)?).ok()?;
@@ -397,7 +398,7 @@ pub fn parse_version_negotiation(bytes: &[u8]) -> Option<Vec<u32>> {
         ));
         pos += 4;
     }
-    Some(versions)
+    Some((versions, dcid))
 }
 
 use blake2::{Blake2s256, Digest};
@@ -1240,9 +1241,11 @@ mod tests {
     #[test]
     fn version_negotiation_round_trip() {
         let vn = build_version_negotiation(&[1u8; 8], &[2u8; 8], &[1]);
-        assert_eq!(parse_version_negotiation(&vn), Some(vec![1]));
+        let (versions, _) = parse_version_negotiation(&vn).expect("vn");
+        assert_eq!(versions, vec![1]);
         let vn = build_version_negotiation(&[], &[], &[2, 3]);
-        assert_eq!(parse_version_negotiation(&vn), Some(vec![2, 3]));
+        let (versions, _) = parse_version_negotiation(&vn).expect("vn");
+        assert_eq!(versions, vec![2, 3]);
         assert_eq!(select_version(&[2, 3]), None);
         // An Initial long header is not a VN packet.
         assert_eq!(parse_version_negotiation(&[0xC0, 0, 0, 0, 1, 0, 0]), None);

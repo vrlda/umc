@@ -190,7 +190,15 @@ impl Node {
         // recognized here, before the Initial decrypt. A VN listing our
         // version signals the caller to retry once; one listing only
         // unsupported versions is a hard error.
-        if let Some(offered) = umc_handshake::xx::parse_version_negotiation(&server_packet) {
+        if let Some((offered, vn_dcid)) =
+            umc_handshake::xx::parse_version_negotiation(&server_packet)
+        {
+            // RFC 9000 §17.2.1 echo check: the VN's DCID must be our SCID.
+            if vn_dcid != scid {
+                return Err(NodeError::Handshake(
+                    "version negotiation: DCID echo mismatch".into(),
+                ));
+            }
             if umc_handshake::xx::select_version(&offered).is_none() {
                 return Err(NodeError::Handshake(
                     "version negotiation: server offers no supported protocol version".into(),

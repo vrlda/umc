@@ -223,7 +223,8 @@ async fn client_retries_on_version_negotiation() {
         .expect("first attempt timed out")
         .expect("client thread panicked")
         .expect("first attempt failed");
-    let offered = parse_version_negotiation(&vn_packet).expect("a Version-Negotiation packet");
+    let (offered, _vn_dcid) =
+        parse_version_negotiation(&vn_packet).expect("a Version-Negotiation packet");
     assert_eq!(offered, vec![1], "the daemon's VN must list version 1");
     // The daemon closed this connection; the client retries with a fresh one.
 
