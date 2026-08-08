@@ -5,6 +5,25 @@ use umc_crypto::aead::PacketKeys;
 pub const MAX_TICKET_LIFETIME_MS: u64 = 24 * 60 * 60 * 1000;
 pub const TICKET_ENTROPY: usize = 16;
 
+/// Label for per-ticket seal-key derivation (handshake.md §35): the AEAD
+/// key is bound to the ticket's clear nonce, so two tickets never seal
+/// under the same (key, nonce) pairing even though the server's ticket
+/// key is stable for its lifetime.
+const TICKET_SEAL_LABEL: &[u8] = b"ticket seal";
+
+/// Derives the per-ticket AEAD seal key: `expand_label(ticket_key,
+/// "ticket seal", nonce, 32)`. The nonce rides in the clear prefix of the
+/// v1 wire format, so both `issue_ticket` and `validate_ticket` can
+/// derive it; a swapped or forged prefix derives a different key and the
+/// seal fails.
+#[must_use]
+fn ticket_seal_key(ticket_key: &[u8; 32], nonce: &[u8]) -> [u8; 32] {
+    umc_crypto::label::expand_label(ticket_key, TICKET_SEAL_LABEL, nonce, 32)
+        .expect("32-byte expansion")
+        .try_into()
+        .expect("32-byte expansion")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketPayload {
     pub version: u8,
@@ -85,16 +104,20 @@ impl TicketPayload {
 ///
 /// The nonce rides in the clear BEFORE the seal (SANCTIONED v1 format,
 /// handshake.md §35): the bearer must be able to derive the resumption PSK
-/// (`resumption_psk(resumption_secret, nonce)`) without opening the seal,
-/// and the sealed payload authenticates the whole ticket — a swapped nonce
-/// fails `validate_ticket` because the sealed copy must match.
+/// (`resumption_psk(resumption_secret, nonce)`) without opening the seal.
+/// The seal authenticates the whole ticket: the AEAD key is derived from
+/// the ticket key AND the nonce (`ticket_seal_key`), so each ticket seals
+/// under its own unique key even at packet number 0 — a swapped nonce
+/// derives a different key and fails `validate_ticket`, and no two tickets
+/// share an AEAD (key, nonce) pairing.
 ///
 /// # Panics
 /// Panics if the 32-byte ticket key cannot be expanded into keys or the
 /// authenticated encryption fails; both are impossible for valid input.
 #[must_use]
 pub fn issue_ticket(ticket_key: &[u8; 32], payload: &TicketPayload) -> Vec<u8> {
-    let keys = PacketKeys::from_traffic_secret(ticket_key).expect("32-byte key");
+    let seal_key = ticket_seal_key(ticket_key, &payload.nonce);
+    let keys = PacketKeys::from_traffic_secret(&seal_key).expect("32-byte key");
     let seal = keys
         .seal(0, b"UMP-SESSION-TICKET-v1", &payload.encode())
         .expect("seal");
@@ -138,7 +161,11 @@ pub fn validate_ticket(
     let seal = ticket
         .get(1 + TICKET_ENTROPY..)
         .ok_or(TicketError::Invalid)?;
-    let keys = PacketKeys::from_traffic_secret(ticket_key).map_err(|_| TicketError::Invalid)?;
+    // The seal key derives from the clear nonce prefix, mirroring
+    // `issue_ticket`: a tampered prefix derives the wrong key and the
+    // seal fails before any payload comparison.
+    let seal_key = ticket_seal_key(ticket_key, &nonce);
+    let keys = PacketKeys::from_traffic_secret(&seal_key).map_err(|_| TicketError::Invalid)?;
     let plaintext = keys
         .open(0, b"UMP-SESSION-TICKET-v1", seal)
         .map_err(|_| TicketError::Invalid)?;
@@ -257,6 +284,66 @@ mod tests {
         assert_eq!(
             validate_ticket(&key, &ticket, now + 1),
             Err(TicketError::Invalid)
+        );
+    }
+
+    /// The v1 seal key is bound to the ticket's clear nonce (handshake.md
+    /// §35): every ticket seals under its own derived AEAD key, so the
+    /// constant (ticket key, PN 0) pairing cannot be reused across tickets
+    /// (a known-plaintext pairing attack would otherwise recover victim
+    /// ticket plaintexts).
+    #[test]
+    fn tickets_do_not_share_aead_keys() {
+        let key = [9u8; 32];
+        let now = 1_700_000_000_000;
+        let mut a = payload(now);
+        let mut b = payload(now);
+        a.nonce = [0xA1u8; TICKET_ENTROPY];
+        b.nonce = [0xB2u8; TICKET_ENTROPY];
+        let ticket_a = issue_ticket(&key, &a);
+        let ticket_b = issue_ticket(&key, &b);
+
+        // The fix contract: a ticket opens under the seal key derived
+        // from its OWN clear nonce (and only under that one).
+        let keys_a =
+            PacketKeys::from_traffic_secret(&ticket_seal_key(&key, &a.nonce)).expect("seal key");
+        let keys_b =
+            PacketKeys::from_traffic_secret(&ticket_seal_key(&key, &b.nonce)).expect("seal key");
+        assert!(
+            keys_a
+                .open(0, b"UMP-SESSION-TICKET-v1", &ticket_a[1 + TICKET_ENTROPY..])
+                .is_ok(),
+            "a ticket must open under the seal key bound to its own nonce"
+        );
+        assert!(
+            keys_b
+                .open(0, b"UMP-SESSION-TICKET-v1", &ticket_a[1 + TICKET_ENTROPY..])
+                .is_err(),
+            "a ticket must not open under another ticket's seal key"
+        );
+        assert!(
+            keys_a
+                .open(0, b"UMP-SESSION-TICKET-v1", &ticket_b[1 + TICKET_ENTROPY..])
+                .is_err(),
+            "a ticket must not open under another ticket's seal key"
+        );
+
+        // Swapping a ticket's clear nonce for another ticket's nonce
+        // fails: the validator derives the seal key from the (tampered)
+        // prefix, so the seal breaks before any payload comparison.
+        let mut swapped = ticket_a.clone();
+        swapped[1..=TICKET_ENTROPY].copy_from_slice(&b.nonce);
+        assert_eq!(
+            validate_ticket(&key, &swapped, now + 60_000),
+            Err(TicketError::Invalid),
+            "the seal must bind the nonce via the key derivation"
+        );
+        let mut swapped_back = ticket_b.clone();
+        swapped_back[1..=TICKET_ENTROPY].copy_from_slice(&a.nonce);
+        assert_eq!(
+            validate_ticket(&key, &swapped_back, now + 60_000),
+            Err(TicketError::Invalid),
+            "the seal must bind the nonce via the key derivation"
         );
     }
 }

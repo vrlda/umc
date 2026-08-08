@@ -1,4 +1,13 @@
 // Stateless retry token (handshake.md §21), encrypted with a rotating Retry key.
+//
+// KNOWN LIMITATION (D7 review, follow-up): the token is a bare seal under
+// `PacketKeys::from_traffic_secret(retry_key)` at packet number 0 — for the
+// key's rotation lifetime every token shares one AEAD (key, nonce) pairing,
+// the same flaw class fixed for session tickets in ticket.rs. Unlike tickets,
+// the retry nonce lives INSIDE the sealed payload: the verifier cannot read
+// it before opening, so per-token seal-key derivation requires moving the
+// nonce to a clear prefix (a v1 wire-format change). SANCTIONED for now —
+// deferred; revisit when the retry token wire format next changes.
 use umc_crypto::aead::PacketKeys;
 
 pub const RETRY_VALIDITY_MS: u64 = 5 * 60 * 1000;
