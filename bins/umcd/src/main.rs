@@ -658,11 +658,20 @@ fn handle_resumed_link(
         return Err("version negotiation: resume hello offered no supported version".into());
     }
     // Capability negotiation (compatibility.md §5.4): the resume hello must
-    // bind the canonical capability set like any other hello.
+    // bind the requested privacy floor like any other hello.
     if hello.capabilities_hash
-        != umc_handshake::xx::capabilities_hash(&umc_handshake::xx::canonical_capabilities())
+        != umc_handshake::xx::capabilities_hash_for_minimum_privacy(&hello.minimum_privacy)
     {
         return Err("client capabilities hash mismatch".into());
+    }
+    let requested_privacy = hello
+        .minimum_privacy_level()
+        .ok_or_else(|| "invalid minimum privacy profile".to_string())?;
+    let max_privacy =
+        umc_handshake::xx::privacy_profile_level(umc_handshake::xx::MAX_SUPPORTED_PRIVACY_PROFILE)
+            .expect("the implementation maximum is a valid profile");
+    if requested_privacy > max_privacy {
+        return Err("requested privacy profile is unsupported".into());
     }
     // The ticket must belong to this node and this protocol: an endpoint or
     // profile mismatch refuses the resume (the accept loop already fell
@@ -706,7 +715,8 @@ fn handle_resumed_link(
             padding.extend_from_slice(&umc_handshake::xx::capabilities_hash(
                 &umc_handshake::xx::canonical_capabilities(),
             ));
-            padding.extend_from_slice(&[0u8; 32]);
+            padding.push(max_privacy);
+            padding.extend_from_slice(&[0u8; 31]);
             padding
         },
     };
