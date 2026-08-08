@@ -612,11 +612,6 @@ async fn process_inbound_packet(
     sweep: &mut SweepState,
 ) -> bool {
     let now = clock.now();
-    runtime
-        .lock()
-        .expect("runtime state")
-        .metrics
-        .incr(metric_names::PACKETS_RECEIVED, 1);
     // The control frames the session layer does not expose: relay,
     // bundle, routing, and key updates. The parse needs the reconstruction
     // anchor (the session's expected pn) or the AEAD open fails once the
@@ -650,6 +645,13 @@ async fn process_inbound_packet(
                 return false;
             }
         };
+        // Count only AUTHENTICATED packets: the metric must not inflate
+        // under forged-traffic floods.
+        runtime
+            .lock()
+            .expect("runtime state")
+            .metrics
+            .incr(metric_names::PACKETS_RECEIVED, 1);
         // Loss detection (session.md §14) runs only for the session data
         // space: an ACK of a packet at least three numbers higher declares
         // older packets lost; their retained payloads are re-sent under
@@ -3117,5 +3119,54 @@ mod tests {
             !should_backpressure(&open, &data),
             "data payload below the 80% threshold is sent"
         );
+    }
+
+    #[test]
+    fn control_frames_parse_after_pn_wrap() {
+        // Regression for the AEAD anchor: parse_control_frames must open
+        // packets whose wire pn has wrapped past the truncated width (the
+        // old expected=0 anchor failed and silently dropped control frames).
+        let secret = [1u8; 32];
+        let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&secret).unwrap();
+        let hp_key = umc_crypto::header_protection::header_protection_key(&secret);
+        let dcid = vec![7u8; 8];
+        let relay_open = RelayOpenFrame {
+            circuit_id: 1,
+            bidirectional: false,
+            store_forward_allowed: false,
+            private_circuit: false,
+            multipath_allowed: false,
+            requested_lifetime: 600_000,
+            requested_byte_quota: 1_048_576,
+            next_hop_hint: vec![1u8; 32],
+            authorization: Vec::new(),
+        }
+        .encode()
+        .unwrap();
+        // pn 70 000 > 65 535: the truncated 16-bit wire value is 4 465.
+        let pkt = umc_session::packet::build_protected_packet(
+            &keys,
+            &hp_key,
+            umc_wire::header::ShortPacketSpace::SessionData,
+            &dcid,
+            0,
+            70_000,
+            false,
+            &relay_open,
+        )
+        .unwrap();
+        // The correct anchor (expected = 70 001) opens and the control
+        // frame is visible.
+        let frames = parse_control_frames(&keys, &hp_key, 70_001, &pkt).expect("control frames");
+        assert!(
+            frames
+                .2
+                .iter()
+                .any(|f| matches!(f, WireFrame::RelayOpen(_))),
+            "relay open must survive the pn wrap"
+        );
+        // The old anchor (0) reconstructs to the truncated value and fails
+        // the AEAD open.
+        assert!(parse_control_frames(&keys, &hp_key, 0, &pkt).is_none());
     }
 }
