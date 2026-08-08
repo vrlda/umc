@@ -1049,6 +1049,8 @@ pub mod metric_names {
     pub const CONTROL_REQUESTS_IDENTITY: &str = "control_requests_identity";
     /// `CarrierService` (task F2).
     pub const CONTROL_REQUESTS_CARRIER: &str = "control_requests_carrier";
+    /// `ApplicationService` (task F4).
+    pub const CONTROL_REQUESTS_APP: &str = "control_requests_app";
     pub const CONTROL_REQUESTS_OTHER: &str = "control_requests_other";
 }
 

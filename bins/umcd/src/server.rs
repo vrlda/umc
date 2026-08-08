@@ -509,6 +509,9 @@ fn handle_hello(hello: &api::ClientHello, store: &SqliteStore) -> Vec<u8> {
 /// When the daemon is configured with a development token, requests whose
 /// connection did not present that exact token at hello time are rejected
 /// with `Unauthenticated` before dispatch (control-api.md §11.3).
+// One flat match table per service (the same shape as the spec's method
+// list); the per-service arms are each a line.
+#[allow(clippy::too_many_lines)]
 fn dispatch_request(
     state: &mut RuntimeState,
     request: &api::Request,
@@ -533,6 +536,7 @@ fn dispatch_request(
         "DiagnosticsService" => metric_names::CONTROL_REQUESTS_DIAGNOSTICS,
         "IdentityService" => metric_names::CONTROL_REQUESTS_IDENTITY,
         "CarrierService" => metric_names::CONTROL_REQUESTS_CARRIER,
+        "ApplicationService" => metric_names::CONTROL_REQUESTS_APP,
         _ => metric_names::CONTROL_REQUESTS_OTHER,
     };
     state.metrics.incr(service_counter, 1);
@@ -559,8 +563,14 @@ fn dispatch_request(
         ("RouteService", "InvalidateRoute") => invalidate_route(state, request),
         ("BundleService", "GetBundles" | "ListBundles") => list_bundles(state, request),
         ("BundleService", "CreateBundle") => create_bundle(state, request),
+        ("BundleService", "GetBundle") => get_bundle(state, request),
+        ("BundleService", "DeleteBundle") => delete_bundle(state, request),
         ("RelayService", "OpenCircuit") => open_circuit(state, request),
         ("RelayService", "CloseCircuit") => close_circuit(state, request),
+        ("RelayService", "GetRelayStatus") => get_relay_status(state, request),
+        ("RelayService", "UpdateRelayPolicy") => update_relay_policy(state, request),
+        ("RelayService", "ListRelayCircuits") => list_relay_circuits(state, request),
+        ("RelayService", "CloseRelayCircuit") => close_relay_circuit(state, request),
         ("NodeAdmin" | "ConfigService", "GetConfig") => get_config(state),
         ("NodeAdmin", "GetEvents") => get_events(state),
         ("DiagnosticsService" | "NodeAdmin", "RunDoctor" | "Doctor") => run_doctor(state),
@@ -590,6 +600,99 @@ fn dispatch_request(
         ("CarrierService", "GetLinkProperties") => get_link_properties(state, request),
         ("CarrierService", "GetLinkStats") => get_link_stats(state, request),
         ("CarrierService", "Listen") => listen(state, request),
+        // ApplicationService (task F4): the registry-backed surface
+        // (RegisterApplication/UnregisterApplication/OpenListener) is real;
+        // the data plane (sessions, streams, datagrams) has no v1 backing,
+        // so each of those methods is Unimplemented with an explicit reason
+        // (no server-side dial initiator, no pending-session queue, no
+        // per-app stream/datagram handles, no bound-session model).
+        ("ApplicationService", "RegisterApplication") => register_application(state, request),
+        ("ApplicationService", "UnregisterApplication") => unregister_application(state, request),
+        ("ApplicationService", "OpenListener") => open_listener(state, request),
+        ("ApplicationService", "CloseListener") => {
+            return application_unimplemented(
+                request,
+                "close-listener: v1 listeners are the app registration; no closeable listener object exists",
+            );
+        }
+        ("ApplicationService", "Connect") => {
+            return application_unimplemented(
+                request,
+                "connect: the node has no server-side dial initiator (v1)",
+            );
+        }
+        ("ApplicationService", "AcceptIncomingSession") => {
+            return application_unimplemented(
+                request,
+                "accept-incoming-session: no pending-session queue on the control surface (v1)",
+            );
+        }
+        ("ApplicationService", "RejectIncomingSession") => {
+            return application_unimplemented(
+                request,
+                "reject-incoming-session: no pending-session queue on the control surface (v1)",
+            );
+        }
+        ("ApplicationService", "OpenStream") => {
+            return application_unimplemented(
+                request,
+                "open-stream: no per-application stream handles (v1)",
+            );
+        }
+        ("ApplicationService", "AcceptStream") => {
+            return application_unimplemented(
+                request,
+                "accept-stream: no pending-stream queue on the control surface (v1)",
+            );
+        }
+        ("ApplicationService", "RejectStream") => {
+            return application_unimplemented(
+                request,
+                "reject-stream: no pending-stream queue on the control surface (v1)",
+            );
+        }
+        ("ApplicationService", "ReadStream") => {
+            return application_unimplemented(
+                request,
+                "read-stream: no per-application stream handles (v1)",
+            );
+        }
+        ("ApplicationService", "WriteStream") => {
+            return application_unimplemented(
+                request,
+                "write-stream: no bound-session model (RegisterApplication carries no session id in v1)",
+            );
+        }
+        ("ApplicationService", "CloseStreamSend") => {
+            return application_unimplemented(
+                request,
+                "close-stream-send: no per-application stream handles (v1)",
+            );
+        }
+        ("ApplicationService", "ResetStream") => {
+            return application_unimplemented(
+                request,
+                "reset-stream: no per-application stream handles (v1)",
+            );
+        }
+        ("ApplicationService", "StopStream") => {
+            return application_unimplemented(
+                request,
+                "stop-stream: no per-application stream handles (v1)",
+            );
+        }
+        ("ApplicationService", "SendDatagram") => {
+            return application_unimplemented(
+                request,
+                "send-datagram: no bound-session model (RegisterApplication carries no session id in v1)",
+            );
+        }
+        ("ApplicationService", "ReceiveDatagram") => {
+            return application_unimplemented(
+                request,
+                "receive-datagram: no datagram queues on the control surface (v1)",
+            );
+        }
         _ => (api::StatusCode::Unimplemented as i32, None),
     };
     response_envelope(request, code, payload)
@@ -607,6 +710,28 @@ fn response_envelope(request: &api::Request, code: i32, payload: Option<Vec<u8>>
                 ..Default::default()
             }),
             payload: payload.unwrap_or_default(),
+            ..Default::default()
+        })),
+    };
+    let mut out = Vec::new();
+    Message::encode(&envelope, &mut out).expect("encode");
+    out
+}
+
+/// Frame a `Unimplemented` response that carries the reason (task F4): the
+/// documented-split methods of `ApplicationService` fail with an explicit
+/// message so clients can distinguish a known gap from a protocol typo.
+fn application_unimplemented(request: &api::Request, reason: &str) -> Vec<u8> {
+    let envelope = api::Envelope {
+        api_version: Some(api::ApiVersion { major: 1, minor: 0 }),
+        sequence: 1,
+        body: Some(api::envelope::Body::Response(api::Response {
+            request_id: request.request_id,
+            status: Some(api::Status {
+                code: api::StatusCode::Unimplemented as i32,
+                message: reason.to_string(),
+                ..Default::default()
+            }),
             ..Default::default()
         })),
     };
@@ -2008,6 +2133,432 @@ fn close_circuit(state: &mut RuntimeState, request: &api::Request) -> (i32, Opti
         }
         Err(_) => (api::StatusCode::NotFound as i32, None),
     }
+}
+
+// --- Task F4: RelayService remaining methods ---
+
+/// `RelayService.GetRelayStatus`: the v1 `AdmissionLimits` mapped onto the
+/// proto policy, plus live circuit counts. `queued_bytes` is always 0 —
+/// the v1 relay has no queue (relay.md §8-24).
+fn get_relay_status(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let _ = request;
+    let snapshot = state.relay.snapshot();
+    let opening_circuits = snapshot
+        .iter()
+        .filter(|snap| {
+            matches!(
+                snap.circuit.state,
+                umc_relay::circuit::CircuitState::Opening
+            )
+        })
+        .count();
+    let bytes_forwarded: u64 = snapshot
+        .iter()
+        .map(|snap| snap.circuit.bytes_forwarded)
+        .sum();
+    let status = api::RelayStatus {
+        policy: Some(relay_policy_message(&state.relay.limits)),
+        opening_circuits: u32::try_from(opening_circuits).unwrap_or(u32::MAX),
+        active_circuits: u32::try_from(state.relay.circuit_count()).unwrap_or(u32::MAX),
+        queued_bytes: 0,
+        bytes_forwarded,
+        pressure: api::ResourcePressure::Normal as i32,
+    };
+    let response = api::GetRelayStatusResponse {
+        status: Some(status),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// The v1 `AdmissionLimits` as the proto `RelayPolicy` (task F4). The
+/// v1 limits model mode, the per-peer cap, the per-circuit byte quota, and
+/// the lifetime cap; idle timeout, bandwidth, and the trust/carrier/route
+/// allowlists are not modeled (they ride as defaults).
+fn relay_policy_message(limits: &umc_relay::admission::AdmissionLimits) -> api::RelayPolicy {
+    api::RelayPolicy {
+        mode: match limits.policy {
+            umc_relay::admission::RelayPolicy::Disabled => api::RelayMode::Disabled as i32,
+            umc_relay::admission::RelayPolicy::FriendsOnly => api::RelayMode::FriendsOnly as i32,
+            umc_relay::admission::RelayPolicy::Community => api::RelayMode::Community as i32,
+            umc_relay::admission::RelayPolicy::Public => api::RelayMode::Public as i32,
+        },
+        maximum_circuits_per_peer: u32::try_from(limits.max_circuits_per_peer).unwrap_or(u32::MAX),
+        maximum_bytes_per_circuit: limits.max_byte_quota,
+        maximum_lifetime_ms: limits.max_lifetime_ms,
+        ..Default::default()
+    }
+}
+
+/// `RelayService.UpdateRelayPolicy` (control-api.md §30.1): mutate the
+/// in-memory `AdmissionLimits`. `expected_revision` is not enforced (no
+/// resource revisions exist yet); `maximum_circuits`, `maximum_idle_ms`,
+/// `maximum_bytes_per_second`, and the allowlists are not modeled by the
+/// v1 limits and are ignored (documented). Zero-valued fields mean "no
+/// change" for the modeled limits.
+fn update_relay_policy(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(update) = api::UpdateRelayPolicyRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(policy) = update.policy else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok(mode) = api::RelayMode::try_from(policy.mode) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if mode == api::RelayMode::Unspecified {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    {
+        let limits = &mut state.relay.limits;
+        limits.policy = match mode {
+            api::RelayMode::Disabled => umc_relay::admission::RelayPolicy::Disabled,
+            api::RelayMode::FriendsOnly => umc_relay::admission::RelayPolicy::FriendsOnly,
+            api::RelayMode::Community => umc_relay::admission::RelayPolicy::Community,
+            api::RelayMode::Public => umc_relay::admission::RelayPolicy::Public,
+            api::RelayMode::Unspecified => unreachable!("rejected above"),
+        };
+        if policy.maximum_circuits_per_peer > 0 {
+            limits.max_circuits_per_peer =
+                usize::try_from(policy.maximum_circuits_per_peer).unwrap_or(usize::MAX);
+        }
+        if policy.maximum_bytes_per_circuit > 0 {
+            limits.max_byte_quota = policy.maximum_bytes_per_circuit;
+        }
+        if policy.maximum_lifetime_ms > 0 {
+            limits.max_lifetime_ms = policy.maximum_lifetime_ms;
+        }
+    }
+    push_event(
+        state,
+        "relay_policy_updated",
+        format!("policy {:?}", state.relay.limits.policy),
+    );
+    let response = api::UpdateRelayPolicyResponse {
+        policy: Some(relay_policy_message(&state.relay.limits)),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// The v1 redaction for circuit peer identifiers (relay.md §30.2,
+/// control-api.md §30.1): keep the first 4 bytes of an endpoint id and
+/// zero the rest, so the operator sees identity without the full peer.
+fn redact_peer(peer: Option<&[u8]>) -> Vec<u8> {
+    let Some(peer) = peer else {
+        return Vec::new();
+    };
+    let mut out = peer.to_vec();
+    for byte in out.iter_mut().skip(4) {
+        *byte = 0;
+    }
+    out
+}
+
+/// The circuit state as the proto's lowercase string (`"opening"`,
+/// `"active"`, `"closing"`, ...).
+fn circuit_state_name(state: umc_relay::circuit::CircuitState) -> String {
+    format!("{state:?}").to_ascii_lowercase()
+}
+
+/// `RelayService.ListRelayCircuits` (control-api.md §30.1): a snapshot of
+/// every circuit with redacted owner/destination peers, paginated
+/// (control-api.md §37). The circuit handle is the 8-byte BE circuit id —
+/// the same value `OpenCircuit` returns. The optional `state` filter keeps
+/// only circuits whose v1 state matches.
+fn list_relay_circuits(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(list) = api::ListRelayCircuitsRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok((offset, page_size)) = page_window(list.page.as_ref(), "ListRelayCircuits") else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let all: Vec<_> = state
+        .relay
+        .snapshot()
+        .into_iter()
+        .filter(|snap| {
+            list.state.is_empty() || circuit_state_name(snap.circuit.state) == list.state
+        })
+        .collect();
+    let total = all.len();
+    let circuits = all
+        .into_iter()
+        .skip(offset)
+        .take(page_size)
+        .map(|snap| api::RelayCircuitSummary {
+            circuit_handle: Some(api::OpaqueHandle {
+                value: snap.circuit_id.to_be_bytes().to_vec(),
+            }),
+            state: circuit_state_name(snap.circuit.state),
+            redacted_upstream_peer: redact_peer(snap.owner_peer.as_deref()),
+            redacted_downstream_peer: redact_peer(snap.destination.as_deref()),
+            granted_byte_quota: snap.circuit.granted_byte_quota,
+            accepted_bytes: snap.circuit.bytes_forwarded,
+            expires_at_unix_ms: i64::try_from(snap.circuit.expires_at.0).unwrap_or(i64::MAX),
+            last_activity_unix_ms: i64::try_from(snap.circuit.last_activity.0).unwrap_or(i64::MAX),
+            private_circuit: snap.circuit.private_handling,
+        })
+        .collect();
+    let response = api::ListRelayCircuitsResponse {
+        circuits,
+        page: Some(page_info(total, offset, page_size, "ListRelayCircuits")),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `RelayService.CloseRelayCircuit` (control-api.md §30.1): close by the
+/// circuit handle — the 8-byte BE circuit id `OpenCircuit`/`ListRelayCircuits`
+/// carry. The string reason rides into the event log; the v1 close path
+/// applies `NoError` (the relay reason codes are wire-only for now).
+fn close_relay_circuit(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(close) = api::CloseRelayCircuitRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(circuit_id) = close
+        .circuit_handle
+        .as_ref()
+        .and_then(|handle| <[u8; 8]>::try_from(handle.value.as_slice()).ok())
+        .map(u64::from_be_bytes)
+    else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let now = state.node.clock.as_ref().now();
+    match state.relay.close_circuit(circuit_id, 0, now) {
+        Ok(()) => {
+            state.metrics.incr(metric_names::RELAY_CIRCUITS_CLOSED, 1);
+            push_event(
+                state,
+                "relay_circuit_closed",
+                format!("circuit {circuit_id}; reason {}", close.reason),
+            );
+            let mut payload = Vec::new();
+            Message::encode(&api::CloseRelayCircuitResponse {}, &mut payload).expect("encode");
+            (api::StatusCode::Ok as i32, Some(payload))
+        }
+        Err(_) => (api::StatusCode::NotFound as i32, None),
+    }
+}
+
+// --- Task F4: BundleService remaining methods ---
+
+/// `BundleService.GetBundle` (control-api.md §30.2): the record summary
+/// plus an optional payload chunk. Chunking honors `payload_offset` /
+/// `payload_length` (0 length means "to the end"); `payload_eof` marks the
+/// final chunk. The v1 `BundleSummary` carries the raw destination hint in
+/// `destination_hint_hash` (the hint-hash plumbing lands with bundle
+/// routing). Unknown ids are `NotFound`.
+fn get_bundle(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(get) = api::GetBundleRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok(id) = <[u8; 32]>::try_from(get.bundle_id.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(record) = state.bundle.record(&id) else {
+        return (api::StatusCode::NotFound as i32, None);
+    };
+    let size = record.size;
+    let (payload_chunk, payload_eof) = if get.include_payload {
+        let payload = state.bundle.payload(&id).unwrap_or_default();
+        let offset = usize::try_from(get.payload_offset)
+            .unwrap_or(usize::MAX)
+            .min(payload.len());
+        let length = if get.payload_length == 0 {
+            payload.len().saturating_sub(offset)
+        } else {
+            usize::try_from(get.payload_length)
+                .unwrap_or(usize::MAX)
+                .min(payload.len().saturating_sub(offset))
+        };
+        let end = offset.saturating_add(length);
+        (payload[offset..end].to_vec(), end >= size)
+    } else {
+        (Vec::new(), false)
+    };
+    let response = api::GetBundleResponse {
+        bundle: Some(api::BundleSummary {
+            bundle_id: id.to_vec(),
+            owner_endpoint_id: record.sender.clone(),
+            destination_hint_hash: record.destination_hint.clone(),
+            state: bundle_state(&record.status) as i32,
+            payload_size: u64::try_from(size).unwrap_or(u64::MAX),
+            priority: u32::try_from(record.priority).unwrap_or(u32::MAX),
+            created_at_unix_ms: i64::try_from(record.created_at.0).unwrap_or(i64::MAX),
+            expires_at_unix_ms: i64::try_from(record.expires_at.0).unwrap_or(i64::MAX),
+        }),
+        payload_chunk,
+        payload_eof,
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `BundleService.DeleteBundle` (control-api.md §30.2): remove the record
+/// via the manager — which releases the quota reservation, the sender
+/// count, and the persisted metadata (bundles.md §11). The content-
+/// addressed object payload stays behind: shared objects are refcounted by
+/// the eviction path, so a delete only drops the record. Unknown ids are
+/// `NotFound`.
+fn delete_bundle(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(delete) = api::DeleteBundleRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok(id) = <[u8; 32]>::try_from(delete.bundle_id.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if state.bundle.record(&id).is_none() {
+        return (api::StatusCode::NotFound as i32, None);
+    }
+    state.bundle.manager.remove(&id);
+    push_event(
+        state,
+        "bundle_deleted",
+        format!("bundle {id:02x?}; reason {}", delete.reason),
+    );
+    let mut payload = Vec::new();
+    Message::encode(&api::DeleteBundleResponse {}, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+// --- Task F4: ApplicationService (registry-backed surface) ---
+
+/// `ApplicationService.RegisterApplication` (control-api.md §31): register
+/// every requested protocol id with the `AppRegistry` (service name =
+/// `application_name`) and create the app's inbound stream channel — the
+/// same wiring `install_echo_app` uses, so session tasks can forward
+/// inbound stream data to the app. The v1 application handle is the first
+/// registered protocol id (documented deviation from the spec's 16-byte
+/// opaque handles). A failed multi-protocol registration rolls back the
+/// already-registered ids. Channel consumers (the application-side drain
+/// tasks) land with in-process app hosting.
+fn register_application(
+    state: &mut RuntimeState,
+    request: &api::Request,
+) -> (i32, Option<Vec<u8>>) {
+    let Ok(register) = api::RegisterApplicationRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if register.application_name.is_empty() || register.requested_protocol_ids.is_empty() {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    for protocol_id in &register.requested_protocol_ids {
+        match state.apps.register(
+            protocol_id.as_bytes().to_vec(),
+            register.application_name.clone(),
+        ) {
+            Ok(()) => {}
+            Err(umc_core::app::AppError::AlreadyRegistered) => {
+                for earlier in &register.requested_protocol_ids {
+                    if earlier == protocol_id {
+                        break;
+                    }
+                    let _ = state.apps.unregister(earlier.as_bytes());
+                }
+                return (api::StatusCode::AlreadyExists as i32, None);
+            }
+            Err(umc_core::app::AppError::InvalidProtocolId) => {
+                for earlier in &register.requested_protocol_ids {
+                    if earlier == protocol_id {
+                        break;
+                    }
+                    let _ = state.apps.unregister(earlier.as_bytes());
+                }
+                return (api::StatusCode::InvalidArgument as i32, None);
+            }
+            Err(umc_core::app::AppError::NotFound) => unreachable!("register never not-finds"),
+        }
+    }
+    let mut channels = state.app_channels.lock().expect("app channels");
+    for protocol_id in &register.requested_protocol_ids {
+        let (in_tx, _in_rx) =
+            umc_core::app_io::spawn_app_channel(crate::app_layer::APP_CHANNEL_BUFFER);
+        channels.insert(protocol_id.as_bytes().to_vec(), in_tx);
+    }
+    drop(channels);
+    push_event(
+        state,
+        "application_registered",
+        format!(
+            "{} ({} protocol id(s))",
+            register.application_name,
+            register.requested_protocol_ids.len()
+        ),
+    );
+    let response = api::RegisterApplicationResponse {
+        application_handle: Some(api::OpaqueHandle {
+            value: register.requested_protocol_ids[0].as_bytes().to_vec(),
+        }),
+        // v1: no capability-grant or resumable-principal model yet.
+        effective_grants: Vec::new(),
+        resume_token: Vec::new(),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `ApplicationService.UnregisterApplication` (control-api.md §31): drop
+/// the app from the registry and remove its inbound channel. Unknown
+/// handles are `NotFound`. `close_owned_sessions` is moot in v1: no
+/// sessions are owned (no bound-session model).
+fn unregister_application(
+    state: &mut RuntimeState,
+    request: &api::Request,
+) -> (i32, Option<Vec<u8>>) {
+    let Ok(unregister) = api::UnregisterApplicationRequest::decode(request.payload.as_slice())
+    else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(handle) = unregister.application_handle else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if !state.apps.unregister(&handle.value) {
+        return (api::StatusCode::NotFound as i32, None);
+    }
+    state
+        .app_channels
+        .lock()
+        .expect("app channels")
+        .remove(&handle.value);
+    push_event(state, "application_unregistered", String::new());
+    let mut payload = Vec::new();
+    Message::encode(&api::UnregisterApplicationResponse {}, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `ApplicationService.OpenListener` (control-api.md §32): bind the app's
+/// protocol registration as a listener. The v1 listener IS the registry
+/// entry — inbound stream dispatch already routes matching protocol ids to
+/// the app's channel — so this validates the registration and returns the
+/// protocol id as the listener handle. Unknown apps are `NotFound`; a
+/// protocol id the app does not serve is `InvalidArgument`.
+fn open_listener(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(open) = api::OpenListenerRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(handle) = open.application_handle else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if state.apps.lookup(&handle.value).is_none() {
+        return (api::StatusCode::NotFound as i32, None);
+    }
+    if !open.protocol_id.is_empty() && open.protocol_id.as_bytes() != handle.value.as_slice() {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    let response = api::OpenListenerResponse {
+        listener_handle: Some(api::OpaqueHandle {
+            value: handle.value,
+        }),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
 }
 
 // --- Task F2: IdentityService (all nine proto RPCs) ---
@@ -5653,6 +6204,692 @@ mod tests {
         assert!(
             !os_peer_authorized(&stream, own_uid ^ 1),
             "a foreign uid must be refused"
+        );
+    }
+
+    #[test]
+    fn register_and_unregister_application_round_trip() {
+        let (mut state, _tx) = test_state();
+        let register = api::RegisterApplicationRequest {
+            application_name: "notes".into(),
+            application_instance_id: b"instance-1".to_vec(),
+            requested_protocol_ids: vec!["org.umc.notes/1".into()],
+            ..Default::default()
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "ApplicationService",
+                "RegisterApplication",
+                encode_request(&register),
+            ),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let registered =
+            api::RegisterApplicationResponse::decode(response.payload.as_slice()).expect("payload");
+        // The v1 application handle is the first registered protocol id.
+        assert_eq!(
+            registered.application_handle.unwrap().value,
+            b"org.umc.notes/1"
+        );
+
+        // The registry entry exists and the app channel was wired the same
+        // way install_echo_app wires the echo application's.
+        let handle = state
+            .apps
+            .lookup(b"org.umc.notes/1")
+            .expect("registry entry");
+        assert_eq!(handle.service_name, "notes");
+        assert!(state
+            .app_channels
+            .lock()
+            .expect("app channels")
+            .contains_key(&b"org.umc.notes/1".to_vec()));
+
+        let unregister = api::UnregisterApplicationRequest {
+            application_handle: Some(api::OpaqueHandle {
+                value: b"org.umc.notes/1".to_vec(),
+            }),
+            ..Default::default()
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "ApplicationService",
+                "UnregisterApplication",
+                encode_request(&unregister),
+            ),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        assert!(state.apps.lookup(b"org.umc.notes/1").is_none());
+        assert!(!state
+            .app_channels
+            .lock()
+            .expect("app channels")
+            .contains_key(&b"org.umc.notes/1".to_vec()));
+
+        // Unregistering an unknown app is NotFound, not Ok.
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "ApplicationService",
+                "UnregisterApplication",
+                encode_request(&unregister),
+            ),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::NotFound as i32
+        );
+    }
+
+    #[test]
+    fn register_application_rejects_duplicates_and_bad_input() {
+        let (mut state, _tx) = test_state();
+        let mut register = api::RegisterApplicationRequest {
+            application_name: "echo2".into(),
+            requested_protocol_ids: vec!["org.umc.echo2/1".into()],
+            ..Default::default()
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "ApplicationService",
+                "RegisterApplication",
+                encode_request(&register),
+            ),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+
+        // A second registration of the same protocol id is AlreadyExists.
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "ApplicationService",
+                "RegisterApplication",
+                encode_request(&register),
+            ),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::AlreadyExists as i32
+        );
+        assert_eq!(state.apps.list().len(), 2, "the echo app plus one more");
+
+        // Missing name or empty protocol list is InvalidArgument.
+        register.application_name.clear();
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "ApplicationService",
+                "RegisterApplication",
+                encode_request(&register),
+            ),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::InvalidArgument as i32
+        );
+        register.application_name = "echo3".into();
+        register.requested_protocol_ids.clear();
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "ApplicationService",
+                "RegisterApplication",
+                encode_request(&register),
+            ),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::InvalidArgument as i32
+        );
+    }
+
+    #[test]
+    fn open_listener_validates_the_registration() {
+        let (mut state, _tx) = test_state();
+        let register = api::RegisterApplicationRequest {
+            application_name: "notes".into(),
+            requested_protocol_ids: vec!["org.umc.notes/1".into()],
+            ..Default::default()
+        };
+        dispatch_request(
+            &mut state,
+            &request(
+                "ApplicationService",
+                "RegisterApplication",
+                encode_request(&register),
+            ),
+            None,
+        );
+
+        // A matching protocol id binds the listener: the v1 listener IS the
+        // app registration, which inbound stream dispatch already honors.
+        let mut open = api::OpenListenerRequest {
+            application_handle: Some(api::OpaqueHandle {
+                value: b"org.umc.notes/1".to_vec(),
+            }),
+            protocol_id: "org.umc.notes/1".into(),
+            ..Default::default()
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("ApplicationService", "OpenListener", encode_request(&open)),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let opened = api::OpenListenerResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .listener_handle
+            .expect("handle");
+        assert_eq!(opened.value, b"org.umc.notes/1");
+
+        // An unregistered app handle is NotFound; a protocol mismatch is
+        // InvalidArgument.
+        let mut foreign = open.clone();
+        foreign.application_handle = Some(api::OpaqueHandle {
+            value: b"org.umc.none/1".to_vec(),
+        });
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "ApplicationService",
+                "OpenListener",
+                encode_request(&foreign),
+            ),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::NotFound as i32
+        );
+        open.protocol_id = "org.umc.other/1".into();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("ApplicationService", "OpenListener", encode_request(&open)),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::InvalidArgument as i32
+        );
+    }
+
+    #[test]
+    fn application_data_plane_methods_are_unimplemented_with_reason() {
+        let (mut state, _tx) = test_state();
+        // The data-plane methods have no v1 backing (no server-side dial
+        // initiator, no pending-session queue, no per-app stream or
+        // datagram handles, no bound-session model): each is Unimplemented
+        // with an explicit reason so clients can tell the gap from a typo.
+        for method in [
+            "CloseListener",
+            "Connect",
+            "AcceptIncomingSession",
+            "RejectIncomingSession",
+            "OpenStream",
+            "AcceptStream",
+            "RejectStream",
+            "ReadStream",
+            "WriteStream",
+            "CloseStreamSend",
+            "ResetStream",
+            "StopStream",
+            "SendDatagram",
+            "ReceiveDatagram",
+        ] {
+            let bytes = dispatch_request(
+                &mut state,
+                &request("ApplicationService", method, vec![]),
+                None,
+            );
+            let response = decode_response(&bytes);
+            assert_eq!(
+                response.status.as_ref().unwrap().code,
+                api::StatusCode::Unimplemented as i32,
+                "{method} must be Unimplemented"
+            );
+            assert!(
+                !response.status.as_ref().unwrap().message.is_empty(),
+                "{method} must carry the reason"
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // one bundle lifecycle: create, get (3 chunk shapes), delete
+    #[test]
+    fn bundle_get_and_delete_round_trip() {
+        let (mut state, _tx) = test_state();
+        let create = api::CreateBundleRequest {
+            application_handle: Some(api::OpaqueHandle {
+                value: b"org.umc.notes/1".to_vec(),
+            }),
+            destination_hint: b"peer-hint".to_vec(),
+            priority: 1,
+            payload_chunk: b"hello-bundle".to_vec(),
+            payload_complete: true,
+            ..Default::default()
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("BundleService", "CreateBundle", encode_request(&create)),
+            None,
+        );
+        let created = api::CreateBundleResponse::decode(decode_response(&bytes).payload.as_slice())
+            .expect("payload")
+            .bundle
+            .expect("bundle");
+
+        // GetBundle without payload: the summary only.
+        let get = api::GetBundleRequest {
+            bundle_id: created.bundle_id.clone(),
+            ..Default::default()
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("BundleService", "GetBundle", encode_request(&get)),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let got = api::GetBundleResponse::decode(response.payload.as_slice()).expect("payload");
+        let summary = got.bundle.expect("summary");
+        assert_eq!(summary.payload_size, 12);
+        assert!(
+            got.payload_chunk.is_empty(),
+            "no payload without include_payload"
+        );
+        assert!(!got.payload_eof);
+
+        // GetBundle with the payload, chunked by offset/length.
+        let get = api::GetBundleRequest {
+            bundle_id: created.bundle_id.clone(),
+            include_payload: true,
+            payload_offset: 0,
+            payload_length: 6,
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("BundleService", "GetBundle", encode_request(&get)),
+            None,
+        );
+        let got = api::GetBundleResponse::decode(decode_response(&bytes).payload.as_slice())
+            .expect("payload");
+        assert_eq!(got.payload_chunk, b"hello-");
+        assert!(!got.payload_eof, "offset 0 + 6 bytes of 12 is not the end");
+
+        // The final chunk sets payload_eof.
+        let get = api::GetBundleRequest {
+            bundle_id: created.bundle_id.clone(),
+            include_payload: true,
+            payload_offset: 11,
+            payload_length: 64,
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("BundleService", "GetBundle", encode_request(&get)),
+            None,
+        );
+        let got = api::GetBundleResponse::decode(decode_response(&bytes).payload.as_slice())
+            .expect("payload");
+        assert_eq!(got.payload_chunk, b"e");
+        assert!(got.payload_eof);
+
+        // Unknown id is NotFound.
+        let get = api::GetBundleRequest {
+            bundle_id: vec![0u8; 32],
+            include_payload: false,
+            payload_offset: 0,
+            payload_length: 0,
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("BundleService", "GetBundle", encode_request(&get)),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::NotFound as i32
+        );
+
+        // DeleteBundle removes the record; a second delete is NotFound.
+        let delete = api::DeleteBundleRequest {
+            bundle_id: created.bundle_id.clone(),
+            reason: "no longer needed".into(),
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("BundleService", "DeleteBundle", encode_request(&delete)),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        assert!(state
+            .bundle
+            .find(&<[u8; 32]>::try_from(created.bundle_id.as_slice()).unwrap())
+            .is_none());
+        let bytes = dispatch_request(
+            &mut state,
+            &request("BundleService", "DeleteBundle", encode_request(&delete)),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::NotFound as i32
+        );
+    }
+
+    #[test]
+    fn relay_status_reports_limits_and_circuit_counts() {
+        let (mut state, _tx) = test_state();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RelayService", "GetRelayStatus", vec![]),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let status = api::GetRelayStatusResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .status
+            .expect("status");
+        // The v1 default limits: community relay with per-peer cap 4.
+        assert_eq!(
+            status.policy.as_ref().unwrap().mode,
+            api::RelayMode::Community as i32
+        );
+        assert_eq!(status.policy.as_ref().unwrap().maximum_circuits_per_peer, 4);
+        assert_eq!(status.active_circuits, 0);
+        assert_eq!(status.bytes_forwarded, 0);
+
+        // A live circuit moves the count.
+        let open = OpenCircuitRequest {
+            requested_lifetime_ms: 600_000,
+            requested_byte_quota: 1_048_576,
+            flags: 0,
+            bidirectional: true,
+            private_handling: false,
+            peer_circuits: 0,
+        };
+        dispatch_request(
+            &mut state,
+            &request("RelayService", "OpenCircuit", encode_request(&open)),
+            None,
+        );
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RelayService", "GetRelayStatus", vec![]),
+            None,
+        );
+        let status =
+            api::GetRelayStatusResponse::decode(decode_response(&bytes).payload.as_slice())
+                .expect("payload")
+                .status
+                .expect("status");
+        assert_eq!(status.active_circuits, 1);
+        assert_eq!(status.opening_circuits, 1);
+    }
+
+    #[test]
+    fn update_relay_policy_mutates_limits_and_blocks_new_circuits() {
+        let (mut state, _tx) = test_state();
+        let update = api::UpdateRelayPolicyRequest {
+            policy: Some(api::RelayPolicy {
+                mode: api::RelayMode::Disabled as i32,
+                maximum_circuits_per_peer: 2,
+                maximum_bytes_per_circuit: 1 << 20,
+                maximum_lifetime_ms: 60_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RelayService", "UpdateRelayPolicy", encode_request(&update)),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let echoed = api::UpdateRelayPolicyResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .policy
+            .expect("policy");
+        assert_eq!(echoed.mode, api::RelayMode::Disabled as i32);
+        assert_eq!(echoed.maximum_circuits_per_peer, 2);
+
+        // The limits mutated in place; a Disabled relay refuses opens.
+        assert_eq!(state.relay.limits.max_circuits_per_peer, 2);
+        assert_eq!(state.relay.limits.max_lifetime_ms, 60_000);
+        let open = OpenCircuitRequest {
+            requested_lifetime_ms: 600_000,
+            requested_byte_quota: 1_048_576,
+            flags: 0,
+            bidirectional: true,
+            private_handling: false,
+            peer_circuits: 0,
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RelayService", "OpenCircuit", encode_request(&open)),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::FailedPrecondition as i32
+        );
+    }
+
+    #[test]
+    fn list_relay_circuits_snapshots_redacted() {
+        let (mut state, _tx) = test_state();
+        let open = OpenCircuitRequest {
+            requested_lifetime_ms: 600_000,
+            requested_byte_quota: 1_048_576,
+            flags: 0,
+            bidirectional: true,
+            private_handling: false,
+            peer_circuits: 0,
+        };
+        // Open with an owner peer directly so the redaction is observable
+        // (the control open path carries no owner).
+        let peer = [7u8; 32];
+        let granted = state
+            .relay
+            .open_circuit(
+                &CircuitOpenRequest {
+                    peer_circuits: 0,
+                    requested_lifetime_ms: open.requested_lifetime_ms,
+                    requested_byte_quota: open.requested_byte_quota,
+                    flags: 0,
+                    bidirectional: true,
+                    private_handling: false,
+                    destination_hint: b"dest-peer".to_vec(),
+                },
+                peer.to_vec(),
+                crate::state::wall_now(),
+            )
+            .expect("open");
+
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RelayService", "ListRelayCircuits", vec![]),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let listing =
+            api::ListRelayCircuitsResponse::decode(response.payload.as_slice()).expect("payload");
+        assert_eq!(listing.circuits.len(), 1);
+        assert_eq!(listing.page.as_ref().unwrap().total_size_hint, 1);
+        let circuit = &listing.circuits[0];
+        assert_eq!(
+            circuit.circuit_handle.as_ref().unwrap().value,
+            granted.circuit_id.to_be_bytes()
+        );
+        assert_eq!(circuit.state, "opening");
+        assert_eq!(circuit.granted_byte_quota, 1_048_576);
+        assert_eq!(circuit.accepted_bytes, 0);
+        // The owner peer is redacted: first 4 bytes kept, the rest zeroed.
+        let mut redacted = [7u8; 32];
+        redacted[4..].fill(0);
+        assert_eq!(circuit.redacted_upstream_peer, redacted);
+    }
+
+    #[test]
+    fn close_relay_circuit_via_handle() {
+        let (mut state, _tx) = test_state();
+        let open = OpenCircuitRequest {
+            requested_lifetime_ms: 600_000,
+            requested_byte_quota: 1_048_576,
+            flags: 0,
+            bidirectional: true,
+            private_handling: false,
+            peer_circuits: 0,
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RelayService", "OpenCircuit", encode_request(&open)),
+            None,
+        );
+        let granted = OpenCircuitResponse::decode(decode_response(&bytes).payload.as_slice())
+            .expect("payload");
+        assert_eq!(state.relay.circuit_count(), 1);
+
+        // The circuit handle is the 8-byte BE circuit id (the same value
+        // OpenCircuit returns).
+        let close = api::CloseRelayCircuitRequest {
+            circuit_handle: Some(api::OpaqueHandle {
+                value: granted.circuit_id.to_be_bytes().to_vec(),
+            }),
+            reason: "done".into(),
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RelayService", "CloseRelayCircuit", encode_request(&close)),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        // The v1 close enters the CLOSING drain (relay.md §9.5): the circuit
+        // leaves the opening/active pool but is still a live registry entry
+        // until the drain completes.
+        assert_eq!(state.relay.circuit_count(), 1);
+        let snap = state.relay.snapshot().into_iter().next().expect("circuit");
+        assert_eq!(
+            snap.circuit.state,
+            umc_relay::circuit::CircuitState::Closing
+        );
+
+        // Closing an already-closing circuit is idempotent Ok; an unknown
+        // circuit id is NotFound and a malformed handle is InvalidArgument.
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RelayService", "CloseRelayCircuit", encode_request(&close)),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let unknown = api::CloseRelayCircuitRequest {
+            circuit_handle: Some(api::OpaqueHandle {
+                value: 999u64.to_be_bytes().to_vec(),
+            }),
+            ..Default::default()
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "RelayService",
+                "CloseRelayCircuit",
+                encode_request(&unknown),
+            ),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::NotFound as i32
+        );
+        let malformed = api::CloseRelayCircuitRequest {
+            circuit_handle: Some(api::OpaqueHandle {
+                value: b"short".to_vec(),
+            }),
+            reason: String::new(),
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "RelayService",
+                "CloseRelayCircuit",
+                encode_request(&malformed),
+            ),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::InvalidArgument as i32
+        );
+    }
+
+    #[test]
+    fn application_requests_count_per_service() {
+        let (mut state, _tx) = test_state();
+        dispatch_request(
+            &mut state,
+            &request(
+                "ApplicationService",
+                "RegisterApplication",
+                encode_request(&api::RegisterApplicationRequest {
+                    application_name: "notes".into(),
+                    requested_protocol_ids: vec!["org.umc.notes/1".into()],
+                    ..Default::default()
+                }),
+            ),
+            None,
+        );
+        assert_eq!(
+            state
+                .metrics
+                .get(crate::state::metric_names::CONTROL_REQUESTS_APP),
+            Some(1)
         );
     }
 }

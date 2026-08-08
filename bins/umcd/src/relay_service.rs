@@ -53,6 +53,16 @@ pub struct RelayService {
     events: Arc<Mutex<DaemonEvents>>,
 }
 
+/// One control-surface circuit snapshot (task F4): the circuit clone plus
+/// its owner peer endpoint id and destination hint.
+#[derive(Debug, Clone)]
+pub struct CircuitSnapshot {
+    pub circuit_id: u64,
+    pub circuit: Circuit,
+    pub owner_peer: Option<Vec<u8>>,
+    pub destination: Option<Vec<u8>>,
+}
+
 impl RelayService {
     #[must_use]
     pub fn new(events: Arc<Mutex<DaemonEvents>>) -> Self {
@@ -292,6 +302,29 @@ impl RelayService {
             .values()
             .filter(|c| !matches!(c.state, umc_relay::circuit::CircuitState::Closed))
             .count()
+    }
+
+    /// Control-surface snapshot (task F4): every circuit with its owner
+    /// peer endpoint id and destination hint, for `GetRelayStatus` and
+    /// `ListRelayCircuits`. The `Circuit` fields are all public, so the
+    /// caller shapes the proto summary.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<CircuitSnapshot> {
+        let mut owner_by_circuit: HashMap<u64, Vec<u8>> = HashMap::new();
+        for (peer, owned) in &self.circuits_by_owner {
+            for circuit_id in owned {
+                owner_by_circuit.insert(*circuit_id, peer.clone());
+            }
+        }
+        self.circuits
+            .iter()
+            .map(|(circuit_id, circuit)| CircuitSnapshot {
+                circuit_id: *circuit_id,
+                circuit: circuit.clone(),
+                owner_peer: owner_by_circuit.get(circuit_id).cloned(),
+                destination: self.destination_hints.get(circuit_id).cloned(),
+            })
+            .collect()
     }
 
     // circuit_count() is the live count the control surface reads; len and
