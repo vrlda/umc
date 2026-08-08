@@ -675,6 +675,21 @@ impl Session {
                 umc_wire::frame::Frame::ConnectionClose(_) => {
                     self.state = SessionState::Closed;
                 }
+                umc_wire::frame::Frame::NewConnectionId(frame) => {
+                    // Packet parsing uses a fixed 8-byte destination CID in
+                    // this protocol version. Do not install a CID that the
+                    // short-header parser could not later decode.
+                    if frame.connection_id.len() != DEFAULT_DCID_LEN {
+                        return Err(SessionError::BadConnectionId);
+                    }
+                    self.dcid = frame.connection_id;
+                }
+                umc_wire::frame::Frame::RetireConnectionId(frame) => {
+                    // Unknown retirements are harmless duplicates; retained
+                    // reset tokens stay in the manager until its bounded
+                    // pruning pass (session.md §30.3).
+                    let _ = self.cids.retire(frame.sequence);
+                }
                 umc_wire::frame::Frame::Ack(ack) => {
                     self.apply_peer_ack(&ack, now)?;
                 }
@@ -1253,6 +1268,47 @@ impl Session {
         self.direct_path_allowed
     }
 
+    /// Issue a fresh connection identifier for the peer and return the
+    /// encoded `NEW_CONNECTION_ID` frame that advertises it. The current
+    /// packet destination remains unchanged until the peer sends its own
+    /// `NEW_CONNECTION_ID`; this method rotates the identifier advertised by
+    /// this endpoint without exposing endpoint identity material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::ConnectionIdLimit`] when the bounded active
+    /// CID pool cannot issue another identifier, or [`SessionError::Encode`]
+    /// if the advertised frame cannot be encoded.
+    pub fn issue_connection_id(
+        &mut self,
+        entropy: &dyn EntropySource,
+    ) -> Result<Vec<u8>, SessionError> {
+        let cid = self
+            .cids
+            .issue(DEFAULT_DCID_LEN, entropy)
+            .ok_or(SessionError::ConnectionIdLimit)?;
+        let retire_prior_to = cid.sequence.saturating_sub(1);
+        if retire_prior_to > 0 {
+            let _ = self.cids.retire_prior_to(retire_prior_to);
+        }
+        umc_wire::frames::path::NewConnectionIdFrame {
+            sequence: cid.sequence,
+            retire_prior_to,
+            connection_id: cid.bytes,
+            reset_token: cid.reset_token,
+        }
+        .encode()
+        .map_err(|_| SessionError::Encode)
+    }
+
+    /// Returns the destination connection identifier currently used for
+    /// outbound packets. This is intentionally opaque to applications; it is
+    /// exposed only for transport/session tests and diagnostics.
+    #[must_use]
+    pub fn destination_connection_id(&self) -> &[u8] {
+        &self.dcid
+    }
+
     /// Enables or disables fixed-size padding for application data packets.
     /// Control packets (ACK/PING) and payloads already at or above the target
     /// remain unchanged.
@@ -1349,6 +1405,8 @@ pub enum SessionError {
     /// The privacy policy forbids using a direct carrier path for this
     /// session (privacy.md §45).
     DirectPathForbidden,
+    /// The bounded connection-ID issuance pool is exhausted.
+    ConnectionIdLimit,
     /// The peer sent a stateless reset (session.md §31): the packet could
     /// not be authenticated and carried the session's reset token. The
     /// session transitions to `Closed`; the daemon logs the event and
@@ -1371,6 +1429,14 @@ mod tests {
     impl Clock for TestClock {
         fn now(&self) -> Instant {
             Instant(0)
+        }
+    }
+
+    struct TestEntropy;
+
+    impl EntropySource for TestEntropy {
+        fn fill(&self, out: &mut [u8]) {
+            out.fill(0xCD);
         }
     }
 
@@ -1429,6 +1495,67 @@ mod tests {
             .expect("plain packet")
             .expect("active session");
         assert_ne!(unpadded.len(), first.len());
+    }
+
+    #[test]
+    fn connection_id_rotation_advertises_bounded_fresh_id() {
+        let mut session = session();
+        let encoded = session
+            .issue_connection_id(&TestEntropy)
+            .expect("connection id frame");
+        assert_eq!(
+            encoded[0],
+            u8::try_from(umc_types::frame::FrameType::NEW_CONNECTION_ID.0).unwrap()
+        );
+        let (frame, used) =
+            umc_wire::frames::path::NewConnectionIdFrame::decode(&encoded[1..]).expect("decode");
+        assert_eq!(used + 1, encoded.len());
+        assert_eq!(frame.connection_id.len(), DEFAULT_DCID_LEN);
+        assert_eq!(session.cids.active_count(), 1);
+    }
+
+    #[test]
+    fn authenticated_new_connection_id_updates_peer_destination() {
+        let mut sender = Session::new(
+            SessionConfig {
+                role: Role::Client,
+                dcid: vec![0u8; DEFAULT_DCID_LEN],
+                local_traffic_secret: [1u8; 32],
+                remote_traffic_secret: [2u8; 32],
+                initial_max_data: 1_000_000,
+                initial_max_stream_data: DEFAULT_INITIAL_MAX_STREAM_DATA,
+                max_ack_delay_ms: 25,
+            },
+            &TestClock,
+        )
+        .expect("sender");
+        let mut receiver = Session::new(
+            SessionConfig {
+                role: Role::Server,
+                dcid: vec![0u8; DEFAULT_DCID_LEN],
+                local_traffic_secret: [2u8; 32],
+                remote_traffic_secret: [1u8; 32],
+                initial_max_data: 1_000_000,
+                initial_max_stream_data: DEFAULT_INITIAL_MAX_STREAM_DATA,
+                max_ack_delay_ms: 25,
+            },
+            &TestClock,
+        )
+        .expect("receiver");
+        let frame = sender
+            .issue_connection_id(&TestEntropy)
+            .expect("new CID frame");
+        let packet = sender
+            .build_outbound(&TestClock, Instant(0), &frame)
+            .expect("packet")
+            .expect("active");
+        receiver
+            .on_inbound(Instant(0), &packet)
+            .expect("authenticated");
+        assert_eq!(
+            receiver.destination_connection_id(),
+            &[0xCD; DEFAULT_DCID_LEN]
+        );
     }
 
     /// Test controller that never limits sends: for tests exercising other

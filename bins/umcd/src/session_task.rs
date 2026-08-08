@@ -58,6 +58,9 @@ pub const FLUSH_INTERVAL: Duration = Duration::from_millis(5);
 /// (session.md §24): every 10 minutes, while the previous update has
 /// completed.
 pub const KEY_UPDATE_INTERVAL_MS: u64 = 10 * 60 * 1000;
+/// Rotate the endpoint's advertised connection ID on the same cadence as
+/// key updates (privacy.md §7, session.md §30).
+pub const DCID_ROTATION_INTERVAL_MS: u64 = 10 * 60 * 1000;
 /// Pending-bundle delivery sweep interval (bundles.md §10.1).
 pub const BUNDLE_FLUSH_INTERVAL_MS: u64 = 30 * 1000;
 /// Maximum bundle frames wrapped per delivery sweep; bundle payloads can
@@ -381,6 +384,7 @@ pub fn spawn_session_task(
 struct SweepState {
     established: Option<Instant>,
     last_key_update: Option<Instant>,
+    last_dcid_rotation: Option<Instant>,
     last_bundle_flush: Option<Instant>,
 }
 
@@ -545,6 +549,44 @@ async fn reader_loop(
                     });
                     if let Err(e) = sent {
                         log::debug!("[session {session_id}] keepalive send error: {e:?}");
+                    }
+                }
+                // Rotate the advertised CID from the periodic sweep as well
+                // as from inbound traffic, so an otherwise quiet session
+                // still gets the privacy benefit of identifier churn.
+                let built_dcid = {
+                    let mut session = session.lock().await;
+                    let due = sweep.established.is_some_and(|started| {
+                        dcid_rotation_due(now, started, sweep.last_dcid_rotation)
+                    });
+                    if due {
+                        if let Some(payload) = maybe_rotate_dcid(&mut session, &OsEntropy) {
+                            match session.build_outbound(clock.as_ref(), now, &payload) {
+                                Ok(packet) => {
+                                    if packet.is_some() {
+                                        sweep.last_dcid_rotation = Some(now);
+                                    }
+                                    packet
+                                }
+                                Err(_) => None,
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some(bytes) = built_dcid {
+                    let sent = tokio::task::block_in_place(|| {
+                        link.send(OutboundPacket {
+                            bytes,
+                            control: true,
+                            deadline_ms: None,
+                        })
+                    });
+                    if let Err(e) = sent {
+                        log::debug!("[session {session_id}] CID rotation send error: {e:?}");
                     }
                 }
                 if done {
@@ -805,10 +847,13 @@ async fn process_inbound_packet(
         let rotation_due = sweep
             .established
             .is_some_and(|started| key_rotation_due(now, started, sweep.last_key_update));
+        let dcid_due = sweep
+            .established
+            .is_some_and(|started| dcid_rotation_due(now, started, sweep.last_dcid_rotation));
         if sweep.established.is_none() {
             sweep.established = Some(now);
         }
-        if frames.is_some() || hint_due || sweep_due || rotation_due {
+        if frames.is_some() || hint_due || sweep_due || rotation_due || dcid_due {
             let mut state = runtime.lock().expect("runtime state");
             if let Some((_space, _path_id, control_frames)) = &frames {
                 if let Some(payload) =
@@ -836,6 +881,12 @@ async fn process_inbound_packet(
                     {
                         combined.extend_from_slice(&payload);
                     }
+                }
+            }
+            if dcid_due {
+                if let Some(payload) = maybe_rotate_dcid(&mut session, &OsEntropy) {
+                    combined.extend_from_slice(&payload);
+                    sweep.last_dcid_rotation = Some(now);
                 }
             }
         }
@@ -1485,6 +1536,17 @@ fn key_rotation_due(now: Instant, established: Instant, last: Option<Instant>) -
         })
 }
 
+/// A connection-ID rotation is due once per interval after session
+/// establishment. Keeping this independent from key-update state lets the
+/// privacy schedule proceed even when a key update is waiting for peer
+/// confirmation.
+fn dcid_rotation_due(now: Instant, established: Instant, last: Option<Instant>) -> bool {
+    now.0.saturating_sub(established.0) >= DCID_ROTATION_INTERVAL_MS
+        && last.map_or(true, |last| {
+            now.0.saturating_sub(last.0) >= DCID_ROTATION_INTERVAL_MS
+        })
+}
+
 /// Initiate a key update when due; returns the `KEY_UPDATE` frame payload.
 /// A still-pending update (the peer has not confirmed) is not an error —
 /// the next packet retries without advancing the schedule.
@@ -1504,6 +1566,16 @@ fn maybe_rotate_keys(
         }
         Err(_) => None,
     }
+}
+
+/// Issue and encode one fresh endpoint connection ID. The peer adopts the
+/// advertised value when it receives `NEW_CONNECTION_ID`; local outbound
+/// packets continue using the peer's current destination CID.
+fn maybe_rotate_dcid(
+    session: &mut Session,
+    entropy: &dyn umc_types::runtime::EntropySource,
+) -> Option<Vec<u8>> {
+    session.issue_connection_id(entropy).ok()
 }
 
 /// Rebuild the relay-request flags byte from a decoded `RELAY_OPEN`
@@ -2424,6 +2496,35 @@ mod tests {
             last == Some(Instant(KEY_UPDATE_INTERVAL_MS)),
             "a declined update must not advance the schedule"
         );
+    }
+
+    #[test]
+    fn dcid_rotation_schedule_and_frame() {
+        assert!(!dcid_rotation_due(Instant(0), Instant(0), None));
+        assert!(!dcid_rotation_due(
+            Instant(DCID_ROTATION_INTERVAL_MS - 1),
+            Instant(0),
+            None
+        ));
+        assert!(dcid_rotation_due(
+            Instant(DCID_ROTATION_INTERVAL_MS),
+            Instant(0),
+            None
+        ));
+        assert!(!dcid_rotation_due(
+            Instant(DCID_ROTATION_INTERVAL_MS),
+            Instant(0),
+            Some(Instant(DCID_ROTATION_INTERVAL_MS))
+        ));
+
+        let mut session = test_session();
+        let payload = maybe_rotate_dcid(&mut session, &OsEntropy).expect("new CID frame");
+        let frames = decode_outbound(&payload);
+        assert!(matches!(
+            &frames[0],
+            WireFrame::NewConnectionId(frame)
+                if frame.connection_id.len() == umc_session::session::DEFAULT_DCID_LEN
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
