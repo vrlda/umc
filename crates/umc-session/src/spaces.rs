@@ -69,6 +69,12 @@ impl PacketSpaceState {
     /// Admit an already-reconstructed packet number (the parser rebuilt the
     /// full pn for the AEAD open): replay-window check without a second
     /// reconstruction step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpaceError::DuplicateOrStale`] for replayed or below-window
+    /// packet numbers.
+    #[must_use]
     pub fn admit_reconstructed(&mut self, pn: u64) -> Result<u64, SpaceError> {
         if !self.replay.check_and_mark(pn) {
             return Err(SpaceError::DuplicateOrStale);
