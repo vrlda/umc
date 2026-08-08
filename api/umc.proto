@@ -664,7 +664,18 @@ message SessionSummary {
 message ListSessionsRequest { bytes endpoint_id = 1; SessionState state = 2; PageRequest page = 3; }
 message ListSessionsResponse { repeated SessionSummary sessions = 1; PageInfo page = 2; }
 message GetSessionRequest { OpaqueHandle session_handle = 1; }
-message GetSessionResponse { SessionSummary session = 1; repeated PathSummary paths = 2; }
+message SessionPrivacyInfo {
+  string requested_profile = 1;
+  string effective_profile = 2;
+  bool direct_path_allowed = 3;
+  bool traffic_padding_active = 4;
+  uint32 hop_count = 5;
+}
+message GetSessionResponse {
+  SessionSummary session = 1;
+  repeated PathSummary paths = 2;
+  SessionPrivacyInfo privacy = 3;
+}
 
 message PathSummary {
   uint64 path_id = 1;
