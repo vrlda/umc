@@ -135,6 +135,9 @@ pub struct Session {
     pub paths: HashMap<u64, crate::path::Path>,
     #[allow(dead_code)]
     cids: crate::cid::ConnectionIdManager,
+    /// Whether this session may use a direct carrier path (privacy.md §45).
+    /// P2 route policy turns this off before adding or migrating paths.
+    direct_path_allowed: bool,
     /// When the idle timer was last reset (session.md §22): every inbound
     /// packet carrying at least one real frame resets it, and the daemon
     /// touches it at app-originated send sites. Probes, retransmits,
@@ -222,6 +225,7 @@ impl Session {
             ),
             paths: HashMap::new(),
             cids: crate::cid::ConnectionIdManager::new(crate::cid::DEFAULT_ACTIVE_LIMIT),
+            direct_path_allowed: true,
             last_activity: None,
             draining_deadline: None,
             stateless_reset_secret: None,
@@ -1082,6 +1086,9 @@ impl Session {
         remote: Vec<u8>,
         now: Instant,
     ) -> Result<(), SessionError> {
+        if !self.direct_path_allowed && is_direct_carrier(&carrier_type) {
+            return Err(SessionError::DirectPathForbidden);
+        }
         let active = self
             .paths
             .values()
@@ -1158,6 +1165,9 @@ impl Session {
             .paths
             .get(&new_path_id)
             .ok_or(SessionError::PathNotFound)?;
+        if !self.direct_path_allowed && is_direct_carrier(&path.carrier_type) {
+            return Err(SessionError::DirectPathForbidden);
+        }
         if path.state != crate::path::PathState::Validated {
             return Err(SessionError::PathNotValidated);
         }
@@ -1222,12 +1232,27 @@ impl Session {
         }
     }
 
+    /// Enables or disables direct-carrier paths for this session.
+    pub fn set_direct_path_allowed(&mut self, allowed: bool) {
+        self.direct_path_allowed = allowed;
+    }
+
+    /// Returns whether direct-carrier paths are permitted.
+    #[must_use]
+    pub fn direct_path_allowed(&self) -> bool {
+        self.direct_path_allowed
+    }
+
     fn entropy_fill(out: &mut [u8]) {
         // The session holds no entropy source directly in Phase 4; the daemon
         // supplies challenges through Node. For library tests, a deterministic
         // fill keeps behavior reproducible.
         out.fill(0xAB);
     }
+}
+
+fn is_direct_carrier(carrier_type: &str) -> bool {
+    !carrier_type.contains("relay") && !carrier_type.contains("route")
 }
 
 /// Upper bound on the protected-packet overhead beyond the payload (short
@@ -1285,6 +1310,9 @@ pub enum SessionError {
     /// exhausted: the send would exceed it (congestion.md §7.1). ACK
     /// payloads are exempt.
     CongestionLimited,
+    /// The privacy policy forbids using a direct carrier path for this
+    /// session (privacy.md §45).
+    DirectPathForbidden,
     /// The peer sent a stateless reset (session.md §31): the packet could
     /// not be authenticated and carried the session's reset token. The
     /// session transitions to `Closed`; the daemon logs the event and
@@ -1324,6 +1352,24 @@ mod tests {
             &TestClock,
         )
         .expect("session")
+    }
+
+    #[test]
+    fn private_path_policy_rejects_direct_carriers() {
+        let mut session = session();
+        session.set_direct_path_allowed(false);
+        assert!(!session.direct_path_allowed());
+        assert_eq!(
+            session.add_path(1, "ump.tcp/1".into(), vec![], vec![], Instant(0)),
+            Err(SessionError::DirectPathForbidden)
+        );
+        session
+            .add_path(1, "ump.relay/1".into(), vec![], vec![], Instant(0))
+            .expect("relay path is allowed by the private policy");
+        session.force_validate(1);
+        session
+            .migrate_to(1, true, Instant(0))
+            .expect("validated relay path can become primary");
     }
 
     /// Test controller that never limits sends: for tests exercising other
