@@ -460,6 +460,9 @@ fn handle_inbound_link_locked(
         state.node.clock.as_ref(),
     )
     .map_err(|e| format!("session: {e:?}"))?;
+    // Stateless-reset support (session.md §31): the token is derived from
+    // the handshake's shared `stateless reset` secret (handshake.md §26).
+    session.set_stateless_reset_secret(secrets.stateless_reset);
     // Register the default data path so the anti-amplification budget is
     // active on the session's primary path (session.md §26).
     session
