@@ -2447,27 +2447,22 @@ fn register_application(
     if register.application_name.is_empty() || register.requested_protocol_ids.is_empty() {
         return (api::StatusCode::InvalidArgument as i32, None);
     }
+    let mut registered_protocols = Vec::with_capacity(register.requested_protocol_ids.len());
     for protocol_id in &register.requested_protocol_ids {
         match state.apps.register(
             protocol_id.as_bytes().to_vec(),
             register.application_name.clone(),
         ) {
-            Ok(()) => {}
+            Ok(()) => registered_protocols.push(protocol_id.as_bytes().to_vec()),
             Err(umc_core::app::AppError::AlreadyRegistered) => {
-                for earlier in &register.requested_protocol_ids {
-                    if earlier == protocol_id {
-                        break;
-                    }
-                    let _ = state.apps.unregister(earlier.as_bytes());
+                for earlier in &registered_protocols {
+                    let _ = state.apps.unregister(earlier);
                 }
                 return (api::StatusCode::AlreadyExists as i32, None);
             }
             Err(umc_core::app::AppError::InvalidProtocolId) => {
-                for earlier in &register.requested_protocol_ids {
-                    if earlier == protocol_id {
-                        break;
-                    }
-                    let _ = state.apps.unregister(earlier.as_bytes());
+                for earlier in &registered_protocols {
+                    let _ = state.apps.unregister(earlier);
                 }
                 return (api::StatusCode::InvalidArgument as i32, None);
             }
@@ -2475,12 +2470,22 @@ fn register_application(
         }
     }
     let mut channels = state.app_channels.lock().expect("app channels");
+    let mut receivers = state.app_echo_rx.lock().expect("app echo receivers");
     for protocol_id in &register.requested_protocol_ids {
-        let (in_tx, _in_rx) =
+        let (in_tx, in_rx) =
             umc_core::app_io::spawn_app_channel(crate::app_layer::APP_CHANNEL_BUFFER);
         channels.insert(protocol_id.as_bytes().to_vec(), in_tx);
+        // Keep the receiver alive. The session writer drains this map for
+        // in-process application hosting; dropping it here makes every
+        // forwarded frame fail with a closed-channel error.
+        receivers.insert(protocol_id.as_bytes().to_vec(), in_rx);
     }
+    drop(receivers);
     drop(channels);
+    state.application_protocols.insert(
+        register.requested_protocol_ids[0].as_bytes().to_vec(),
+        registered_protocols,
+    );
     push_event(
         state,
         "application_registered",
@@ -2504,9 +2509,9 @@ fn register_application(
 }
 
 /// `ApplicationService.UnregisterApplication` (control-api.md §31): drop
-/// the app from the registry and remove its inbound channel. Unknown
-/// handles are `NotFound`. `close_owned_sessions` is moot in v1: no
-/// sessions are owned (no bound-session model).
+/// the app from the registry and remove every protocol/channel belonging to
+/// its handle. Unknown handles are `NotFound`. `close_owned_sessions` is moot
+/// in v1: no sessions are owned (no bound-session model).
 fn unregister_application(
     state: &mut RuntimeState,
     request: &api::Request,
@@ -2518,14 +2523,27 @@ fn unregister_application(
     let Some(handle) = unregister.application_handle else {
         return (api::StatusCode::InvalidArgument as i32, None);
     };
-    if !state.apps.unregister(&handle.value) {
+    let Some(protocol_ids) = state
+        .application_protocols
+        .remove(&handle.value)
+        .or_else(|| {
+            state
+                .apps
+                .lookup(&handle.value)
+                .map(|_| vec![handle.value.clone()])
+        })
+    else {
         return (api::StatusCode::NotFound as i32, None);
+    };
+    let mut channels = state.app_channels.lock().expect("app channels");
+    let mut receivers = state.app_echo_rx.lock().expect("app echo receivers");
+    for protocol_id in protocol_ids {
+        let _ = state.apps.unregister(&protocol_id);
+        channels.remove(&protocol_id);
+        receivers.remove(&protocol_id);
     }
-    state
-        .app_channels
-        .lock()
-        .expect("app channels")
-        .remove(&handle.value);
+    drop(receivers);
+    drop(channels);
     push_event(state, "application_unregistered", String::new());
     let mut payload = Vec::new();
     Message::encode(&api::UnregisterApplicationResponse {}, &mut payload).expect("encode");
@@ -6291,6 +6309,118 @@ mod tests {
             decode_response(&bytes).status.unwrap().code,
             api::StatusCode::NotFound as i32
         );
+    }
+
+    #[test]
+    fn register_application_retains_channel_receiver() {
+        let (mut state, _tx) = test_state();
+        let protocol = b"org.umc.notes/1".to_vec();
+        let register = api::RegisterApplicationRequest {
+            application_name: "notes".into(),
+            requested_protocol_ids: vec![String::from_utf8(protocol.clone()).expect("protocol")],
+            ..Default::default()
+        };
+
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "ApplicationService",
+                "RegisterApplication",
+                encode_request(&register),
+            ),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+
+        let sender = state
+            .app_channels
+            .lock()
+            .expect("app channels")
+            .get(&protocol)
+            .cloned()
+            .expect("registered sender");
+        let mut receiver = state
+            .app_echo_rx
+            .lock()
+            .expect("app echo receivers")
+            .remove(&protocol)
+            .expect("registered receiver must stay alive");
+        sender
+            .try_send_stream_frame(7, b"payload".to_vec())
+            .expect("receiver is alive");
+        assert_eq!(
+            receiver.try_recv_stream_frame().expect("queued frame"),
+            (7, b"payload".to_vec())
+        );
+    }
+
+    #[test]
+    fn unregister_application_removes_all_protocols_and_channels() {
+        let (mut state, _tx) = test_state();
+        let protocols = [b"org.umc.notes/1".to_vec(), b"org.umc.notes/2".to_vec()];
+        let register = api::RegisterApplicationRequest {
+            application_name: "notes".into(),
+            requested_protocol_ids: protocols
+                .iter()
+                .map(|id| String::from_utf8(id.clone()).expect("protocol"))
+                .collect(),
+            ..Default::default()
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "ApplicationService",
+                "RegisterApplication",
+                encode_request(&register),
+            ),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let handle = api::RegisterApplicationResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .application_handle
+            .expect("application handle");
+
+        let unregister = api::UnregisterApplicationRequest {
+            application_handle: Some(handle),
+            ..Default::default()
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "ApplicationService",
+                "UnregisterApplication",
+                encode_request(&unregister),
+            ),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        for protocol in protocols {
+            assert!(
+                state.apps.lookup(&protocol).is_none(),
+                "registry entry must be removed: {protocol:?}"
+            );
+            assert!(!state
+                .app_channels
+                .lock()
+                .expect("app channels")
+                .contains_key(&protocol));
+            assert!(!state
+                .app_echo_rx
+                .lock()
+                .expect("app echo receivers")
+                .contains_key(&protocol));
+        }
     }
 
     #[test]
