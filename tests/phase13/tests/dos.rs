@@ -137,6 +137,7 @@ fn session_close_releases_state() {
     let payload = frame.encode().expect("close frame");
     let pkt = build_protected_packet(
         &keys,
+        &umc_crypto::header_protection::header_protection_key(&[2u8; 32]),
         ShortPacketSpace::SessionData,
         &[7u8; 8],
         0,

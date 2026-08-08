@@ -115,13 +115,14 @@ fn send_client_auth(
 
 /// Client-side TCP handshake over `Node`'s carrier, returning the live
 /// link, the client session, the client's REAL peer endpoint id (which the
-/// daemon registers from the `CLIENT_AUTH` binding), and the client's
-/// remote packet keys for parsing the daemon's protected replies.
+/// daemon registers from the `CLIENT_AUTH` binding), the client's
+/// remote packet keys for parsing the daemon's protected replies, and the
+/// matching remote header-protection key.
 #[allow(clippy::type_complexity, clippy::too_many_lines)]
 fn tcp_handshake(
     node: &umc_core::node::Node,
     remote: &str,
-) -> Result<(BoxLink, Session, [u8; 32], PacketKeys), String> {
+) -> Result<(BoxLink, Session, [u8; 32], PacketKeys, [u8; 32]), String> {
     let carrier = node.carrier("ump.tcp/1").ok_or("tcp carrier missing")?;
     let link = carrier
         .dial(remote.to_string())
@@ -228,11 +229,13 @@ fn tcp_handshake(
     .map_err(|e| format!("session: {e:?}"))?;
     let remote_keys = PacketKeys::from_traffic_secret(&secrets.server)
         .map_err(|e| format!("remote keys: {e:?}"))?;
+    let remote_hp_key = umc_crypto::header_protection::header_protection_key(&secrets.server);
     Ok((
         link,
         session,
         node.config.identity.endpoint_id(),
         remote_keys,
+        remote_hp_key,
     ))
 }
 
@@ -283,9 +286,9 @@ impl WaitFor {
 /// daemon's session layer has the same limitation), so the payload is
 /// walked varint-by-varint: `ACK` bodies are skipped via their own decode,
 /// the status body is decoded directly.
-fn status_from_protected(keys: &PacketKeys, bytes: &[u8]) -> Option<u64> {
+fn status_from_protected(keys: &PacketKeys, hp_key: &[u8; 32], bytes: &[u8]) -> Option<u64> {
     let (_space, _dcid, _path, _pn, payload) =
-        umc_session::packet::parse_protected_packet(keys, bytes).ok()?;
+        umc_session::packet::parse_protected_packet(keys, hp_key, bytes).ok()?;
     let mut pos = 0usize;
     while pos < payload.len() {
         let (ty, used) = umc_wire::varint::decode(&payload[pos..]).ok()?;
@@ -317,6 +320,7 @@ async fn recv_until(
     link: &Arc<BoxLink>,
     session: &Arc<Mutex<Session>>,
     keys: PacketKeys,
+    hp_key: [u8; 32],
     statuses: &Arc<Mutex<Vec<u64>>>,
     raw_frames: &Arc<Mutex<Vec<Vec<u8>>>>,
     wait_for: WaitFor,
@@ -349,7 +353,7 @@ async fn recv_until(
                         });
                     }
                 }
-                if let Some(code) = status_from_protected(&keys, &bytes) {
+                if let Some(code) = status_from_protected(&keys, &hp_key, &bytes) {
                     statuses_arc.lock().expect("statuses").push(code);
                 }
             }
@@ -552,7 +556,7 @@ async fn relay_data_forwarded_between_two_live_sessions() {
         let remote = remote.clone();
         move || tcp_handshake(&node_a, &remote)
     });
-    let (link_a, session_a, peer_a_id, keys_a) =
+    let (link_a, session_a, peer_a_id, keys_a, hp_a) =
         tokio::time::timeout(Duration::from_secs(20), handshake_a)
             .await
             .expect("A handshake timed out")
@@ -562,7 +566,7 @@ async fn relay_data_forwarded_between_two_live_sessions() {
         let remote = remote.clone();
         move || tcp_handshake(&node_b, &remote)
     });
-    let (link_b, session_b, peer_b_eid, keys_b) =
+    let (link_b, session_b, peer_b_eid, keys_b, hp_b) =
         tokio::time::timeout(Duration::from_secs(20), handshake_b)
             .await
             .expect("B handshake timed out")
@@ -607,6 +611,7 @@ async fn relay_data_forwarded_between_two_live_sessions() {
         &link_a,
         &session_a,
         keys_a.clone(),
+        hp_a,
         &statuses_a,
         &raw_frames_b,
         WaitFor::Status(1),
@@ -630,6 +635,7 @@ async fn relay_data_forwarded_between_two_live_sessions() {
         &link_b,
         &session_b,
         keys_b.clone(),
+        hp_b,
         &statuses_b,
         &raw_frames_b,
         WaitFor::Status(1),
@@ -672,6 +678,7 @@ async fn relay_data_forwarded_between_two_live_sessions() {
             &link_b,
             &session_b,
             keys_b.clone(),
+            hp_b,
             &statuses_b,
             &raw_frames_b,
             WaitFor::ForwardedRelayData,

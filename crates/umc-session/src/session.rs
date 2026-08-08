@@ -10,6 +10,7 @@ use super::spaces::{PacketSpace, PacketSpaceState};
 use super::stream::{Stream, StreamError};
 use std::collections::{HashMap, HashSet};
 use umc_crypto::aead::PacketKeys;
+use umc_crypto::header_protection::header_protection_key;
 use umc_types::runtime::{Clock, Duration, EntropySource, Instant};
 use umc_wire::header::ShortPacketSpace;
 use umc_wire::packet::PacketContext;
@@ -96,6 +97,11 @@ pub struct Session {
     pub state: SessionState,
     local_keys: PacketKeys,
     remote_keys: PacketKeys,
+    /// Header protection keys (wire-format §18), derived from the traffic
+    /// secrets at construction: the local key masks outbound headers, the
+    /// remote key unmasks inbound ones.
+    local_hp_key: [u8; 32],
+    remote_hp_key: [u8; 32],
     spaces: HashMap<PacketSpace, PacketSpaceState>,
     sent: AckSendState,
     /// Congestion controller (congestion.md §7): bounds in-flight bytes
@@ -190,6 +196,8 @@ impl Session {
                 .map_err(|_| SessionError::BadKeys)?,
             remote_keys: PacketKeys::from_traffic_secret(&config.remote_traffic_secret)
                 .map_err(|_| SessionError::BadKeys)?,
+            local_hp_key: header_protection_key(&config.local_traffic_secret),
+            remote_hp_key: header_protection_key(&config.remote_traffic_secret),
             spaces,
             sent: AckSendState::new(),
             congestion: Box::new(RenoCongestionController::new()),
@@ -476,6 +484,7 @@ impl Session {
         let keys = &self.local_keys;
         let pkt = build_protected_packet(
             keys,
+            &self.local_hp_key,
             ShortPacketSpace::SessionData,
             &self.dcid,
             0,
@@ -522,7 +531,11 @@ impl Session {
     #[allow(clippy::too_many_lines)] // per-frame dispatch arms; each is a few lines
     pub fn on_inbound(&mut self, now: Instant, bytes: &[u8]) -> Result<Vec<u8>, SessionError> {
         let (space_kind, _dcid, path_id, truncated_pn, payload) =
-            match super::packet::parse_protected_packet(&self.remote_keys, bytes) {
+            match super::packet::parse_protected_packet(
+                &self.remote_keys,
+                &self.remote_hp_key,
+                bytes,
+            ) {
                 Ok(parsed) => parsed,
                 Err(e) => {
                     // session.md §31: a packet that cannot be authenticated
@@ -971,10 +984,8 @@ impl Session {
             return None;
         }
         self.last_reset_ms = Some(now.0);
-        let mut reset = crate::reset::build_stateless_reset(
-            &crate::reset::reset_token(&secret),
-            entropy,
-        );
+        let mut reset =
+            crate::reset::build_stateless_reset(&crate::reset::reset_token(&secret), entropy);
         // Amplification guard (wire-format.md §76): the reset must be no
         // larger than the triggering packet; small triggers are answered
         // with a shorter reset (never below the minimum packet size).

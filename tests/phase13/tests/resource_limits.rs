@@ -51,6 +51,7 @@ fn replay_window_memory_bounded() {
         let wire_pn = pn & 0xFFFF;
         let pkt = build_protected_packet(
             &keys,
+            &umc_crypto::header_protection::header_protection_key(&[2u8; 32]),
             ShortPacketSpace::SessionData,
             &dcid,
             0,

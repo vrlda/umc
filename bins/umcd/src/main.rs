@@ -727,6 +727,8 @@ fn register_session(
     let session_id = state.sessions.next_id();
     let remote_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&remote_traffic_secret)
         .map_err(|e| format!("remote keys: {e:?}"))?;
+    let remote_hp_key =
+        umc_crypto::header_protection::header_protection_key(&remote_traffic_secret);
     // Ticket-issuance material (handshake.md §35): XX sessions carry their
     // resumption secret to the clean-close path; resumed sessions issue no
     // ticket (single resumption hop).
@@ -751,6 +753,7 @@ fn register_session(
         state.app_echo_rx.clone(),
         runtime,
         remote_keys,
+        remote_hp_key,
         ticket_material,
         bus_inbound_rx,
         bus_outbound_rx,

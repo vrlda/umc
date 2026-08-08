@@ -8,6 +8,22 @@ use chacha20::ChaCha20;
 /// Length of the header protection mask in bytes.
 pub const MASK_LEN: usize = 5;
 
+/// Derives the header protection key from a traffic secret via
+/// `expand_label(secret, b"hp key", b"", 32)` (wire-format §18).
+///
+/// The label is the sanctioned convention for header protection keys; it
+/// domain-separates the hp key from the AEAD packet key and IV. The
+/// expansion cannot fail for a 32-byte output (HKDF's length bound is
+/// `255 * HashLen`), so the helper returns the key directly.
+#[must_use]
+pub fn header_protection_key(traffic_secret: &[u8; 32]) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    if let Ok(expanded) = crate::label::expand_label(traffic_secret, b"hp key", b"", 32) {
+        key.copy_from_slice(&expanded);
+    }
+    key
+}
+
 /// Computes the header protection mask as 5 bytes of `ChaCha20` keystream.
 ///
 /// Provisional construction: the mask is key-only. The packet number
@@ -95,5 +111,20 @@ mod tests {
         let a = mask(&[1u8; 32], &pn);
         let b = mask(&[2u8; 32], &pn);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hp_key_derivation_stable_and_distinct() {
+        let a = header_protection_key(&[1u8; 32]);
+        let b = header_protection_key(&[1u8; 32]);
+        assert_eq!(a, b, "derivation is deterministic");
+        let c = header_protection_key(&[2u8; 32]);
+        assert_ne!(a, c, "different traffic secrets give different hp keys");
+        // The hp key is domain-separated from the packet key by label
+        // (wire-format §18), so it must never equal the AEAD key.
+        let packet_key = crate::aead::PacketKeys::from_traffic_secret(&[1u8; 32])
+            .expect("packet keys")
+            .key;
+        assert_ne!(a, packet_key, "hp key differs from the packet key");
     }
 }
