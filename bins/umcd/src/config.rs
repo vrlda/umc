@@ -29,6 +29,9 @@ pub struct NodeConfig {
     /// Immediately refuses new public-relay circuit admission. Existing
     /// circuits are drained by their normal lifetime/close path.
     pub disable_public_relay: bool,
+    /// Peers to dial at startup and on the bounded retry interval
+    /// (discovery.md §15). Endpoint ids are lowercase/uppercase hex.
+    pub static_peers: Vec<StaticPeerConfig>,
     /// Telemetry opt-in (core.md §61, privacy.md §38): off by default. The
     /// daemon dumps a bounded JSONL metrics file only when enabled.
     pub telemetry_enabled: bool,
@@ -44,6 +47,13 @@ pub struct NodeConfig {
     /// to it (defaults to `<data_dir>/node.json`). Never serialized.
     #[serde(skip)]
     pub config_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaticPeerConfig {
+    pub endpoint_id: String,
+    pub carrier: String,
+    pub address: String,
 }
 
 impl Default for NodeConfig {
@@ -62,6 +72,7 @@ impl Default for NodeConfig {
             disabled_crypto_profiles: Vec::new(),
             disabled_carriers: Vec::new(),
             disable_public_relay: false,
+            static_peers: Vec::new(),
             telemetry_enabled: false,
             allow_secret_export: false,
             development_token: None,
@@ -159,6 +170,10 @@ impl NodeConfig {
             }
             "disabled_carriers" => {
                 self.disabled_carriers = parse_csv(value);
+            }
+            "static_peers" => {
+                self.static_peers = serde_json::from_str(value)
+                    .map_err(|e| format!("static_peers must be a JSON array: {e}"))?;
             }
             other => return Err(format!("unsupported config key {other:?}")),
         }
@@ -269,6 +284,7 @@ mod tests {
         assert!(config.disabled_crypto_profiles.is_empty());
         assert!(config.disabled_carriers.is_empty());
         assert!(!config.disable_public_relay);
+        assert!(config.static_peers.is_empty());
     }
 
     #[test]
@@ -318,6 +334,13 @@ mod tests {
         let mut config = NodeConfig::default();
         config.set_entry("profile", "relay").unwrap();
         assert_eq!(config.profile, "relay");
+        config
+            .set_entry(
+                "static_peers",
+                r#"[{"endpoint_id":"0000000000000000000000000000000000000000000000000000000000000001","carrier":"ump.tcp/1","address":"127.0.0.1:9001"}]"#,
+            )
+            .unwrap();
+        assert_eq!(config.static_peers.len(), 1);
         config.set_entry("mesh", "true").unwrap();
         assert!(config.mesh);
         config.set_entry("public_relay", "false").unwrap();

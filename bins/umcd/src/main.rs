@@ -19,6 +19,7 @@ mod session_bus;
 mod session_manager;
 mod session_task;
 mod state;
+mod static_peers;
 mod telemetry;
 
 use clap::Parser;
@@ -170,6 +171,11 @@ async fn run(config: NodeConfig) {
     let server_state = state.clone();
     let server_task = tokio::spawn(server::run(server_state));
 
+    let static_peers = state.lock().expect("state").config.static_peers.clone();
+    if !static_peers.is_empty() {
+        static_peers::dial_all(&state, &static_peers).await;
+    }
+
     // Graceful shutdown: SIGINT sets the flag and releases the channel.
     let (shutdown_flag, shutdown_tx) = {
         let state = state.lock().expect("state");
@@ -185,7 +191,18 @@ async fn run(config: NodeConfig) {
         let _ = shutdown_tx.send(()).await;
     });
 
-    let _ = shutdown_rx.recv().await;
+    // Retry static bootstrap contacts after a bounded interval. The first
+    // interval tick is consumed so startup dialing above is not duplicated.
+    let mut static_retry = tokio::time::interval(Duration::from_secs(30));
+    static_retry.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => break,
+            _ = static_retry.tick() => {
+                static_peers::dial_all(&state, &static_peers).await;
+            }
+        }
+    }
     log::info!("shutdown: complete");
     // Wait for the control socket to finish closing before exiting.
     let _ = server_task.await;
