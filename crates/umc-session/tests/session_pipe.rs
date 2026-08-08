@@ -1211,3 +1211,99 @@ fn stop_sending_marks_send_stopped() {
         ))
     );
 }
+
+/// A session with a known stateless-reset secret, for reset tests.
+fn reset_capable_session(secret: [u8; 32]) -> Session {
+    let mut session = Session::new(
+        SessionConfig {
+            role: Role::Server,
+            dcid: vec![9u8; 8],
+            local_traffic_secret: [1u8; 32],
+            remote_traffic_secret: [2u8; 32],
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("server session");
+    session.set_stateless_reset_secret(secret);
+    session
+}
+
+#[test]
+fn peer_stateless_reset_closes_session() {
+    // The stateless-reset secret is shared by both endpoints (handshake.md
+    // §26), so the client's token is the server's token: a reset crafted
+    // with it must be accepted.
+    let secret = [0x22u8; 32];
+    let mut server = reset_capable_session(secret);
+    let token = umc_session::reset::reset_token(&secret);
+    let reset = umc_session::reset::build_stateless_reset(&token, &TestEntropy);
+
+    // The reset cannot be authenticated (its tail is random) and carries
+    // the session's token at the fixed slot: the peer is resetting us
+    // (session.md §31) — the session closes without a response.
+    assert_eq!(
+        server.on_inbound(Instant(1_000_000), &reset),
+        Err(umc_session::session::SessionError::StatelessReset)
+    );
+    assert_eq!(server.state, SessionState::Closed);
+}
+
+#[test]
+fn tampered_reset_does_not_close_session() {
+    let secret = [0x22u8; 32];
+    let mut server = reset_capable_session(secret);
+    let wrong_token = [0x99u8; 16];
+    let reset = umc_session::reset::build_stateless_reset(&wrong_token, &TestEntropy);
+
+    // A packet that fails decryption but does NOT carry the session's token
+    // is a plain unauthenticated packet: the session stays active.
+    assert!(server.on_inbound(Instant(1_000_000), &reset).is_err());
+    assert_eq!(server.state, SessionState::Active);
+}
+
+#[test]
+fn reset_emission_is_rate_limited() {
+    let secret = [0x22u8; 32];
+    let mut server = reset_capable_session(secret);
+    let token = umc_session::reset::reset_token(&secret);
+
+    // First emission: builds a reset carrying the session's token.
+    let first = server
+        .maybe_emit_stateless_reset(Instant(1_000_000), &TestEntropy)
+        .expect("first reset");
+    assert!(umc_session::reset::token_matches(&first, &token));
+    // Immediate second emission is suppressed by the 1-per-minute rate
+    // limit (session.md §31).
+    assert!(server
+        .maybe_emit_stateless_reset(Instant(1_000_001), &TestEntropy)
+        .is_none());
+    // Still suppressed inside the minute.
+    assert!(server
+        .maybe_emit_stateless_reset(Instant(1_059_999), &TestEntropy)
+        .is_none());
+    // After a full minute the limit has elapsed: emitted again.
+    let third = server
+        .maybe_emit_stateless_reset(Instant(1_060_000), &TestEntropy)
+        .expect("reset after the rate limit elapses");
+    assert!(umc_session::reset::token_matches(&third, &token));
+    // A session without a configured secret never emits.
+    let mut plain = Session::new(
+        SessionConfig {
+            role: Role::Server,
+            dcid: vec![9u8; 8],
+            local_traffic_secret: [1u8; 32],
+            remote_traffic_secret: [2u8; 32],
+            initial_max_data: 4 * 1024 * 1024,
+            initial_max_stream_data: 256 * 1024,
+            max_ack_delay_ms: 25,
+        },
+        &TestClock,
+    )
+    .expect("session without a reset secret");
+    assert!(plain
+        .maybe_emit_stateless_reset(Instant(1_000_000), &TestEntropy)
+        .is_none());
+}

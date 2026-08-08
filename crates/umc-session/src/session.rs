@@ -10,7 +10,7 @@ use super::spaces::{PacketSpace, PacketSpaceState};
 use super::stream::{Stream, StreamError};
 use std::collections::{HashMap, HashSet};
 use umc_crypto::aead::PacketKeys;
-use umc_types::runtime::{Clock, Duration, Instant};
+use umc_types::runtime::{Clock, Duration, EntropySource, Instant};
 use umc_wire::header::ShortPacketSpace;
 use umc_wire::packet::PacketContext;
 
@@ -33,6 +33,9 @@ pub const IDLE_TIMEOUT_MS: u64 = 30_000;
 pub const CLOSE_REASON_IDLE_TIMEOUT: u64 = 0x16;
 /// Minimum draining period (session.md §6.4): 1 s.
 pub const MIN_DRAIN_MS: u64 = 1_000;
+/// Rate limit between emitted stateless resets (session.md §31): 1 per
+/// minute per connection.
+pub const STATELESS_RESET_INTERVAL_MS: u64 = 60_000;
 
 /// Bounded set of stream ids that reached EOF and were read: re-opening
 /// (or delivering to) a closed id is a protocol violation (session.md §29).
@@ -136,6 +139,13 @@ pub struct Session {
     /// Absolute deadline of the draining period (session.md §6.4), set by
     /// [`Session::close`]; `None` until the session starts draining.
     draining_deadline: Option<Instant>,
+    /// Stateless-reset secret (session.md §31): `None` disables reset
+    /// detection and emission for this session.
+    stateless_reset_secret: Option<[u8; 32]>,
+    /// Millisecond instant of the last emitted stateless reset: emission is
+    /// rate-limited to one per [`STATELESS_RESET_INTERVAL_MS`] per
+    /// connection (session.md §31).
+    last_reset_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for Session {
@@ -206,7 +216,18 @@ impl Session {
             cids: crate::cid::ConnectionIdManager::new(crate::cid::DEFAULT_ACTIVE_LIMIT),
             last_activity: None,
             draining_deadline: None,
+            stateless_reset_secret: None,
+            last_reset_ms: None,
         })
+    }
+
+    /// Supply the session's stateless-reset secret (session.md §31): the
+    /// first 16 bytes are the connection's stateless-reset token. The daemon
+    /// fills it from its handshake-derived session secrets right after
+    /// construction; without it the session neither detects nor emits
+    /// stateless resets.
+    pub fn set_stateless_reset_secret(&mut self, secret: [u8; 32]) {
+        self.stateless_reset_secret = Some(secret);
     }
 
     /// Open a new initiator-bidirectional stream.
@@ -501,8 +522,26 @@ impl Session {
     #[allow(clippy::too_many_lines)] // per-frame dispatch arms; each is a few lines
     pub fn on_inbound(&mut self, now: Instant, bytes: &[u8]) -> Result<Vec<u8>, SessionError> {
         let (space_kind, _dcid, path_id, truncated_pn, payload) =
-            super::packet::parse_protected_packet(&self.remote_keys, bytes)
-                .map_err(SessionError::Packet)?;
+            match super::packet::parse_protected_packet(&self.remote_keys, bytes) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    // session.md §31: a packet that cannot be authenticated
+                    // may be a stateless reset — a short-header packet
+                    // carrying our token at the fixed slot of the canonical
+                    // layout. The check runs on ANY parse failure: with a
+                    // random token the header parse can fail before reaching
+                    // the AEAD tag. A match closes the session without a
+                    // response.
+                    if let Some(secret) = self.stateless_reset_secret {
+                        let token = crate::reset::reset_token(&secret);
+                        if crate::reset::token_matches(bytes, &token) {
+                            self.state = SessionState::Closed;
+                            return Err(SessionError::StatelessReset);
+                        }
+                    }
+                    return Err(SessionError::Packet(e));
+                }
+            };
         let space = match space_kind {
             ShortPacketSpace::SessionData => PacketSpace::SessionData,
             ShortPacketSpace::PathControl => PacketSpace::PathControl,
@@ -911,6 +950,32 @@ impl Session {
         self.state = SessionState::Closed;
     }
 
+    /// Build a stateless-reset packet (session.md §31), rate-limited to one
+    /// per [`STATELESS_RESET_INTERVAL_MS`] per connection. The daemon calls
+    /// this when a packet arrives for a session that no longer exists (an
+    /// inbound that failed authentication, or a closed session) and sends
+    /// the bytes on the link as ordinary traffic. Returns `None` when the
+    /// session has no configured reset secret or the rate limit has not
+    /// elapsed.
+    pub fn maybe_emit_stateless_reset(
+        &mut self,
+        now: Instant,
+        entropy: &dyn EntropySource,
+    ) -> Option<Vec<u8>> {
+        let secret = self.stateless_reset_secret?;
+        if self
+            .last_reset_ms
+            .is_some_and(|last| now.0.saturating_sub(last) < STATELESS_RESET_INTERVAL_MS)
+        {
+            return None;
+        }
+        self.last_reset_ms = Some(now.0);
+        Some(crate::reset::build_stateless_reset(
+            &crate::reset::reset_token(&secret),
+            entropy,
+        ))
+    }
+
     /// Replay-window footprint in bytes for `space` (session.md §8.2): a
     /// fixed 512 bytes no matter how many packets were received.
     #[must_use]
@@ -1187,6 +1252,11 @@ pub enum SessionError {
     /// exhausted: the send would exceed it (congestion.md §7.1). ACK
     /// payloads are exempt.
     CongestionLimited,
+    /// The peer sent a stateless reset (session.md §31): the packet could
+    /// not be authenticated and carried the session's reset token. The
+    /// session transitions to `Closed`; the daemon logs the event and
+    /// answers with its own rate-limited reset.
+    StatelessReset,
 }
 
 impl From<StreamError> for SessionError {

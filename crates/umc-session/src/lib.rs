@@ -7,6 +7,7 @@ pub mod key_update;
 pub mod loss;
 pub mod packet;
 pub mod path;
+pub mod reset;
 pub mod rtt;
 pub mod sent_packet;
 pub mod session;

@@ -25,7 +25,9 @@ use umc_carrier::BoxLink;
 use umc_core::app_io::{AppRx, AppTx};
 use umc_crypto::aead::PacketKeys;
 use umc_session::loss::{detect_lost_packets, PtoState};
-use umc_session::session::{payload_is_exempt, Session, SessionState, IDLE_TIMEOUT_MS};
+use umc_session::session::{
+    payload_is_exempt, Session, SessionError, SessionState, IDLE_TIMEOUT_MS,
+};
 use umc_types::runtime::{Clock, Instant};
 use umc_wire::frame::Frame;
 use umc_wire::frames::bundle::BundleFrame;
@@ -35,6 +37,7 @@ use umc_wire::header::ShortPacketSpace;
 use umc_wire::packet::{parse_payload, PacketContext};
 
 use crate::relay_service::CircuitOpenRequest;
+use crate::runtime_adapters::OsEntropy;
 use crate::state::RuntimeState;
 
 /// Poll interval when the link reports `WouldBlock`.
@@ -544,6 +547,18 @@ async fn process_inbound_packet(
         let mut session = session.lock().await;
         let ack_payload = match session.on_inbound(now, bytes) {
             Ok(payload) => payload,
+            Err(SessionError::StatelessReset) => {
+                // session.md §31: the packet could not be authenticated and
+                // carried the session's reset token — the peer reset us and
+                // the session is now Closed. Answer with our own
+                // rate-limited stateless reset so the peer learns the
+                // connection is dead from its side too; no ACK or frame
+                // processing follows.
+                #[cfg(debug_assertions)]
+                println!("[session {session_id}] stateless reset received; session closed");
+                outbound = session.maybe_emit_stateless_reset(now, &OsEntropy);
+                Vec::new()
+            }
             Err(e) => {
                 #[cfg(debug_assertions)]
                 println!("[session {session_id}] inbound error: {e:?}");
@@ -1442,7 +1457,7 @@ mod tests {
     }
 
     fn test_session() -> Session {
-        Session::new(
+        let mut session = Session::new(
             SessionConfig {
                 role: Role::Client,
                 dcid: vec![3u8; 8],
@@ -1454,14 +1469,18 @@ mod tests {
             },
             &crate::runtime_adapters::OsClock,
         )
-        .expect("session")
+        .expect("session");
+        // The shared stateless-reset secret (handshake.md §26): both sides
+        // derive the same token.
+        session.set_stateless_reset_secret([9u8; 32]);
+        session
     }
 
     /// Peer session with swapped traffic secrets so the two can exchange
     /// protected packets (the client builds with `[1u8; 32]`, the peer
     /// parses with the same key).
     fn peer_session() -> Session {
-        Session::new(
+        let mut session = Session::new(
             SessionConfig {
                 role: Role::Server,
                 dcid: vec![3u8; 8],
@@ -1473,7 +1492,9 @@ mod tests {
             },
             &crate::runtime_adapters::OsClock,
         )
-        .expect("peer session")
+        .expect("peer session");
+        session.set_stateless_reset_secret([9u8; 32]);
+        session
     }
 
     /// Deterministic clock for loss-detection timing.
@@ -2729,6 +2750,64 @@ mod tests {
             !session.idle_expired(Instant(t0.0 + 1_000 + IDLE_TIMEOUT_MS - 1)),
             "bus outbound traffic keeps the destination session alive"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closed_session_sends_stateless_reset() {
+        let (state, _tx) = test_state();
+        let runtime = Arc::new(std::sync::Mutex::new(state));
+        let t0 = Instant(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(t0.0));
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let link: Arc<BoxLink> = Arc::new(Box::new(RecordingLink {
+            sent: recorded.clone(),
+        }));
+        let remote_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[2u8; 32]).unwrap();
+
+        // A drained session is finalized as Closed; traffic on it must be
+        // answered with a stateless reset (session.md §31).
+        let mut session = test_session();
+        session.close(t0);
+        session.finalize_close();
+        assert_eq!(session.state, SessionState::Closed);
+
+        // The peer (who shares the stateless-reset secret) sends a reset.
+        let token = umc_session::reset::reset_token(&[9u8; 32]);
+        let reset_pkt =
+            umc_session::reset::build_stateless_reset(&token, &crate::runtime_adapters::OsEntropy);
+        assert!(umc_session::reset::token_matches(&reset_pkt, &token));
+
+        let session = Arc::new(tokio::sync::Mutex::new(session));
+        let app_channels: Arc<std::sync::Mutex<HashMap<Vec<u8>, AppTx>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut sweep = SweepState::default();
+        process_inbound_packet(
+            &link,
+            &session,
+            &clock,
+            &app_channels,
+            &runtime,
+            &remote_keys,
+            1,
+            &reset_pkt,
+            &mut sweep,
+        )
+        .await;
+
+        // The daemon answers with one rate-limited reset carrying the
+        // session's token, and the session stays closed.
+        {
+            let sent = recorded.lock().expect("link sent");
+            assert_eq!(sent.len(), 1, "the daemon answers with exactly one reset");
+            let reset = &sent[0];
+            assert!(reset.len() >= 32, "reset is at least as long as a packet");
+            assert!(
+                umc_session::reset::token_matches(reset, &token),
+                "the emitted reset carries the session's token"
+            );
+        }
+        let session = session.lock().await;
+        assert_eq!(session.state, SessionState::Closed);
     }
 
     #[tokio::test(flavor = "multi_thread")]
