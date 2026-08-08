@@ -16,6 +16,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use umc_carrier::Listener;
+use umc_control::events::EventBus;
 use umc_core::app::AppRegistry;
 use umc_core::app_io::{AppRx, AppTx};
 use umc_core::block::Blocklist;
@@ -460,6 +461,8 @@ pub struct RuntimeState {
     pub routing: RoutingService,
     /// Bounded daemon event log; services push transitions into it.
     pub events: Arc<Mutex<DaemonEvents>>,
+    /// Live event subscriptions for control-plane clients.
+    pub event_bus: Arc<Mutex<EventBus>>,
     /// Bounded metrics registry (core.md §42): the daemon's counters,
     /// surfaced through `DiagnosticsService.GetMetricsSnapshot`.
     pub metrics: Arc<Registry>,
@@ -507,6 +510,7 @@ impl RuntimeState {
     /// created, the node database cannot be opened, or the keystore cannot
     /// be opened with the configured password
     /// ([`UMC_KEYSTORE_PASSWORD`](keystore_password)).
+    #[allow(clippy::too_many_lines)] // startup composes all bounded daemon subsystems
     pub fn new(config: NodeConfig, shutdown_channel: mpsc::Sender<()>) -> Result<Self, String> {
         let data_dir = config.resolved_data_dir();
         std::fs::create_dir_all(&data_dir).map_err(|e| format!("data dir: {e}"))?;
@@ -541,7 +545,12 @@ impl RuntimeState {
             MeshConfig::endpoint()
         };
 
+        let event_bus = Arc::new(Mutex::new(EventBus::new()));
         let events = Arc::new(Mutex::new(DaemonEvents::new(200)));
+        events
+            .lock()
+            .expect("event log")
+            .attach_event_bus(event_bus.clone());
         let development_token = config
             .development_token
             .as_deref()
@@ -617,6 +626,7 @@ impl RuntimeState {
             bundle,
             routing,
             events,
+            event_bus,
             metrics: Arc::new(Registry::new()),
             apps,
             app_channels: Arc::new(Mutex::new(HashMap::new())),

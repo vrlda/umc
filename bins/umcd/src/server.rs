@@ -269,30 +269,49 @@ async fn handle_connection(
     let mut decoder = EnvelopeDecoder::new(DEFAULT_ENVELOPE_MAX);
     let mut buf = [0u8; 8 * 1024];
     let mut conn = ConnectionState::new();
+    let mut event_tick = tokio::time::interval(Duration::from_millis(25));
     loop {
-        let Ok(n) = stream.read(&mut buf).await else {
-            break;
-        };
-        if n == 0 {
-            break;
-        }
-        let Ok(envelopes) = decoder.feed(&buf[..n]) else {
-            break;
-        };
-        for envelope in envelopes {
-            let Ok(msg) = api::Envelope::decode(envelope.as_slice()) else {
-                break;
-            };
-            let response = {
-                let mut state = state.lock().expect("runtime state");
-                handle_envelope(&mut conn, &mut state, msg)
-            };
-            let Some(response) = response else {
-                continue;
-            };
-            let mut out = Vec::new();
-            if frame_envelope(&mut out, &response, DEFAULT_ENVELOPE_MAX).is_ok() {
-                let _ = stream.write_all(&out).await;
+        tokio::select! {
+            read_result = stream.read(&mut buf) => {
+                let Ok(n) = read_result else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                let Ok(envelopes) = decoder.feed(&buf[..n]) else {
+                    break;
+                };
+                for envelope in envelopes {
+                    let Ok(msg) = api::Envelope::decode(envelope.as_slice()) else {
+                        break;
+                    };
+                    let response = {
+                        let mut state = state.lock().expect("runtime state");
+                        handle_envelope(&mut conn, &mut state, msg)
+                    };
+                    let Some(response) = response else {
+                        continue;
+                    };
+                    let mut out = Vec::new();
+                    if frame_envelope(&mut out, &response, DEFAULT_ENVELOPE_MAX).is_ok() {
+                        let _ = stream.write_all(&out).await;
+                    }
+                }
+            }
+            _ = event_tick.tick(), if !conn.subscriptions.is_empty() => {
+                let events = {
+                    let mut state = state.lock().expect("runtime state");
+                    drain_event_envelopes(&mut state, &mut conn)
+                };
+                for event in events {
+                    let mut encoded = Vec::new();
+                    Message::encode(&event, &mut encoded).expect("encode event envelope");
+                    let mut out = Vec::new();
+                    if frame_envelope(&mut out, &encoded, DEFAULT_ENVELOPE_MAX).is_ok() {
+                        let _ = stream.write_all(&out).await;
+                    }
+                }
             }
         }
         if conn.draining {
@@ -300,6 +319,13 @@ async fn handle_connection(
             // (control-api.md §6.4).
             log::info!("[control] connection drained after go-away, closing");
             break;
+        }
+    }
+    if !conn.subscriptions.is_empty() {
+        let state = state.lock().expect("runtime state");
+        let mut bus = state.event_bus.lock().expect("event bus");
+        for subscription_id in conn.subscriptions.keys() {
+            bus.unsubscribe(*subscription_id);
         }
     }
 }
@@ -325,6 +351,8 @@ struct ConnectionState {
     sequences: SequenceTracker,
     draining: bool,
     idempotent: IdempotencyCache,
+    subscriptions: HashMap<u64, api::EventFilter>,
+    next_server_sequence: u64,
 }
 
 impl ConnectionState {
@@ -335,7 +363,15 @@ impl ConnectionState {
             sequences: SequenceTracker::new(),
             draining: false,
             idempotent: IdempotencyCache::new(),
+            subscriptions: HashMap::new(),
+            next_server_sequence: 1,
         }
+    }
+
+    fn next_server_sequence(&mut self) -> u64 {
+        let sequence = self.next_server_sequence;
+        self.next_server_sequence = self.next_server_sequence.saturating_add(1);
+        sequence
     }
 }
 
@@ -440,15 +476,21 @@ fn handle_envelope(
                     );
                     return Some(stored);
                 }
-                let response = dispatch_request(state, &request, conn.presented_token.as_deref());
+                let presented_token = conn.presented_token.clone();
+                let response =
+                    dispatch_connection_request(conn, state, &request, presented_token.as_deref());
                 conn.idempotent.insert(key, response.clone(), now_ms);
                 return Some(response);
             }
-            Some(dispatch_request(
-                state,
-                &request,
-                conn.presented_token.as_deref(),
-            ))
+            {
+                let presented_token = conn.presented_token.clone();
+                Some(dispatch_connection_request(
+                    conn,
+                    state,
+                    &request,
+                    presented_token.as_deref(),
+                ))
+            }
         }
         Some(api::envelope::Body::Cancel(cancel)) => {
             // Sequential dispatch makes cancellation moot (control-api.md
@@ -501,6 +543,199 @@ fn handle_hello(hello: &api::ClientHello, store: &SqliteStore) -> Vec<u8> {
     let mut out = Vec::new();
     Message::encode(&envelope, &mut out).expect("encode");
     out
+}
+
+/// Dispatch a request that may create or consume a connection-owned event
+/// subscription. All other services retain the ordinary stateless dispatch
+/// path used by unit tests and the control API.
+fn dispatch_connection_request(
+    conn: &mut ConnectionState,
+    state: &mut RuntimeState,
+    request: &api::Request,
+    presented_token: Option<&[u8]>,
+) -> Vec<u8> {
+    if request.service == "EventService" {
+        dispatch_event_request(conn, state, request, presented_token)
+    } else {
+        dispatch_request(state, request, presented_token)
+    }
+}
+
+fn dispatch_event_request(
+    conn: &mut ConnectionState,
+    state: &mut RuntimeState,
+    request: &api::Request,
+    presented_token: Option<&[u8]>,
+) -> Vec<u8> {
+    if let Some(configured) = &state.development_token {
+        let authorized = presented_token.is_some_and(|token| token == configured.as_slice());
+        if !authorized {
+            return response_envelope(request, api::StatusCode::Unauthenticated as i32, None);
+        }
+    }
+    let (code, payload) = match request.method.as_str() {
+        "Subscribe" => subscribe_events(conn, state, request),
+        "Unsubscribe" => unsubscribe_events(conn, state, request),
+        _ => (api::StatusCode::Unimplemented as i32, None),
+    };
+    response_envelope(request, code, payload)
+}
+
+fn subscribe_events(
+    conn: &mut ConnectionState,
+    state: &mut RuntimeState,
+    request: &api::Request,
+) -> (i32, Option<Vec<u8>>) {
+    let Ok(subscribe) = api::SubscribeRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if !subscribe.resume_cursor.is_empty() {
+        return (api::StatusCode::OutOfRange as i32, None);
+    }
+    if conn.subscriptions.len() >= umc_control::events::MAX_EVENT_STREAMS_PER_CLIENT {
+        return (api::StatusCode::ResourceExhausted as i32, None);
+    }
+    let filter = subscribe.filter.unwrap_or_default();
+    let initial = if filter.include_initial_snapshot {
+        Some(state.events.lock().expect("event log").recent(100))
+    } else {
+        None
+    };
+    let subscription_id = {
+        let mut bus = state.event_bus.lock().expect("event bus");
+        let id = bus.subscribe();
+        if let Some(initial) = initial {
+            if let Some(subscription) = bus.subscription(id) {
+                for event in initial.into_iter().rev() {
+                    let _ = subscription.push(crate::event_log::to_control_event(&event));
+                }
+            }
+        }
+        id
+    };
+    conn.subscriptions.insert(subscription_id, filter);
+    let handle = subscription_id.to_be_bytes().to_vec();
+    let response = api::SubscribeResponse {
+        subscription_handle: Some(api::OpaqueHandle {
+            value: handle.clone(),
+        }),
+        resume_cursor: handle,
+        first_event_sequence: 1,
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+fn unsubscribe_events(
+    conn: &mut ConnectionState,
+    state: &mut RuntimeState,
+    request: &api::Request,
+) -> (i32, Option<Vec<u8>>) {
+    let Ok(unsubscribe) = api::UnsubscribeRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(handle) = unsubscribe.subscription_handle else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok(id_bytes) = <[u8; 8]>::try_from(handle.value.as_slice()) else {
+        return (api::StatusCode::NotFound as i32, None);
+    };
+    let id = u64::from_be_bytes(id_bytes);
+    if conn.subscriptions.remove(&id).is_none() {
+        return (api::StatusCode::NotFound as i32, None);
+    }
+    state.event_bus.lock().expect("event bus").unsubscribe(id);
+    let mut payload = Vec::new();
+    Message::encode(&api::UnsubscribeResponse {}, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+fn drain_event_envelopes(
+    state: &mut RuntimeState,
+    conn: &mut ConnectionState,
+) -> Vec<api::Envelope> {
+    let subscriptions: Vec<(u64, api::EventFilter)> = conn
+        .subscriptions
+        .iter()
+        .map(|(id, filter)| (*id, filter.clone()))
+        .collect();
+    let mut bus = state.event_bus.lock().expect("event bus");
+    let mut envelopes = Vec::new();
+    for (id, filter) in subscriptions {
+        let Some(subscription) = bus.subscription(id) else {
+            continue;
+        };
+        while let Some((sequence, event)) = subscription.pop_with_sequence() {
+            if !event_matches_filter(&event, &filter) {
+                continue;
+            }
+            envelopes.push(api::Envelope {
+                api_version: Some(api::ApiVersion { major: 1, minor: 0 }),
+                sequence: conn.next_server_sequence(),
+                body: Some(api::envelope::Body::Event(api::Event {
+                    subscription_handle: Some(api::OpaqueHandle {
+                        value: id.to_be_bytes().to_vec(),
+                    }),
+                    event_sequence: sequence,
+                    event_type: event_type_code(&event.event_type),
+                    event_class: event_class_code(event.class),
+                    occurred_at_unix_ms: i64::try_from(event.occurred_at_ms).unwrap_or(i64::MAX),
+                    resource_handle: None,
+                    resource_id: event.resource.unwrap_or_default(),
+                    payload_type: event.event_type,
+                    payload: event.payload,
+                    resume_cursor: id.to_be_bytes().to_vec(),
+                })),
+            });
+        }
+    }
+    envelopes
+}
+
+fn event_matches_filter(event: &umc_control::events::UmpEvent, filter: &api::EventFilter) -> bool {
+    let event_type = event_type_code(&event.event_type);
+    if !filter.event_types.is_empty() && !filter.event_types.contains(&event_type) {
+        return false;
+    }
+    if !filter.resource_handles.is_empty() || !filter.endpoint_ids.is_empty() {
+        return false;
+    }
+    let minimum = filter.minimum_severity;
+    minimum == 0 || event_severity(event.class) >= minimum
+}
+
+fn event_severity(class: umc_control::events::EventClass) -> i32 {
+    match class {
+        umc_control::events::EventClass::Critical => api::DiagnosticSeverity::Critical as i32,
+        umc_control::events::EventClass::State => api::DiagnosticSeverity::Warning as i32,
+        umc_control::events::EventClass::Edge | umc_control::events::EventClass::Sample => {
+            api::DiagnosticSeverity::Info as i32
+        }
+    }
+}
+
+fn event_class_code(class: umc_control::events::EventClass) -> i32 {
+    match class {
+        umc_control::events::EventClass::Critical => api::EventClass::Critical as i32,
+        umc_control::events::EventClass::State => api::EventClass::State as i32,
+        umc_control::events::EventClass::Edge => api::EventClass::Edge as i32,
+        umc_control::events::EventClass::Sample => api::EventClass::Sample as i32,
+    }
+}
+
+fn event_type_code(kind: &str) -> i32 {
+    match kind {
+        "session_active" | "session_closed" => api::EventType::SessionState as i32,
+        "path_degraded" => api::EventType::PathChanged as i32,
+        "bundle_admitted" | "bundle_expired" => api::EventType::BundleState as i32,
+        "circuit_opened" | "circuit_closed" | "relay_data_forwarded" => {
+            api::EventType::RelayState as i32
+        }
+        "application_registered" | "application_unregistered" => api::EventType::NodeState as i32,
+        "peer_blocked" | "peer_unblocked" | "trust_state_set" => api::EventType::PeerChanged as i32,
+        _ => api::EventType::Audit as i32,
+    }
 }
 
 /// Service-backed envelope dispatch (control-api.md §16-24). Methods without
@@ -6491,6 +6726,77 @@ mod tests {
             decode_response(&bytes).status.unwrap().code,
             api::StatusCode::InvalidArgument as i32
         );
+    }
+
+    #[test]
+    fn event_subscription_delivers_and_unsubscribes() {
+        let (mut state, _tx) = test_state();
+        let mut conn = ConnectionState::new();
+        let subscribe = api::SubscribeRequest {
+            filter: Some(api::EventFilter::default()),
+            ..Default::default()
+        };
+        let response = handle_envelope(
+            &mut conn,
+            &mut state,
+            api::Envelope {
+                sequence: 1,
+                body: Some(api::envelope::Body::Request(api::Request {
+                    request_id: 1,
+                    service: "EventService".into(),
+                    method: "Subscribe".into(),
+                    payload: encode_request(&subscribe),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        )
+        .expect("subscribe response");
+        let response = decode_response(&response);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let handle = api::SubscribeResponse::decode(response.payload.as_slice())
+            .expect("subscribe payload")
+            .subscription_handle
+            .expect("subscription handle");
+
+        push_event(&state, "session_active", "session 1".into());
+        let events = drain_event_envelopes(&mut state, &mut conn);
+        assert_eq!(events.len(), 1);
+        let event = match events[0].body.as_ref().expect("event body") {
+            api::envelope::Body::Event(event) => event,
+            other => panic!("expected event envelope, got {other:?}"),
+        };
+        assert_eq!(event.event_sequence, 1);
+        assert_eq!(event.event_type, api::EventType::SessionState as i32);
+
+        let unsubscribe = api::UnsubscribeRequest {
+            subscription_handle: Some(handle),
+        };
+        let response = handle_envelope(
+            &mut conn,
+            &mut state,
+            api::Envelope {
+                sequence: 2,
+                body: Some(api::envelope::Body::Request(api::Request {
+                    request_id: 2,
+                    service: "EventService".into(),
+                    method: "Unsubscribe".into(),
+                    payload: encode_request(&unsubscribe),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        )
+        .expect("unsubscribe response");
+        assert_eq!(
+            decode_response(&response).status.unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        push_event(&state, "session_active", "session 2".into());
+        assert!(drain_event_envelopes(&mut state, &mut conn).is_empty());
     }
 
     #[test]

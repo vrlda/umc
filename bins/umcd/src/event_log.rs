@@ -5,6 +5,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::Mutex;
+use umc_control::events::{EventBus, EventClass, UmpEvent};
 use umc_storage::sqlite::SqliteStore;
 use umc_storage::store::{Namespace, Store, StoreError};
 
@@ -35,6 +37,7 @@ pub struct DaemonEvents {
     log: Vec<DaemonEvent>,
     max_entries: usize,
     store: Option<Arc<SqliteStore>>,
+    event_bus: Option<Arc<Mutex<EventBus>>>,
     /// Monotonic key sequence for persisted events; continues from the
     /// highest sequence observed at restore.
     persisted_seq: u64,
@@ -47,6 +50,7 @@ impl fmt::Debug for DaemonEvents {
             .field("max_entries", &self.max_entries)
             .field("persisted_seq", &self.persisted_seq)
             .field("store_attached", &self.store.is_some())
+            .field("event_bus_attached", &self.event_bus.is_some())
             .finish()
     }
 }
@@ -58,6 +62,7 @@ impl DaemonEvents {
             log: Vec::new(),
             max_entries,
             store: None,
+            event_bus: None,
             persisted_seq: 0,
         }
     }
@@ -66,6 +71,13 @@ impl DaemonEvents {
     /// namespace (storage.md §15 audit logging).
     pub fn attach_store(&mut self, store: Arc<SqliteStore>) {
         self.store = Some(store);
+    }
+
+    /// Attaches the live control-plane event bus. Persisted events are not
+    /// replayed into new subscriptions; only events recorded after attach
+    /// are published.
+    pub fn attach_event_bus(&mut self, event_bus: Arc<Mutex<EventBus>>) {
+        self.event_bus = Some(event_bus);
     }
 
     /// Loads persisted events back into the ring so audit history survives
@@ -110,6 +122,12 @@ impl DaemonEvents {
     pub fn push(&mut self, event: DaemonEvent) {
         if let Some(store) = self.store.clone() {
             self.persist(store.as_ref(), &event);
+        }
+        if let Some(event_bus) = self.event_bus.clone() {
+            event_bus
+                .lock()
+                .expect("event bus")
+                .publish(to_control_event(&event));
         }
         self.log.push(event);
         let excess = self.log.len().saturating_sub(self.max_entries);
@@ -162,6 +180,32 @@ impl DaemonEvents {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.log.is_empty()
+    }
+}
+
+pub(crate) fn to_control_event(event: &DaemonEvent) -> UmpEvent {
+    UmpEvent {
+        class: event_class(&event.kind),
+        event_type: event.kind.clone(),
+        resource: None,
+        payload: event.detail.as_bytes().to_vec(),
+        occurred_at_ms: event.at_ms,
+    }
+}
+
+fn event_class(kind: &str) -> EventClass {
+    if kind.contains("failed") || kind.contains("error") || kind.contains("blocked") {
+        EventClass::Critical
+    } else if kind.contains("metric") || kind.contains("forwarded") {
+        EventClass::Sample
+    } else if kind.ends_with("_active")
+        || kind.ends_with("_changed")
+        || kind.ends_with("_state")
+        || kind.ends_with("_degraded")
+    {
+        EventClass::State
+    } else {
+        EventClass::Edge
     }
 }
 
