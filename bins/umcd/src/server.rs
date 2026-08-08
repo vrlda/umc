@@ -3,7 +3,7 @@
 use crate::config::NodeConfig;
 use crate::doctor;
 use crate::relay_service::CircuitOpenRequest;
-use crate::state::RuntimeState;
+use crate::state::{metric_names, RuntimeState};
 use prost::Message;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -244,6 +244,18 @@ fn dispatch_request(
             return response_envelope(request, api::StatusCode::Unauthenticated as i32, None);
         }
     }
+    // One request counter per service (core.md §42): the name is flat, the
+    // service distinction is baked into it.
+    let service_counter = match request.service.as_str() {
+        "NodeAdmin" => metric_names::CONTROL_REQUESTS_NODEADMIN,
+        "PeerService" | "DiscoveryService" => metric_names::CONTROL_REQUESTS_PEERSERVICE,
+        "BundleService" => metric_names::CONTROL_REQUESTS_BUNDLE,
+        "RelayService" => metric_names::CONTROL_REQUESTS_RELAY,
+        "ConfigService" => metric_names::CONTROL_REQUESTS_CONFIG,
+        "DiagnosticsService" => metric_names::CONTROL_REQUESTS_DIAGNOSTICS,
+        _ => metric_names::CONTROL_REQUESTS_OTHER,
+    };
+    state.metrics.incr(service_counter, 1);
     let (code, payload) = match (request.service.as_str(), request.method.as_str()) {
         ("NodeAdmin", "GetStatus") => get_status(state),
         ("PeerService" | "DiscoveryService", "ListCandidates") => list_candidates(state),
@@ -254,6 +266,8 @@ fn dispatch_request(
         ("NodeAdmin" | "ConfigService", "GetConfig") => get_config(state),
         ("NodeAdmin", "GetEvents") => get_events(state),
         ("DiagnosticsService" | "NodeAdmin", "RunDoctor" | "Doctor") => run_doctor(state),
+        ("DiagnosticsService", "GetMetricsSnapshot") => get_metrics_snapshot(state, request),
+        ("DiagnosticsService", "GetSubsystemHealth") => get_subsystem_health(state, request),
         ("ConfigService", "SetConfig") | ("NodeAdmin", "UpdateConfig") => {
             set_config(state, request)
         }
@@ -483,6 +497,7 @@ fn create_bundle(state: &mut RuntimeState, request: &api::Request) -> (i32, Opti
         now,
     ) {
         Ok(id) => {
+            state.metrics.incr(metric_names::BUNDLES_ADMITTED, 1);
             let record = state.bundle.record(&id).expect("just admitted");
             let summary = api::BundleSummary {
                 bundle_id: id.to_vec(),
@@ -568,6 +583,79 @@ fn run_doctor(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
     (api::StatusCode::Ok as i32, Some(payload))
 }
 
+/// `DiagnosticsService.GetMetricsSnapshot`: the metrics registry snapshot
+/// as `MetricPoint`s (core.md §42, control-api.md §42). A non-empty
+/// `metric_prefixes` list filters the series by name prefix.
+// Counters ride the proto's `double` value field; u64 counters beyond 2^53
+// lose precision there, which the daemon's counters never approach.
+#[allow(clippy::cast_precision_loss)]
+fn get_metrics_snapshot(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let prefixes = match api::GetMetricsSnapshotRequest::decode(request.payload.as_slice()) {
+        Ok(re) => re.metric_prefixes,
+        Err(_) => return (api::StatusCode::InvalidArgument as i32, None),
+    };
+    let now = crate::state::wall_now();
+    let points = state
+        .metrics
+        .snapshot()
+        .into_iter()
+        .filter(|(name, _)| prefixes.is_empty() || prefixes.iter().any(|p| name.starts_with(p)))
+        .map(|(name, value)| api::MetricPoint {
+            name,
+            value: value as f64,
+            labels: Vec::new(),
+            observed_at_unix_ms: i64::try_from(now.0).unwrap_or(i64::MAX),
+        })
+        .collect();
+    let response = api::GetMetricsSnapshotResponse { points };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `DiagnosticsService.GetSubsystemHealth`: the core subsystems each report
+/// `healthy` with their live counts (control-api.md §42). A non-empty
+/// `subsystems` list filters the report by name.
+fn get_subsystem_health(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let requested = match api::GetSubsystemHealthRequest::decode(request.payload.as_slice()) {
+        Ok(re) => re.subsystems,
+        Err(_) => return (api::StatusCode::InvalidArgument as i32, None),
+    };
+    let now = crate::state::wall_now();
+    let all = vec![
+        (
+            "sessions".to_string(),
+            format!("{} active", state.sessions.count()),
+        ),
+        (
+            "relay".to_string(),
+            format!("{} circuits", state.relay.circuit_count()),
+        ),
+        (
+            "bundle".to_string(),
+            format!("{} stored", state.bundle.count()),
+        ),
+        (
+            "routing".to_string(),
+            format!("{} cached routes", state.routing.cache.len()),
+        ),
+    ];
+    let health = all
+        .into_iter()
+        .filter(|(subsystem, _)| requested.is_empty() || requested.contains(subsystem))
+        .map(|(subsystem, summary)| api::SubsystemHealth {
+            subsystem,
+            state: "healthy".into(),
+            summary,
+            changed_at_unix_ms: i64::try_from(now.0).unwrap_or(i64::MAX),
+        })
+        .collect();
+    let response = api::GetSubsystemHealthResponse { health };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
 /// `RelayService.OpenCircuit`: relay admission + circuit allocation.
 fn open_circuit(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
     let Ok(open) = OpenCircuitRequest::decode(request.payload.as_slice()) else {
@@ -587,6 +675,7 @@ fn open_circuit(state: &mut RuntimeState, request: &api::Request) -> (i32, Optio
     };
     match state.relay.open_circuit(&circuit_request, Vec::new(), now) {
         Ok(result) => {
+            state.metrics.incr(metric_names::RELAY_CIRCUITS_OPENED, 1);
             let response = OpenCircuitResponse {
                 circuit_id: result.circuit_id,
                 granted_lifetime_ms: result.granted_lifetime_ms,
@@ -612,7 +701,10 @@ fn close_circuit(state: &mut RuntimeState, request: &api::Request) -> (i32, Opti
         .relay
         .close_circuit(close.circuit_id, close.reason, now)
     {
-        Ok(()) => (api::StatusCode::Ok as i32, None),
+        Ok(()) => {
+            state.metrics.incr(metric_names::RELAY_CIRCUITS_CLOSED, 1);
+            (api::StatusCode::Ok as i32, None)
+        }
         Err(_) => (api::StatusCode::NotFound as i32, None),
     }
 }
@@ -1206,6 +1298,172 @@ mod tests {
             .results;
         assert!(!results.is_empty());
         assert!(results.iter().any(|r| r.check_id == "database"));
+    }
+
+    #[test]
+    fn get_metrics_snapshot_round_trips_registry() {
+        let (mut state, _tx) = test_state();
+        state
+            .metrics
+            .incr(crate::state::metric_names::SESSIONS_TOTAL, 3);
+        state
+            .metrics
+            .set(crate::state::metric_names::SESSIONS_ACTIVE, 2);
+        let bytes = dispatch_request(
+            &mut state,
+            &request("DiagnosticsService", "GetMetricsSnapshot", vec![]),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let points = api::GetMetricsSnapshotResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .points;
+        assert!(
+            points
+                .iter()
+                .any(|p| p.name == "sessions_total" && (p.value - 3.0).abs() < f64::EPSILON),
+            "sessions_total missing from snapshot: {points:?}"
+        );
+        assert!(
+            points
+                .iter()
+                .any(|p| p.name == "sessions_active" && (p.value - 2.0).abs() < f64::EPSILON),
+            "sessions_active missing from snapshot: {points:?}"
+        );
+    }
+
+    #[test]
+    fn get_metrics_snapshot_filters_by_prefix() {
+        let (mut state, _tx) = test_state();
+        state
+            .metrics
+            .incr(crate::state::metric_names::SESSIONS_TOTAL, 1);
+        state
+            .metrics
+            .incr(crate::state::metric_names::PACKETS_RECEIVED, 5);
+        let mut payload = Vec::new();
+        api::GetMetricsSnapshotRequest {
+            metric_prefixes: vec!["packets".into()],
+        }
+        .encode(&mut payload)
+        .expect("encode");
+        let bytes = dispatch_request(
+            &mut state,
+            &request("DiagnosticsService", "GetMetricsSnapshot", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let points = api::GetMetricsSnapshotResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .points;
+        assert_eq!(points.len(), 1, "prefix filter must keep one series");
+        assert_eq!(points[0].name, "packets_received");
+        assert!((points[0].value - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn get_subsystem_health_reports_live_counts() {
+        let (mut state, _tx) = test_state();
+        state.sessions.register(
+            state.sessions.next_id(),
+            crate::session_manager::SessionEntry {
+                peer_endpoint_id: [1u8; 32],
+                carrier_type: "ump.tcp/1".into(),
+                task: tokio::spawn(async {}).abort_handle(),
+                established_at_ms: 0,
+            },
+        );
+        let bytes = dispatch_request(
+            &mut state,
+            &request("DiagnosticsService", "GetSubsystemHealth", vec![]),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let health = api::GetSubsystemHealthResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .health;
+        assert_eq!(health.len(), 4);
+        for entry in &health {
+            assert_eq!(entry.state, "healthy");
+        }
+        let sessions = health
+            .iter()
+            .find(|h| h.subsystem == "sessions")
+            .expect("sessions subsystem");
+        assert!(
+            sessions.summary.contains("1 active"),
+            "unexpected sessions summary: {}",
+            sessions.summary
+        );
+    }
+
+    #[test]
+    fn get_subsystem_health_filters_by_requested_subsystem() {
+        let (mut state, _tx) = test_state();
+        let mut payload = Vec::new();
+        api::GetSubsystemHealthRequest {
+            subsystems: vec!["relay".into()],
+        }
+        .encode(&mut payload)
+        .expect("encode");
+        let bytes = dispatch_request(
+            &mut state,
+            &request("DiagnosticsService", "GetSubsystemHealth", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let health = api::GetSubsystemHealthResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .health;
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].subsystem, "relay");
+        assert_eq!(health[0].state, "healthy");
+    }
+
+    #[test]
+    fn dispatch_counts_requests_per_service() {
+        let (mut state, _tx) = test_state();
+        dispatch_request(&mut state, &request("NodeAdmin", "GetStatus", vec![]), None);
+        dispatch_request(
+            &mut state,
+            &request("DiagnosticsService", "RunDoctor", vec![]),
+            None,
+        );
+        assert_eq!(
+            state
+                .metrics
+                .get(crate::state::metric_names::CONTROL_REQUESTS_NODEADMIN),
+            Some(1)
+        );
+        assert_eq!(
+            state
+                .metrics
+                .get(crate::state::metric_names::CONTROL_REQUESTS_DIAGNOSTICS),
+            Some(1)
+        );
+        dispatch_request(&mut state, &request("NodeAdmin", "GetStatus", vec![]), None);
+        assert_eq!(
+            state
+                .metrics
+                .get(crate::state::metric_names::CONTROL_REQUESTS_NODEADMIN),
+            Some(2)
+        );
     }
 
     #[test]

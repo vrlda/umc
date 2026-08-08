@@ -221,6 +221,9 @@ fn record_handshake_failure(state: &Arc<std::sync::Mutex<state::RuntimeState>>, 
     };
     let now = state.node.clock.as_ref().now();
     state
+        .metrics
+        .incr(state::metric_names::HANDSHAKE_FAILURES, 1);
+    state
         .events
         .lock()
         .expect("event log")
@@ -658,6 +661,11 @@ fn handle_resumed_link(
         return Err(format!("send server hello: {e:?}"));
     }
     tracker.lock().expect("handshake tracker").record(dcid, now);
+    state
+        .lock()
+        .expect("state")
+        .metrics
+        .incr(state::metric_names::RESUMPTION_SESSIONS, 1);
     // The resumed session registers under the identity the ticket binds —
     // the ticket's client endpoint hash (the v1 resume carries no identity
     // proof; the ticket is the credential).
@@ -794,6 +802,11 @@ fn register_session(
             task: abort_handle,
             established_at_ms: now.0,
         },
+    );
+    state.metrics.incr(state::metric_names::SESSIONS_TOTAL, 1);
+    state.metrics.set(
+        state::metric_names::SESSIONS_ACTIVE,
+        u64::try_from(state.sessions.count()).unwrap_or(u64::MAX),
     );
     state
         .events

@@ -25,6 +25,7 @@ use umc_core::rate_limiter::RateLimiter;
 use umc_core::trust::{TrustLevel, TrustStore};
 use umc_core::well_known::WELL_KNOWN_APP;
 use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
+use umc_metrics::Registry;
 use umc_storage::keystore::{KeyClass, Keystore, KeystoreError};
 use umc_storage::objects::ObjectStore;
 use umc_storage::quota::{Profile, QuotaAccount};
@@ -198,6 +199,9 @@ pub struct RuntimeState {
     pub routing: RoutingService,
     /// Bounded daemon event log; services push transitions into it.
     pub events: Arc<Mutex<DaemonEvents>>,
+    /// Bounded metrics registry (core.md §42): the daemon's counters,
+    /// surfaced through `DiagnosticsService.GetMetricsSnapshot`.
+    pub metrics: Arc<Registry>,
     /// Registered applications (core.md §9.6); the echo application is
     /// installed at startup so `org.umc.app/1` streams dispatch end to end.
     #[allow(dead_code)] // app registration over the control API lands in Phase 10
@@ -344,6 +348,7 @@ impl RuntimeState {
             bundle,
             routing,
             events,
+            metrics: Arc::new(Registry::new()),
             apps,
             app_channels: Arc::new(Mutex::new(HashMap::new())),
             app_echo_rx: Arc::new(Mutex::new(HashMap::new())),
@@ -360,6 +365,49 @@ impl RuntimeState {
     pub fn trust_store(&self) -> TrustStore<'_> {
         TrustStore::new(self.store.as_ref(), self.trust_default_level)
     }
+}
+
+/// Daemon metric names (core.md §42). Names are flat and unlabeled — the
+/// callers bake per-service distinctions into the name
+/// (`control_requests_nodeadmin`, never `control_requests{service=NodeAdmin}`)
+/// — and every series name lives here so all update sites share one
+/// spelling. The registry caps distinct series at 1,024; daemon wiring uses
+/// a fixed set well below that.
+pub mod metric_names {
+    /// Live sessions (gauge): set to the session registry count at each
+    /// registration.
+    pub const SESSIONS_ACTIVE: &str = "sessions_active";
+    /// Sessions established since daemon start (counter).
+    pub const SESSIONS_TOTAL: &str = "sessions_total";
+    /// Inbound handshakes refused (counter).
+    pub const HANDSHAKE_FAILURES: &str = "handshake_failures";
+    /// IK-mode resumed sessions established (counter).
+    pub const RESUMPTION_SESSIONS: &str = "resumption_sessions";
+    /// Inbound protected packets fed to the session layer (counter).
+    pub const PACKETS_RECEIVED: &str = "packets_received";
+    /// Lost packets re-sent under fresh numbers (counter).
+    pub const RETRANSMISSIONS: &str = "retransmissions";
+    /// Persistent-congestion path degradations recorded (counter).
+    pub const PATH_DEGRADED_EVENTS: &str = "path_degraded_events";
+    /// Relay circuits admitted (counter; wire and control paths).
+    pub const RELAY_CIRCUITS_OPENED: &str = "relay_circuits_opened";
+    /// Relay circuits closed (counter; wire and control paths).
+    pub const RELAY_CIRCUITS_CLOSED: &str = "relay_circuits_closed";
+    /// Bundles admitted into the store (counter; wire and control paths).
+    pub const BUNDLES_ADMITTED: &str = "bundles_admitted";
+    /// Bundles expired and evicted by the delivery sweep (counter).
+    pub const BUNDLES_EXPIRED: &str = "bundles_expired";
+    /// Inbound route requests, admitted or refused (counter).
+    pub const ROUTE_REQUESTS_RECEIVED: &str = "route_requests_received";
+    /// Control API requests dispatched, per service (counters).
+    pub const CONTROL_REQUESTS_NODEADMIN: &str = "control_requests_nodeadmin";
+    /// `PeerService` and its `DiscoveryService` alias.
+    pub const CONTROL_REQUESTS_PEERSERVICE: &str = "control_requests_peerservice";
+    pub const CONTROL_REQUESTS_BUNDLE: &str = "control_requests_bundle";
+    pub const CONTROL_REQUESTS_RELAY: &str = "control_requests_relay";
+    pub const CONTROL_REQUESTS_CONFIG: &str = "control_requests_config";
+    pub const CONTROL_REQUESTS_DIAGNOSTICS: &str = "control_requests_diagnostics";
+    pub const CONTROL_REQUESTS_OTHER: &str = "control_requests_other";
 }
 
 #[cfg(test)]
