@@ -376,7 +376,21 @@ async fn recv_until(
 fn umcd_binary() -> std::path::PathBuf {
     let here = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let bin = here.join("../../target/debug/umcd");
-    if !bin.exists() {
+    // Rebuild whenever the daemon sources are newer than the binary: a stale
+    // daemon silently tests the wrong code.
+    let src_newer = std::fs::read_dir(here.join("../../bins/umcd/src"))
+        .map(|entries| {
+            entries.filter_map(Result::ok).any(|e| {
+                e.path()
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .zip(bin.metadata().and_then(|m| m.modified()).ok())
+                    .is_some_and(|(src, bin)| src > bin)
+            })
+        })
+        .unwrap_or(true);
+    if !bin.exists() || src_newer {
         let status = std::process::Command::new(env!("CARGO"))
             .args(["build", "-p", "umcd"])
             .current_dir(here.join("../.."))
