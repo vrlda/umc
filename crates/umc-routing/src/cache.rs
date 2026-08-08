@@ -56,6 +56,13 @@ impl RouteCache {
             .unwrap_or_default()
     }
 
+    /// Removes every cached record for `key` (routing.md §24
+    /// invalidation): a control-surface `InvalidateRoute` drops the entry
+    /// so the forwarder cannot pick it again.
+    pub fn remove(&mut self, key: &RouteKey) {
+        self.by_key.remove(key);
+    }
+
     pub fn evict_expired(&mut self, now: Instant) {
         self.by_key.retain(|_, entries| {
             entries.retain(|r| !r.is_expired(now));
@@ -136,6 +143,23 @@ mod tests {
         cache.insert(record(&key(1), "hop-a", now), now);
         cache.evict_expired(now + Duration::from_millis(DEFAULT_MAX_ROUTE_LIFETIME_MS + 1));
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn remove_drops_only_the_matching_key() {
+        let now = Instant(0);
+        let mut cache = RouteCache::new(
+            DEFAULT_CACHE_MAX,
+            Duration::from_millis(DEFAULT_MAX_ROUTE_LIFETIME_MS),
+        );
+        cache.insert(record(&key(1), "hop-a", now), now);
+        cache.insert(record(&key(2), "hop-b", now), now);
+        cache.remove(&key(1));
+        assert_eq!(cache.candidates(&key(1), now).len(), 0);
+        assert_eq!(cache.candidates(&key(2), now).len(), 1);
+        // Removing an unknown key is a no-op.
+        cache.remove(&key(3));
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

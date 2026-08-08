@@ -708,7 +708,7 @@ fn handle_resumed_link(
 /// secret — documented). `resumption_secret` is `Some` for XX sessions —
 /// the daemon issues one ticket at the session's clean close (handshake.md
 /// §35) — and `None` for resumed sessions (no ticket re-issuance).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn register_session(
     state: &Arc<std::sync::Mutex<state::RuntimeState>>,
     carrier_type: &str,
@@ -723,6 +723,10 @@ fn register_session(
 ) -> Result<(), String> {
     let runtime = state.clone();
     let state = state.lock().expect("state");
+    // Blocklist admission (security-operations.md §16.2): a blocked peer's
+    // session attempt is refused before any session state is built or
+    // registered (`PeerService.BlockPeer` wires the blocklist).
+    state.refuse_if_blocked(&peer_endpoint_id, now)?;
     let mut session = umc_session::session::Session::new(
         umc_session::session::SessionConfig {
             role: umc_session::session::Role::Server,

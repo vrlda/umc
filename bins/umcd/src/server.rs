@@ -18,7 +18,15 @@ use umc_control::conn::SequenceTracker;
 use umc_control::framing::{frame_envelope, EnvelopeDecoder};
 use umc_control::pages::PageToken;
 use umc_control::proto::umc::api::v1 as api;
+use umc_core::block::BlockReason;
+use umc_core::trust::TrustLevel;
+use umc_discovery::invitation::InvitationError;
+use umc_discovery::provider::{CandidateAuth, CandidateSource, PeerCandidate, SharingPolicy};
+use umc_routing::types::{RouteKey, RouteScope, RouteState};
+use umc_storage::records;
 use umc_storage::sqlite::SqliteStore;
+use umc_storage::store::{Namespace, Store};
+use umc_types::runtime::Instant;
 
 const DEFAULT_ENVELOPE_MAX: usize = 4 * 1024 * 1024;
 
@@ -87,6 +95,18 @@ struct ListCandidatesResponse {
     candidates: Vec<CandidateSummary>,
     #[prost(uint32, tag = "2")]
     total: u32,
+}
+
+/// Wire body of the `PeerService.CreateInvitation` invitation document
+/// (discovery.md §14): the proto `InvitationScope` does not carry the
+/// invitation id, and `ImportInvitationRequest` carries only the document
+/// and the secret — so the document embeds the id next to the scope.
+#[derive(Clone, PartialEq, prost::Message)]
+struct InvitationDocument {
+    #[prost(bytes, tag = "1")]
+    invitation_id: Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    scope: Option<api::InvitationScope>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -520,9 +540,23 @@ fn dispatch_request(
         ("NodeAdmin", "GetStatus") => get_status(state),
         ("PeerService" | "DiscoveryService", "ListCandidates") => list_candidates(state),
         ("PeerService", "ListPeers") => list_peers(state, request),
+        ("PeerService", "GetPeer") => get_peer(state, request),
+        ("PeerService", "AddPeerHint") => add_peer_hint(state, request),
+        ("PeerService", "RemovePeer") => remove_peer(state, request),
+        ("PeerService", "SetTrustState") => set_trust_state(state, request),
+        ("PeerService", "BlockPeer") => block_peer(state, request),
+        ("PeerService", "UnblockPeer") => unblock_peer(state, request),
+        ("PeerService", "CreateInvitation") => create_invitation(state, request),
+        ("PeerService", "ImportInvitation") => import_invitation(state, request),
+        ("PeerService", "RevokeInvitation") => revoke_invitation(state, request),
         ("SessionService", "ListSessions") => list_sessions(state, request),
         ("SessionService", "GetSession") => get_session(state, request),
+        ("SessionService", "CloseSession") => close_session(state, request),
+        ("SessionService", "ListStreams") => list_streams(state, request),
         ("RouteService", "ListRoutes") => list_routes(state, request),
+        ("RouteService", "GetRoute") => get_route(state, request),
+        ("RouteService", "ProbeRoute") => probe_route(state, request),
+        ("RouteService", "InvalidateRoute") => invalidate_route(state, request),
         ("BundleService", "GetBundles" | "ListBundles") => list_bundles(state, request),
         ("BundleService", "CreateBundle") => create_bundle(state, request),
         ("RelayService", "OpenCircuit") => open_circuit(state, request),
@@ -706,6 +740,463 @@ fn list_peers(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<
     (api::StatusCode::Ok as i32, Some(payload))
 }
 
+/// The v1 peer-table endpoint id is the discovery candidate id (8 bytes):
+/// `ListPeers` surfaces it, and `GetPeer`/`AddPeerHint`/`RemovePeer` key
+/// off it. The 32-byte identity space (what the accept loop verifies and
+/// what `BlockPeer`/`SetTrustState` key) is separate in v1 — see
+/// [`block_peer`].
+fn peer_endpoint_id_to_candidate(endpoint_id: &[u8]) -> Option<u64> {
+    <[u8; 8]>::try_from(endpoint_id)
+        .ok()
+        .map(u64::from_be_bytes)
+}
+
+/// One `PeerSummary` from a discovery candidate (discovery.md §6): the
+/// v1 peer table is the candidate table, with the candidate id as the
+/// provisional endpoint id (the same mapping `ListPeers` uses).
+fn peer_summary(candidate: &PeerCandidate) -> api::PeerSummary {
+    api::PeerSummary {
+        endpoint_id: candidate.candidate_id.to_be_bytes().to_vec(),
+        label: candidate.carrier_type.clone(),
+        trust_state: api::TrustState::Observed as i32,
+        last_seen_unix_ms: i64::try_from(candidate.expires_at.0).unwrap_or(i64::MAX),
+        carrier_hint_count: 1,
+        ..Default::default()
+    }
+}
+
+/// One `PeerHint` mirroring a candidate back out (discovery.md §8): the
+/// v1 candidate carries exactly one connection hint.
+fn peer_hint(candidate: &PeerCandidate) -> api::PeerHint {
+    api::PeerHint {
+        carrier_type_id: candidate.carrier_type.clone(),
+        connection_hint: candidate.connection_hint.clone(),
+        expires_at_unix_ms: i64::try_from(candidate.expires_at.0).unwrap_or(i64::MAX),
+        source: match candidate.source {
+            CandidateSource::Static => "static",
+            CandidateSource::LocalDiscovery => "local-discovery",
+            CandidateSource::PeerHint => "peer-hint",
+            CandidateSource::Invitation => "invitation",
+            CandidateSource::Bootstrap => "bootstrap",
+            CandidateSource::Application => "application",
+            CandidateSource::CarrierNative => "carrier-native",
+        }
+        .into(),
+        do_not_reshare: candidate.sharing_policy == SharingPolicy::DoNotReshare,
+    }
+}
+
+/// `PeerService.GetPeer`: one candidate entry by id (discovery.md §24.1).
+/// Unknown ids are `NotFound`.
+fn get_peer(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(get) = api::GetPeerRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(candidate_id) = peer_endpoint_id_to_candidate(&get.endpoint_id) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(candidate) = state.discovery.candidates.get(candidate_id) else {
+        return (api::StatusCode::NotFound as i32, None);
+    };
+    let response = api::GetPeerResponse {
+        peer: Some(peer_summary(candidate)),
+        hints: vec![peer_hint(candidate)],
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `PeerService.AddPeerHint`: record or refresh a candidate from an
+/// operator-supplied hint (discovery.md §24.1). The hint's sharing flag
+/// maps to the candidate's resharing policy; an expired hint is refused.
+fn add_peer_hint(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(add) = api::AddPeerHintRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(candidate_id) = peer_endpoint_id_to_candidate(&add.endpoint_id) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(hint) = add.hint else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let now = wall_now();
+    let expires_at = u64::try_from(hint.expires_at_unix_ms).unwrap_or(u64::MAX);
+    if expires_at <= now.0 {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    let candidate = PeerCandidate {
+        candidate_id,
+        carrier_type: hint.carrier_type_id,
+        connection_hint: hint.connection_hint,
+        source: CandidateSource::PeerHint,
+        created_at: now,
+        expires_at: Instant(expires_at),
+        sharing_policy: if hint.do_not_reshare {
+            SharingPolicy::DoNotReshare
+        } else {
+            SharingPolicy::ShareGeneral
+        },
+        authentication: CandidateAuth::Unauthenticated,
+        local: false,
+    };
+    if let Err(e) = state.discovery.record_candidate(candidate, now) {
+        log::warn!("[peers] hint rejected, table full: {e:?}");
+        return (api::StatusCode::ResourceExhausted as i32, None);
+    }
+    let stored = state
+        .discovery
+        .candidates
+        .get(candidate_id)
+        .expect("recorded candidate");
+    let response = api::AddPeerHintResponse {
+        peer: Some(peer_summary(stored)),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `PeerService.RemovePeer`: drop a candidate from the table AND its
+/// persisted record (storage.md §16.4), so the peer disappears from
+/// `ListPeers`/`GetPeer` and does not come back on restart. Unknown ids
+/// are `NotFound`. The `expected_revision` precondition is not enforced in
+/// v1 (no resource revisions exist yet).
+fn remove_peer(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(remove) = api::RemovePeerRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(candidate_id) = peer_endpoint_id_to_candidate(&remove.endpoint_id) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if state.discovery.candidates.get(candidate_id).is_none() {
+        return (api::StatusCode::NotFound as i32, None);
+    }
+    state.discovery.candidates.remove(candidate_id);
+    if let Err(e) = state
+        .store
+        .delete(Namespace::Peer, &candidate_id.to_be_bytes())
+    {
+        log::error!("[peers] failed to delete persisted candidate {candidate_id}: {e:?}");
+    }
+    let mut payload = Vec::new();
+    Message::encode(&api::RemovePeerResponse {}, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// The effective trust state of `endpoint` in the proto enum's terms. The
+/// v1 trust store has five levels; the spec's seven-state set replaces
+/// them in Phase G (gap-closure G1), so this mapping is documented coarse.
+fn trust_state_code(state: &RuntimeState, endpoint: &[u8]) -> i32 {
+    match state.trust_store().effective_trust_level(endpoint) {
+        Ok(TrustLevel::Distrusted) => api::TrustState::Blocked as i32,
+        Ok(TrustLevel::Unknown) | Err(_) => api::TrustState::Unknown as i32,
+        Ok(TrustLevel::Basic) => api::TrustState::Observed as i32,
+        Ok(TrustLevel::Familiar | TrustLevel::Privileged) => api::TrustState::Trusted as i32,
+    }
+}
+
+/// One `PeerSummary` for a security operation (`BlockPeer` etc.): the
+/// 32-byte identity space, with the trust state reflecting the blocklist /
+/// trust-store reality.
+fn security_peer_summary(endpoint_id: &[u8; 32], trust_state: i32) -> api::PeerSummary {
+    api::PeerSummary {
+        endpoint_id: endpoint_id.to_vec(),
+        trust_state,
+        ..Default::default()
+    }
+}
+
+/// The v1 trust-level mapping for `SetTrustState` (identity-trust.md §13):
+/// the spec's seven states land on the store's five levels. `Restricted`,
+/// `Blocked`, and `Revoked` collapse to `Distrusted`; `Introduced` falls
+/// back to `Basic` (the v1 store has no introduction level); `Trusted`
+/// maps to `Familiar`. Phase G (gap-closure G1) replaces this with the
+/// full seven-state set.
+fn trust_level_from_proto(state: api::TrustState) -> TrustLevel {
+    match state {
+        api::TrustState::Observed | api::TrustState::Introduced => TrustLevel::Basic,
+        api::TrustState::Trusted => TrustLevel::Familiar,
+        api::TrustState::Restricted | api::TrustState::Blocked | api::TrustState::Revoked => {
+            TrustLevel::Distrusted
+        }
+        api::TrustState::Unknown | api::TrustState::Unspecified => TrustLevel::Unknown,
+    }
+}
+
+/// `PeerService.SetTrustState`: move one endpoint's persisted trust level
+/// (identity-trust.md §13, security-operations.md §16.3). `UNKNOWN`
+/// restores the default; the negative states mark distrusted. Emits a
+/// `trust_state_set` event. The `expected_revision` precondition is not
+/// enforced in v1 (no resource revisions exist yet).
+fn set_trust_state(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(set) = api::SetTrustStateRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok(endpoint) = <[u8; 32]>::try_from(set.endpoint_id.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(proto_state) = api::TrustState::try_from(set.trust_state).ok() else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if proto_state == api::TrustState::Unspecified {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    let now_ms = wall_now().0;
+    let level = trust_level_from_proto(proto_state);
+    let trust = state.trust_store();
+    let result = match level {
+        TrustLevel::Distrusted => trust.mark_distrusted(&endpoint, now_ms),
+        TrustLevel::Unknown => trust.remove_distrust(&endpoint),
+        other => trust.set_level(&endpoint, other, now_ms),
+    };
+    if let Err(e) = result {
+        log::error!("[peers] trust update failed: {e:?}");
+        return (api::StatusCode::Internal as i32, None);
+    }
+    push_event(
+        state,
+        "trust_state_set",
+        format!(
+            "peer {:02x?} -> {proto_state:?} (v1 {level:?}); reason {}",
+            endpoint, set.reason
+        ),
+    );
+    let response = api::SetTrustStateResponse {
+        peer: Some(security_peer_summary(&endpoint, proto_state as i32)),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `PeerService.BlockPeer` (security-operations.md §16.2): block the
+/// 32-byte endpoint identity for the configured blocklist permanence. The
+/// accept loop consults the blocklist before registering any session, so
+/// the block refuses future sessions. The request's custom
+/// `expires_at_unix_ms` is not applied in v1 — the blocklist applies its
+/// configured permanence uniformly (custom expiry lands with the blocklist
+/// rewrite).
+fn block_peer(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(block) = api::BlockPeerRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok(endpoint) = <[u8; 32]>::try_from(block.endpoint_id.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let now = wall_now();
+    state.blocklist.block(&endpoint, BlockReason::Operator, now);
+    push_event(
+        state,
+        "peer_blocked",
+        format!("peer {:02x?}; reason {}", endpoint, block.reason),
+    );
+    let response = api::BlockPeerResponse {
+        peer: Some(security_peer_summary(
+            &endpoint,
+            api::TrustState::Blocked as i32,
+        )),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `PeerService.UnblockPeer`: lift an active block (security-operations.md
+/// §16.2); the response carries the peer's effective trust state, which
+/// may still be negative if `SetTrustState` separately marked it
+/// distrusted.
+fn unblock_peer(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(unblock) = api::UnblockPeerRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok(endpoint) = <[u8; 32]>::try_from(unblock.endpoint_id.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    state.blocklist.unblock(&endpoint);
+    push_event(state, "peer_unblocked", format!("peer {endpoint:02x?}"));
+    let response = api::UnblockPeerResponse {
+        peer: Some(security_peer_summary(
+            &endpoint,
+            trust_state_code(state, &endpoint),
+        )),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `PeerService.CreateInvitation` (discovery.md §14, §24.1): issue one
+/// invitation whose document embeds the invitation id and the
+/// proto-encoded `InvitationScope` (see [`InvitationDocument`]). The
+/// issuing identity handle must resolve to the primary or a secondary
+/// (task F2); v1 invitations carry no identity binding beyond that
+/// selection. `maximum_uses` of exactly 1 makes the invitation single-use;
+/// anything else is multi-use in v1 (the store models single-use only).
+fn create_invitation(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(create) = api::CreateInvitationRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if let Some(handle) = &create.identity_handle {
+        if state.identity_by_handle(&handle.value).is_none() {
+            return (api::StatusCode::NotFound as i32, None);
+        }
+    }
+    let Some(scope) = create.scope else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let expires_at_ms = u64::try_from(scope.expires_at_unix_ms).unwrap_or(0);
+    if expires_at_ms == 0 {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    let single_use = scope.maximum_uses == 1;
+    match state
+        .invitations
+        .create(expires_at_ms, single_use, &OsEntropy)
+    {
+        Ok(invitation) => {
+            let document = InvitationDocument {
+                invitation_id: invitation.id.to_vec(),
+                scope: Some(scope),
+            };
+            let mut invitation_document = Vec::new();
+            Message::encode(&document, &mut invitation_document).expect("encode");
+            push_event(
+                state,
+                "invitation_created",
+                format!(
+                    "invitation {:02x?} single_use {single_use} expires {}",
+                    invitation.id, expires_at_ms
+                ),
+            );
+            let response = api::CreateInvitationResponse {
+                invitation_id: invitation.id.to_vec(),
+                invitation_secret: invitation.key.to_vec(),
+                invitation_document,
+            };
+            let mut payload = Vec::new();
+            Message::encode(&response, &mut payload).expect("encode");
+            (api::StatusCode::Ok as i32, Some(payload))
+        }
+        Err(InvitationError::Full) => (api::StatusCode::ResourceExhausted as i32, None),
+        Err(_) => (api::StatusCode::Internal as i32, None),
+    }
+}
+
+/// `PeerService.ImportInvitation` (discovery.md §24.1): validate the
+/// invitation's id + secret against the store, then record each invited
+/// endpoint as a candidate — invitation-authenticated and private, never
+/// reshared. The v1 candidate table keys by 8-byte ids, so the first 8
+/// bytes of each invited endpoint id key the candidate (documented
+/// provisional; endpoints too short to key the table are skipped).
+fn import_invitation(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(import) = api::ImportInvitationRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok(document) = InvitationDocument::decode(import.invitation_document.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok(invitation_id) = <[u8; 16]>::try_from(document.invitation_id.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(scope) = document.scope else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let now = wall_now();
+    match state
+        .invitations
+        .validate(&invitation_id, &import.invitation_secret, now.0)
+    {
+        Ok(()) => {}
+        Err(InvitationError::Unknown) => return (api::StatusCode::NotFound as i32, None),
+        Err(_) => {
+            return (api::StatusCode::FailedPrecondition as i32, None);
+        }
+    }
+    let candidate_expiry = if scope.expires_at_unix_ms > 0 {
+        u64::try_from(scope.expires_at_unix_ms).unwrap_or(u64::MAX)
+    } else {
+        // No scope expiry: candidates live out the v1 default hint lifetime
+        // of 24 hours (discovery.md §8).
+        now.0.saturating_add(24 * 60 * 60 * 1_000)
+    };
+    for endpoint_id in &scope.endpoint_ids {
+        let Some(candidate_id) = peer_endpoint_id_to_candidate(endpoint_id) else {
+            continue;
+        };
+        let candidate = PeerCandidate {
+            candidate_id,
+            carrier_type: scope
+                .protocol_ids
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "invitation".into()),
+            connection_hint: Vec::new(),
+            source: CandidateSource::Invitation,
+            created_at: now,
+            expires_at: Instant(candidate_expiry),
+            sharing_policy: SharingPolicy::LocalUseOnly,
+            authentication: CandidateAuth::InvitationAuthenticated,
+            local: false,
+        };
+        if let Err(e) = state.discovery.record_candidate(candidate, now) {
+            log::warn!("[peers] imported candidate {candidate_id} rejected: {e:?}");
+        }
+    }
+    push_event(
+        state,
+        "invitation_imported",
+        format!(
+            "invitation {:02x?} recorded {} endpoint(s)",
+            invitation_id,
+            scope.endpoint_ids.len()
+        ),
+    );
+    let response = api::ImportInvitationResponse {
+        invitation_id: invitation_id.to_vec(),
+        scope: Some(scope),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `PeerService.RevokeInvitation`: revoke by id, idempotently — an
+/// unknown or already-revoked invitation still succeeds.
+fn revoke_invitation(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(revoke) = api::RevokeInvitationRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok(invitation_id) = <[u8; 16]>::try_from(revoke.invitation_id.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    state.invitations.revoke(&invitation_id);
+    push_event(
+        state,
+        "invitation_revoked",
+        format!(
+            "invitation {:02x?}; reason {}",
+            invitation_id, revoke.reason
+        ),
+    );
+    let mut payload = Vec::new();
+    Message::encode(&api::RevokeInvitationResponse {}, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// Push one daemon event (core.md §15) from the control surface.
+fn push_event(state: &RuntimeState, kind: &str, detail: String) {
+    state
+        .events
+        .lock()
+        .expect("event log")
+        .push(crate::event_log::DaemonEvent {
+            kind: kind.to_string(),
+            at_ms: wall_now().0,
+            detail,
+        });
+}
+
 /// `SessionService.ListSessions`: the live session registry (core.md §9.5).
 /// The v1 registry tracks the carrier a session rides on, not a separate
 /// protocol id, so the carrier type rides in `protocol_id`. Paginated
@@ -778,6 +1269,62 @@ fn session_summary(id: u64, entry: &crate::session_manager::SessionEntry) -> api
     }
 }
 
+/// The 8-byte session id behind an opaque handle.
+fn session_id_from_handle(handle: Option<&api::OpaqueHandle>) -> Option<u64> {
+    handle
+        .and_then(|handle| <[u8; 8]>::try_from(handle.value.as_slice()).ok())
+        .map(u64::from_be_bytes)
+}
+
+/// `SessionService.CloseSession` (core.md §9.5): abort the session task via
+/// the registry entry's `AbortHandle`. The v1 registry is append-only, so
+/// the entry stays (its task is finished); the task watcher records the
+/// final `session_closed` event. Unknown handles are `NotFound`.
+fn close_session(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(close) = api::CloseSessionRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(session_id) = session_id_from_handle(close.session_handle.as_ref()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(entry) = state.sessions.lookup(session_id) else {
+        return (api::StatusCode::NotFound as i32, None);
+    };
+    entry.task.abort();
+    push_event(
+        state,
+        "session_close_requested",
+        format!(
+            "session {session_id} peer {:02x?}; code {}; reason {}",
+            entry.peer_endpoint_id, close.application_error_code, close.reason
+        ),
+    );
+    let mut payload = Vec::new();
+    Message::encode(&api::CloseSessionResponse {}, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `SessionService.ListStreams` (core.md §9.5): the session's open streams.
+/// SANCTIONED minimal (gap-closure F3): the v1 registry tracks no open
+/// streams — the session object (with its stream table) lives inside the
+/// session task, unreachable from the control surface. A known handle
+/// returns an empty listing; stream enumeration lands with a shared
+/// session handle. Unknown handles are `NotFound`.
+fn list_streams(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(list) = api::ListStreamsRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(session_id) = session_id_from_handle(list.session_handle.as_ref()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if state.sessions.lookup(session_id).is_none() {
+        return (api::StatusCode::NotFound as i32, None);
+    }
+    let mut payload = Vec::new();
+    Message::encode(&api::ListStreamsResponse::default(), &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
 /// `RouteService.ListRoutes`: the persisted route snapshots (storage.md
 /// §15.1) — the same table the cache restores from at startup (§15.2), so
 /// restored routes list as `candidate` until revalidated. Paginated
@@ -838,6 +1385,229 @@ fn route_scope_from_u8(scope: u8) -> i32 {
         3 => api::RouteScope::General as i32,
         _ => api::RouteScope::Unspecified as i32,
     }
+}
+
+fn route_scope_code(scope: RouteScope) -> i32 {
+    match scope {
+        RouteScope::LinkLocal => api::RouteScope::LinkLocal as i32,
+        RouteScope::LocalMesh => api::RouteScope::LocalMesh as i32,
+        RouteScope::Introduced => api::RouteScope::Introduced as i32,
+        RouteScope::General => api::RouteScope::General as i32,
+    }
+}
+
+fn route_state_str(state: RouteState) -> &'static str {
+    match state {
+        RouteState::Candidate => "candidate",
+        RouteState::Probing => "probing",
+        RouteState::Usable => "usable",
+        RouteState::Degraded => "degraded",
+        RouteState::Failed => "failed",
+        _ => "unknown",
+    }
+}
+
+/// One `RouteSummary` from a cached route record (routing.md §24): the key
+/// hash doubles as the opaque handle, the next hop rides in
+/// `carrier_class` (the same field `ListRoutes` uses).
+fn route_summary(record: &umc_routing::types::RouteRecord) -> api::RouteSummary {
+    api::RouteSummary {
+        route_handle: Some(api::OpaqueHandle {
+            value: record.key.destination_hash.to_vec(),
+        }),
+        destination_hint_hash: record.key.destination_hash.to_vec(),
+        scope: route_scope_code(record.scope),
+        state: route_state_str(record.state).into(),
+        hop_count: 1,
+        carrier_class: record.next_hop.clone(),
+        expires_at_unix_ms: i64::try_from(record.expires_at.0).unwrap_or(i64::MAX),
+        last_success_unix_ms: record
+            .last_success
+            .map_or(0, |instant| i64::try_from(instant.0).unwrap_or(i64::MAX)),
+        ..Default::default()
+    }
+}
+
+/// `RouteService.GetRoute`: one route by handle (the 32-byte destination
+/// key hash, matching `ListRoutes`). The cache is consulted first; routes
+/// restored from the store but not yet revalidated live only in the
+/// persisted snapshot (storage.md §15.2), so the store is the fallback.
+/// Unknown hashes are `NotFound`.
+fn get_route(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(get) = api::GetRouteRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(hash) = get
+        .route_handle
+        .as_ref()
+        .and_then(|handle| <[u8; 32]>::try_from(handle.value.as_slice()).ok())
+    else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    // The route cache is stamped with the node clock (monotonic, per-boot),
+    // so cache lookups must compare against the same clock family — the
+    // epoch-relative `wall_now()` would see every record as expired.
+    let now = state.node.clock.as_ref().now();
+    let key = RouteKey {
+        destination_profile: 0,
+        destination_hash: hash,
+        scope: RouteScope::General,
+        policy_class: 0,
+    };
+    let route = state
+        .routing
+        .cache
+        .candidates(&key, now)
+        .into_iter()
+        .next()
+        .map(|record| route_summary(&record))
+        .or_else(|| {
+            records::list_routes(state.store.as_ref())
+                .ok()
+                .and_then(|snapshots| {
+                    snapshots
+                        .into_iter()
+                        .find(|snapshot| snapshot.key_hash == hash)
+                })
+                .map(|snapshot| api::RouteSummary {
+                    route_handle: Some(api::OpaqueHandle {
+                        value: snapshot.key_hash.clone(),
+                    }),
+                    destination_hint_hash: snapshot.key_hash,
+                    scope: route_scope_from_u8(snapshot.scope),
+                    state: "candidate".into(),
+                    carrier_class: String::from_utf8_lossy(&snapshot.next_hop).into_owned(),
+                    expires_at_unix_ms: i64::try_from(
+                        snapshot.learned_at_ms.saturating_add(snapshot.lifetime_ms),
+                    )
+                    .unwrap_or(i64::MAX),
+                    ..Default::default()
+                })
+        });
+    let Some(route) = route else {
+        return (api::StatusCode::NotFound as i32, None);
+    };
+    let response = api::GetRouteResponse {
+        route: Some(route),
+        // The v1 cache records no legs; nothing to redact.
+        redacted_legs: Vec::new(),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `RouteService.ProbeRoute`. SANCTIONED minimal (gap-closure F3): a cache
+/// probe, not a wire probe — the daemon has no session-bus route-request
+/// path yet (multi-hop `ROUTE_REQUEST` forwarding is Phase H). The
+/// destination hint is hashed exactly like a learned route's
+/// (routing.md §17) and the best cached candidates are returned; the
+/// operation handle is the key hash, and `wait_for_usable` is accepted but
+/// has no effect (the cache holds usable and candidate records alike).
+fn probe_route(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(probe) = api::ProbeRouteRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let hash = crate::session_task::hash_destination(&probe.destination_hint);
+    let key = RouteKey {
+        destination_profile: 0,
+        destination_hash: hash,
+        scope: RouteScope::General,
+        policy_class: 0,
+    };
+    // Node-clock `now`: the cache is stamped with the monotonic node clock
+    // (see `get_route`).
+    let now = state.node.clock.as_ref().now();
+    let candidates: Vec<api::RouteSummary> = state
+        .routing
+        .cache
+        .candidates(&key, now)
+        .into_iter()
+        .take(3)
+        .map(|record| route_summary(&record))
+        .collect();
+    let response = api::ProbeRouteResponse {
+        operation_handle: Some(api::OpaqueHandle {
+            value: hash.to_vec(),
+        }),
+        candidates,
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `RouteService.InvalidateRoute`: drop every cached entry for the key
+/// hash AND the persisted snapshot (storage.md §15.3), so the route does
+/// not come back on restart. Unknown hashes are `NotFound`. Emits a
+/// `route_invalidated` event.
+fn invalidate_route(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(invalidate) = api::InvalidateRouteRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(hash) = invalidate
+        .route_handle
+        .as_ref()
+        .and_then(|handle| <[u8; 32]>::try_from(handle.value.as_slice()).ok())
+    else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    // Node-clock `now`: the cache is stamped with the monotonic node clock
+    // (see `get_route`).
+    let now = state.node.clock.as_ref().now();
+    let persisted = match records::list_routes(state.store.as_ref()) {
+        Ok(snapshots) => snapshots,
+        Err(e) => {
+            log::error!("[routing] route listing failed: {e:?}");
+            return (api::StatusCode::Internal as i32, None);
+        }
+    };
+    let persisted_hit = persisted.iter().any(|snapshot| snapshot.key_hash == hash);
+    let cache_hit = [
+        RouteScope::LinkLocal,
+        RouteScope::LocalMesh,
+        RouteScope::Introduced,
+        RouteScope::General,
+    ]
+    .into_iter()
+    .any(|scope| {
+        let key = RouteKey {
+            destination_profile: 0,
+            destination_hash: hash,
+            scope,
+            policy_class: 0,
+        };
+        !state.routing.cache.candidates(&key, now).is_empty()
+    });
+    if !persisted_hit && !cache_hit {
+        return (api::StatusCode::NotFound as i32, None);
+    }
+    for scope in [
+        RouteScope::LinkLocal,
+        RouteScope::LocalMesh,
+        RouteScope::Introduced,
+        RouteScope::General,
+    ] {
+        let key = RouteKey {
+            destination_profile: 0,
+            destination_hash: hash,
+            scope,
+            policy_class: 0,
+        };
+        state.routing.cache.remove(&key);
+    }
+    if let Err(e) = state.store.delete(Namespace::Route, &hash) {
+        log::error!("[routing] failed to delete persisted route: {e:?}");
+        return (api::StatusCode::Internal as i32, None);
+    }
+    push_event(
+        state,
+        "route_invalidated",
+        format!("hash {hash:02x?}; reason {}", invalidate.reason),
+    );
+    let mut payload = Vec::new();
+    Message::encode(&api::InvalidateRouteResponse {}, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
 }
 
 /// `BundleService.ListBundles`: bundle listing, bounded to 100 per page
@@ -2466,6 +3236,799 @@ mod tests {
         );
         assert_eq!(peers[0].label, "ump.udp/1");
         assert_eq!(peers[0].trust_state, api::TrustState::Observed as i32);
+    }
+
+    fn record_peer(state: &mut RuntimeState, id: u64, now: Instant) {
+        state
+            .discovery
+            .record_candidate(
+                umc_discovery::provider::PeerCandidate {
+                    candidate_id: id,
+                    carrier_type: "ump.udp/1".into(),
+                    connection_hint: vec![1, 2, 3],
+                    source: umc_discovery::provider::CandidateSource::PeerHint,
+                    created_at: now,
+                    expires_at: Instant(now.0 + 600_000),
+                    sharing_policy: umc_discovery::provider::SharingPolicy::ShareGeneral,
+                    authentication: umc_discovery::provider::CandidateAuth::Unauthenticated,
+                    local: false,
+                },
+                now,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn get_peer_round_trip_and_not_found() {
+        let (mut state, _tx) = test_state();
+        let now = state.node.clock.as_ref().now();
+        record_peer(&mut state, 42, now);
+
+        let get = api::GetPeerRequest {
+            endpoint_id: 42u64.to_be_bytes().to_vec(),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&get, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "GetPeer", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(response.status.unwrap().code, api::StatusCode::Ok as i32);
+        let got = api::GetPeerResponse::decode(response.payload.as_slice()).expect("payload");
+        let peer = got.peer.expect("peer");
+        assert_eq!(peer.endpoint_id, 42u64.to_be_bytes());
+        assert_eq!(peer.label, "ump.udp/1");
+        assert_eq!(peer.carrier_hint_count, 1);
+        let hint = &got.hints[0];
+        assert_eq!(hint.carrier_type_id, "ump.udp/1");
+        assert_eq!(hint.connection_hint, vec![1, 2, 3]);
+        assert_eq!(hint.source, "peer-hint");
+
+        // An unknown id is NotFound.
+        let get = api::GetPeerRequest {
+            endpoint_id: 99u64.to_be_bytes().to_vec(),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&get, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "GetPeer", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::NotFound as i32
+        );
+
+        // A non-8-byte endpoint id is InvalidArgument.
+        let get = api::GetPeerRequest {
+            endpoint_id: vec![1, 2, 3],
+        };
+        let mut payload = Vec::new();
+        Message::encode(&get, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "GetPeer", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::InvalidArgument as i32
+        );
+    }
+
+    #[test]
+    fn add_peer_hint_records_a_candidate() {
+        let (mut state, _tx) = test_state();
+        let add = api::AddPeerHintRequest {
+            endpoint_id: 7u64.to_be_bytes().to_vec(),
+            hint: Some(api::PeerHint {
+                carrier_type_id: "ump.tcp/1".into(),
+                connection_hint: vec![9, 9],
+                expires_at_unix_ms: i64::try_from(wall_now().0).unwrap_or(i64::MAX) + 600_000,
+                source: "operator".into(),
+                do_not_reshare: true,
+            }),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&add, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "AddPeerHint", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(response.status.unwrap().code, api::StatusCode::Ok as i32);
+        let peer = api::AddPeerHintResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .peer
+            .expect("peer");
+        assert_eq!(peer.endpoint_id, 7u64.to_be_bytes());
+
+        // The hint became a candidate: listed, with the resharing policy
+        // honoring do_not_reshare.
+        let snapshot = state.discovery.candidates();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].candidate_id, 7);
+        assert_eq!(
+            snapshot[0].sharing_policy,
+            umc_discovery::provider::SharingPolicy::DoNotReshare
+        );
+
+        // An already-expired hint is refused.
+        let add = api::AddPeerHintRequest {
+            endpoint_id: 8u64.to_be_bytes().to_vec(),
+            hint: Some(api::PeerHint {
+                carrier_type_id: "ump.tcp/1".into(),
+                connection_hint: Vec::new(),
+                expires_at_unix_ms: 0,
+                source: "operator".into(),
+                do_not_reshare: false,
+            }),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&add, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "AddPeerHint", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::InvalidArgument as i32
+        );
+    }
+
+    #[test]
+    fn remove_peer_clears_table_and_persisted_record() {
+        let (mut state, _tx) = test_state();
+        let now = state.node.clock.as_ref().now();
+        record_peer(&mut state, 42, now);
+        assert!(
+            state
+                .store
+                .get(Namespace::Peer, &42u64.to_be_bytes())
+                .unwrap()
+                .is_some(),
+            "recorded candidates persist (storage.md §16.4)"
+        );
+
+        let remove = api::RemovePeerRequest {
+            endpoint_id: 42u64.to_be_bytes().to_vec(),
+            expected_revision: None,
+        };
+        let mut payload = Vec::new();
+        Message::encode(&remove, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "RemovePeer", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(response.status.unwrap().code, api::StatusCode::Ok as i32);
+
+        assert!(state.discovery.candidates().is_empty());
+        assert!(
+            state
+                .store
+                .get(Namespace::Peer, &42u64.to_be_bytes())
+                .unwrap()
+                .is_none(),
+            "the persisted record is deleted too"
+        );
+
+        // Removing an unknown peer is NotFound.
+        let remove = api::RemovePeerRequest {
+            endpoint_id: 43u64.to_be_bytes().to_vec(),
+            expected_revision: None,
+        };
+        let mut payload = Vec::new();
+        Message::encode(&remove, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "RemovePeer", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::NotFound as i32
+        );
+    }
+
+    fn set_trust_raw(state: &mut RuntimeState, endpoint: &[u8; 32], proto_state: i32) -> i32 {
+        let set = api::SetTrustStateRequest {
+            endpoint_id: endpoint.to_vec(),
+            trust_state: proto_state,
+            expected_revision: None,
+            reason: "test".into(),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&set, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            state,
+            &request("PeerService", "SetTrustState", payload),
+            None,
+        );
+        decode_response(&bytes).status.unwrap().code
+    }
+
+    #[test]
+    fn set_trust_state_moves_effective_level_and_emits_event() {
+        let (mut state, _tx) = test_state();
+        let endpoint = [4u8; 32];
+        assert_eq!(
+            state
+                .trust_store()
+                .effective_trust_level(&endpoint)
+                .unwrap(),
+            TrustLevel::Unknown,
+            "unseen endpoints start at the default"
+        );
+
+        assert_eq!(
+            set_trust_raw(&mut state, &endpoint, api::TrustState::Trusted as i32),
+            api::StatusCode::Ok as i32
+        );
+        assert_eq!(
+            state
+                .trust_store()
+                .effective_trust_level(&endpoint)
+                .unwrap(),
+            TrustLevel::Familiar,
+            "TRUSTED maps to the v1 Familiar level"
+        );
+
+        assert_eq!(
+            set_trust_raw(&mut state, &endpoint, api::TrustState::Restricted as i32),
+            api::StatusCode::Ok as i32
+        );
+        assert_eq!(
+            state
+                .trust_store()
+                .effective_trust_level(&endpoint)
+                .unwrap(),
+            TrustLevel::Distrusted,
+            "RESTRICTED marks the peer distrusted"
+        );
+
+        // UNKNOWN restores the default (the trust record is removed).
+        assert_eq!(
+            set_trust_raw(&mut state, &endpoint, api::TrustState::Unknown as i32),
+            api::StatusCode::Ok as i32
+        );
+        assert_eq!(
+            state
+                .trust_store()
+                .effective_trust_level(&endpoint)
+                .unwrap(),
+            TrustLevel::Unknown
+        );
+
+        // The mutation is audited in the event log.
+        let events = state.events.lock().unwrap().recent(10);
+        assert!(
+            events.iter().any(|event| event.kind == "trust_state_set"),
+            "SetTrustState emits a trust event"
+        );
+
+        // UNSPECIFIED is refused.
+        assert_eq!(
+            set_trust_raw(&mut state, &endpoint, api::TrustState::Unspecified as i32),
+            api::StatusCode::InvalidArgument as i32
+        );
+        // A non-32-byte endpoint id is refused.
+        let set = api::SetTrustStateRequest {
+            endpoint_id: vec![1, 2],
+            trust_state: api::TrustState::Trusted as i32,
+            expected_revision: None,
+            reason: "test".into(),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&set, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "SetTrustState", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::InvalidArgument as i32
+        );
+    }
+
+    #[test]
+    fn block_peer_refuses_new_sessions_and_unblock_restores() {
+        let (mut state, _tx) = test_state();
+        let endpoint = [9u8; 32];
+        let now = state.node.clock.as_ref().now();
+
+        let block = api::BlockPeerRequest {
+            endpoint_id: endpoint.to_vec(),
+            reason: "abuse".into(),
+            expires_at_unix_ms: 0,
+        };
+        let mut payload = Vec::new();
+        Message::encode(&block, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "BlockPeer", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(response.status.unwrap().code, api::StatusCode::Ok as i32);
+        let peer = api::BlockPeerResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .peer
+            .expect("peer");
+        assert_eq!(peer.trust_state, api::TrustState::Blocked as i32);
+
+        // The accept loop refuses new sessions from the blocked peer
+        // (register_session consults the blocklist).
+        assert!(
+            state.refuse_if_blocked(&endpoint, now).is_err(),
+            "a blocked peer's session attempt is refused"
+        );
+        assert!(
+            state.refuse_if_blocked(&[8u8; 32], now).is_ok(),
+            "other peers are unaffected"
+        );
+
+        let unblock = api::UnblockPeerRequest {
+            endpoint_id: endpoint.to_vec(),
+            expected_revision: None,
+        };
+        let mut payload = Vec::new();
+        Message::encode(&unblock, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "UnblockPeer", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(response.status.unwrap().code, api::StatusCode::Ok as i32);
+        assert!(state.refuse_if_blocked(&endpoint, now).is_ok());
+
+        // A short endpoint id is refused.
+        let block = api::BlockPeerRequest {
+            endpoint_id: vec![1, 2],
+            reason: "abuse".into(),
+            expires_at_unix_ms: 0,
+        };
+        let mut payload = Vec::new();
+        Message::encode(&block, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "BlockPeer", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::InvalidArgument as i32
+        );
+    }
+
+    #[allow(clippy::too_many_lines)] // one invitation lifecycle: create, import, consume, revoke
+    #[test]
+    fn invitation_create_import_revoke_round_trip() {
+        let (mut state, _tx) = test_state();
+        let scope = api::InvitationScope {
+            endpoint_ids: vec![42u64.to_be_bytes().to_vec()],
+            protocol_ids: vec!["ump.tcp/1".into()],
+            allow_relay: false,
+            allow_discovery: true,
+            maximum_uses: 1,
+            expires_at_unix_ms: i64::try_from(wall_now().0).unwrap_or(i64::MAX) + 3_600_000,
+        };
+        let create = api::CreateInvitationRequest {
+            identity_handle: Some(api::OpaqueHandle {
+                value: NODE_IDENTITY_RECORD.to_vec(),
+            }),
+            scope: Some(scope.clone()),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&create, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "CreateInvitation", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(response.status.unwrap().code, api::StatusCode::Ok as i32);
+        let created =
+            api::CreateInvitationResponse::decode(response.payload.as_slice()).expect("payload");
+        assert_eq!(created.invitation_id.len(), 16);
+        assert_eq!(created.invitation_secret.len(), 32);
+        assert!(!created.invitation_document.is_empty());
+
+        // Import round trip: validates the invitation and records the
+        // invited endpoint as an invitation-authenticated candidate.
+        let import = api::ImportInvitationRequest {
+            invitation_document: created.invitation_document.clone(),
+            invitation_secret: created.invitation_secret.clone(),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&import, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "ImportInvitation", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(response.status.unwrap().code, api::StatusCode::Ok as i32);
+        let imported =
+            api::ImportInvitationResponse::decode(response.payload.as_slice()).expect("payload");
+        assert_eq!(imported.invitation_id, created.invitation_id);
+        assert_eq!(imported.scope, Some(scope));
+        let candidates = state.discovery.candidates();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].candidate_id, 42);
+        assert_eq!(
+            candidates[0].authentication,
+            umc_discovery::provider::CandidateAuth::InvitationAuthenticated
+        );
+        assert_eq!(
+            candidates[0].source,
+            umc_discovery::provider::CandidateSource::Invitation
+        );
+
+        // A single-use invitation imports exactly once.
+        let mut payload = Vec::new();
+        Message::encode(&import, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "ImportInvitation", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::FailedPrecondition as i32,
+            "single-use invitations are consumed by the first import"
+        );
+
+        // Revoke: the invitation no longer validates.
+        let revoke = api::RevokeInvitationRequest {
+            invitation_id: created.invitation_id.clone(),
+            reason: "expired".into(),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&revoke, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "RevokeInvitation", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let mut payload = Vec::new();
+        Message::encode(&import, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "ImportInvitation", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::NotFound as i32,
+            "a revoked invitation is unknown"
+        );
+
+        // An unknown issuing identity is NotFound.
+        let create = api::CreateInvitationRequest {
+            identity_handle: Some(api::OpaqueHandle {
+                value: b"nobody".to_vec(),
+            }),
+            scope: Some(api::InvitationScope {
+                endpoint_ids: vec![],
+                protocol_ids: vec![],
+                allow_relay: false,
+                allow_discovery: false,
+                maximum_uses: 0,
+                expires_at_unix_ms: i64::try_from(wall_now().0).unwrap_or(i64::MAX) + 3_600_000,
+            }),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&create, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "CreateInvitation", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::NotFound as i32
+        );
+    }
+
+    #[test]
+    fn get_route_and_probe_round_trip() {
+        let (mut state, _tx) = test_state();
+        let now = state.node.clock.as_ref().now();
+        let rid = [1u8; 16];
+        let hash = crate::session_task::hash_destination(b"peer-a");
+        state
+            .routing
+            .admit_route_request(&rid, b"upstream", 0, 8, 30_000, &[b"peer-a".to_vec()], now)
+            .unwrap();
+        let _ = state.routing.record_route_response(
+            umc_routing::types::RouteKey {
+                destination_profile: 0,
+                destination_hash: hash,
+                scope: umc_routing::types::RouteScope::General,
+                policy_class: 0,
+            },
+            rid,
+            "hop-a".into(),
+            600_000,
+            now,
+        );
+
+        // GetRoute by the key-hash handle.
+        let get = api::GetRouteRequest {
+            route_handle: Some(api::OpaqueHandle {
+                value: hash.to_vec(),
+            }),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&get, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RouteService", "GetRoute", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(response.status.unwrap().code, api::StatusCode::Ok as i32);
+        let route = api::GetRouteResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .route
+            .expect("route");
+        assert_eq!(route.destination_hint_hash, hash);
+        assert_eq!(route.state, "usable");
+        assert_eq!(route.carrier_class, "hop-a");
+
+        // An unknown hash is NotFound.
+        let get = api::GetRouteRequest {
+            route_handle: Some(api::OpaqueHandle {
+                value: [9u8; 32].to_vec(),
+            }),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&get, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RouteService", "GetRoute", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::NotFound as i32
+        );
+
+        // ProbeRoute: a cache probe returns the learned route for the hint.
+        let probe = api::ProbeRouteRequest {
+            destination_hint: b"peer-a".to_vec(),
+            policy: None,
+            wait_for_usable: true,
+        };
+        let mut payload = Vec::new();
+        Message::encode(&probe, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RouteService", "ProbeRoute", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(response.status.unwrap().code, api::StatusCode::Ok as i32);
+        let probed = api::ProbeRouteResponse::decode(response.payload.as_slice()).expect("payload");
+        assert_eq!(probed.candidates.len(), 1);
+        assert_eq!(probed.candidates[0].destination_hint_hash, hash);
+        assert_eq!(probed.operation_handle.unwrap().value, hash);
+
+        // An unknown destination yields no candidates.
+        let probe = api::ProbeRouteRequest {
+            destination_hint: b"nobody".to_vec(),
+            policy: None,
+            wait_for_usable: false,
+        };
+        let mut payload = Vec::new();
+        Message::encode(&probe, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RouteService", "ProbeRoute", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(response.status.unwrap().code, api::StatusCode::Ok as i32);
+        let probed = api::ProbeRouteResponse::decode(response.payload.as_slice()).expect("payload");
+        assert!(probed.candidates.is_empty());
+    }
+
+    #[test]
+    fn invalidate_route_clears_cache_and_persisted_record() {
+        let (mut state, _tx) = test_state();
+        let now = state.node.clock.as_ref().now();
+        let rid = [2u8; 16];
+        let hash = crate::session_task::hash_destination(b"peer-b");
+        let key = umc_routing::types::RouteKey {
+            destination_profile: 0,
+            destination_hash: hash,
+            scope: umc_routing::types::RouteScope::General,
+            policy_class: 0,
+        };
+        state
+            .routing
+            .admit_route_request(&rid, b"upstream", 0, 8, 30_000, &[], now)
+            .unwrap();
+        let _ = state
+            .routing
+            .record_route_response(key.clone(), rid, "hop-b".into(), 600_000, now);
+        assert!(state.routing.find_route(&key, now).is_some());
+        assert_eq!(
+            umc_storage::records::list_routes(state.store.as_ref())
+                .unwrap()
+                .len(),
+            1,
+            "learned routes persist (storage.md §15.1)"
+        );
+
+        let invalidate = api::InvalidateRouteRequest {
+            route_handle: Some(api::OpaqueHandle {
+                value: hash.to_vec(),
+            }),
+            reason: "stale".into(),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&invalidate, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RouteService", "InvalidateRoute", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(response.status.unwrap().code, api::StatusCode::Ok as i32);
+
+        assert!(
+            state.routing.find_route(&key, now).is_none(),
+            "the cache entry is gone"
+        );
+        assert!(
+            umc_storage::records::list_routes(state.store.as_ref())
+                .unwrap()
+                .is_empty(),
+            "the persisted snapshot is gone"
+        );
+
+        // Invalidating an unknown route is NotFound.
+        let invalidate = api::InvalidateRouteRequest {
+            route_handle: Some(api::OpaqueHandle {
+                value: [9u8; 32].to_vec(),
+            }),
+            reason: "stale".into(),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&invalidate, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RouteService", "InvalidateRoute", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::NotFound as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn close_session_aborts_the_session_task() {
+        let (mut state, _tx) = test_state();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let id = state.sessions.next_id();
+        state.sessions.register(
+            id,
+            crate::session_manager::SessionEntry {
+                peer_endpoint_id: [7u8; 32],
+                carrier_type: "ump.tcp/1".into(),
+                task: task.abort_handle(),
+                established_at_ms: 1_000,
+            },
+        );
+
+        let close = api::CloseSessionRequest {
+            session_handle: Some(api::OpaqueHandle {
+                value: id.to_be_bytes().to_vec(),
+            }),
+            application_error_code: 0,
+            reason: "operator".into(),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&close, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("SessionService", "CloseSession", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(response.status.unwrap().code, api::StatusCode::Ok as i32);
+        assert!(
+            task.await.is_err(),
+            "the session task was aborted by CloseSession"
+        );
+        assert!(
+            state.sessions.lookup(id).unwrap().task.is_finished(),
+            "the registry entry's abort handle reports the finished task"
+        );
+
+        // An unknown handle is NotFound.
+        let close = api::CloseSessionRequest {
+            session_handle: Some(api::OpaqueHandle {
+                value: 999u64.to_be_bytes().to_vec(),
+            }),
+            application_error_code: 0,
+            reason: "operator".into(),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&close, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("SessionService", "CloseSession", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::NotFound as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn list_streams_known_session_returns_empty_listing() {
+        let (mut state, _tx) = test_state();
+        let id = state.sessions.next_id();
+        register_session(&state, id, [7u8; 32]);
+
+        let list = api::ListStreamsRequest {
+            session_handle: Some(api::OpaqueHandle {
+                value: id.to_be_bytes().to_vec(),
+            }),
+            page: None,
+        };
+        let mut payload = Vec::new();
+        Message::encode(&list, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("SessionService", "ListStreams", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(response.status.unwrap().code, api::StatusCode::Ok as i32);
+        let streams = api::ListStreamsResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .streams;
+        assert!(
+            streams.is_empty(),
+            "v1 registry tracks no open streams (documented minimal)"
+        );
+
+        // An unknown session is NotFound.
+        let list = api::ListStreamsRequest {
+            session_handle: Some(api::OpaqueHandle {
+                value: 999u64.to_be_bytes().to_vec(),
+            }),
+            page: None,
+        };
+        let mut payload = Vec::new();
+        Message::encode(&list, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("SessionService", "ListStreams", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::NotFound as i32
+        );
     }
 
     #[test]
