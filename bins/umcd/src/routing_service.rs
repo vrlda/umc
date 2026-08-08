@@ -8,6 +8,7 @@ use umc_routing::cache::{RouteCache, DEFAULT_CACHE_MAX, DEFAULT_MAX_ROUTE_LIFETI
 use umc_routing::duplicate::{RequestCache, DEFAULT_CACHE_ENTRIES};
 use umc_routing::request::{admit_request, Admission, AdmissionError, RequestPolicy};
 use umc_routing::reverse::ReverseState;
+use umc_routing::sybil::{SybilGroup, SybilGuard};
 use umc_routing::types::{RouteKey, RouteRecord, RouteScope, RouteState};
 use umc_storage::records;
 use umc_storage::sqlite::SqliteStore;
@@ -23,6 +24,7 @@ pub struct RoutingService {
     pub cache: RouteCache,
     pub reverse: ReverseState,
     pub duplicate: RequestCache,
+    pub sybil: SybilGuard,
     pub request_policy: RequestPolicy,
     store: Option<Arc<SqliteStore>>,
 }
@@ -33,6 +35,7 @@ impl std::fmt::Debug for RoutingService {
             .field("cache", &self.cache)
             .field("reverse", &self.reverse)
             .field("duplicate", &self.duplicate)
+            .field("sybil", &self.sybil)
             .field("request_policy", &self.request_policy)
             .field("store_attached", &self.store.is_some())
             .finish()
@@ -50,6 +53,7 @@ impl RoutingService {
             ),
             reverse: ReverseState::new(Duration::from_millis(REVERSE_RETENTION_MS)),
             duplicate: RequestCache::new(DEFAULT_CACHE_ENTRIES, Duration::from_millis(30_000)),
+            sybil: SybilGuard::default(),
             request_policy: RequestPolicy::default(),
             store: None,
         }
@@ -164,6 +168,10 @@ impl RoutingService {
             now,
         )?;
         if matches!(admission, Admission::Admit { .. }) {
+            let group = SybilGroup::from_requester(adjacent_sender, &[]);
+            if !self.sybil.admit(group, now) {
+                return Err(AdmissionError::RateLimited);
+            }
             self.reverse
                 .create(*request_id, adjacent_sender.to_vec(), now);
         }
@@ -293,6 +301,44 @@ mod tests {
         assert_eq!(
             routing.admit_route_request(&[3u8; 16], b"u", 0, 0, 30_000, &[], Instant(0)),
             Err(AdmissionError::HopLimitZero)
+        );
+    }
+
+    #[test]
+    fn sybil_group_budget_limits_shared_source_prefix() {
+        let mut routing = RoutingService::new();
+        let peers = vec![b"peer-a".to_vec()];
+        for request_number in 0..umc_routing::sybil::REQUESTS_PER_GROUP_PER_MINUTE {
+            let request_tag = u8::try_from(request_number).expect("test budget fits in u8");
+            let mut request_id = [0u8; 16];
+            request_id[0] = request_tag;
+            let requester = [1, 2, 3, 4, request_tag];
+            assert!(matches!(
+                routing.admit_route_request(
+                    &request_id,
+                    &requester,
+                    0,
+                    8,
+                    30_000,
+                    &peers,
+                    Instant(0),
+                ),
+                Ok(Admission::Admit { .. })
+            ));
+        }
+        let mut request_id = [0u8; 16];
+        request_id[0] = 99;
+        assert_eq!(
+            routing.admit_route_request(
+                &request_id,
+                &[1, 2, 3, 4, 99],
+                0,
+                8,
+                30_000,
+                &peers,
+                Instant(0),
+            ),
+            Err(AdmissionError::RateLimited)
         );
     }
 

@@ -3,9 +3,11 @@
 //! addresses. The per-link accept loops and the LAN discovery loop land in
 //! Task 15+.
 use crate::state::RuntimeState;
+use umc_carrier::registry::CarrierRegistry;
 use umc_carrier::Carrier;
 use umc_carrier_lan::{LanDiscoveryCarrier, LanDiscoveryConfig};
 use umc_carrier_tcp::TcpCarrier;
+use umc_carrier_tls::TlsCarrier;
 use umc_carrier_udp::UdpCarrier;
 
 /// Default TCP bind address when `tcp_listen` is unset.
@@ -17,7 +19,12 @@ pub const DEFAULT_UDP_LISTEN: &str = "127.0.0.1:9002";
 /// data-carrier listeners, holding the binders in the runtime state.
 pub fn wire_carriers(state: &mut RuntimeState) {
     let config = state.config.clone();
+    let registry = CarrierRegistry::default();
     for carrier_type in &config.carriers {
+        if !registry.contains(carrier_type) {
+            log::error!("[carrier] unknown carrier type {carrier_type}; skipped");
+            continue;
+        }
         if config.carrier_disabled(carrier_type) {
             log::warn!("[carrier] {carrier_type} disabled by emergency policy");
             continue;
@@ -25,9 +32,33 @@ pub fn wire_carriers(state: &mut RuntimeState) {
         match carrier_type.as_str() {
             "ump.tcp/1" => bind_tcp(state, config.tcp_listen.clone()),
             "ump.udp/1" => bind_udp(state, config.udp_listen.clone()),
+            "ump.tls-stream/1" => bind_tls(state, config.tls_listen.clone()),
             "ump.lan-discovery/1" => register_lan(state),
             other => log::warn!("[carrier] {other} not built in"),
         }
+    }
+}
+
+fn bind_tls(state: &mut RuntimeState, bind: Option<String>) {
+    let Ok(carrier) = TlsCarrier::new() else {
+        log::error!("[carrier] ump.tls-stream/1 configuration failed");
+        return;
+    };
+    state.node.register_carrier(Box::new(carrier.clone()));
+    let Some(addr) = bind else {
+        log::warn!("[carrier] ump.tls-stream/1 enabled without tls_listen; no listener bound");
+        return;
+    };
+    let result = tokio::task::block_in_place(|| carrier.listen(addr.clone()));
+    match result {
+        Ok(listener) => {
+            state.listeners.push(listener);
+            log::info!(
+                "[carrier] ump.tls-stream/1 listening on {}",
+                crate::logging::redact_addr(&addr)
+            );
+        }
+        Err(e) => log::error!("[carrier] ump.tls-stream/1 failed to listen on {addr}: {e:?}"),
     }
 }
 

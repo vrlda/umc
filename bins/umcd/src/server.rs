@@ -2187,6 +2187,11 @@ fn node_config_message(config: &NodeConfig) -> api::NodeConfig {
             sensitive_present: false,
         },
         api::ConfigEntry {
+            key: "tls_listen".into(),
+            value: config.tls_listen.clone().unwrap_or_default(),
+            sensitive_present: false,
+        },
+        api::ConfigEntry {
             key: "disabled_protocol_versions".into(),
             value: config.disabled_protocol_versions.join(","),
             sensitive_present: false,

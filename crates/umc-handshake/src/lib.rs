@@ -2,6 +2,7 @@ pub mod encoding;
 pub mod identity;
 pub mod ik;
 pub mod initial;
+pub mod psk;
 pub mod retry;
 pub mod ticket;
 pub mod tracker;

@@ -39,7 +39,9 @@ use umc_handshake::xx::{
 use umc_session::session::{Role, Session, SessionConfig};
 use umc_types::frame::FrameType;
 use umc_types::runtime::{Clock, EntropySource, Instant};
+use umc_wire::frame::Frame;
 use umc_wire::frames::relay::{RelayDataFrame, RelayOpenFrame, RelayStatusFrame};
+use umc_wire::packet::{parse_payload, PacketContext};
 
 struct TestClock;
 
@@ -310,6 +312,29 @@ fn status_from_protected(keys: &PacketKeys, hp_key: &[u8; 32], bytes: &[u8]) -> 
     None
 }
 
+/// Extract relay-data frames from a protected session packet. Bus-forwarded
+/// frames are now encrypted with the destination session's traffic keys, so
+/// they arrive through the normal `on_inbound` success path rather than as
+/// raw bytes rejected by the session parser.
+fn relay_data_from_protected(keys: &PacketKeys, hp_key: &[u8; 32], bytes: &[u8]) -> Vec<Vec<u8>> {
+    let Ok((space, _dcid, _path, _pn, payload)) =
+        umc_session::packet::parse_protected_packet(keys, hp_key, 0, bytes)
+    else {
+        return Vec::new();
+    };
+    let Ok(parsed) = parse_payload(&PacketContext::Protected(space), &payload) else {
+        return Vec::new();
+    };
+    parsed
+        .frames
+        .into_iter()
+        .filter_map(|frame| match frame {
+            Frame::RelayData(data) => data.encode().ok(),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Client receive window: drain the link, feed the session state machine,
 /// reply with ACK payloads, record relay statuses from protected packets
 /// (body-first, the generic parser refuses them), and capture raw
@@ -357,6 +382,10 @@ async fn recv_until(
                 if let Some(code) = status_from_protected(&keys, &hp_key, &bytes) {
                     statuses_arc.lock().expect("statuses").push(code);
                 }
+                raw_arc
+                    .lock()
+                    .expect("raw frames")
+                    .extend(relay_data_from_protected(&keys, &hp_key, &bytes));
             }
             Err(_) => raw_arc.lock().expect("raw frames").push(bytes),
         }

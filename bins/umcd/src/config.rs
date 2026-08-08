@@ -14,6 +14,8 @@ pub struct NodeConfig {
     pub carriers: Vec<String>,
     pub tcp_listen: Option<String>,
     pub udp_listen: Option<String>,
+    /// Experimental TLS-stream listener address (disabled unless set).
+    pub tls_listen: Option<String>,
     /// Local mesh mode (core.md §23.3). Conservative default: off
     /// (decisions.md §3.2).
     pub mesh: bool,
@@ -65,6 +67,7 @@ impl Default for NodeConfig {
             carriers: vec!["ump.tcp/1".to_string(), "ump.udp/1".to_string()],
             tcp_listen: None,
             udp_listen: None,
+            tls_listen: None,
             mesh: false,
             keystore: None,
             public_relay: false,
@@ -161,6 +164,13 @@ impl NodeConfig {
                     return Err("carriers must name at least one carrier".into());
                 }
                 self.carriers = carriers;
+            }
+            "tls_listen" => {
+                self.tls_listen = if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value.trim().to_string())
+                };
             }
             "disabled_protocol_versions" => {
                 self.disabled_protocol_versions = parse_csv(value);
