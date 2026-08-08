@@ -6,9 +6,18 @@
 //! The flow is two steps (handshake.md §16, §18):
 //! [`respond_hello`] builds `SERVER_HELLO` and the pending handshake state;
 //! [`HandshakePending::complete`] processes `CLIENT_AUTH` — decrypts the
-//! client's static key + identity binding + signature with the client-auth
-//! key, verifies the static key against the one the DH chain used, stores
-//! the peer identity, and answers with `SERVER_FINISHED`.
+//! client's real static key + identity binding + signature with the
+//! client-auth key, validates the binding and the transcript-bound
+//! signature (the identity proof), stores the peer identity, and answers
+//! with `SERVER_FINISHED`.
+//!
+//! The DH chain (es/se/ss) is derived with the client's EPHEMERAL standing
+//! in for the static (the accept loop's provisional, handshake.md §18): the
+//! real static key only arrives inside `CLIENT_AUTH`, encrypted with a key
+//! derived from that same provisional chain — the circularity is resolved
+//! by deriving the client-auth key provisionally on BOTH sides and carrying
+//! the real static as authenticated payload. `complete` verifies the real
+//! static against the binding; the provisional never becomes peer identity.
 use crate::runtime_adapters::OsEntropy;
 use crate::state::RuntimeState;
 use umc_crypto::signatures::{IdentityPublicKey, StaticHandshakeKeyPair, StaticHandshakePublicKey};
@@ -17,8 +26,8 @@ use umc_handshake::identity::{endpoint_id, IdentityBinding};
 use umc_handshake::traffic::{derive_session_secrets, SessionSecrets};
 use umc_handshake::transcript::Transcript;
 use umc_handshake::xx::{
-    client_signature_input, encrypt_server_auth, finished_key, finished_mac, ClientHello,
-    ServerAuthBlock, ServerHello, CRYPTO_PROFILE, MODE_XX,
+    client_signature_input, decrypt_client_auth, encrypt_server_auth, finished_key, finished_mac,
+    ClientHello, ServerAuthBlock, ServerHello, CRYPTO_PROFILE, MODE_XX,
 };
 use umc_types::runtime::EntropySource;
 
@@ -47,16 +56,14 @@ pub struct HandshakePending {
     transcript: Transcript,
     secret3: [u8; 32],
     secret4: [u8; 32],
-    client_static_public_key: StaticHandshakePublicKey,
     server_eid: [u8; 32],
     session_secrets: SessionSecrets,
 }
 
-/// The client's verified identity recovered from `CLIENT_AUTH`. Live
-/// consumption (session registration) lands with the accept-loop wire
-/// wiring; the responder tests drive it today.
+/// The client's verified identity recovered from `CLIENT_AUTH`: the real
+/// static handshake key and the identity binding, registered by the accept
+/// loop as the session's peer identity (handshake.md §18).
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct PeerIdentity {
     pub client_static_public_key: StaticHandshakePublicKey,
     pub binding: IdentityBinding,
@@ -66,34 +73,34 @@ impl HandshakePending {
     /// The session secrets this handshake derives, computed at
     /// [`respond_hello`] time from the DH chain (es/se/ss).
     #[must_use]
+    #[allow(dead_code)] // accessor for the secrets `complete` also returns
     pub fn session_secrets(&self) -> &SessionSecrets {
         &self.session_secrets
-    }
-
-    /// The static handshake key the client's `CLIENT_AUTH` must match.
-    #[must_use]
-    #[allow(dead_code)] // consumed by the accept-loop wire wiring
-    pub fn expected_client_static(&self) -> &StaticHandshakePublicKey {
-        &self.client_static_public_key
     }
 
     /// Complete the server side of the handshake with the client's
     /// `CLIENT_AUTH` message (handshake.md §18-19): decrypt it with the
     /// client-auth key derived from the DH chain (per the T13 driver),
-    /// verify the client's static handshake key, validate the client's
-    /// identity binding (`IdentityBinding::validate`: version, endpoint-id
-    /// binding, signature, validity window), and build `SERVER_FINISHED`
-    /// (server signature + finished MAC). Returns `(SERVER_FINISHED bytes,
-    /// session secrets, peer identity)`.
+    /// validate the client's identity binding (`IdentityBinding::validate`:
+    /// version, endpoint-id binding, signature, validity window), verify
+    /// the recovered static key against the binding and the client's
+    /// transcript-bound signature, and build `SERVER_FINISHED` (server
+    /// signature + finished MAC). Returns `(SERVER_FINISHED bytes, session
+    /// secrets, peer identity)`.
+    ///
+    /// The DH chain's static is the client's EPHEMERAL (the accept loop's
+    /// provisional, handshake.md §18) — the real static only arrives here,
+    /// encrypted with the provisional-derived client-auth key; the binding
+    /// and signature are the identity proof, so the recovered static is
+    /// verified against the binding, not the provisional.
     ///
     /// # Errors
     ///
     /// Returns a message when the auth message cannot be decoded or
-    /// decrypted, the recovered client static key does not match the key
-    /// the DH chain used, the client identity binding fails validation
-    /// (the session is refused), or the client's transcript-bound
-    /// signature does not verify.
-    #[allow(clippy::similar_names, dead_code)] // consumed by the accept-loop wire wiring
+    /// decrypted, the client identity binding fails validation (the session
+    /// is refused), or the client's transcript-bound signature does not
+    /// verify.
+    #[allow(clippy::similar_names)]
     pub fn complete(
         &self,
         state: &RuntimeState,
@@ -106,10 +113,7 @@ impl HandshakePending {
         let client_auth_key = expand(&self.secret3, b"client auth key", &client_auth_transcript);
         let (ciphertext, _) = umc_wire::bytes::decode(auth_bytes, 16_384)
             .map_err(|_| "client auth framing".to_string())?;
-        let plaintext = umc_crypto::aead::PacketKeys::from_traffic_secret(&client_auth_key)
-            .map_err(|e| format!("{e:?}"))?
-            .open(0, &client_auth_transcript, ciphertext)
-            .map_err(|e| format!("client auth open: {e:?}"))?;
+        let plaintext = decrypt_client_auth(&client_auth_key, &client_auth_transcript, ciphertext)?;
 
         // Plaintext: client static key (32) || identity binding (217: signed
         // bytes + the binding's own signature) || client signature (64), as
@@ -120,9 +124,6 @@ impl HandshakePending {
                 .and_then(|s| s.try_into().ok())
                 .ok_or("client auth truncated")?,
         );
-        if recovered_static.0 != self.client_static_public_key.0 {
-            return Err("client static key mismatch".into());
-        }
         let peer_signature: [u8; 64] = plaintext
             .get(32 + BINDING_WIRE_LEN..32 + BINDING_WIRE_LEN + 64)
             .and_then(|s| s.try_into().ok())
@@ -167,6 +168,9 @@ impl HandshakePending {
             .map_err(|e| format!("transcript: {e:?}"))?;
         let server_finished_key = finished_key(&self.secret4, b"server finished", &transcript.hash);
         let server_mac = finished_mac(&server_finished_key, &transcript.hash);
+        // The server signature binds the server's and the client's REAL
+        // static keys (the T13 driver layout; the client checks it against
+        // its own material).
         let server_sig_input: [u8; 32] = {
             use blake2::Digest;
             let mut hasher = blake2::Blake2s256::new();
@@ -174,7 +178,7 @@ impl HandshakePending {
             hasher.update(transcript.hash);
             hasher.update(self.server_eid);
             hasher.update(peer.binding.endpoint_id);
-            hasher.update(self.client_static_public_key.0);
+            hasher.update(state.node_identity.static_handshake.public().0);
             hasher.update(peer.client_static_public_key.0);
             hasher.finalize().into()
         };
@@ -194,7 +198,6 @@ impl HandshakePending {
 /// # Errors
 ///
 /// Returns a message when the slice is shorter than the fixed layout.
-#[allow(dead_code)] // consumed by the accept-loop wire wiring
 fn parse_client_binding(bytes: &[u8]) -> Result<IdentityBinding, String> {
     let read = |start: usize, len: usize| -> Result<&[u8], String> {
         bytes
@@ -231,8 +234,7 @@ fn parse_client_binding(bytes: &[u8]) -> Result<IdentityBinding, String> {
     })
 }
 
-#[allow(dead_code)] // consumed by the accept-loop wire wiring
-fn expand(secret: &[u8; 32], label: &[u8], context: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn expand(secret: &[u8; 32], label: &[u8], context: &[u8; 32]) -> [u8; 32] {
     let out =
         umc_crypto::label::expand_label(secret, label, context, 32).expect("32-byte expansion");
     let mut result = [0u8; 32];
@@ -241,8 +243,11 @@ fn expand(secret: &[u8; 32], label: &[u8], context: &[u8; 32]) -> [u8; 32] {
 }
 
 /// Answer a `CLIENT_HELLO` with a `SERVER_HELLO` and the pending handshake
-/// state. The full DH chain (es/se/ss) completes with the client's static
-/// handshake key (handshake.md §26).
+/// state. The DH chain (es/se/ss) completes with the client's static
+/// handshake key — the accept loop's PROVISIONAL (the client's ephemeral
+/// standing in for the static, handshake.md §18): the real static only
+/// arrives inside `CLIENT_AUTH`, so both sides derive the same chain and
+/// the client-auth key on the provisional inputs.
 ///
 /// # Errors
 ///
@@ -316,7 +321,9 @@ pub fn respond_hello(
 
     // Full DH chain es/se/ss -> session secrets (handshake.md §26). DH is
     // symmetric, so the server's shares equal the client's. `secret3` also
-    // keys the client-auth message the responder will decrypt next.
+    // keys the client-auth message the responder will decrypt next; both
+    // sides derive it from the PROVISIONAL static (the client's ephemeral),
+    // and the real static arrives authenticated inside CLIENT_AUTH.
     let dh_es = state
         .node_identity
         .static_handshake
@@ -334,7 +341,6 @@ pub fn respond_hello(
         transcript,
         secret3,
         secret4,
-        client_static_public_key: client_static_public_key.clone(),
         server_eid,
         session_secrets: derive_session_secrets(&secret4, &final_transcript),
     };
@@ -530,7 +536,7 @@ mod tests {
 
         // The client side derives identical session secrets against the
         // same transcript (complete_client_side, as the live client does).
-        let (client_secrets, _) = complete_client_side(
+        let client_out = complete_client_side(
             &client_identity,
             &client_static,
             &client_ephemeral,
@@ -540,8 +546,8 @@ mod tests {
             b"ump.tcp/1",
         )
         .expect("client side");
-        assert_eq!(client_secrets.client, secrets.client);
-        assert_eq!(client_secrets.server, secrets.server);
+        assert_eq!(client_out.session_secrets.client, secrets.client);
+        assert_eq!(client_out.session_secrets.server, secrets.server);
     }
 
     #[test]
@@ -562,8 +568,10 @@ mod tests {
             0,
             [0u8; 32],
         );
-        // The client encrypts for a static key the server never saw: the
-        // client-auth key cannot decrypt the message (same hello/ephemeral).
+        // An auth message sealed with a client-auth key derived from a DH
+        // chain the server never ran cannot be decrypted: the client
+        // encrypts with a different static than the provisional the
+        // responder used, so the session is refused at the AEAD open.
         let (identity, other_static, _ephemeral) = client_identity();
         let auth_bytes = build_client_auth(
             &identity,

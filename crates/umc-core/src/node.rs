@@ -82,7 +82,9 @@ impl Node {
 
     /// Complete an XX handshake with a remote over the given carrier.
     /// Sends `CLIENT_HELLO` through the carrier link, receives `SERVER_HELLO`,
-    /// and derives session secrets from the transcript (handshake.md §14-18).
+    /// sends `CLIENT_AUTH` (the real static key + identity binding +
+    /// transcript signature), and derives session secrets from the
+    /// transcript (handshake.md §14-18).
     ///
     /// # Errors
     ///
@@ -152,9 +154,15 @@ impl Node {
             .map_err(|e| NodeError::Handshake(format!("{e:?}")))?;
 
         // Derive session secrets using the verified client continuation.
-        let (client_secrets, _client_finished_key) = umc_handshake::xx::complete_client_side(
+        // The daemon's DH chain stands the client's ephemeral in for the
+        // static until the real static rides CLIENT_AUTH (handshake.md
+        // §18), so the client derives with the same provisional inputs —
+        // the session secrets and the client-auth key then match on both
+        // sides. The CLIENT_AUTH payload itself carries the REAL static,
+        // binding, and signature.
+        let handshake_out = umc_handshake::xx::complete_client_side(
             &self.config.identity.identity,
-            &self.config.identity.static_handshake,
+            &client_ephemeral,
             &client_ephemeral,
             &hello,
             &server_hello,
@@ -162,12 +170,65 @@ impl Node {
             carrier_type.as_bytes(),
         )
         .map_err(NodeError::Handshake)?;
+
+        // CLIENT_AUTH (handshake.md §18): the client's real static handshake
+        // key, its identity binding, and a transcript-bound signature over
+        // both endpoint ids, sealed with the provisional-chain client-auth
+        // key. The message rides as a raw framed handshake message (the
+        // transitional wire form; session protection lands with D3+).
+        let binding = umc_handshake::identity::IdentityBinding::sign(
+            &self.config.identity.identity,
+            &self.config.identity.static_handshake.public(),
+            0,
+            u64::MAX,
+            0,
+            [0u8; 32],
+        );
+        let client_eid =
+            umc_handshake::identity::endpoint_id(&self.config.identity.identity.public());
+        let sig_input = umc_handshake::xx::client_signature_input(
+            &handshake_out.transcript_hash,
+            &client_eid,
+            &handshake_out.server_endpoint_id,
+            &self.config.identity.static_handshake.public().0,
+            &handshake_out.server_static_public_key,
+        );
+        let client_signature = self.config.identity.identity.sign(&sig_input);
+        let plaintext = umc_handshake::xx::build_client_auth_plaintext(
+            &self.config.identity.static_handshake.public().0,
+            &binding,
+            &client_signature,
+        );
+        let ciphertext = umc_handshake::xx::encrypt_client_auth(
+            &handshake_out.client_auth_key,
+            &handshake_out.transcript_hash,
+            &plaintext,
+        );
+        // The CLIENT_AUTH message body is length-prefixed bytes (the T13
+        // driver layout the responder's `complete` decodes), inside the
+        // handshake message envelope.
+        let mut auth_body = Vec::new();
+        umc_wire::bytes::encode(
+            &mut auth_body,
+            &ciphertext,
+            umc_handshake::encoding::MAX_HANDSHAKE_MESSAGE,
+        )
+        .map_err(|e| NodeError::Handshake(format!("{e:?}")))?;
+        let mut auth_frame = Vec::new();
+        umc_handshake::encoding::encode_message(
+            &mut auth_frame,
+            umc_handshake::encoding::CLIENT_AUTH,
+            &auth_body,
+        )
+        .map_err(|e| NodeError::Handshake(format!("{e:?}")))?;
+        send_packet(link.as_ref(), &auth_frame).map_err(NodeError::Carrier)?;
+
         let id = self.next_session;
         self.next_session += 1;
         self.sessions.lock().await.insert(
             id,
             SessionEntry {
-                secrets: client_secrets,
+                secrets: handshake_out.session_secrets,
                 peer_endpoint_id: server_identity_public.endpoint_id(),
             },
         );

@@ -1,4 +1,6 @@
-use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair, StaticHandshakePublicKey};
+use umc_crypto::signatures::{
+    IdentityKeyPair, IdentityPublicKey, StaticHandshakeKeyPair, StaticHandshakePublicKey,
+};
 use umc_types::runtime::EntropySource;
 
 pub const CRYPTO_PROFILE: &[u8] = b"UMP-CRYPTO-1";
@@ -341,6 +343,63 @@ pub fn finished_key(handshake_secret4: &[u8; 32], label: &[u8], transcript: &[u8
     expand(handshake_secret4, label, transcript)
 }
 
+/// Encrypts the `CLIENT_AUTH` payload with the client-auth key derived
+/// from `secret3` and the transcript hash BEFORE the message is appended
+/// (handshake.md §18). Returns the AEAD ciphertext; the caller applies the
+/// wire framing (the responder's `CLIENT_AUTH` body is length-prefixed
+/// bytes, per the T13 driver).
+///
+/// # Panics
+///
+/// Panics when the key derivation or the AEAD seal fails (a 32-byte
+/// client-auth key always derives valid packet keys).
+#[must_use]
+pub fn encrypt_client_auth(
+    client_auth_key: &[u8; 32],
+    transcript: &[u8; 32],
+    plaintext: &[u8],
+) -> Vec<u8> {
+    umc_crypto::aead::PacketKeys::from_traffic_secret(client_auth_key)
+        .expect("32-byte client auth key")
+        .seal(0, transcript, plaintext)
+        .expect("seal client auth")
+}
+
+/// Decrypts a `CLIENT_AUTH` ciphertext with the client-auth key and the
+/// transcript hash before the message was appended (handshake.md §18).
+///
+/// # Errors
+///
+/// Returns a message when key derivation or the AEAD open fails.
+pub fn decrypt_client_auth(
+    client_auth_key: &[u8; 32],
+    transcript: &[u8; 32],
+    ct: &[u8],
+) -> Result<Vec<u8>, String> {
+    umc_crypto::aead::PacketKeys::from_traffic_secret(client_auth_key)
+        .map_err(|e| format!("client auth keys: {e:?}"))?
+        .open(0, transcript, ct)
+        .map_err(|e| format!("client auth open: {e:?}"))
+}
+
+/// Assembles the `CLIENT_AUTH` plaintext (handshake.md §18, T13 driver
+/// layout): client static key (32) || identity binding signed bytes (153)
+/// || the binding's own signature (64) || the client's transcript-bound
+/// signature (64).
+#[must_use]
+pub fn build_client_auth_plaintext(
+    client_static_public_key: &[u8; 32],
+    binding: &crate::identity::IdentityBinding,
+    client_signature: &[u8; 64],
+) -> Vec<u8> {
+    let mut plaintext = Vec::with_capacity(32 + binding.signed_bytes().len() + 64 + 64);
+    plaintext.extend_from_slice(client_static_public_key);
+    plaintext.extend_from_slice(&binding.signed_bytes());
+    plaintext.extend_from_slice(&binding.signature);
+    plaintext.extend_from_slice(client_signature);
+    plaintext
+}
+
 /// Client authentication signature input (handshake.md §18.1).
 #[must_use]
 pub fn client_signature_input(
@@ -370,6 +429,26 @@ fn expand(secret: &[u8; 32], label: &[u8], context: &[u8; 32]) -> [u8; 32] {
 
 use crate::traffic::SessionSecrets;
 use crate::transcript::Transcript;
+
+/// Client-side material from [`complete_client_side`]: the session
+/// secrets, the `CLIENT_FINISHED` key, and the inputs the client needs to
+/// build and seal its `CLIENT_AUTH` message (handshake.md §18).
+#[derive(Debug, Clone)]
+pub struct ClientHandshakeOutput {
+    /// Session secrets (client and server traffic secrets).
+    pub session_secrets: SessionSecrets,
+    /// The `CLIENT_FINISHED` confirmation MAC key (handshake.md §20).
+    pub client_finished_key: [u8; 32],
+    /// The client-auth key sealing `CLIENT_AUTH` (handshake.md §18).
+    pub client_auth_key: [u8; 32],
+    /// The transcript hash BEFORE `CLIENT_AUTH` is appended: the AEAD AAD
+    /// and the signature-input transcript.
+    pub transcript_hash: [u8; 32],
+    /// The server's endpoint id, recovered from its identity binding.
+    pub server_endpoint_id: [u8; 32],
+    /// The server's static handshake public key, from its auth block.
+    pub server_static_public_key: [u8; 32],
+}
 
 /// Deterministic XX handshake over an in-memory transport (handshake.md §14).
 ///
@@ -623,16 +702,19 @@ pub fn run_xx_handshake(
 
 /// Client-side continuation of the XX handshake given a received
 /// `SERVER_HELLO` (handshake.md §14-18). The client has already sent
-/// `client_hello`; the transcript covers `CLIENT_HELLO` and `SERVER_HELLO` as
-/// the driver does. Returns `(client_session_secrets, client_finished_key)`.
-/// The `CLIENT_AUTH`/`SERVER_FINISHED` continuation arrives with the daemon
-/// loop.
+/// `client_hello`; the transcript covers `CLIENT_HELLO` and `SERVER_HELLO`
+/// as the driver does. Returns the session secrets, the `CLIENT_FINISHED`
+/// key, and the material the client seals into `CLIENT_AUTH` next (the
+/// client-auth key, the pre-append transcript hash, and the server's
+/// endpoint id / static handshake key recovered from its auth block).
+/// The `CLIENT_AUTH`/`SERVER_FINISHED` continuation arrives with the
+/// daemon loop.
 ///
 /// # Errors
 ///
 /// Returns a message describing the first failed protocol invariant: a
 /// `CLIENT_HELLO`/`SERVER_HELLO` encoding failure, a failed AEAD open of the
-/// server-auth block, or a truncated auth plaintext.
+/// server-auth block, or a truncated auth plaintext or server binding.
 // The DH variable names follow handshake.md §14-18 (DH_ee, DH_es, DH_se,
 // DH_ss) as in the deterministic driver.
 #[allow(clippy::similar_names)]
@@ -644,7 +726,7 @@ pub fn complete_client_side(
     server_hello: &ServerHello,
     entropy: &dyn EntropySource,
     carrier_binding: &[u8],
-) -> Result<(SessionSecrets, [u8; 32]), String> {
+) -> Result<ClientHandshakeOutput, String> {
     let _ = client_identity;
     let _ = entropy;
     // Transcript through CLIENT_HELLO; SERVER_HELLO fields are the preceding
@@ -672,6 +754,18 @@ pub fn complete_client_side(
     )
     .map_err(|e| format!("{e:?}"))?;
     let server_static_pub = StaticHandshakePublicKey(server_block.server_static_public_key);
+    // The server's endpoint id rides in its identity binding (signed bytes
+    // layout: version (1) || endpoint id (32) || identity key (32) ||
+    // static key (32) || validity || sequence || capabilities). The client
+    // signs it into `CLIENT_AUTH`, so the server's identity is recovered
+    // here without parsing the full binding (handshake.md §18.1).
+    let server_binding_bytes = &server_block.server_identity_binding;
+    let server_identity_key: [u8; 32] = server_binding_bytes
+        .get(33..65)
+        .ok_or("server binding truncated")?
+        .try_into()
+        .map_err(|_| "server binding truncated")?;
+    let server_endpoint_id = crate::identity::endpoint_id(&IdentityPublicKey(server_identity_key));
 
     // Append SERVER_HELLO to the transcript (decrypt used the pre-append hash).
     transcript
@@ -690,9 +784,21 @@ pub fn complete_client_side(
     let dh_ss = client_static.diffie_hellman(&server_static_pub);
     let secret4 = umc_crypto::hkdf::extract(&secret3, &dh_ss);
 
-    let client_finished_key = finished_key(&secret4, b"client finished", &transcript.hash);
-    let client_secrets = crate::traffic::derive_session_secrets(&secret4, &transcript.hash);
-    Ok((client_secrets, client_finished_key))
+    // The client-auth key derives from the transcript hash BEFORE the
+    // CLIENT_AUTH message is appended (handshake.md §18) — the same hash
+    // the client signs over and seals with.
+    let transcript_hash = transcript.hash;
+    let client_auth_key = expand(&secret3, b"client auth key", &transcript_hash);
+    let client_finished_key = finished_key(&secret4, b"client finished", &transcript_hash);
+    let client_secrets = crate::traffic::derive_session_secrets(&secret4, &transcript_hash);
+    Ok(ClientHandshakeOutput {
+        session_secrets: client_secrets,
+        client_finished_key,
+        client_auth_key,
+        transcript_hash,
+        server_endpoint_id,
+        server_static_public_key: server_static_pub.0,
+    })
 }
 
 #[cfg(test)]
@@ -801,5 +907,29 @@ mod tests {
         let a = client_signature_input(&[1u8; 32], &[2u8; 32], &[3u8; 32], &[4u8; 32], &[5u8; 32]);
         let b = client_signature_input(&[1u8; 32], &[2u8; 32], &[9u8; 32], &[4u8; 32], &[5u8; 32]);
         assert_ne!(a, b);
+    }
+
+    /// The `CLIENT_AUTH` halves (handshake.md §18): a plaintext sealed with
+    /// `encrypt_client_auth` under the client-auth key and the transcript
+    /// hash reopens verbatim with `decrypt_client_auth`; a different
+    /// transcript cannot open it.
+    #[test]
+    fn client_auth_round_trip() {
+        let auth_key = [0x11u8; 32];
+        let transcript = [0x22u8; 32];
+        // 32-byte static + 153 signed bytes + 64 binding signature + 64
+        // client signature, as the T13 driver lays the plaintext out.
+        let plaintext = vec![0x33u8; 32 + 153 + 64 + 64];
+        let ct = encrypt_client_auth(&auth_key, &transcript, &plaintext);
+        let reopened = decrypt_client_auth(&auth_key, &transcript, &ct).expect("decrypt");
+        assert_eq!(reopened, plaintext);
+        assert!(
+            decrypt_client_auth(&auth_key, &[0x44u8; 32], &ct).is_err(),
+            "a transcript-bound message must not open under another transcript"
+        );
+        assert!(
+            decrypt_client_auth(&[0x55u8; 32], &transcript, &ct).is_err(),
+            "a transcript-bound message must not open under another key"
+        );
     }
 }
