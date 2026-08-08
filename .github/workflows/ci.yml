@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "41 3 * * 0"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,3 +30,44 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+
+  sbom:
+    name: SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate Cargo SBOM metadata
+        run: cargo metadata --format-version 1 --locked > sbom.json
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+
+  coverage:
+    name: Protocol coverage
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Measure protocol-pure coverage
+        run: >-
+          cargo llvm-cov
+          --package umc-wire
+          --package umc-crypto
+          --package umc-handshake
+          --package umc-session
+          --lib
+          --lcov
+          --output-path lcov.info
+          --fail-under-lines 70
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: protocol-coverage
+          path: lcov.info

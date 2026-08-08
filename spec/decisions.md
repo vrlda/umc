@@ -1572,3 +1572,8 @@ A–K gap-closure plan:
     secret reject authenticated frames; receivers with the secret reject any
     entry whose tag does not validate. The secret is never returned by
     `GetConfig`.
+17. **J5/J6 CI artifacts.** The main CI workflow publishes a locked
+    `cargo metadata` SBOM artifact on every event. A scheduled/manual job
+    runs `cargo-llvm-cov` over `umc-wire`, `umc-crypto`, `umc-handshake`, and
+    `umc-session` with a 70% line threshold; local runs remain authoritative
+    until the hosted runner produces its first report.
