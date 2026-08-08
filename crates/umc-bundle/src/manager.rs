@@ -14,6 +14,12 @@ pub const DEFAULT_LIFETIME_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_LIFETIME_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 pub const DEFAULT_MAX_REPLICATION: u64 = 8;
 pub const MAX_BUNDLES_PER_SENDER: u64 = 1_000;
+/// Retention of a removed Bundle ID, preventing an immediate replay from
+/// consuming storage again (bundles.md §12.2).
+pub const DUPLICATE_CACHE_TTL_MS: u64 = DEFAULT_LIFETIME_MS;
+pub const DUPLICATE_CACHE_CAPACITY: usize = 1_024;
+
+pub type BundleTransferChunk = (BundleRecord, Vec<u8>, u64, bool);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BundleStatus {
@@ -39,7 +45,19 @@ pub struct BundleRecord {
     pub replication_count: u64,
     pub replication_limit: u64,
     pub custody: bool,
+    /// A custody commitment may outlive the payload's ordinary expiry. The
+    /// node retains the record until this deadline or explicit release.
+    pub custody_deadline: Option<Instant>,
+    /// Next packet-sized BUNDLE chunk to send. This operational cursor is
+    /// persisted so a restart safely resumes from the beginning or cursor.
+    pub transfer_chunk_index: u64,
     pub status: BundleStatus,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DuplicateEntry {
+    expires_at: Instant,
+    inserted_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +77,8 @@ pub struct BundleManager {
     quota: QuotaAccount,
     records: HashMap<[u8; BUNDLE_ID_LEN], BundleRecord>,
     bundles_per_sender: HashMap<Vec<u8>, u64>,
+    duplicate_cache: HashMap<[u8; BUNDLE_ID_LEN], DuplicateEntry>,
+    last_now: Instant,
     /// Persistence backend for bundle metadata (storage.md §6.3). Attached
     /// by the daemon at startup; `None` keeps the manager in-memory-only.
     store: Option<Arc<dyn Store + Send + Sync>>,
@@ -82,6 +102,8 @@ impl BundleManager {
             quota,
             records: HashMap::new(),
             bundles_per_sender: HashMap::new(),
+            duplicate_cache: HashMap::new(),
+            last_now: Instant(0),
             store: None,
         }
     }
@@ -103,6 +125,8 @@ impl BundleManager {
     ///
     /// Returns a message when the metadata cannot be scanned.
     pub fn restore(&mut self, store: &dyn Store, now: Instant) -> Result<usize, String> {
+        self.last_now = now;
+        self.prune_duplicate_cache(now);
         let metas = load_all_metas(store).map_err(|e| format!("bundle meta scan: {e:?}"))?;
         let mut restored = 0;
         for meta in metas {
@@ -110,7 +134,7 @@ impl BundleManager {
                 eprintln!("[bundle] restore: skipping corrupt bundle meta");
                 continue;
             };
-            if record.expires_at <= now {
+            if record.expires_at <= now && !record.custody_holds(now) {
                 if let Err(e) = delete_meta(store, &record.id) {
                     eprintln!("[bundle] restore: expired meta delete failed: {e:?}");
                 }
@@ -166,6 +190,8 @@ impl BundleManager {
         custody: bool,
         now: Instant,
     ) -> Result<[u8; BUNDLE_ID_LEN], BundleError> {
+        self.last_now = now;
+        self.prune_duplicate_cache(now);
         if payload.len() > DEFAULT_MAX_BUNDLE_BYTES {
             return Err(BundleError::TooLarge);
         }
@@ -188,6 +214,9 @@ impl BundleManager {
         };
         let id = bundle_id(&envelope, destination_hint);
         if self.records.contains_key(&id) {
+            return Err(BundleError::Duplicate);
+        }
+        if self.duplicate_cache.contains_key(&id) {
             return Err(BundleError::Duplicate);
         }
         // Reserve quota BEFORE allocation (resource-limits.md §32).
@@ -213,6 +242,8 @@ impl BundleManager {
                 replication_count: 0,
                 replication_limit,
                 custody,
+                custody_deadline: custody.then_some(now + Duration::from_millis(lifetime)),
+                transfer_chunk_index: 0,
                 status: if custody {
                     BundleStatus::CustodyAccepted
                 } else {
@@ -247,6 +278,50 @@ impl BundleManager {
             .map_err(BundleError::Storage)
     }
 
+    /// Returns and advances one bounded transfer chunk for a stored bundle.
+    /// The record remains `Received` until the caller observes `final_chunk`
+    /// and explicitly marks the handoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::NotFound`] for an unknown bundle,
+    /// [`BundleError::Conflict`] for an invalid chunk size or cursor, and
+    /// [`BundleError::Storage`] when the payload cannot be read.
+    pub fn next_transfer_chunk(
+        &mut self,
+        id: &[u8; BUNDLE_ID_LEN],
+        chunk_size: usize,
+    ) -> Result<Option<BundleTransferChunk>, BundleError> {
+        if chunk_size == 0 {
+            return Err(BundleError::Conflict);
+        }
+        let record = self.records.get(id).cloned().ok_or(BundleError::NotFound)?;
+        let payload = self.get_payload(id)?;
+        let index = record.transfer_chunk_index;
+        let start = usize::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(chunk_size))
+            .ok_or(BundleError::Conflict)?;
+        if start >= payload.len() {
+            return Ok(None);
+        }
+        let end = start
+            .checked_add(chunk_size)
+            .unwrap_or(payload.len())
+            .min(payload.len());
+        let final_chunk = end == payload.len();
+        if let Some(current) = self.records.get_mut(id) {
+            current.transfer_chunk_index = index.saturating_add(1);
+        }
+        self.persist_record(id);
+        Ok(Some((
+            self.records.get(id).cloned().unwrap_or(record),
+            payload[start..end].to_vec(),
+            index,
+            final_chunk,
+        )))
+    }
+
     #[must_use]
     pub fn record(&self, id: &[u8; BUNDLE_ID_LEN]) -> Option<&BundleRecord> {
         self.records.get(id)
@@ -278,6 +353,52 @@ impl BundleManager {
         Ok(())
     }
 
+    /// Extends or shortens the deadline of an accepted custody commitment.
+    /// The deadline is explicit so a node cannot accidentally promise
+    /// unbounded retention.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::NotFound`] for an unknown bundle and
+    /// [`BundleError::Conflict`] when the bundle is not in custody.
+    pub fn set_custody_deadline(
+        &mut self,
+        id: &[u8; BUNDLE_ID_LEN],
+        deadline: Instant,
+    ) -> Result<(), BundleError> {
+        let record = self.records.get_mut(id).ok_or(BundleError::NotFound)?;
+        if !record.custody || record.status != BundleStatus::CustodyAccepted {
+            return Err(BundleError::Conflict);
+        }
+        record.custody_deadline = Some(deadline);
+        self.persist_record(id);
+        Ok(())
+    }
+
+    /// Explicitly releases custody after a delivery acknowledgement. The
+    /// payload remains addressable until normal expiry/eviction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::NotFound`] for an unknown bundle.
+    pub fn release_custody(&mut self, id: &[u8; BUNDLE_ID_LEN]) -> Result<(), BundleError> {
+        let record = self.records.get_mut(id).ok_or(BundleError::NotFound)?;
+        if !record.custody {
+            return Ok(());
+        }
+        record.custody = false;
+        record.custody_deadline = None;
+        record.status = BundleStatus::Delivered;
+        self.persist_record(id);
+        Ok(())
+    }
+
+    fn persist_record(&self, id: &[u8; BUNDLE_ID_LEN]) {
+        if let (Some(store), Some(record)) = (&self.store, self.records.get(id)) {
+            let _ = save_meta(store.as_ref(), &BundleMeta::from_record(record));
+        }
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.records.len()
@@ -292,9 +413,21 @@ impl BundleManager {
         self.records.values()
     }
 
+    #[must_use]
+    pub fn duplicate_cache_len(&self) -> usize {
+        self.duplicate_cache.len()
+    }
+
     /// Removes a bundle record, releasing its quota reservation and sender
     /// count (bundles.md §11, resource-limits.md §33).
     pub fn remove(&mut self, id: &[u8; BUNDLE_ID_LEN]) {
+        self.remove_at(id, self.last_now);
+    }
+
+    /// Removes a bundle and records its id in the bounded replay cache at a
+    /// caller-supplied clock value.
+    pub fn remove_at(&mut self, id: &[u8; BUNDLE_ID_LEN], now: Instant) {
+        self.last_now = now;
         if let Some(record) = self.records.remove(id) {
             self.quota.release(record.size as u64);
             if let Some(count) = self.bundles_per_sender.get_mut(&record.sender) {
@@ -305,6 +438,7 @@ impl BundleManager {
                     println!("[bundle] remove: meta delete failed: {e:?}");
                 }
             }
+            self.remember_duplicate(record.id, now);
         }
     }
 
@@ -314,9 +448,11 @@ impl BundleManager {
     /// the evicted ids, sorted for deterministic ordering.
     #[must_use]
     pub fn evict_expired(&mut self, now: Instant) -> Vec<[u8; BUNDLE_ID_LEN]> {
+        self.last_now = now;
+        self.prune_duplicate_cache(now);
         let mut expired: Vec<([u8; BUNDLE_ID_LEN], [u8; 32])> = self
             .records_iter()
-            .filter(|r| r.expires_at <= now)
+            .filter(|r| r.expires_at <= now && !r.custody_holds(now))
             .map(|r| (r.id, r.object_id))
             .collect();
         expired.sort_unstable();
@@ -333,10 +469,45 @@ impl BundleManager {
                     println!("[bundle] evict: object delete failed: {e:?}");
                 }
             }
-            self.remove(&id);
+            self.remove_at(&id, now);
             ids.push(id);
         }
         ids
+    }
+
+    fn prune_duplicate_cache(&mut self, now: Instant) {
+        self.duplicate_cache
+            .retain(|_, entry| entry.expires_at > now);
+    }
+
+    fn remember_duplicate(&mut self, id: [u8; BUNDLE_ID_LEN], now: Instant) {
+        self.prune_duplicate_cache(now);
+        if self.duplicate_cache.len() >= DUPLICATE_CACHE_CAPACITY {
+            if let Some(oldest) = self
+                .duplicate_cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_at)
+                .map(|(id, _)| *id)
+            {
+                self.duplicate_cache.remove(&oldest);
+            }
+        }
+        self.duplicate_cache.insert(
+            id,
+            DuplicateEntry {
+                expires_at: now + Duration::from_millis(DUPLICATE_CACHE_TTL_MS),
+                inserted_at: now,
+            },
+        );
+    }
+}
+
+impl BundleRecord {
+    #[must_use]
+    pub fn custody_holds(&self, now: Instant) -> bool {
+        self.custody
+            && self.status == BundleStatus::CustodyAccepted
+            && self.custody_deadline.is_some_and(|deadline| now < deadline)
     }
 }
 
@@ -491,6 +662,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(m.record(&id).unwrap().status, BundleStatus::CustodyAccepted);
+    }
+
+    #[test]
+    fn custody_hold_survives_expiry_until_deadline_or_release() {
+        let mut m = manager();
+        let id = m
+            .admit(b"custody", b"s", b"d", 1, 1_000, 3, true, Instant(0))
+            .unwrap();
+        m.set_custody_deadline(&id, Instant(5_000)).unwrap();
+        assert!(m.evict_expired(Instant(1_000)).is_empty());
+        assert!(m.record(&id).is_some());
+
+        m.release_custody(&id).unwrap();
+        assert_eq!(m.record(&id).unwrap().status, BundleStatus::Delivered);
+        assert_eq!(m.evict_expired(Instant(5_000)), vec![id]);
+    }
+
+    #[test]
+    fn removed_bundle_ids_are_suppressed_by_bounded_cache() {
+        let mut m = manager();
+        let id = m
+            .admit(b"replay", b"s", b"d", 1, 1_000, 3, false, Instant(0))
+            .unwrap();
+        m.remove_at(&id, Instant(10));
+        assert_eq!(m.duplicate_cache_len(), 1);
+        assert_eq!(
+            m.admit(b"replay", b"s", b"d", 1, 1_000, 3, false, Instant(11)),
+            Err(BundleError::Duplicate)
+        );
+        assert_eq!(m.duplicate_cache_len(), 1);
+        assert!(m
+            .admit(
+                b"replay",
+                b"s",
+                b"d",
+                1,
+                1_000,
+                3,
+                false,
+                Instant(10 + DUPLICATE_CACHE_TTL_MS + 1),
+            )
+            .is_ok());
     }
 
     #[test]

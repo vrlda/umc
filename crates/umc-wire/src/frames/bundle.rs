@@ -5,6 +5,8 @@ pub const MAX_BUNDLE_ID: usize = 64;
 pub const MAX_BUNDLE_DESTINATION_HINT: usize = 512;
 pub const MAX_BUNDLE_AUTH: usize = 1_024;
 pub const MAX_BUNDLE_PAYLOAD: usize = 65_535 - 128; // one base frame, headers/tags excluded
+const FLAG_CHUNKED: u8 = 0x20;
+const FLAG_CHUNK_FINAL: u8 = 0x40;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -22,6 +24,11 @@ pub struct BundleFrame {
     pub destination_hint: Vec<u8>,
     pub payload: Vec<u8>,
     pub bundle_auth: Vec<u8>,
+    /// Stream-transfer chunk index. Zero with `chunk_final = true` denotes a
+    /// legacy, unsegmented BUNDLE frame.
+    pub chunk_index: u64,
+    /// Marks the final chunk of a segmented bundle.
+    pub chunk_final: bool,
 }
 
 impl BundleFrame {
@@ -56,7 +63,18 @@ impl BundleFrame {
         if self.high_sensitivity {
             flags |= 0x10;
         }
+        let chunked = self.chunk_index != 0 || !self.chunk_final;
+        if chunked {
+            flags |= FLAG_CHUNKED;
+            if self.chunk_final {
+                flags |= FLAG_CHUNK_FINAL;
+            }
+        }
         out.push(flags);
+        if chunked {
+            crate::varint::encode_into(&mut out, self.chunk_index)
+                .map_err(FrameError::VarintEncode)?;
+        }
         crate::varint::encode_into(&mut out, self.priority).map_err(FrameError::VarintEncode)?;
         crate::varint::encode_into(&mut out, self.creation_time)
             .map_err(FrameError::VarintEncode)?;
@@ -96,9 +114,11 @@ impl BundleFrame {
         pos += n;
         let flags = *body.get(pos).ok_or(FrameError::Truncated)?;
         pos += 1;
-        if flags & 0xE0 != 0 {
+        if flags & 0x80 != 0 || (flags & FLAG_CHUNK_FINAL != 0 && flags & FLAG_CHUNKED == 0) {
             return Err(FrameError::InvalidPadding);
         }
+        let chunked = flags & FLAG_CHUNKED != 0;
+        let chunk_index = if chunked { read_varint(&mut pos)? } else { 0 };
         let priority = read_varint(&mut pos)?;
         let created = read_varint(&mut pos)?;
         let expires = read_varint(&mut pos)?;
@@ -127,6 +147,8 @@ impl BundleFrame {
                 destination_hint: dh.to_vec(),
                 payload: payload.to_vec(),
                 bundle_auth: auth.to_vec(),
+                chunk_index,
+                chunk_final: !chunked || flags & FLAG_CHUNK_FINAL != 0,
             },
             pos,
         ))
@@ -216,6 +238,8 @@ mod tests {
             destination_hint: b"dest-token".to_vec(),
             payload: vec![0xAA; 256],
             bundle_auth: b"sig".to_vec(),
+            chunk_index: 3,
+            chunk_final: false,
         };
         let enc = f.encode().unwrap();
         let (dec, used) = BundleFrame::decode(&enc[type_len(FrameType::BUNDLE.0)..]).unwrap();

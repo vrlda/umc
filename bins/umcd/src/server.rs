@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use umc_bundle::envelope::seal_bundle;
 use umc_bundle::manager::BundleStatus;
 use umc_carrier::Carrier;
 use umc_control::conn::SequenceTracker;
@@ -2272,9 +2273,11 @@ fn set_config(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<
     (api::StatusCode::Ok as i32, Some(payload))
 }
 
-/// `BundleService.CreateBundle`: admit a bundle over the control surface
-/// (bundles.md §8.1) and return its id. The chunk upload is treated as the
-/// complete bundle payload for now.
+/// `BundleService.CreateBundle`: seal a payload when the destination hint is a
+/// static handshake public key, then admit the opaque envelope. Legacy hints
+/// that are not 32-byte keys retain the experimental opaque-payload behavior;
+/// this keeps v0.1 callers interoperable while making the destination-bound
+/// path available without adding a new control message field.
 fn create_bundle(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
     let Ok(create) = api::CreateBundleRequest::decode(request.payload.as_slice()) else {
         return (api::StatusCode::InvalidArgument as i32, None);
@@ -2287,8 +2290,9 @@ fn create_bundle(state: &mut RuntimeState, request: &api::Request) -> (i32, Opti
         .unwrap_or_default();
     let expires_at_ms = u64::try_from(create.expires_at_unix_ms).unwrap_or(now.0);
     let lifetime_ms = expires_at_ms.saturating_sub(now.0).max(1_000);
+    let stored_payload = seal_bundle_for_hint(&create.payload_chunk, &create.destination_hint);
     match state.bundle.admit(
-        &create.payload_chunk,
+        &stored_payload,
         &sender,
         &create.destination_hint,
         u64::from(create.priority),
@@ -2306,7 +2310,7 @@ fn create_bundle(state: &mut RuntimeState, request: &api::Request) -> (i32, Opti
                 destination_hint_hash: umc_bundle::id::bundle_id(
                     &umc_bundle::envelope::BundleEnvelope {
                         sender_ephemeral_public_key: [0u8; 32],
-                        encrypted_payload: create.payload_chunk.clone(),
+                        encrypted_payload: stored_payload.clone(),
                     },
                     &record.destination_hint,
                 )
@@ -2330,6 +2334,19 @@ fn create_bundle(state: &mut RuntimeState, request: &api::Request) -> (i32, Opti
             (api::StatusCode::InvalidArgument as i32, None)
         }
     }
+}
+
+fn seal_bundle_for_hint(payload: &[u8], destination_hint: &[u8]) -> Vec<u8> {
+    let Ok(destination_key) = <[u8; 32]>::try_from(destination_hint) else {
+        return payload.to_vec();
+    };
+    let sender_ephemeral = umc_crypto::signatures::StaticHandshakeKeyPair::generate();
+    let envelope = seal_bundle(
+        &sender_ephemeral,
+        &umc_crypto::signatures::StaticHandshakePublicKey(destination_key),
+        payload,
+    );
+    envelope.encode()
 }
 
 /// `NodeAdmin.GetEvents`: the bounded recent event log, newest first
@@ -3864,6 +3881,18 @@ mod tests {
             .bundles;
         assert_eq!(listing.len(), 1);
         assert_eq!(listing[0].bundle_id, created.bundle_id);
+    }
+
+    #[test]
+    fn destination_key_hint_seals_create_payload() {
+        let destination = umc_crypto::signatures::StaticHandshakeKeyPair::generate();
+        let sealed = seal_bundle_for_hint(b"secret", &destination.public().0);
+        let envelope = umc_bundle::envelope::BundleEnvelope::decode(&sealed).expect("envelope");
+        assert_eq!(
+            umc_bundle::envelope::open_bundle(&destination, &envelope).expect("open"),
+            b"secret"
+        );
+        assert_ne!(sealed, b"secret");
     }
 
     #[test]

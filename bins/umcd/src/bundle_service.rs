@@ -1,13 +1,16 @@
 //! Bundle service (bundles.md §9-12): the daemon's bundle admission, lookup,
 //! expiry, and control-surface listing, backed by the object store.
 use crate::event_log::{DaemonEvent, DaemonEvents};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use umc_bundle::manager::BundleStatus;
 use umc_bundle::manager::{BundleError, BundleManager, BundleRecord};
+use umc_bundle::transfer::{BundleChunk, BundleReassembler, TransferError};
 use umc_storage::objects::ObjectStore;
 use umc_storage::quota::QuotaAccount;
 use umc_storage::store::Store;
 use umc_types::runtime::Instant;
+use umc_wire::frames::bundle::BundleFrame;
 
 /// Upper bound for control-surface bundle listings.
 pub const MAX_LIST_BUNDLES: usize = 100;
@@ -17,6 +20,7 @@ pub const MAX_LIST_BUNDLES: usize = 100;
 pub struct BundleService {
     pub manager: BundleManager,
     events: Arc<Mutex<DaemonEvents>>,
+    reassembly: HashMap<[u8; 32], BundleReassembler>,
 }
 
 #[allow(clippy::too_many_arguments)] // admit() takes the full bundle header
@@ -30,6 +34,7 @@ impl BundleService {
         Self {
             manager: BundleManager::new(objects, quota),
             events,
+            reassembly: HashMap::new(),
         }
     }
 
@@ -83,6 +88,83 @@ impl BundleService {
             detail: format!("bundle {:02x?} ({} bytes)", id, payload.len()),
         });
         Ok(id)
+    }
+
+    /// Admit a received `BUNDLE` frame. Segmented frames are reassembled in a
+    /// bounded in-memory map and consume storage only once the final chunk is
+    /// complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError`] for malformed/replayed chunks or admission
+    /// policy failures. `Ok(None)` means the chunk was accepted but the
+    /// envelope is not complete yet.
+    pub fn admit_frame(
+        &mut self,
+        frame: &BundleFrame,
+        sender: &[u8],
+        now: Instant,
+    ) -> Result<Option<[u8; 32]>, BundleError> {
+        let lifetime = frame.expiration_time.saturating_sub(frame.creation_time);
+        if frame.chunk_index == 0 && frame.chunk_final {
+            return self
+                .admit(
+                    &frame.payload,
+                    sender,
+                    &frame.destination_hint,
+                    frame.priority,
+                    lifetime.max(1_000),
+                    frame.replication_limit,
+                    frame.custody_requested,
+                    now,
+                )
+                .map(Some);
+        }
+        let bundle_id: [u8; 32] = frame
+            .bundle_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| BundleError::Conflict)?;
+        let result = {
+            let reassembler = self
+                .reassembly
+                .entry(bundle_id)
+                .or_insert_with(|| BundleReassembler::new(bundle_id));
+            reassembler.push(BundleChunk {
+                bundle_id,
+                chunk_index: frame.chunk_index,
+                chunk_final: frame.chunk_final,
+                payload: frame.payload.clone(),
+            })
+        };
+        match result {
+            Ok(None) => Ok(None),
+            Ok(Some(payload)) => {
+                self.reassembly.remove(&bundle_id);
+                self.admit(
+                    &payload,
+                    sender,
+                    &frame.destination_hint,
+                    frame.priority,
+                    lifetime.max(1_000),
+                    frame.replication_limit,
+                    frame.custody_requested,
+                    now,
+                )
+                .map(Some)
+            }
+            Err(TransferError::ChunkTooLarge | TransferError::ReassemblyTooLarge) => {
+                self.reassembly.remove(&bundle_id);
+                Err(BundleError::TooLarge)
+            }
+            Err(TransferError::ConflictingChunk) => {
+                self.reassembly.remove(&bundle_id);
+                Err(BundleError::Conflict)
+            }
+            Err(TransferError::WrongBundle | TransferError::IndexOverflow) => {
+                Err(BundleError::Conflict)
+            }
+        }
     }
 
     /// Look up a bundle record by id.
@@ -145,6 +227,16 @@ impl BundleService {
     #[must_use]
     pub fn payload(&self, id: &[u8; 32]) -> Option<Vec<u8>> {
         self.manager.get_payload(id).ok()
+    }
+
+    /// Advances one packet-sized delivery chunk while retaining the bundle
+    /// as `Received` until the final chunk is handed off.
+    pub fn next_delivery_chunk(
+        &mut self,
+        id: &[u8; 32],
+        chunk_size: usize,
+    ) -> Result<Option<umc_bundle::manager::BundleTransferChunk>, BundleError> {
+        self.manager.next_transfer_chunk(id, chunk_size)
     }
 
     /// Record a bundle that has been wrapped into a `BUNDLE` frame as
@@ -260,6 +352,42 @@ mod tests {
                 Instant(0)
             ),
             Err(BundleError::Duplicate)
+        );
+    }
+
+    #[test]
+    fn segmented_frames_reassemble_before_admission() {
+        let mut service = service();
+        let common = |index: u64, final_chunk: bool, payload: &[u8]| BundleFrame {
+            bundle_id: vec![4u8; 32],
+            custody_requested: false,
+            delivery_ack_requested: true,
+            do_not_replicate: false,
+            local_scope_only: false,
+            high_sensitivity: false,
+            priority: 1,
+            creation_time: 0,
+            expiration_time: 10_000,
+            replication_limit: 3,
+            destination_hint: b"dest".to_vec(),
+            payload: payload.to_vec(),
+            bundle_auth: Vec::new(),
+            chunk_index: index,
+            chunk_final: final_chunk,
+        };
+        assert_eq!(
+            service
+                .admit_frame(&common(0, false, b"hello"), b"sender", Instant(1))
+                .unwrap(),
+            None
+        );
+        let id = service
+            .admit_frame(&common(1, true, b"world"), b"sender", Instant(1))
+            .unwrap()
+            .expect("final chunk admits");
+        assert_eq!(
+            service.payload(&id).as_deref(),
+            Some(b"helloworld".as_slice())
         );
     }
 
