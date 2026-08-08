@@ -25,7 +25,7 @@ use umc_core::block::Blocklist;
 use umc_core::mesh::MeshConfig;
 use umc_core::node::{Node, NodeConfig as NodeRuntimeConfig, NodeIdentity};
 use umc_core::rate_limiter::RateLimiter;
-use umc_core::trust::{TrustLevel, TrustStore};
+use umc_core::trust::{TrustLevel, TrustState, TrustStore};
 use umc_core::well_known::WELL_KNOWN_APP;
 use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
 use umc_discovery::invitation::InvitationStore;
@@ -666,6 +666,33 @@ impl RuntimeState {
         }
     }
 
+    /// Refuses new authenticated sessions for restricted, blocked, or revoked
+    /// trust states while retaining the local relationship record.
+    ///
+    /// # Errors
+    /// Returns a protocol-facing reason suitable for the handshake close
+    /// event. Revocation deliberately uses the wire close reason name from
+    /// handshake.md §46.
+    pub fn refuse_if_trust_disallowed(&self, peer_endpoint_id: &[u8]) -> Result<(), String> {
+        let state = self
+            .trust_store()
+            .effective_trust_state(peer_endpoint_id)
+            .map_err(|error| format!("trust state unavailable: {error:?}"))?;
+        if state.allows_new_session() {
+            return Ok(());
+        }
+        let reason = match state {
+            TrustState::Restricted => "TRUST_RESTRICTED",
+            TrustState::Blocked => "TRUST_BLOCKED",
+            TrustState::Revoked => "IDENTITY_REVOKED",
+            TrustState::Unknown
+            | TrustState::Observed
+            | TrustState::Introduced
+            | TrustState::Trusted => unreachable!("allowed trust state filtered above"),
+        };
+        Err(format!("{reason}: peer trust state {state:?}"))
+    }
+
     /// Resolve an identity handle (the keystore record name) to the primary
     /// or a secondary (task F2). The primary's handle is the node-identity
     /// record name; secondaries use their own record names.
@@ -1113,6 +1140,30 @@ mod tests {
     fn build(config: NodeConfig) -> RuntimeState {
         let (tx, _rx) = mpsc::channel(1);
         RuntimeState::new(config, tx).expect("runtime state")
+    }
+
+    #[test]
+    fn restricted_and_revoked_trust_states_refuse_new_sessions() {
+        with_password("state-trust-test", || {
+            let state = build(fresh_config());
+            let endpoint = [7u8; 32];
+            state
+                .trust_store()
+                .set_state(&endpoint, TrustState::Restricted, 1)
+                .expect("persist restricted state");
+            let error = state
+                .refuse_if_trust_disallowed(&endpoint)
+                .expect_err("restricted peer must be refused");
+            assert!(error.contains("TRUST_RESTRICTED"), "{error}");
+            state
+                .trust_store()
+                .set_state(&endpoint, TrustState::Revoked, 2)
+                .expect("persist revoked state");
+            let error = state
+                .refuse_if_trust_disallowed(&endpoint)
+                .expect_err("revoked peer must be refused");
+            assert!(error.contains("IDENTITY_REVOKED"), "{error}");
+        });
     }
 
     #[test]

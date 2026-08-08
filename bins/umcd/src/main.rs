@@ -726,6 +726,7 @@ fn register_session(
     // Blocklist admission (security-operations.md §16.2): a blocked peer's
     // session attempt is refused before any session state is built or
     // registered (`PeerService.BlockPeer` wires the blocklist).
+    state.refuse_if_trust_disallowed(&peer_endpoint_id)?;
     state.refuse_if_blocked(&peer_endpoint_id, now)?;
     let mut session = umc_session::session::Session::new(
         umc_session::session::SessionConfig {
