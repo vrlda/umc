@@ -83,15 +83,19 @@ impl Node {
     /// Complete an XX handshake with a remote over the given carrier.
     /// Sends `CLIENT_HELLO` through the carrier link, receives `SERVER_HELLO`,
     /// sends `CLIENT_AUTH` (the real static key + identity binding +
-    /// transcript signature), and derives session secrets from the
-    /// transcript (handshake.md §14-18).
+    /// transcript signature), verifies `SERVER_FINISHED` (the server
+    /// finished MAC and signature), sends `CLIENT_FINISHED` (the
+    /// confirmation MAC), and derives session secrets from the transcript
+    /// (handshake.md §14-20).
     ///
     /// # Errors
     ///
     /// Returns [`NodeError::CarrierUnknown`] when no carrier of the given type
     /// is registered, [`NodeError::Carrier`] when dialing or exchanging
     /// packets fails, and [`NodeError::Handshake`] when the XX handshake
-    /// fails.
+    /// fails (including a `SERVER_FINISHED` whose MAC or signature does not
+    /// verify).
+    #[allow(clippy::too_many_lines)] // one wire handshake path: hello, auth, finished, confirmation
     pub async fn connect(
         &mut self,
         carrier_type: &str,
@@ -222,6 +226,86 @@ impl Node {
         )
         .map_err(|e| NodeError::Handshake(format!("{e:?}")))?;
         send_packet(link.as_ref(), &auth_frame).map_err(NodeError::Carrier)?;
+
+        // SERVER_FINISHED (handshake.md §19): the daemon's reply after a
+        // verified CLIENT_AUTH, a raw framed handshake message on the
+        // transitional wire path. Pause so the link's background writer
+        // flushes our CLIENT_AUTH before the first read (carriers/tcp.md),
+        // then poll briefly (recv yields WouldBlock while the reply is
+        // buffered).
+        std::thread::sleep(Duration::from_millis(100));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let finished_packet = loop {
+            match link.recv() {
+                Ok(packet) => break packet.bytes,
+                Err(e)
+                    if e.kind == CarrierErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(NodeError::Carrier(e)),
+            }
+        };
+        let (finished_message, _) = umc_handshake::encoding::decode_message(&finished_packet)
+            .map_err(|e| NodeError::Handshake(format!("server finished framing: {e:?}")))?;
+        if finished_message.message_type != umc_handshake::encoding::SERVER_FINISHED {
+            return Err(NodeError::Handshake(format!(
+                "expected SERVER_FINISHED, got message type {}",
+                finished_message.message_type
+            )));
+        }
+        // Rebuild the client's transcript through SERVER_HELLO (the same
+        // messages both sides appended), verify the server's finished MAC
+        // and signature over the hash BEFORE SERVER_FINISHED, and build the
+        // CLIENT_FINISHED confirmation MAC over the hash AFTER
+        // SERVER_FINISHED (the T13 driver's snapshot order, handshake.md
+        // §19-20).
+        let mut transcript = umc_handshake::transcript::Transcript::new(
+            umc_handshake::xx::MODE_XX,
+            umc_handshake::xx::CRYPTO_PROFILE,
+            carrier_type.as_bytes(),
+        );
+        transcript
+            .update_message(umc_handshake::encoding::CLIENT_HELLO, &hello_bytes)
+            .map_err(|e| NodeError::Handshake(format!("transcript: {e:?}")))?;
+        // Re-encode the canonical SERVER_HELLO: the Initial response's
+        // decrypted payload may carry PADDING frames after the hello that
+        // `decode` ignores (wire-format §13), and the transcript must bind
+        // the hello bytes only — exactly what the daemon appended.
+        let server_hello_canonical = server_hello
+            .encode()
+            .map_err(|e| NodeError::Handshake(format!("server hello: {e:?}")))?;
+        transcript
+            .update_message(
+                umc_handshake::encoding::SERVER_HELLO,
+                &server_hello_canonical,
+            )
+            .map_err(|e| NodeError::Handshake(format!("transcript: {e:?}")))?;
+        let confirmation = umc_handshake::xx::verify_server_finished_and_build_confirmation(
+            &mut transcript,
+            &handshake_out.handshake_secret4,
+            &handshake_out.server_identity_public_key,
+            &handshake_out.server_endpoint_id,
+            &client_eid,
+            &handshake_out.server_static_public_key,
+            &self.config.identity.static_handshake.public().0,
+            &auth_body,
+            &finished_message.body,
+        )
+        .map_err(NodeError::Handshake)?;
+        // CLIENT_FINISHED (handshake.md §20): the confirmation MAC, framed
+        // as a raw handshake message. The session secrets were already
+        // derived (complete_client_side); the confirmation is what the
+        // daemon verifies before it activates the session.
+        let mut finished_frame = Vec::new();
+        umc_handshake::encoding::encode_message(
+            &mut finished_frame,
+            umc_handshake::encoding::CLIENT_FINISHED,
+            &confirmation,
+        )
+        .map_err(|e| NodeError::Handshake(format!("{e:?}")))?;
+        send_packet(link.as_ref(), &finished_frame).map_err(NodeError::Carrier)?;
 
         let id = self.next_session;
         self.next_session += 1;

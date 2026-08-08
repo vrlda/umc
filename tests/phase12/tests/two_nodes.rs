@@ -17,10 +17,13 @@ use umc_carrier::BoxLink;
 use umc_control::proto::umc::api::v1 as api;
 use umc_core::node::{Node, NodeConfig, NodeIdentity};
 use umc_crypto::signatures::StaticHandshakeKeyPair;
+use umc_handshake::encoding::{CLIENT_FINISHED, SERVER_FINISHED};
 use umc_handshake::identity::{endpoint_id, IdentityBinding};
+use umc_handshake::transcript::Transcript;
 use umc_handshake::xx::{
     build_client_auth_plaintext, client_signature_input, complete_client_side, encrypt_client_auth,
-    ClientHandshakeOutput, ClientHello, ServerHello,
+    verify_server_finished_and_build_confirmation, ClientHandshakeOutput, ClientHello, ServerHello,
+    CRYPTO_PROFILE, MODE_XX,
 };
 use umc_session::session::{Role, Session, SessionConfig};
 use umc_types::runtime::{Clock, EntropySource};
@@ -175,12 +178,14 @@ struct OpenCircuitResponse {
 /// static key plus identity binding and transcript-bound signature, sealed
 /// with the provisional-chain client-auth key (the daemon's DH chain
 /// stands the ephemeral in for the static, so the auth key matches on both
-/// sides) and framed as a raw handshake message.
+/// sides) and framed as a raw handshake message. Returns the message body
+/// (the length-prefixed ciphertext): the bytes appended to the transcript
+/// by both sides.
 fn send_client_auth(
     node: &umc_core::node::Node,
     link: &(dyn umc_carrier::Link + Send + Sync),
     out: &ClientHandshakeOutput,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     let binding = IdentityBinding::sign(
         &node.config.identity.identity,
         &node.config.identity.static_handshake.public(),
@@ -220,7 +225,7 @@ fn send_client_auth(
         deadline_ms: Some(3_000),
     })
     .map_err(|e| format!("send client auth: {e:?}"))?;
-    Ok(())
+    Ok(auth_body)
 }
 
 /// Synchronous analogue of `Node::connect` over TCP, returning the live
@@ -237,7 +242,7 @@ fn tcp_handshake(node: &umc_core::node::Node, remote: &str) -> Result<(BoxLink, 
     let hello = ClientHello::new(node.entropy.as_ref(), &client_ephemeral);
     let hello_bytes = hello.encode().map_err(|e| format!("hello: {e:?}"))?;
     link.send(OutboundPacket {
-        bytes: hello_bytes,
+        bytes: hello_bytes.clone(),
         control: true,
         deadline_ms: Some(3_000),
     })
@@ -260,7 +265,65 @@ fn tcp_handshake(node: &umc_core::node::Node, remote: &str) -> Result<(BoxLink, 
         "ump.tcp/1".as_bytes(),
     )
     .map_err(|e| format!("client side: {e}"))?;
-    send_client_auth(node, link.as_ref(), &out)?;
+    let auth_body = send_client_auth(node, link.as_ref(), &out)?;
+    // SERVER_FINISHED (handshake.md §19): a raw framed handshake message.
+    // The TCP carrier's recv yields WouldBlock while the daemon's reply is
+    // buffered, so poll briefly.
+    std::thread::sleep(Duration::from_millis(100));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let finished_packet = loop {
+        match link.recv() {
+            Ok(packet) => break packet.bytes,
+            Err(e)
+                if e.kind == umc_carrier::error::CarrierErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => return Err(format!("recv server finished: {e:?}")),
+        }
+    };
+    let (finished_message, _) = umc_handshake::encoding::decode_message(&finished_packet)
+        .map_err(|e| format!("server finished framing: {e:?}"))?;
+    if finished_message.message_type != SERVER_FINISHED {
+        return Err(format!(
+            "expected SERVER_FINISHED, got message type {}",
+            finished_message.message_type
+        ));
+    }
+    // Verify the server's finished MAC + signature and build the
+    // CLIENT_FINISHED confirmation (handshake.md §19-20, the driver's
+    // snapshot order: MAC/signature over the hash BEFORE SERVER_FINISHED,
+    // confirmation over the hash AFTER SERVER_FINISHED).
+    let mut transcript = Transcript::new(MODE_XX, CRYPTO_PROFILE, b"ump.tcp/1");
+    transcript
+        .update_message(umc_handshake::encoding::CLIENT_HELLO, &hello_bytes)
+        .map_err(|e| format!("transcript: {e:?}"))?;
+    transcript
+        .update_message(umc_handshake::encoding::SERVER_HELLO, &server_hello_bytes)
+        .map_err(|e| format!("transcript: {e:?}"))?;
+    let client_eid = endpoint_id(&node.config.identity.identity.public());
+    let confirmation = verify_server_finished_and_build_confirmation(
+        &mut transcript,
+        &out.handshake_secret4,
+        &out.server_identity_public_key,
+        &out.server_endpoint_id,
+        &client_eid,
+        &out.server_static_public_key,
+        &node.config.identity.static_handshake.public().0,
+        &auth_body,
+        &finished_message.body,
+    )
+    .map_err(|e| format!("server finished refused: {e}"))?;
+    let mut finished_frame = Vec::new();
+    umc_handshake::encoding::encode_message(&mut finished_frame, CLIENT_FINISHED, &confirmation)
+        .map_err(|e| format!("client finished frame: {e:?}"))?;
+    link.send(OutboundPacket {
+        bytes: finished_frame,
+        control: true,
+        deadline_ms: Some(3_000),
+    })
+    .map_err(|e| format!("send client finished: {e:?}"))?;
     let secrets = out.session_secrets;
     let session = Session::new(
         SessionConfig {
