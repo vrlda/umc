@@ -6,6 +6,7 @@ members = [
     "crates/umc-wire",
     "crates/umc-crypto",
     "crates/umc-handshake",
+    "crates/umc-metrics",
     "crates/umc-session",
     "crates/umc-routing",
     "crates/umc-relay",

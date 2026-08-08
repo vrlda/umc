@@ -38,7 +38,7 @@ use umc_wire::packet::{parse_payload, PacketContext};
 
 use crate::relay_service::CircuitOpenRequest;
 use crate::runtime_adapters::OsEntropy;
-use crate::state::RuntimeState;
+use crate::state::{metric_names, RuntimeState};
 
 /// Poll interval when the link reports `WouldBlock`.
 pub const RECV_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -612,9 +612,21 @@ async fn process_inbound_packet(
     sweep: &mut SweepState,
 ) -> bool {
     let now = clock.now();
+    runtime
+        .lock()
+        .expect("runtime state")
+        .metrics
+        .incr(metric_names::PACKETS_RECEIVED, 1);
     // The control frames the session layer does not expose: relay,
-    // bundle, routing, and key updates.
-    let frames = parse_control_frames(remote_keys, remote_hp_key, bytes);
+    // bundle, routing, and key updates. The parse needs the reconstruction
+    // anchor (the session's expected pn) or the AEAD open fails once the
+    // wire pn wraps past the truncated width — control frames would be
+    // silently dropped.
+    let expected = session
+        .lock()
+        .await
+        .expected_pn(umc_session::spaces::PacketSpace::SessionData);
+    let frames = parse_control_frames(remote_keys, remote_hp_key, expected, bytes);
     let mut outbound = None;
     let mut retransmits: Vec<Vec<u8>> = Vec::new();
     let mut pending: Vec<(Vec<u8>, u64, Vec<u8>)> = Vec::new();
@@ -707,6 +719,7 @@ async fn process_inbound_packet(
                             {
                                 let span = newest.duration_since(*oldest).as_millis();
                                 let mut state = runtime.lock().expect("runtime state");
+                                state.metrics.incr(metric_names::PATH_DEGRADED_EVENTS, 1);
                                 push_event(
                                     &mut state,
                                     "path_degraded",
@@ -724,7 +737,14 @@ async fn process_inbound_packet(
                             session.congestion_mut().on_packet_lost(*size);
                         }
                         match session.retransmit(pn, now) {
-                            Ok(Some(bytes)) => retransmits.push(bytes),
+                            Ok(Some(bytes)) => {
+                                runtime
+                                    .lock()
+                                    .expect("runtime state")
+                                    .metrics
+                                    .incr(metric_names::RETRANSMISSIONS, 1);
+                                retransmits.push(bytes);
+                            }
                             Ok(None) => session.prune_retransmit_payload(pn),
                             Err(e) => {
                                 // A gated retransmit (CongestionLimited) is a
@@ -895,10 +915,12 @@ async fn process_inbound_packet(
 fn parse_control_frames(
     remote_keys: &PacketKeys,
     remote_hp_key: &[u8; 32],
+    expected_pn: u64,
     bytes: &[u8],
 ) -> Option<(ShortPacketSpace, u64, Vec<Frame>)> {
     let (space, _dcid, path_id, _pn, payload) =
-        umc_session::packet::parse_protected_packet(remote_keys, remote_hp_key, 0, bytes).ok()?;
+        umc_session::packet::parse_protected_packet(remote_keys, remote_hp_key, expected_pn, bytes)
+            .ok()?;
     let parsed = parse_payload(&PacketContext::Protected(space), &payload).ok()?;
     Some((space, path_id, parsed.frames))
 }
@@ -942,6 +964,7 @@ fn handle_control_frames(
                     Ok(accepted) => {
                         let circuit_id = accepted.circuit_id;
                         state.relay.record_circuit_owner(circuit_id, session_id);
+                        state.metrics.incr(metric_names::RELAY_CIRCUITS_OPENED, 1);
                         (RELAY_STATUS_ACCEPTED, false, Some(accepted))
                     }
                     Err(_) => (RELAY_STATUS_REFUSED, true, None),
@@ -1025,16 +1048,19 @@ fn handle_control_frames(
                 }
             }
             Frame::RelayClose(close) => {
-                if let Err(e) = state
+                match state
                     .relay
                     .close_circuit(close.circuit_id, close.reason_code, now)
                 {
-                    push_event(
+                    Ok(()) => {
+                        state.metrics.incr(metric_names::RELAY_CIRCUITS_CLOSED, 1);
+                    }
+                    Err(e) => push_event(
                         state,
                         "relay_close_rejected",
                         now,
                         format!("circuit {}: {e}", close.circuit_id),
-                    );
+                    ),
                 }
             }
             Frame::Bundle(bundle) => {
@@ -1050,17 +1076,20 @@ fn handle_control_frames(
                     now,
                 );
                 match admitted {
-                    Ok(id) => push_event(
-                        state,
-                        "bundle_admitted",
-                        now,
-                        format!(
-                            "frame id {} -> local {} ({} bytes from {peer_endpoint_id:02x?})",
-                            String::from_utf8_lossy(&bundle.bundle_id),
-                            hex_id(&id),
-                            bundle.payload.len()
-                        ),
-                    ),
+                    Ok(id) => {
+                        state.metrics.incr(metric_names::BUNDLES_ADMITTED, 1);
+                        push_event(
+                            state,
+                            "bundle_admitted",
+                            now,
+                            format!(
+                                "frame id {} -> local {} ({} bytes from {peer_endpoint_id:02x?})",
+                                String::from_utf8_lossy(&bundle.bundle_id),
+                                hex_id(&id),
+                                bundle.payload.len()
+                            ),
+                        );
+                    }
                     Err(e) => push_event(
                         state,
                         "bundle_rejected",
@@ -1091,6 +1120,7 @@ fn handle_control_frames(
                 }
             }
             Frame::RouteRequest(request) => {
+                state.metrics.incr(metric_names::ROUTE_REQUESTS_RECEIVED, 1);
                 let mut request_id = [0u8; 16];
                 request_id[..8].copy_from_slice(&request.request_id.to_be_bytes());
                 let candidates: Vec<Vec<u8>> = if request.destination_hint.is_empty() {
@@ -1199,7 +1229,10 @@ fn flush_pending_bundles(state: &mut RuntimeState, now: Instant) -> Vec<u8> {
     let mut outbound = Vec::new();
     // Evict expired bundles FIRST (bundles.md §11): they are removed (records
     // + object store) and never selected for delivery.
-    let _ = state.bundle.expire_old(now);
+    let expired = state.bundle.expire_old(now);
+    state
+        .metrics
+        .incr(metric_names::BUNDLES_EXPIRED, expired.len() as u64);
     let pending = state.bundle.pending_delivery(now);
     for id in pending.into_iter().take(BUNDLES_PER_FLUSH) {
         let Some(record) = state.bundle.record(&id) else {
