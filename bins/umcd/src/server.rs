@@ -271,8 +271,8 @@ impl ConnectionState {
 /// without re-dispatching.
 #[derive(Debug, Default)]
 struct IdempotencyCache {
-    entries: HashMap<(u64, Vec<u8>), (Vec<u8>, u64)>,
-    order: VecDeque<(u64, Vec<u8>)>,
+    entries: HashMap<(String, String, Vec<u8>), (Vec<u8>, u64)>,
+    order: VecDeque<(String, String, Vec<u8>)>,
 }
 
 impl IdempotencyCache {
@@ -284,7 +284,7 @@ impl IdempotencyCache {
     /// Store `response` for `key` stamped at `now_ms`; re-keying an existing
     /// entry refreshes it, otherwise the oldest entry is evicted once the
     /// FIFO cap is exceeded.
-    fn insert(&mut self, key: (u64, Vec<u8>), response: Vec<u8>, now_ms: u64) {
+    fn insert(&mut self, key: (String, String, Vec<u8>), response: Vec<u8>, now_ms: u64) {
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.0 = response;
             entry.1 = now_ms;
@@ -300,7 +300,7 @@ impl IdempotencyCache {
     }
 
     /// The stored bytes for `key` when it is fresh at `now_ms`.
-    fn get(&self, key: &(u64, Vec<u8>), now_ms: u64) -> Option<Vec<u8>> {
+    fn get(&self, key: &(String, String, Vec<u8>), now_ms: u64) -> Option<Vec<u8>> {
         let (response, inserted_at) = self.entries.get(key)?;
         (now_ms < inserted_at + IDEMPOTENCY_TTL_MS).then(|| response.clone())
     }
@@ -346,7 +346,14 @@ fn handle_envelope(
                 ));
             }
             if !request.idempotency_key.is_empty() {
-                let key = (request.request_id, request.idempotency_key.clone());
+                // Scoped per control-api.md §18: service+method+key, so the
+                // same key on a different method cannot replay another
+                // method's response.
+                let key = (
+                    request.service.clone(),
+                    request.method.clone(),
+                    request.idempotency_key.clone(),
+                );
                 let now_ms = wall_now().0;
                 if let Some(stored) = conn.idempotent.get(&key, now_ms) {
                     log::debug!(
@@ -564,9 +571,9 @@ fn page_window(page: Option<&api::PageRequest>, method: &str) -> Result<(usize, 
 /// `PageInfo` for a windowed result (control-api.md §37): a fresh
 /// `next_page_token` when more items follow, the total as the size hint.
 fn page_info(total: usize, offset: usize, page_size: usize, method: &str) -> api::PageInfo {
-    let next_page_token = if offset + page_size < total {
+    let next_page_token = if offset.saturating_add(page_size) < total {
         PageToken::issue(
-            u64::try_from(offset + page_size).unwrap_or(u64::MAX),
+            u64::try_from(offset.saturating_add(page_size)).unwrap_or(u64::MAX),
             0,
             method,
             wall_now().0,
@@ -2483,7 +2490,13 @@ mod tests {
     #[test]
     fn idempotency_cache_evicts_fifo_and_expires() {
         let mut cache = IdempotencyCache::new();
-        let key = |n: u64| (n, vec![u8::try_from(n).unwrap_or(u8::MAX)]);
+        let key = |n: u64| {
+            (
+                "NodeAdmin".to_string(),
+                "GetStatus".to_string(),
+                n.to_be_bytes().to_vec(),
+            )
+        };
         for i in 0..(IDEMPOTENCY_CACHE_CAP + 5) as u64 {
             cache.insert(key(i), vec![0xAA], 1_000);
         }
