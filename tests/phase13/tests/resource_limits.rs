@@ -46,16 +46,17 @@ fn replay_window_memory_bounded() {
     let dcid = vec![7u8; 8];
     let payload = [0x04]; // PING
     for pn in 0..100_000u64 {
-        // The AEAD nonce is derived from the truncated wire pn; admission
-        // reconstructs the full pn from the same 16-bit value.
-        let wire_pn = pn & 0xFFFF;
+        // Packets are sealed with the FULL packet number (the wire carries
+        // the low 16 bits); the receiver reconstructs the full pn before
+        // the AEAD open, so sealing with the truncated value would fail
+        // after 65 536 packets.
         let pkt = build_protected_packet(
             &keys,
             &umc_crypto::header_protection::header_protection_key(&[2u8; 32]),
             ShortPacketSpace::SessionData,
             &dcid,
             0,
-            wire_pn,
+            pn,
             false,
             &payload,
         )

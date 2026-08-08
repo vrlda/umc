@@ -530,31 +530,35 @@ impl Session {
     /// [`SessionError::Encode`] if ACK encoding fails.
     #[allow(clippy::too_many_lines)] // per-frame dispatch arms; each is a few lines
     pub fn on_inbound(&mut self, now: Instant, bytes: &[u8]) -> Result<Vec<u8>, SessionError> {
-        let (space_kind, _dcid, path_id, truncated_pn, payload) =
-            match super::packet::parse_protected_packet(
-                &self.remote_keys,
-                &self.remote_hp_key,
-                bytes,
-            ) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    // session.md §31: a packet that cannot be authenticated
-                    // may be a stateless reset — a short-header packet
-                    // carrying our token at the fixed slot of the canonical
-                    // layout. The check runs on ANY parse failure: with a
-                    // random token the header parse can fail before reaching
-                    // the AEAD tag. A match closes the session without a
-                    // response.
-                    if let Some(secret) = self.stateless_reset_secret {
-                        let token = crate::reset::reset_token(&secret);
-                        if crate::reset::token_matches(bytes, &token) {
-                            self.state = SessionState::Closed;
-                            return Err(SessionError::StatelessReset);
-                        }
+        let expected = self
+            .spaces
+            .get(&PacketSpace::SessionData)
+            .map_or(0, |s| s.largest_received().saturating_add(1));
+        let (space_kind, _dcid, path_id, pn, payload) = match super::packet::parse_protected_packet(
+            &self.remote_keys,
+            &self.remote_hp_key,
+            expected,
+            bytes,
+        ) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                // session.md §31: a packet that cannot be authenticated
+                // may be a stateless reset — a short-header packet
+                // carrying our token at the fixed slot of the canonical
+                // layout. The check runs on ANY parse failure: with a
+                // random token the header parse can fail before reaching
+                // the AEAD tag. A match closes the session without a
+                // response.
+                if let Some(secret) = self.stateless_reset_secret {
+                    let token = crate::reset::reset_token(&secret);
+                    if crate::reset::token_matches(bytes, &token) {
+                        self.state = SessionState::Closed;
+                        return Err(SessionError::StatelessReset);
                     }
-                    return Err(SessionError::Packet(e));
                 }
-            };
+                return Err(SessionError::Packet(e));
+            }
+        };
         let space = match space_kind {
             ShortPacketSpace::SessionData => PacketSpace::SessionData,
             ShortPacketSpace::PathControl => PacketSpace::PathControl,
@@ -564,8 +568,10 @@ impl Session {
         // Reject duplicates/stale packets BEFORE touching the idle timer: a
         // replayed packet must not keep a zombie session alive (session.md
         // §22).
+        // The full pn was already reconstructed for the AEAD open; the replay
+        // window admits it directly (no second reconstruction).
         let pn = space_state
-            .admit_received(truncated_pn, 16)
+            .admit_reconstructed(pn)
             .map_err(SessionError::Space)?;
         self.recv_acks.entry(space).or_default().record(pn);
         // Anti-amplification accounting (congestion.md §18): every admitted

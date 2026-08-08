@@ -66,6 +66,19 @@ impl PacketSpaceState {
     }
 
     #[must_use]
+    /// Admit an already-reconstructed packet number (the parser rebuilt the
+    /// full pn for the AEAD open): replay-window check without a second
+    /// reconstruction step.
+    pub fn admit_reconstructed(&mut self, pn: u64) -> Result<u64, SpaceError> {
+        if !self.replay.check_and_mark(pn) {
+            return Err(SpaceError::DuplicateOrStale);
+        }
+        if pn > self.largest_received {
+            self.largest_received = pn;
+        }
+        Ok(pn)
+    }
+
     pub fn largest_received(&self) -> u64 {
         self.largest_received
     }
