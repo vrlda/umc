@@ -36,6 +36,7 @@ use umc_wire::frames::routing::RouteResponseFrame;
 use umc_wire::header::ShortPacketSpace;
 use umc_wire::packet::{parse_payload, PacketContext};
 
+use crate::relay_auth::RelayAuthorization;
 use crate::relay_service::CircuitOpenRequest;
 use crate::runtime_adapters::OsEntropy;
 use crate::state::{metric_names, RuntimeState};
@@ -70,6 +71,12 @@ pub const BUNDLE_PACKET_HEADROOM: usize = 256;
 /// `RELAY_STATUS` result codes (relay.md §12.2).
 pub const RELAY_STATUS_ACCEPTED: u64 = 1;
 pub const RELAY_STATUS_REFUSED: u64 = 2;
+/// Routing error-code registry (routing.md §27). Values are stable on the
+/// wire even though diagnostics remain intentionally sparse.
+pub const ROUTE_NOT_FOUND: u64 = 1;
+pub const ROUTE_RESOURCE_LIMIT: u64 = 3;
+pub const ROUTE_EXPIRED: u64 = 4;
+pub const ROUTE_POLICY_REJECTED: u64 = 5;
 
 /// Ticket-issuance material for one session (handshake.md §35): the daemon
 /// seals the session's resumption secret into a session ticket when the
@@ -462,23 +469,37 @@ async fn reader_loop(
                 match recv {
                     Some(bytes) => {
                         let now = clock.now();
-                        let sent = tokio::task::block_in_place(|| {
-                            link.send(OutboundPacket {
-                                bytes,
-                                control: false,
-                                deadline_ms: None,
-                            })
-                        });
-                        if sent.is_ok() {
-                            // Bus-outbound traffic is app-originated (relay
-                            // forwarding, bundle delivery): resets the idle
-                            // timer (session.md §22) so a one-way relay flow
-                            // keeps the destination session from idle-closing
-                            // a live circuit.
+                        // Bus messages are frame payloads, not carrier
+                        // packets. Protect them with this session's traffic
+                        // keys before putting them on the link (relay,
+                        // routing, and bundle forwarding all use this path).
+                        let packet = {
                             let mut session = session.lock().await;
-                            session.touch(now);
-                        } else if let Err(e) = sent {
-                            log::debug!("[session {session_id}] send error: {e:?}");
+                            match session.build_outbound(clock.as_ref(), now, &bytes) {
+                                Ok(Some(packet)) => {
+                                    session.touch(now);
+                                    Some(packet)
+                                }
+                                Ok(None) => None,
+                                Err(e) => {
+                                    log::debug!(
+                                        "[session {session_id}] bus payload build error: {e:?}"
+                                    );
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(packet) = packet {
+                            let sent = tokio::task::block_in_place(|| {
+                                link.send(OutboundPacket {
+                                    bytes: packet,
+                                    control: false,
+                                    deadline_ms: None,
+                                })
+                            });
+                            if let Err(e) = sent {
+                                log::debug!("[session {session_id}] send error: {e:?}");
+                            }
                         }
                     }
                     None => break,
@@ -777,13 +798,14 @@ async fn process_inbound_packet(
             combined.extend_from_slice(&credit);
         }
         let sweep_due = bundle_flush_due(now, sweep.last_bundle_flush);
+        let hint_due = sweep.established.is_none() || sweep_due;
         let rotation_due = sweep
             .established
             .is_some_and(|started| key_rotation_due(now, started, sweep.last_key_update));
         if sweep.established.is_none() {
             sweep.established = Some(now);
         }
-        if frames.is_some() || sweep_due || rotation_due {
+        if frames.is_some() || hint_due || sweep_due || rotation_due {
             let mut state = runtime.lock().expect("runtime state");
             if let Some((_space, _path_id, control_frames)) = &frames {
                 if let Some(payload) =
@@ -796,6 +818,13 @@ async fn process_inbound_packet(
                 let payload = flush_pending_bundles(&mut state, crate::state::wall_now());
                 combined.extend_from_slice(&payload);
                 sweep.last_bundle_flush = Some(now);
+            }
+            if hint_due {
+                if let Some(hint) = state.discovery.build_hint(32, now) {
+                    if let Ok(payload) = hint.encode() {
+                        combined.extend_from_slice(&payload);
+                    }
+                }
             }
             if rotation_due {
                 if let Some(started) = sweep.established {
@@ -946,6 +975,20 @@ fn handle_control_frames(
     for frame in frames {
         match frame {
             Frame::RelayOpen(open) => {
+                let authorization_valid = if open.authorization.is_empty() {
+                    // Empty authorization is the legacy capability shape. It
+                    // remains accepted for compatibility; operators can
+                    // require the signed form by issuing it to callers.
+                    true
+                } else {
+                    RelayAuthorization::decode(&open.authorization)
+                        .and_then(|authorization| {
+                            authorization.verify(&state.node_identity.identity, now.0)
+                        })
+                        .is_ok()
+                };
+                let public_relay_disabled =
+                    state.config.disable_public_relay && !open.private_circuit;
                 let result = state.relay.open_circuit(
                     &CircuitOpenRequest {
                         peer_circuits: state.relay.circuits_for_peer(session_id),
@@ -959,14 +1002,35 @@ fn handle_control_frames(
                     peer_endpoint_id.to_vec(),
                     now,
                 );
-                let (code, retryable, granted) = match result {
-                    Ok(accepted) => {
-                        let circuit_id = accepted.circuit_id;
-                        state.relay.record_circuit_owner(circuit_id, session_id);
-                        state.metrics.incr(metric_names::RELAY_CIRCUITS_OPENED, 1);
-                        (RELAY_STATUS_ACCEPTED, false, Some(accepted))
+                let (code, retryable, granted) = match (authorization_valid, public_relay_disabled)
+                {
+                    (false, _) => {
+                        push_event(
+                            state,
+                            "relay_authorization_rejected",
+                            now,
+                            format!("session {session_id}: invalid authorization"),
+                        );
+                        (RELAY_STATUS_REFUSED, false, None)
                     }
-                    Err(_) => (RELAY_STATUS_REFUSED, true, None),
+                    (true, true) => {
+                        push_event(
+                            state,
+                            "relay_public_disabled",
+                            now,
+                            format!("session {session_id}: public relay disabled"),
+                        );
+                        (RELAY_STATUS_REFUSED, false, None)
+                    }
+                    (true, false) => match result {
+                        Ok(accepted) => {
+                            let circuit_id = accepted.circuit_id;
+                            state.relay.record_circuit_owner(circuit_id, session_id);
+                            state.metrics.incr(metric_names::RELAY_CIRCUITS_OPENED, 1);
+                            (RELAY_STATUS_ACCEPTED, false, Some(accepted))
+                        }
+                        Err(_) => (RELAY_STATUS_REFUSED, true, None),
+                    },
                 };
                 let status = RelayStatusFrame {
                     circuit_id: open.circuit_id,
@@ -1118,20 +1182,56 @@ fn handle_control_frames(
                     }
                 }
             }
+            Frame::PeerHint(hint) => {
+                match state
+                    .discovery
+                    .apply_received_hints(hint, &peer_endpoint_id, now)
+                {
+                    Ok(accepted) => push_event(
+                        state,
+                        "peer_hints_received",
+                        now,
+                        format!("session {session_id}: {accepted} candidate(s)"),
+                    ),
+                    Err(error) => push_event(
+                        state,
+                        "peer_hints_rejected",
+                        now,
+                        format!("session {session_id}: {error:?}"),
+                    ),
+                }
+            }
             Frame::RouteRequest(request) => {
                 state.metrics.incr(metric_names::ROUTE_REQUESTS_RECEIVED, 1);
                 let mut request_id = [0u8; 16];
                 request_id[..8].copy_from_slice(&request.request_id.to_be_bytes());
-                let candidates: Vec<Vec<u8>> = if request.destination_hint.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![request.destination_hint.clone()]
-                };
+                let peers: Vec<Vec<u8>> = state
+                    .sessions
+                    .snapshot()
+                    .into_iter()
+                    .filter_map(|(candidate_id, entry)| {
+                        if candidate_id == session_id
+                            || entry.peer_endpoint_id.as_slice() == peer_endpoint_id
+                            || request
+                                .path_exclusions
+                                .iter()
+                                .any(|excluded| excluded.as_slice() == entry.peer_endpoint_id)
+                        {
+                            None
+                        } else {
+                            Some(entry.peer_endpoint_id.to_vec())
+                        }
+                    })
+                    .collect();
+                // A destination hint that names a live adjacent endpoint is a
+                // local match. An empty hint retains the direct-service
+                // behavior used by local callers; otherwise the bounded peer
+                // snapshot supplies forwarding candidates.
+                let local_match = request.destination_hint.is_empty()
+                    || peers.iter().any(|peer| peer == &request.destination_hint);
+                let candidates = if local_match { Vec::new() } else { peers };
                 let flags = route_request_flags(request);
-                if let Ok(umc_routing::request::Admission::Admit {
-                    remaining_lifetime_ms,
-                    ..
-                }) = state.routing.admit_route_request(
+                let admission = state.routing.admit_route_request(
                     &request_id,
                     &peer_endpoint_id,
                     flags,
@@ -1139,22 +1239,81 @@ fn handle_control_frames(
                     request.expiration_delta,
                     &candidates,
                     now,
-                ) {
-                    let response = RouteResponseFrame {
-                        request_id: request.request_id,
-                        response_sequence: 0,
-                        direct: true,
-                        relay_required: false,
-                        store_forward_available: request.allow_store_forward,
-                        local_path: true,
-                        gateway_path: false,
-                        route_lifetime: remaining_lifetime_ms,
-                        next_hop_hint: peer_endpoint_id.to_vec(),
-                        route_metadata: Vec::new(),
-                        authentication: Vec::new(),
-                    };
-                    if let Ok(encoded) = response.encode() {
-                        outbound.extend_from_slice(&encoded);
+                );
+                match admission {
+                    Ok(umc_routing::request::Admission::Admit {
+                        hop_limit,
+                        remaining_lifetime_ms,
+                        forward_to,
+                    }) if !forward_to.is_empty() && hop_limit > 0 => {
+                        let forwarded = umc_wire::frames::routing::RouteRequestFrame {
+                            hop_limit,
+                            ..request.clone()
+                        }
+                        .encode();
+                        let mut delivered = false;
+                        if let Ok(bytes) = forwarded {
+                            for next_hop in forward_to {
+                                if state
+                                    .bus
+                                    .lock()
+                                    .expect("session bus")
+                                    .inject_outbound(&next_hop, bytes.clone())
+                                    .is_ok()
+                                {
+                                    delivered = true;
+                                }
+                            }
+                        }
+                        if !delivered {
+                            append_route_error(&mut outbound, request.request_id, ROUTE_NOT_FOUND);
+                        }
+                    }
+                    Ok(umc_routing::request::Admission::Admit {
+                        remaining_lifetime_ms,
+                        ..
+                    }) => {
+                        let response = RouteResponseFrame {
+                            request_id: request.request_id,
+                            response_sequence: 0,
+                            direct: true,
+                            relay_required: false,
+                            store_forward_available: request.allow_store_forward,
+                            local_path: true,
+                            gateway_path: false,
+                            route_lifetime: remaining_lifetime_ms,
+                            next_hop_hint: peer_endpoint_id.to_vec(),
+                            route_metadata: Vec::new(),
+                            authentication: Vec::new(),
+                        };
+                        if let Ok(encoded) = response.encode() {
+                            outbound.extend_from_slice(&encoded);
+                        }
+                    }
+                    Ok(umc_routing::request::Admission::Suppress) => {}
+                    Ok(umc_routing::request::Admission::Drop) => {
+                        append_route_error(
+                            &mut outbound,
+                            request.request_id,
+                            ROUTE_POLICY_REJECTED,
+                        );
+                    }
+                    Err(error) => {
+                        let code = match error {
+                            umc_routing::request::AdmissionError::HopLimitZero
+                            | umc_routing::request::AdmissionError::HopLimitExceeded => {
+                                ROUTE_EXPIRED
+                            }
+                            umc_routing::request::AdmissionError::LifetimeTooLong => ROUTE_EXPIRED,
+                            umc_routing::request::AdmissionError::FanoutExceeded
+                            | umc_routing::request::AdmissionError::RateLimited => {
+                                ROUTE_RESOURCE_LIMIT
+                            }
+                            umc_routing::request::AdmissionError::UnknownFlag => {
+                                ROUTE_POLICY_REJECTED
+                            }
+                        };
+                        append_route_error(&mut outbound, request.request_id, code);
                     }
                 }
             }
@@ -1183,6 +1342,28 @@ fn handle_control_frames(
                         response.request_id, record.next_hop, response.route_lifetime
                     ),
                 );
+                if !record.source_peer.is_empty() {
+                    if let Ok(encoded) = response.encode() {
+                        let _ = state
+                            .bus
+                            .lock()
+                            .expect("session bus")
+                            .inject_outbound(&record.source_peer, encoded);
+                    }
+                }
+            }
+            Frame::RouteError(error) => {
+                let mut request_id = [0u8; 16];
+                request_id[..8].copy_from_slice(&error.request_id.to_be_bytes());
+                if let Some(upstream) = state.routing.reverse.route_response(&request_id, now) {
+                    if let Ok(encoded) = error.encode() {
+                        let _ = state
+                            .bus
+                            .lock()
+                            .expect("session bus")
+                            .inject_outbound(&upstream, encoded);
+                    }
+                }
             }
             Frame::KeyUpdate(update) => {
                 if let Err(e) = session.on_key_update(update.update_sequence) {
@@ -1353,6 +1534,18 @@ fn route_request_flags(request: &umc_wire::frames::routing::RouteRequestFrame) -
         flags |= 0x10;
     }
     flags
+}
+
+fn append_route_error(outbound: &mut Vec<u8>, request_id: u64, error_code: u64) {
+    let error = umc_wire::frames::routing::RouteErrorFrame {
+        request_id,
+        error_code,
+        failed_hop_index: umc_wire::frames::routing::RouteErrorFrame::UNKNOWN_HOP,
+        diagnostic: Vec::new(),
+    };
+    if let Ok(encoded) = error.encode() {
+        outbound.extend_from_slice(&encoded);
+    }
 }
 
 /// Route-cache destination hash for a route response's next-hop hint
@@ -1795,6 +1988,63 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn relay_authorization_accepts_valid_and_rejects_forged_or_expired() {
+        let (mut state, _tx) = test_state();
+        let valid = RelayAuthorization::issue(&state.node_identity.identity, 10_000, [3u8; 16]);
+        let mut session = test_session();
+        let open = RelayOpenFrame {
+            circuit_id: 7,
+            bidirectional: true,
+            store_forward_allowed: false,
+            private_circuit: false,
+            multipath_allowed: false,
+            requested_lifetime: 60_000,
+            requested_byte_quota: 1_024,
+            next_hop_hint: Vec::new(),
+            authorization: valid,
+        };
+        let accepted = handle_control_frames(
+            &mut state,
+            1,
+            &mut session,
+            &[WireFrame::RelayOpen(open.clone())],
+            Instant(1_000),
+        )
+        .expect("valid authorization gets a status");
+        assert_eq!(
+            relay_status_of(&accepted).status_code,
+            RELAY_STATUS_ACCEPTED
+        );
+
+        let mut forged = open.clone();
+        let last = forged.authorization.len() - 1;
+        forged.authorization[last] ^= 1;
+        let refused = handle_control_frames(
+            &mut state,
+            1,
+            &mut session,
+            &[WireFrame::RelayOpen(forged)],
+            Instant(1_000),
+        )
+        .expect("forged authorization gets a refusal status");
+        assert_eq!(relay_status_of(&refused).status_code, RELAY_STATUS_REFUSED);
+
+        let expired = RelayAuthorization::issue(&state.node_identity.identity, 999, [4u8; 16]);
+        let mut expired_open = open;
+        expired_open.circuit_id = 8;
+        expired_open.authorization = expired;
+        let refused = handle_control_frames(
+            &mut state,
+            1,
+            &mut session,
+            &[WireFrame::RelayOpen(expired_open)],
+            Instant(1_000),
+        )
+        .expect("expired authorization gets a refusal status");
+        assert_eq!(relay_status_of(&refused).status_code, RELAY_STATUS_REFUSED);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn bundle_frame_admitted_and_swept() {
         let (mut state, _tx) = test_state();
         let bundle = BundleFrame {
@@ -1923,6 +2173,138 @@ mod tests {
         assert_eq!(response.route_lifetime, 30_000);
         // The direct route points back at the requesting session's peer.
         assert_eq!(response.next_hop_hint, [7u8; 32]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn route_request_forwards_to_bounded_peers_and_decrements_ttl() {
+        let (mut state, _tx) = test_state();
+        let mut receives = Vec::new();
+        for (id, peer) in [(2u64, [8u8; 32]), (3, [9u8; 32]), (4, [10u8; 32])] {
+            state.sessions.register(
+                id,
+                SessionEntry {
+                    peer_endpoint_id: peer,
+                    carrier_type: "ump.tcp/1".into(),
+                    task: tokio::spawn(async {}).abort_handle(),
+                    established_at_ms: 0,
+                },
+            );
+            let (in_tx, _in_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+            state
+                .bus
+                .lock()
+                .expect("bus")
+                .register(peer.to_vec(), id, in_tx, out_tx);
+            receives.push(out_rx);
+        }
+        let request = RouteRequestFrame {
+            request_id: 100,
+            allow_relay: true,
+            allow_store_forward: false,
+            require_private_response: false,
+            local_scope_only: false,
+            gateway_query: false,
+            hop_limit: 8,
+            expiration_delta: 30_000,
+            destination_hint: b"remote-destination".to_vec(),
+            path_exclusions: vec![],
+            requester_auth: b"scope".to_vec(),
+        };
+        let mut session = test_session();
+        let outbound = handle_control_frames(
+            &mut state,
+            1,
+            &mut session,
+            &[WireFrame::RouteRequest(request)],
+            Instant(0),
+        );
+        assert!(
+            outbound.is_none(),
+            "forwarded requests await a downstream response"
+        );
+        for mut rx in receives {
+            let bytes = rx.recv().await.expect("forwarded request");
+            let (kind, type_len) = umc_wire::varint::decode(&bytes).expect("frame type");
+            assert_eq!(kind, umc_types::frame::FrameType::ROUTE_REQUEST.0);
+            let (forwarded, _) = RouteRequestFrame::decode(&bytes[type_len..]).expect("request");
+            assert_eq!(forwarded.request_id, 100);
+            assert_eq!(forwarded.hop_limit, 7);
+            assert_eq!(forwarded.destination_hint, b"remote-destination");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn route_error_returns_to_request_upstream() {
+        let (mut state, _tx) = test_state();
+        let (in_tx, _in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .bus
+            .lock()
+            .expect("bus")
+            .register([8u8; 32].to_vec(), 2, in_tx, out_tx);
+        let request_id = [0x2Au8; 16];
+        state
+            .routing
+            .admit_route_request(&request_id, &[8u8; 32], 0, 8, 30_000, &[], Instant(0))
+            .expect("reverse state");
+        let mut session = test_session();
+        let error = umc_wire::frames::routing::RouteErrorFrame {
+            request_id: u64::from_be_bytes(request_id[..8].try_into().unwrap()),
+            error_code: 4,
+            failed_hop_index: 0,
+            diagnostic: Vec::new(),
+        };
+        let outbound = handle_control_frames(
+            &mut state,
+            1,
+            &mut session,
+            &[WireFrame::RouteError(error)],
+            Instant(1),
+        );
+        assert!(outbound.is_none());
+        let bytes = out_rx.recv().await.expect("error forwarded upstream");
+        let (kind, type_len) = umc_wire::varint::decode(&bytes).expect("frame type");
+        assert_eq!(kind, umc_types::frame::FrameType::ROUTE_ERROR.0);
+        let (forwarded, _) =
+            umc_wire::frames::routing::RouteErrorFrame::decode(&bytes[type_len..]).unwrap();
+        assert_eq!(forwarded.error_code, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_hint_is_applied_and_persisted_as_a_candidate() {
+        let (mut state, _tx) = test_state();
+        let hint = umc_wire::frames::misc::PeerHintFrame {
+            entries: vec![umc_wire::frames::misc::PeerHintEntry {
+                temporary_peer_id: 77u64.to_be_bytes().to_vec(),
+                carrier_type: b"ump.udp/1".to_vec(),
+                connection_hint: b"127.0.0.1:9002".to_vec(),
+                expiration_time: u64::MAX,
+                public: true,
+                introduced: false,
+                local: false,
+                ephemeral: false,
+                do_not_reshare: false,
+                authenticator: Vec::new(),
+            }],
+        };
+        let mut session = test_session();
+        let outbound = handle_control_frames(
+            &mut state,
+            1,
+            &mut session,
+            &[WireFrame::PeerHint(hint)],
+            Instant(5),
+        );
+        assert!(outbound.is_none());
+        let candidates = state.discovery.candidates();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].candidate_id, 77);
+        assert_eq!(
+            candidates[0].source,
+            umc_discovery::provider::CandidateSource::PeerHint
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2930,11 +3312,16 @@ mod tests {
         )
         .await;
 
-        // The relay bytes reached the link...
+        // The relay payload reached the link as a protected session packet.
         {
             let sent = recorded.lock().expect("link sent");
             assert_eq!(sent.len(), 1, "bus-outbound bytes sent once");
-            assert_eq!(sent[0], b"relay-bytes");
+            let local_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[1u8; 32]).unwrap();
+            let local_hp = umc_crypto::header_protection::header_protection_key(&[1u8; 32]);
+            let (_, _, _, _, payload) =
+                umc_session::packet::parse_protected_packet(&local_keys, &local_hp, 0, &sent[0])
+                    .expect("bus payload is protected");
+            assert_eq!(payload, b"relay-bytes");
         }
         // ...and the successful send reset the idle timer: a session last
         // active at t0 would be idle at the close instant, but the relay
