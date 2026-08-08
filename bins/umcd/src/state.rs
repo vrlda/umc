@@ -25,6 +25,7 @@ use umc_core::block::Blocklist;
 use umc_core::mesh::MeshConfig;
 use umc_core::node::{Node, NodeConfig as NodeRuntimeConfig, NodeIdentity};
 use umc_core::rate_limiter::RateLimiter;
+use umc_core::revocation::{RevocationError, RevocationStore, TofuError, TofuStore};
 use umc_core::trust::{TrustLevel, TrustState, TrustStore};
 use umc_core::well_known::WELL_KNOWN_APP;
 use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
@@ -652,6 +653,34 @@ impl RuntimeState {
         TrustStore::new(self.store.as_ref(), self.trust_default_level)
     }
 
+    /// Checks a verified handshake binding against revocation and TOFU state
+    /// before the session is registered.
+    ///
+    /// # Errors
+    /// Returns `IDENTITY_REVOKED` for an active revocation, or
+    /// `TOFU_BINDING_MISMATCH` when the identity presents an unapproved
+    /// binding change.
+    pub fn validate_peer_binding(
+        &self,
+        binding: &IdentityBinding,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        match RevocationStore::new(self.store.as_ref()).check(binding, now_ms) {
+            Ok(()) => {}
+            Err(RevocationError::Revoked { .. }) => {
+                return Err(format!("IDENTITY_REVOKED: {:?}", binding.endpoint_id));
+            }
+            Err(error) => return Err(format!("revocation check failed: {error:?}")),
+        }
+        match TofuStore::new(self.store.as_ref()).observe(binding, now_ms) {
+            Ok(()) => Ok(()),
+            Err(TofuError::BindingChanged { .. }) => {
+                Err(format!("TOFU_BINDING_MISMATCH: {:?}", binding.endpoint_id))
+            }
+            Err(error) => Err(format!("TOFU check failed: {error:?}")),
+        }
+    }
+
     /// Refuses the endpoint while the blocklist holds an active block
     /// (security-operations.md §16.2). The accept loop consults this before
     /// registering any session, so `PeerService.BlockPeer` stops future
@@ -1162,6 +1191,40 @@ mod tests {
             let error = state
                 .refuse_if_trust_disallowed(&endpoint)
                 .expect_err("revoked peer must be refused");
+            assert!(error.contains("IDENTITY_REVOKED"), "{error}");
+        });
+    }
+
+    #[test]
+    fn binding_validation_enforces_tofu_and_revocation() {
+        with_password("state-binding-test", || {
+            let state = build(fresh_config());
+            assert_eq!(
+                umc_core::trust::TrustGraph::new(state.store.as_ref())
+                    .effective_state(&[1u8; 32], "public", 1)
+                    .expect("empty introduction graph"),
+                TrustState::Unknown
+            );
+            let identity = IdentityKeyPair::generate();
+            let first_static = StaticHandshakeKeyPair::generate();
+            let first =
+                IdentityBinding::sign(&identity, &first_static.public(), 0, u64::MAX, 0, [0; 32]);
+            state
+                .validate_peer_binding(&first, 10)
+                .expect("first binding");
+            let changed_static = StaticHandshakeKeyPair::generate();
+            let changed =
+                IdentityBinding::sign(&identity, &changed_static.public(), 0, u64::MAX, 1, [0; 32]);
+            let error = state
+                .validate_peer_binding(&changed, 11)
+                .expect_err("TOFU mismatch");
+            assert!(error.contains("TOFU_BINDING_MISMATCH"), "{error}");
+            umc_core::revocation::RevocationStore::new(state.store.as_ref())
+                .revoke(&first.endpoint_id, 0, 100, b"operator", 12)
+                .expect("revoke");
+            let error = state
+                .validate_peer_binding(&first, 13)
+                .expect_err("revocation");
             assert!(error.contains("IDENTITY_REVOKED"), "{error}");
         });
     }
