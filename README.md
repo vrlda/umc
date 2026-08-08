@@ -34,4 +34,5 @@ Specifications are licensed under Creative Commons Attribution 4.0 International
 
 The A–K gap-closure status is tracked in [`docs/PHASES.md`](docs/PHASES.md).
 Phase J’s full fuzz/simulator/adversarial/coverage gate and Phase K’s P1–P3
-privacy mechanisms are not claimed complete yet.
+privacy mechanisms are not claimed complete yet; K1 only exposes the secure
+profile default and policy floor.

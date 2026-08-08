@@ -1108,6 +1108,11 @@ fn get_status(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
         active_links: u32::try_from(state.sessions.count()).unwrap_or(u32::MAX),
         active_relay_circuits: u32::try_from(state.relay.circuit_count()).unwrap_or(u32::MAX),
         pending_handshakes: 0,
+        privacy_profile: state
+            .config
+            .effective_privacy_profile()
+            .as_str()
+            .to_string(),
         ..Default::default()
     };
     let response = api::GetStatusResponse {
@@ -2159,6 +2164,16 @@ fn node_config_message(config: &NodeConfig) -> api::NodeConfig {
         api::ConfigEntry {
             key: "profile".into(),
             value: config.profile.clone(),
+            sensitive_present: false,
+        },
+        api::ConfigEntry {
+            key: "privacy_profile".into(),
+            value: config.effective_privacy_profile().as_str().into(),
+            sensitive_present: false,
+        },
+        api::ConfigEntry {
+            key: "privacy_policy_override".into(),
+            value: config.privacy_policy_override.clone().unwrap_or_default(),
             sensitive_present: false,
         },
         api::ConfigEntry {
@@ -3649,6 +3664,7 @@ mod tests {
             .expect("status");
         assert_eq!(status.active_sessions, 0);
         assert_eq!(status.active_relay_circuits, 0);
+        assert_eq!(status.privacy_profile, "p0");
         // Register a session; the count moves.
         state.sessions.register(
             state.sessions.next_id(),
@@ -5071,6 +5087,8 @@ mod tests {
         let (mut state, _tx) = test_state();
         state.config.profile = "relay".into();
         state.config.carriers = vec!["ump.udp/1".into()];
+        state.config.privacy_profile = "p1".into();
+        state.config.privacy_policy_override = Some("p2".into());
         let bytes = dispatch_request(&mut state, &request("NodeAdmin", "GetConfig", vec![]), None);
         let response = decode_response(&bytes);
         assert_eq!(
@@ -5099,6 +5117,14 @@ mod tests {
             .entries
             .iter()
             .any(|e| e.key == "disable_public_relay"));
+        assert!(config
+            .entries
+            .iter()
+            .any(|e| e.key == "privacy_profile" && e.value == "p2"));
+        assert!(config
+            .entries
+            .iter()
+            .any(|e| e.key == "privacy_policy_override" && e.value == "p2"));
     }
 
     #[test]
