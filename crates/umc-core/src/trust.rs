@@ -319,6 +319,263 @@ pub enum TrustTransitionStoreError {
     Storage(StoreError),
 }
 
+/// Maximum number of introducer edges followed when deriving scoped trust.
+pub const MAX_INTRODUCTION_DEPTH: usize = 2;
+const MAX_INTRODUCTIONS_PER_SUBJECT: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IntroductionRecord {
+    introducer: Vec<u8>,
+    subject: Vec<u8>,
+    scope: String,
+    expires_at_ms: u64,
+    sequence: u64,
+}
+
+/// Persisted, bounded introduction graph (identity-trust.md §18).
+pub struct TrustGraph<'a> {
+    store: &'a dyn Store,
+    max_depth: usize,
+}
+
+impl std::fmt::Debug for TrustGraph<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TrustGraph")
+            .field("max_depth", &self.max_depth)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> TrustGraph<'a> {
+    /// Creates a graph backed by the trust namespace.
+    #[must_use]
+    pub const fn new(store: &'a dyn Store) -> Self {
+        Self {
+            store,
+            max_depth: MAX_INTRODUCTION_DEPTH,
+        }
+    }
+
+    /// Creates a graph with a lower depth bound for constrained profiles.
+    #[must_use]
+    pub const fn with_max_depth(store: &'a dyn Store, max_depth: usize) -> Self {
+        Self { store, max_depth }
+    }
+
+    /// Persists one scoped, expiring introducer edge.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Corrupt`] for malformed identities/scope or an
+    /// expired edge, and [`StoreError::QuotaExceeded`] when the subject has
+    /// reached the bounded introduction count.
+    pub fn introduce(
+        &self,
+        introducer: &[u8],
+        subject: &[u8],
+        scope: &str,
+        expires_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        if introducer.is_empty() || subject.is_empty() || introducer == subject {
+            return Err(StoreError::Corrupt(
+                "invalid introduction identities".into(),
+            ));
+        }
+        if scope.is_empty() || expires_at_ms <= now_ms {
+            return Err(StoreError::Corrupt(
+                "invalid introduction scope or expiry".into(),
+            ));
+        }
+        let records = self.records()?;
+        if records
+            .iter()
+            .filter(|record| record.subject == subject)
+            .count()
+            >= MAX_INTRODUCTIONS_PER_SUBJECT
+        {
+            return Err(StoreError::QuotaExceeded);
+        }
+        let sequence = records
+            .iter()
+            .filter(|record| record.introducer == introducer && record.subject == subject)
+            .map(|record| record.sequence)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let record = IntroductionRecord {
+            introducer: introducer.to_vec(),
+            subject: subject.to_vec(),
+            scope: scope.to_string(),
+            expires_at_ms,
+            sequence,
+        };
+        self.store.put(
+            Namespace::Trust,
+            &introduction_key(&record),
+            &encode_introduction(&record),
+        )
+    }
+
+    /// Returns the effective state for a subject and requested scope. An
+    /// active, authorized path from a trusted introducer yields `Introduced`;
+    /// it never promotes the subject to `Trusted`.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] when trust or introduction records are corrupt.
+    pub fn effective_state(
+        &self,
+        subject: &[u8],
+        scope: &str,
+        now_ms: u64,
+    ) -> Result<TrustState, StoreError> {
+        let trust = TrustStore::new(self.store, TrustState::Unknown);
+        let current = trust.effective_trust_state(subject)?;
+        if !matches!(current, TrustState::Unknown | TrustState::Observed) {
+            return Ok(current);
+        }
+        if self.has_authorized_introduction(subject, scope, now_ms, 0, &mut Vec::new())? {
+            Ok(TrustState::Introduced)
+        } else {
+            Ok(current)
+        }
+    }
+
+    fn has_authorized_introduction(
+        &self,
+        subject: &[u8],
+        scope: &str,
+        now_ms: u64,
+        depth: usize,
+        visiting: &mut Vec<Vec<u8>>,
+    ) -> Result<bool, StoreError> {
+        if depth > self.max_depth || visiting.iter().any(|seen| seen == subject) {
+            return Ok(false);
+        }
+        let trust = TrustStore::new(self.store, TrustState::Unknown);
+        if trust.effective_trust_state(subject)? == TrustState::Trusted {
+            return Ok(true);
+        }
+        visiting.push(subject.to_vec());
+        let records = self.records()?;
+        for record in records.iter().filter(|record| {
+            record.subject == subject
+                && record.expires_at_ms > now_ms
+                && scope_matches(&record.scope, scope)
+        }) {
+            if self.has_authorized_introduction(
+                &record.introducer,
+                scope,
+                now_ms,
+                depth + 1,
+                visiting,
+            )? {
+                visiting.pop();
+                return Ok(true);
+            }
+        }
+        visiting.pop();
+        Ok(false)
+    }
+
+    fn records(&self) -> Result<Vec<IntroductionRecord>, StoreError> {
+        self.store
+            .scan(Namespace::Trust)?
+            .into_iter()
+            .filter(|entry| entry.key.starts_with(b"intro/"))
+            .map(|entry| decode_introduction(&entry.key, &entry.value))
+            .collect()
+    }
+}
+
+fn scope_matches(record_scope: &str, requested_scope: &str) -> bool {
+    record_scope == "*" || record_scope == requested_scope
+}
+
+fn introduction_key(record: &IntroductionRecord) -> Vec<u8> {
+    let mut key = b"intro/".to_vec();
+    append_len_prefixed(&mut key, &record.introducer);
+    append_len_prefixed(&mut key, &record.subject);
+    key.extend_from_slice(&record.sequence.to_be_bytes());
+    key
+}
+
+fn append_len_prefixed(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend_from_slice(&u16::try_from(value.len()).unwrap_or(u16::MAX).to_be_bytes());
+    out.extend_from_slice(value);
+}
+
+fn encode_introduction(record: &IntroductionRecord) -> Vec<u8> {
+    let mut value = Vec::new();
+    value.push(1);
+    value.extend_from_slice(&record.expires_at_ms.to_be_bytes());
+    value.extend_from_slice(
+        &u16::try_from(record.scope.len())
+            .unwrap_or(u16::MAX)
+            .to_be_bytes(),
+    );
+    value.extend_from_slice(record.scope.as_bytes());
+    value
+}
+
+fn decode_introduction(key: &[u8], value: &[u8]) -> Result<IntroductionRecord, StoreError> {
+    if !key.starts_with(b"intro/") || key.len() < 6 {
+        return Err(StoreError::Corrupt("bad introduction key".into()));
+    }
+    let mut offset = 6;
+    let introducer = read_len_prefixed(key, &mut offset)?;
+    let subject = read_len_prefixed(key, &mut offset)?;
+    if key.len() != offset + 8 || value.len() < 11 || value[0] != 1 {
+        return Err(StoreError::Corrupt("bad introduction record".into()));
+    }
+    let sequence = u64::from_be_bytes(
+        key[offset..]
+            .try_into()
+            .map_err(|_| StoreError::Corrupt("bad introduction sequence".into()))?,
+    );
+    let expires_at_ms = u64::from_be_bytes(
+        value[1..9]
+            .try_into()
+            .map_err(|_| StoreError::Corrupt("bad introduction expiry".into()))?,
+    );
+    let scope_len =
+        usize::from(u16::from_be_bytes(value[9..11].try_into().map_err(
+            |_| StoreError::Corrupt("bad introduction scope".into()),
+        )?));
+    if value.len() != 11 + scope_len {
+        return Err(StoreError::Corrupt("bad introduction scope length".into()));
+    }
+    let scope = String::from_utf8(value[11..].to_vec())
+        .map_err(|_| StoreError::Corrupt("introduction scope is not utf8".into()))?;
+    Ok(IntroductionRecord {
+        introducer,
+        subject,
+        scope,
+        expires_at_ms,
+        sequence,
+    })
+}
+
+fn read_len_prefixed(bytes: &[u8], offset: &mut usize) -> Result<Vec<u8>, StoreError> {
+    if *offset + 2 > bytes.len() {
+        return Err(StoreError::Corrupt(
+            "bad introduction identity length".into(),
+        ));
+    }
+    let len = usize::from(u16::from_be_bytes(
+        bytes[*offset..*offset + 2]
+            .try_into()
+            .map_err(|_| StoreError::Corrupt("bad introduction identity length".into()))?,
+    ));
+    *offset += 2;
+    if *offset + len > bytes.len() {
+        return Err(StoreError::Corrupt("bad introduction identity".into()));
+    }
+    let value = bytes[*offset..*offset + len].to_vec();
+    *offset += len;
+    Ok(value)
+}
+
 fn encode(metadata: &TrustMetadata) -> Vec<u8> {
     let mut out = Vec::with_capacity(11);
     out.push(TRUST_RECORD_VERSION);
@@ -519,6 +776,59 @@ mod tests {
         assert_eq!(
             trust.effective_trust_state(b"old").unwrap(),
             TrustState::Blocked
+        );
+    }
+
+    #[test]
+    fn introduction_graph_is_scoped_expiring_and_depth_bounded() {
+        let path = temp_path();
+        let store = open_store(&path);
+        let trust = TrustStore::new(&store, TrustState::Unknown);
+        let graph = TrustGraph::new(&store);
+        let root = b"root";
+        let middle = b"middle";
+        let leaf = b"leaf";
+        trust.set_state(root, TrustState::Trusted, 1).unwrap();
+        graph.introduce(root, middle, "chat", 100, 2).unwrap();
+        graph.introduce(middle, leaf, "chat", 100, 3).unwrap();
+        assert_eq!(
+            graph.effective_state(leaf, "chat", 4).unwrap(),
+            TrustState::Introduced
+        );
+        assert_eq!(
+            graph.effective_state(leaf, "files", 4).unwrap(),
+            TrustState::Unknown
+        );
+        assert_eq!(
+            graph.effective_state(leaf, "chat", 100).unwrap(),
+            TrustState::Unknown
+        );
+
+        let too_deep = b"too-deep";
+        graph.introduce(leaf, too_deep, "chat", 200, 5).unwrap();
+        assert_eq!(
+            graph.effective_state(too_deep, "chat", 6).unwrap(),
+            TrustState::Unknown
+        );
+    }
+
+    #[test]
+    fn introductions_persist_across_store_reopen() {
+        let path = temp_path();
+        {
+            let store = open_store(&path);
+            let trust = TrustStore::new(&store, TrustState::Unknown);
+            trust.set_state(b"root", TrustState::Trusted, 1).unwrap();
+            TrustGraph::new(&store)
+                .introduce(b"root", b"peer", "public", 100, 2)
+                .unwrap();
+        }
+        let store = open_store(&path);
+        assert_eq!(
+            TrustGraph::new(&store)
+                .effective_state(b"peer", "public", 3)
+                .unwrap(),
+            TrustState::Introduced
         );
     }
 }
