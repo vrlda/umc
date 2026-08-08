@@ -470,6 +470,10 @@ pub struct RuntimeState {
     /// Per-application inbound stream channels: session tasks forward
     /// received stream data into the application's channel.
     pub app_channels: Arc<Mutex<HashMap<Vec<u8>, AppTx>>>,
+    /// Protocol ids owned by each control-plane application handle. The v1
+    /// handle is the first requested protocol id, so this side table keeps
+    /// multi-protocol registrations removable as one application.
+    pub application_protocols: HashMap<Vec<u8>, Vec<Vec<u8>>>,
     /// Per-application echo receivers: the application's outbound channel,
     /// drained by the session writers and sent back on the same stream.
     pub app_echo_rx: Arc<Mutex<HashMap<Vec<u8>, AppRx>>>,
@@ -616,6 +620,7 @@ impl RuntimeState {
             metrics: Arc::new(Registry::new()),
             apps,
             app_channels: Arc::new(Mutex::new(HashMap::new())),
+            application_protocols: HashMap::new(),
             app_echo_rx: Arc::new(Mutex::new(HashMap::new())),
             development_token,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
