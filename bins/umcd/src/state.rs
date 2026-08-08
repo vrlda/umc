@@ -16,7 +16,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use umc_carrier::Listener;
+use umc_control::auth::TokenRegistry;
 use umc_control::events::EventBus;
+use umc_control::proto::umc::api::v1 as api;
 use umc_core::app::AppRegistry;
 use umc_core::app_io::{AppRx, AppTx};
 use umc_core::block::Blocklist;
@@ -463,6 +465,9 @@ pub struct RuntimeState {
     pub events: Arc<Mutex<DaemonEvents>>,
     /// Live event subscriptions for control-plane clients.
     pub event_bus: Arc<Mutex<EventBus>>,
+    /// Bearer-token registry and grants for local control clients.
+    pub token_registry: TokenRegistry,
+    pub token_grants: HashMap<u64, Vec<api::CapabilityGrant>>,
     /// Bounded metrics registry (core.md §42): the daemon's counters,
     /// surfaced through `DiagnosticsService.GetMetricsSnapshot`.
     pub metrics: Arc<Registry>,
@@ -627,6 +632,8 @@ impl RuntimeState {
             routing,
             events,
             event_bus,
+            token_registry: TokenRegistry::new(),
+            token_grants: HashMap::new(),
             metrics: Arc::new(Registry::new()),
             apps,
             app_channels: Arc::new(Mutex::new(HashMap::new())),
