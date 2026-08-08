@@ -829,6 +829,10 @@ fn register_session(
         state.node.clock.as_ref(),
     )
     .map_err(|e| format!("session: {e:?}"))?;
+    // P3 traffic-analysis resistance is an explicit local opt-in. Apply it
+    // to every newly registered session so resumed and full handshakes share
+    // the same policy.
+    session.set_traffic_padding(state.config.traffic_padding);
     // Stateless-reset support (session.md §31): the token is derived from
     // the handshake's shared `stateless reset` secret (handshake.md §26).
     if let Some(secret) = stateless_reset_secret {

@@ -18,6 +18,10 @@ pub struct NodeConfig {
     /// Optional local policy floor. It can raise, but never lower, the
     /// requested profile (privacy.md §43).
     pub privacy_policy_override: Option<String>,
+    /// Pad application data packets to a fixed target size. This is an
+    /// explicit opt-in because P3 traffic-analysis resistance is not the
+    /// secure-by-default profile (privacy.md §P3).
+    pub traffic_padding: bool,
     pub carriers: Vec<String>,
     pub tcp_listen: Option<String>,
     pub udp_listen: Option<String>,
@@ -73,6 +77,7 @@ impl Default for NodeConfig {
             profile: "standard".to_string(),
             privacy_profile: PrivacyProfile::P0.as_str().to_string(),
             privacy_policy_override: None,
+            traffic_padding: false,
             carriers: vec!["ump.tcp/1".to_string(), "ump.udp/1".to_string()],
             tcp_listen: None,
             udp_listen: None,
@@ -152,6 +157,11 @@ impl NodeConfig {
                         .map_err(|e| format!("privacy_policy_override: {e}"))?;
                     Some(profile.as_str().to_string())
                 };
+            }
+            "traffic_padding" => {
+                self.traffic_padding = value
+                    .parse::<bool>()
+                    .map_err(|_| format!("traffic_padding must be a bool, got {value:?}"))?;
             }
             "public_relay" => {
                 self.public_relay = value
@@ -340,6 +350,7 @@ mod tests {
         assert!(!config.mesh);
         assert_eq!(config.privacy_profile_value(), PrivacyProfile::P0);
         assert_eq!(config.effective_privacy_profile(), PrivacyProfile::P0);
+        assert!(!config.traffic_padding);
         assert!(
             !config.allow_secret_export,
             "secret export is off by default"
@@ -416,6 +427,9 @@ mod tests {
         assert_eq!(config.effective_privacy_profile(), PrivacyProfile::P1);
         config.set_entry("privacy_policy_override", "").unwrap();
         assert!(config.privacy_policy_override.is_none());
+        config.set_entry("traffic_padding", "true").unwrap();
+        assert!(config.traffic_padding);
+        assert!(config.set_entry("traffic_padding", "maybe").is_err());
         config.set_entry("public_relay", "false").unwrap();
         assert!(!config.public_relay);
         config.set_entry("telemetry_enabled", "true").unwrap();
