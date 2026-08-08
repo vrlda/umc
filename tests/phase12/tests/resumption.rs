@@ -585,12 +585,17 @@ fn daemon_ticket_material(daemon_dir: &Path) -> ([u8; 32], [u8; 32]) {
 
 /// Build the resume ticket for the given session's resumption secret,
 /// sealed with daemon B's ticket key (handshake.md §35, v1 wire format).
+/// The nonce is unique per issue (a monotonic counter — the daemon's
+/// single-use replay guard keys on it), so two tickets for the same
+/// session never collide.
 fn build_ticket(
     ticket_key: &[u8; 32],
     server_eid: &[u8; 32],
     client_eid: &[u8; 32],
     resumption_secret: &[u8; 32],
 ) -> Vec<u8> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
     let now = u64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -598,6 +603,8 @@ fn build_ticket(
             .as_millis(),
     )
     .unwrap_or(0);
+    let mut nonce = [0u8; umc_handshake::ticket::TICKET_ENTROPY];
+    nonce[..8].copy_from_slice(&NONCE_COUNTER.fetch_add(1, Ordering::Relaxed).to_be_bytes());
     umc_handshake::ticket::issue_ticket(
         ticket_key,
         &umc_handshake::ticket::TicketPayload {
@@ -610,7 +617,7 @@ fn build_ticket(
             expires_at_ms: now + 3_600_000,
             protocol_version: 1,
             crypto_profile: CRYPTO_PROFILE.to_vec(),
-            nonce: [0x33u8; 16],
+            nonce,
         },
     )
 }
@@ -829,13 +836,16 @@ async fn node_connect_resumed_end_to_end() {
     std::thread::sleep(Duration::from_millis(300));
 
     // 4. A second resumed connection round-trips a stream through the
-    //    daemon's echo application (the same ticket resumes again — tickets
-    //    are stateless).
+    //    daemon's echo application. Tickets are single-use (the daemon's
+    //    replay guard keys on the clear nonce), so the second resume needs
+    //    a FRESH ticket with fresh entropy — a replayed ticket would fall
+    //    back to the full XX handshake.
     let expected = b"phase12 resumed echo".to_vec();
     let payload = expected.clone();
+    let ticket2 = build_ticket(&ticket_key, &server_eid, &client_eid, &resumption_secret);
     let node = client_node();
     let echo = tokio::task::spawn_blocking(move || {
-        run_echo_client(&node, &remote, &ticket, &resumption_secret, &payload)
+        run_echo_client(&node, &remote, &ticket2, &resumption_secret, &payload)
     });
     let echoed = tokio::time::timeout(Duration::from_secs(20), echo)
         .await

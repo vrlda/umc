@@ -307,19 +307,32 @@ fn handle_inbound_link_locked(
         None
     };
     if let Some(ticket) = resumed_ticket {
-        return handle_resumed_link(
-            state,
-            carrier_type,
-            link,
-            &hello,
-            &hello_bytes,
-            parsed_initial.as_ref(),
-            &dcid,
-            &vn_scid,
-            now,
-            tracker,
-            &ticket,
-        );
+        // Single-use enforcement (handshake.md §35): the clear nonce is
+        // the ticket id; a nonce seen before means the ticket was already
+        // consumed — refuse the short path and fall back to the full XX
+        // path below, so one stolen ticket grants at most one session.
+        let state_guard = state.lock().expect("state");
+        let fresh = state_guard
+            .ticket_replay_cache
+            .lock()
+            .expect("ticket replay cache")
+            .insert(ticket.nonce);
+        drop(state_guard);
+        if fresh {
+            return handle_resumed_link(
+                state,
+                carrier_type,
+                link,
+                &hello,
+                &hello_bytes,
+                parsed_initial.as_ref(),
+                &dcid,
+                &vn_scid,
+                now,
+                tracker,
+                &ticket,
+            );
+        }
     }
 
     // The client's static handshake key arrives in CLIENT_AUTH (handshake.md
@@ -1437,6 +1450,59 @@ mod tests {
                 .iter()
                 .any(|e| e.kind == "session_active"),
             "the resumed session activates without CLIENT_AUTH"
+        );
+    }
+
+    /// A ticket is single-use (handshake.md §35): after a successful
+    /// resume, presenting the same ticket again (same clear nonce) is a
+    /// replay — the daemon refuses the short path and falls back to the
+    /// full XX path, so one stolen ticket grants at most one session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_loop_refuses_replayed_ticket() {
+        let state = test_state();
+        let ticket = daemon_ticket(&state);
+        let client_ephemeral = umc_crypto::signatures::StaticHandshakeKeyPair::generate();
+        let mut hello = ClientHello::new(&crate::runtime_adapters::OsEntropy, &client_ephemeral);
+        hello.supported_handshake_modes = vec![umc_handshake::ik::MODE_IK.to_vec()];
+        hello.retry_token = ticket;
+        let hello_bytes = hello.encode().expect("hello");
+
+        let resume = |captured: Arc<StdMutex<Vec<u8>>>| {
+            let link = ResumeScriptedLink {
+                hello_bytes: hello_bytes.clone(),
+                server_hello_bytes: captured,
+                stage: StdMutex::new(0),
+            };
+            let tracker = StdMutex::new(HandshakeTracker::new());
+            handle_inbound_link(&state, "ump.tcp/1", Box::new(link), &tracker)
+        };
+
+        // First use of the ticket: the resume path is taken and the
+        // session registers.
+        let first = Arc::new(StdMutex::new(Vec::new()));
+        resume(first.clone()).expect("first use of the ticket resumes");
+        let captured = first.lock().expect("captured");
+        let server_hello = ServerHello::decode(&captured).expect("captured server hello");
+        assert_eq!(
+            server_hello.selected_handshake_mode,
+            umc_handshake::ik::MODE_IK.to_vec(),
+            "the first use must take the IK resume path"
+        );
+        drop(captured);
+        assert_eq!(state.lock().expect("state").sessions.count(), 1);
+
+        // Replay of the same ticket: refused — the daemon falls back to
+        // the full XX path, where the scripted link ends.
+        let err = resume(Arc::new(StdMutex::new(Vec::new())))
+            .expect_err("a replayed ticket must not resume again");
+        assert!(
+            err.contains("client auth"),
+            "the replay must fall back to the XX path: {err}"
+        );
+        assert_eq!(
+            state.lock().expect("state").sessions.count(),
+            1,
+            "no second session may be registered for a replayed ticket"
         );
     }
 

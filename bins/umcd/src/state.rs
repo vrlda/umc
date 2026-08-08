@@ -10,7 +10,7 @@ use crate::routing_service::RoutingService;
 use crate::runtime_adapters::{OsClock, OsEntropy, TokioAdaptor};
 use crate::session_bus::SessionBus;
 use crate::session_manager::SessionManager;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -102,6 +102,45 @@ fn identity_from_seeds(seeds: &[u8]) -> NodeIdentity {
     }
 }
 
+/// Bounded single-use session-ticket cache (handshake.md §35): the clear
+/// ticket nonce is the ticket id, so a resume presenting an already-seen
+/// nonce is a replay and is refused. FIFO eviction keeps the cache bounded.
+#[derive(Debug, Default)]
+pub struct TicketReplayCache {
+    seen: HashSet<[u8; 16]>,
+    order: VecDeque<[u8; 16]>,
+}
+
+impl TicketReplayCache {
+    /// Maximum ticket ids retained.
+    pub const CAP: usize = 1_024;
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    /// Records `nonce` as consumed. Returns `true` when the nonce is fresh
+    /// (the resume may proceed) and `false` when it was seen before (a
+    /// replay — refuse the resume).
+    #[must_use]
+    pub fn insert(&mut self, nonce: [u8; 16]) -> bool {
+        if !self.seen.insert(nonce) {
+            return false;
+        }
+        self.order.push_back(nonce);
+        if self.order.len() > Self::CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+        true
+    }
+}
+
 /// The daemon's shared runtime context.
 pub struct RuntimeState {
     pub config: NodeConfig,
@@ -133,6 +172,10 @@ pub struct RuntimeState {
     /// it are opaque to peers — the ticket only carries its nonce in the
     /// clear (v1 wire format).
     pub ticket_key: [u8; 32],
+    /// Bounded single-use ticket cache: a ticket nonce seen before refuses
+    /// the resume (handshake.md §35), so one ticket grants at most one
+    /// session under the victim's endpoint id.
+    pub ticket_replay_cache: std::sync::Mutex<TicketReplayCache>,
     /// Operating mode profile (local mesh vs endpoint).
     pub mesh: MeshConfig,
     /// The runtime node: registered carriers, sessions (core.md §8).
@@ -290,6 +333,7 @@ impl RuntimeState {
             rate_limiter: RateLimiter::new(1_024),
             node_identity: state_identity,
             ticket_key,
+            ticket_replay_cache: std::sync::Mutex::new(TicketReplayCache::new()),
             mesh,
             node,
             listeners: Vec::new(),
@@ -384,6 +428,36 @@ mod tests {
             let sb = build(b);
             assert_ne!(id_a, sb.node_identity.endpoint_id());
         });
+    }
+
+    #[test]
+    fn replay_cache_is_single_use() {
+        let mut cache = TicketReplayCache::new();
+        let nonce = [7u8; 16];
+        assert!(cache.insert(nonce), "the first use of a nonce is fresh");
+        assert!(
+            !cache.insert(nonce),
+            "a second use of the same nonce is a replay"
+        );
+        assert!(cache.insert([8u8; 16]), "a different nonce is fresh");
+    }
+
+    #[test]
+    fn replay_cache_evicts_fifo_at_cap() {
+        let mut cache = TicketReplayCache::new();
+        let mut oldest = None;
+        for i in 0..=TicketReplayCache::CAP {
+            let mut nonce = [0u8; 16];
+            nonce[..2].copy_from_slice(&u16::try_from(i).expect("cap fits u16").to_be_bytes());
+            if i == 0 {
+                oldest = Some(nonce);
+            }
+            assert!(cache.insert(nonce), "fresh nonce {i} must be admitted");
+        }
+        assert!(
+            cache.insert(oldest.expect("first nonce")),
+            "the oldest entry must be evicted once the cap is exceeded"
+        );
     }
 
     #[test]
