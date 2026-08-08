@@ -19,6 +19,7 @@
 //! pings periodically so the daemon's recv pump hands the stream mutex to
 //! B's writer long enough to flush the forwarded frame.
 use prost::Message;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use umc_carrier::types::OutboundPacket;
@@ -567,4 +568,74 @@ async fn relay_data_forwarded_between_two_live_sessions() {
     wait_for_event(&socket, "relay_data_forwarded").await;
 
     drop(daemon);
+}
+
+/// D1 end-to-end proof: `Node::connect` over a live TCP carrier speaks
+/// Initial-protected `CLIENT_HELLO`/`SERVER_HELLO` (wire-format §13) — the
+/// client seals the hello with the client initial keys, the daemon
+/// decrypts it and answers with an Initial-protected `SERVER_HELLO`, and
+/// the client decrypts that with the server initial keys before
+/// completing the XX handshake.
+#[tokio::test(flavor = "multi_thread")]
+async fn node_connect_completes_protected_handshake() {
+    let tcp_port = free_tcp_port();
+    let (daemon, socket) = spawn_daemon("protected", tcp_port, free_udp_port());
+    wait_for_control_socket(&socket);
+    let remote = format!("127.0.0.1:{tcp_port}");
+
+    let mut node = Node::new(
+        NodeConfig {
+            identity: NodeIdentity::generate(&TestEntropy),
+            dcid: vec![3u8; 8],
+        },
+        Arc::new(TestClock),
+        Arc::new(TestEntropy),
+    );
+    node.register_carrier(Box::new(umc_carrier_tcp::TcpCarrier));
+    let server_identity = NodeIdentity::generate(&TestEntropy);
+    let handshake =
+        tokio::task::spawn_blocking(move || drive_connect(&mut node, &remote, &server_identity));
+    let session_id = tokio::time::timeout(Duration::from_secs(20), handshake)
+        .await
+        .expect("protected handshake timed out")
+        .expect("client thread panicked")
+        .expect("protected handshake failed");
+    assert_eq!(session_id, 0);
+
+    // The daemon accepted the protected Initial and registered the session.
+    wait_for_event(&socket, "session_active").await;
+
+    drop(daemon);
+}
+
+/// Drive `Node::connect` to completion on a blocking thread without a
+/// tokio runtime context: `Handle::block_on` would mark this thread an
+/// async execution context, which panics the carriers' own nested
+/// `Handle::block_on` calls ("Cannot block the current thread from within
+/// a runtime"). `connect` awaits only a tokio mutex, so a plain poll loop
+/// suffices; the `spawn_blocking` thread keeps the runtime context the
+/// carriers require.
+fn drive_connect(
+    node: &mut Node,
+    remote: &str,
+    server_identity: &NodeIdentity,
+) -> Result<u64, umc_core::node::NodeError> {
+    let mut fut = Box::pin(node.connect("ump.tcp/1", remote.to_string(), server_identity));
+    let waker = std::task::Waker::from(Arc::new(NoopWaker));
+    let mut cx = std::task::Context::from_waker(&waker);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(out) => return out,
+            std::task::Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+/// A waker that does nothing: the poll loop drives progress with
+/// `yield_now` instead of wake notifications.
+struct NoopWaker;
+
+impl std::task::Wake for NoopWaker {
+    fn wake(self: Arc<Self>) {}
+    fn wake_by_ref(self: &Arc<Self>) {}
 }
