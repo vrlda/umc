@@ -1555,3 +1555,9 @@ A–K gap-closure plan:
     already at or above the target are unchanged; the target is provisional
     and does not claim timing privacy, cover traffic, or MTU-aware P3
     conformance.
+14. **Connection-ID privacy rotation.** The daemon advertises a fresh bounded
+    8-byte connection ID every ten minutes after session establishment. A
+    peer adopts a received `NEW_CONNECTION_ID` only after authenticated frame
+    processing; the endpoint's identity is never encoded in the ID. Rotation
+    is transport metadata only and does not claim full route or timing
+    anonymity.

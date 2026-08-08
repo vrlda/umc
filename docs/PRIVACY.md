@@ -8,7 +8,7 @@ must never be silently enabled or claimed.
 | Profile | Current status |
 | --- | --- |
 | P0 Secure | Implemented and the default: end-to-end authenticated encryption, encrypted identity binding, redacted peer logging, bounded discovery hints, and no TLS-to-endpoint identity conflation. |
-| P1 Identity/topology minimization | Partial: the profile and local policy floor are exposed, the handshake binds a requested minimum and fails closed above the daemon’s p1 maximum, and control candidate enumeration is budgeted; per-session identifiers, bounded hints, and redacted logs exist, while session-level reporting and periodic DCID rotation remain pending. |
+| P1 Identity/topology minimization | Partial: the profile and local policy floor are exposed, the handshake binds a requested minimum and fails closed above the daemon’s p1 maximum, control candidate enumeration is budgeted, and the daemon rotates advertised connection IDs periodically; bounded hints and redacted logs exist, while session-level reporting and mesh-secret hint authentication remain pending. |
 | P2 Private routing | Primitives implemented: authenticated onion layers expose only one opaque transition at a time, and sessions can reject direct paths; daemon route integration, rendezvous/introduction points, and replica privacy remain future work. |
 | P3 Traffic analysis resistance | Partial: an explicit daemon/session opt-in pads small application payloads to a fixed 1,024-byte target; cover traffic, timing hygiene, and profile-level reporting remain future work. |
 
