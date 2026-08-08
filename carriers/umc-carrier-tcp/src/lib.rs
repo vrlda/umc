@@ -213,12 +213,10 @@ impl Link for TcpLink {
         // backpressure gate permanently); on rejection the count is
         // compensated.
         self.pending_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
-        self.outbound
-            .try_send(packet)
-            .map_err(|_| {
-                self.pending_bytes.fetch_sub(bytes, AtomicOrdering::Relaxed);
-                CarrierError::new(CarrierErrorKind::QueueFull, "send")
-            })?;
+        self.outbound.try_send(packet).map_err(|_| {
+            self.pending_bytes.fetch_sub(bytes, AtomicOrdering::Relaxed);
+            CarrierError::new(CarrierErrorKind::QueueFull, "send")
+        })?;
         Ok(SendResult::Accepted {
             queue_state: QueueState::QueuedBounded,
         })

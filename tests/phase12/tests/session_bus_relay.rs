@@ -172,7 +172,10 @@ fn status_from_protected(keys: &PacketKeys, bytes: &[u8]) -> Option<u64> {
         let (ty, used) = umc_wire::varint::decode(&payload[pos..]).ok()?;
         pos += used;
         if ty == FrameType::RELAY_STATUS.0 {
-            let (status, _) = RelayStatusFrame::decode(&payload[pos..]).ok()?;
+            // RELAY_STATUS is a length-delimited frame (type || length ||
+            // body); the body decoder expects the raw body.
+            let (status, used) = RelayStatusFrame::decode_length_delimited(&payload[pos..]).ok()?;
+            let _ = used;
             return Some(status.status_code);
         }
         if ty == FrameType::ACK.0 {
@@ -206,8 +209,13 @@ async fn recv_until(
     let statuses_arc = statuses.clone();
     let raw_arc = raw_frames.clone();
     let handle = tokio::task::spawn_blocking(move || loop {
-        let Ok(packet) = link.recv() else {
-            return;
+        // WouldBlock (a timed-out partial read on the TCP carrier) is a
+        // retry, not a link failure: exiting the window here raced the
+        // daemon's reply and made the relay test flaky.
+        let packet = match link.recv() {
+            Ok(packet) => packet,
+            Err(e) if e.kind == umc_carrier::error::CarrierErrorKind::WouldBlock => continue,
+            Err(_) => return,
         };
         let bytes = packet.bytes;
         let mut session = session.lock().expect("client session");
