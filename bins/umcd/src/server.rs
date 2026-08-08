@@ -556,6 +556,15 @@ fn dispatch_connection_request(
 ) -> Vec<u8> {
     if request.service == "EventService" {
         dispatch_event_request(conn, state, request, presented_token)
+    } else if request.service == "TokenService" && request.method == "InspectCurrentGrant" {
+        if let Some(configured) = &state.development_token {
+            let authorized = presented_token.is_some_and(|token| token == configured.as_slice());
+            if !authorized {
+                return response_envelope(request, api::StatusCode::Unauthenticated as i32, None);
+            }
+        }
+        let (code, payload) = inspect_current_grant(state, request, presented_token);
+        response_envelope(request, code, payload)
     } else {
         dispatch_request(state, request, presented_token)
     }
@@ -738,6 +747,112 @@ fn event_type_code(kind: &str) -> i32 {
     }
 }
 
+fn create_token(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(create) = api::CreateTokenRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if create.expires_at_unix_ms < 0 {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    let expires_at_ms = match u64::try_from(create.expires_at_unix_ms) {
+        Ok(0) => None,
+        Ok(value) => Some(value),
+        Err(_) => return (api::StatusCode::InvalidArgument as i32, None),
+    };
+    let (principal_id, token) = state.token_registry.create_token(expires_at_ms, &OsEntropy);
+    let grants = create.grants;
+    state.token_grants.insert(principal_id, grants.clone());
+    let response = api::CreateTokenResponse {
+        token_id: principal_id.to_be_bytes().to_vec(),
+        token,
+        effective_grants: grants,
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+fn list_grants(
+    state: &RuntimeState,
+    request: &api::Request,
+    current_principal: u64,
+) -> (i32, Option<Vec<u8>>) {
+    let Ok(list) = api::ListGrantsRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let principal_id = if list.principal_id.is_empty() {
+        current_principal
+    } else {
+        let Ok(bytes) = <[u8; 8]>::try_from(list.principal_id.as_slice()) else {
+            return (api::StatusCode::InvalidArgument as i32, None);
+        };
+        u64::from_be_bytes(bytes)
+    };
+    let Ok((offset, page_size)) = page_window(list.page.as_ref(), "ListGrants") else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let all = state
+        .token_grants
+        .get(&principal_id)
+        .cloned()
+        .unwrap_or_default();
+    let total = all.len();
+    let grants = all.into_iter().skip(offset).take(page_size).collect();
+    let response = api::ListGrantsResponse {
+        grants,
+        page: Some(page_info(total, offset, page_size, "ListGrants")),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+fn revoke_token(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(revoke) = api::RevokeTokenRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok(bytes) = <[u8; 8]>::try_from(revoke.token_id.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let principal_id = u64::from_be_bytes(bytes);
+    let existed = state.token_registry.revoke(principal_id);
+    state.token_grants.remove(&principal_id);
+    if !existed {
+        return (api::StatusCode::NotFound as i32, None);
+    }
+    let mut payload = Vec::new();
+    Message::encode(&api::RevokeTokenResponse {}, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+fn inspect_current_grant(
+    state: &RuntimeState,
+    request: &api::Request,
+    presented_token: Option<&[u8]>,
+) -> (i32, Option<Vec<u8>>) {
+    if api::InspectCurrentGrantRequest::decode(request.payload.as_slice()).is_err() {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    let principal_id = presented_token
+        .and_then(|token| state.token_registry.authenticate(token, wall_now().0).ok())
+        .unwrap_or(0);
+    let response = api::InspectCurrentGrantResponse {
+        principal_id: if principal_id == 0 {
+            Vec::new()
+        } else {
+            principal_id.to_be_bytes().to_vec()
+        },
+        grants: state
+            .token_grants
+            .get(&principal_id)
+            .cloned()
+            .unwrap_or_default(),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
 /// Service-backed envelope dispatch (control-api.md §16-24). Methods without
 /// a service implementation return `Unimplemented`.
 ///
@@ -811,6 +926,10 @@ fn dispatch_request(
         ("DiagnosticsService" | "NodeAdmin", "RunDoctor" | "Doctor") => run_doctor(state),
         ("DiagnosticsService", "GetMetricsSnapshot") => get_metrics_snapshot(state, request),
         ("DiagnosticsService", "GetSubsystemHealth") => get_subsystem_health(state, request),
+        ("TokenService", "ListGrants") => list_grants(state, request, 0),
+        ("TokenService", "CreateToken") => create_token(state, request),
+        ("TokenService", "RevokeToken") => revoke_token(state, request),
+        ("TokenService", "InspectCurrentGrant") => inspect_current_grant(state, request, None),
         ("ConfigService", "SetConfig") | ("NodeAdmin", "UpdateConfig") => {
             set_config(state, request)
         }
@@ -6797,6 +6916,81 @@ mod tests {
         );
         push_event(&state, "session_active", "session 2".into());
         assert!(drain_event_envelopes(&mut state, &mut conn).is_empty());
+    }
+
+    #[test]
+    fn token_service_create_list_inspect_revoke() {
+        let (mut state, _tx) = test_state();
+        let create = api::CreateTokenRequest {
+            label: "test-client".into(),
+            grants: vec![api::CapabilityGrant {
+                capability: api::Capability::NodeRead as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("TokenService", "CreateToken", encode_request(&create)),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let created =
+            api::CreateTokenResponse::decode(response.payload.as_slice()).expect("create payload");
+        assert_eq!(created.token.len(), 32);
+        let principal = created.token_id.clone();
+        assert_eq!(principal.len(), 8);
+        assert_eq!(created.effective_grants.len(), 1);
+
+        let list = api::ListGrantsRequest {
+            principal_id: principal.clone(),
+            ..Default::default()
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("TokenService", "ListGrants", encode_request(&list)),
+            None,
+        );
+        let listed = api::ListGrantsResponse::decode(decode_response(&bytes).payload.as_slice())
+            .expect("list payload");
+        assert_eq!(listed.grants.len(), 1);
+        assert_eq!(
+            listed.grants[0].capability,
+            api::Capability::NodeRead as i32
+        );
+
+        let revoke = api::RevokeTokenRequest {
+            token_id: principal.clone(),
+            ..Default::default()
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("TokenService", "RevokeToken", encode_request(&revoke)),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+
+        let inspect = api::InspectCurrentGrantRequest {};
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "TokenService",
+                "InspectCurrentGrant",
+                encode_request(&inspect),
+            ),
+            None,
+        );
+        let inspected =
+            api::InspectCurrentGrantResponse::decode(decode_response(&bytes).payload.as_slice())
+                .expect("inspect payload");
+        assert!(inspected.grants.is_empty());
     }
 
     #[test]

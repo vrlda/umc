@@ -77,8 +77,10 @@ impl TokenRegistry {
         Ok(record.principal_id)
     }
 
-    pub fn revoke(&mut self, principal_id: PrincipalId) {
+    pub fn revoke(&mut self, principal_id: PrincipalId) -> bool {
+        let before = self.tokens.len();
         self.tokens.retain(|_, r| r.principal_id != principal_id);
+        self.tokens.len() != before
     }
 }
 
