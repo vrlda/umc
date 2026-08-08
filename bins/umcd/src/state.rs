@@ -429,6 +429,9 @@ pub struct RuntimeState {
     pub listeners: Vec<Box<dyn Listener + Send + Sync>>,
     /// Live session registry (core.md §9.5); populated by the accept loops.
     pub sessions: Arc<SessionManager>,
+    /// Weak self-reference so runtime handlers (e.g. CarrierService.Listen)
+    /// can spawn state-bound tasks without deadlocking the held lock.
+    pub self_arc: std::sync::Weak<std::sync::Mutex<RuntimeState>>,
     /// Session bus: cross-session delivery within one daemon (relay
     /// forwarding, future bundle delivery).
     pub bus: Arc<Mutex<SessionBus>>,
@@ -588,6 +591,7 @@ impl RuntimeState {
             node,
             listeners: Vec::new(),
             sessions: Arc::new(SessionManager::new()),
+            self_arc: std::sync::Weak::new(),
             bus: Arc::new(Mutex::new(SessionBus::new())),
             discovery,
             relay: RelayService::new(events.clone()),

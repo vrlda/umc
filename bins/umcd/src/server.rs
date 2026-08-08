@@ -1782,7 +1782,17 @@ fn listen(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<
     let result = tokio::task::block_in_place(|| carrier.listen(bind_address.clone()));
     match result {
         Ok(listener) => {
-            state.listeners.push(listener);
+            // Service the new listener immediately: the spawned accept loop
+            // owns it (keeping the socket alive), so runtime binds actually
+            // accept connections instead of queueing in the backlog.
+            if let Some(accept_state) = state.self_arc.upgrade() {
+                let carrier_type = listen.carrier_type.clone();
+                tokio::spawn(async move {
+                    crate::accept_loop(&accept_state, carrier_type, listener).await;
+                });
+            } else {
+                log::warn!("[carrier] runtime listener not serviced: state gone");
+            }
             let response = ListenResponse {
                 bound_address: bind_address,
             };
@@ -3987,7 +3997,12 @@ mod tests {
             .expect("payload")
             .bound_address;
         assert_eq!(bound, "127.0.0.1:0", "the requested address is reported");
-        assert_eq!(state.listeners.len(), 1, "the listener is held open");
+        // The runtime listener is moved into its accept loop (owned by the
+        // spawned task), not parked in the state vector.
+        assert!(
+            state.listeners.is_empty(),
+            "runtime listeners are serviced, not parked"
+        );
 
         // An unknown carrier is NotFound.
         let listen = ListenRequest {
