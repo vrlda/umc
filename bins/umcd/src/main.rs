@@ -248,9 +248,11 @@ fn handle_inbound_link_locked(
 ) -> Result<(), String> {
     let runtime = state.clone();
     let state = state.lock().expect("state");
-    // The first framed packet is the CLIENT_HELLO: either an Initial
-    // long-header packet (wire-format §24-25) or, on the raw path used by
-    // `Node::connect`, the hello body itself.
+    // The first framed packet is the CLIENT_HELLO: an Initial long-header
+    // packet (wire-format §13), or — on the transitional raw path kept for
+    // the pre-D1 test harnesses — the hello body itself. The raw path is
+    // removed once the harnesses migrate to protected Initials (plan
+    // D2/D3); the response always mirrors the request's form.
     let first = tokio::task::block_in_place(|| link.recv())
         .map_err(|e| format!("recv first packet: {e:?}"))?
         .bytes;
@@ -292,9 +294,27 @@ fn handle_inbound_link_locked(
         &client_static,
     )?;
     let secrets = pending.session_secrets();
+    // SERVER_HELLO travels in the same form as the request: Initial-
+    // protected when the client spoke Initial, raw on the transitional
+    // path. For the protected response the keys derive from the client's
+    // DCID, the response's DCID is the client's SCID (the QUIC echo rule),
+    // and the daemon's own SCID is the derived session DCID.
+    let response_bytes = match &parsed_initial {
+        Some((origin, _pn, _payload, return_to)) => {
+            let keys = umc_handshake::initial::derive_initial_keys(origin).server;
+            initial::build_initial_packet(
+                return_to,
+                &session_dcid(&hello),
+                0,
+                &server_hello_bytes,
+                &keys,
+            )?
+        }
+        None => server_hello_bytes,
+    };
     let send_result = tokio::task::block_in_place(|| {
         link.send(OutboundPacket {
-            bytes: server_hello_bytes,
+            bytes: response_bytes,
             control: true,
             deadline_ms: Some(3_000),
         })
