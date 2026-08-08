@@ -868,7 +868,12 @@ async fn process_inbound_packet(
                 sweep.last_bundle_flush = Some(now);
             }
             if hint_due {
-                if let Some(hint) = state.discovery.build_hint(32, now) {
+                let mesh_secret = state.config.mesh_secret.as_deref().map(str::as_bytes);
+                if let Some(hint) =
+                    state
+                        .discovery
+                        .build_hint_with_mesh_secret(32, now, mesh_secret)
+                {
                     if let Ok(payload) = hint.encode() {
                         combined.extend_from_slice(&payload);
                     }
@@ -1241,10 +1246,13 @@ fn handle_control_frames(
                 }
             }
             Frame::PeerHint(hint) => {
-                match state
-                    .discovery
-                    .apply_received_hints(hint, &peer_endpoint_id, now)
-                {
+                let mesh_secret = state.config.mesh_secret.as_deref().map(str::as_bytes);
+                match state.discovery.apply_received_hints_with_mesh_secret(
+                    hint,
+                    &peer_endpoint_id,
+                    now,
+                    mesh_secret,
+                ) {
                     Ok(accepted) => push_event(
                         state,
                         "peer_hints_received",

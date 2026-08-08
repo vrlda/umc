@@ -4,7 +4,10 @@
 //! after a restart the table is restored so operational hints survive.
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use umc_discovery::hints::{apply_received_hints, build_peer_hint, select_for_share, HintError};
+use umc_discovery::hints::{
+    apply_received_hints, apply_received_hints_with_mesh_secret, build_peer_hint,
+    build_peer_hint_with_mesh_secret, select_for_share, HintError,
+};
 use umc_discovery::provider::{CandidateAuth, CandidateSource, PeerCandidate, SharingPolicy};
 use umc_discovery::table::{CandidateTable, TableError};
 use umc_storage::sqlite::SqliteStore;
@@ -251,12 +254,27 @@ impl DiscoveryService {
     /// at `maximum` (and the wire limit of 32 entries).
     #[must_use]
     pub fn build_hint(&self, maximum: usize, now: Instant) -> Option<PeerHintFrame> {
+        self.build_hint_with_mesh_secret(maximum, now, None)
+    }
+
+    /// Build a hint frame with an optional local-mesh membership secret.
+    #[must_use]
+    pub fn build_hint_with_mesh_secret(
+        &self,
+        maximum: usize,
+        now: Instant,
+        mesh_secret: Option<&[u8]>,
+    ) -> Option<PeerHintFrame> {
         let snapshot = self.candidates();
         let selected = select_for_share(&snapshot, maximum, now);
         if selected.is_empty() {
             return None;
         }
-        build_peer_hint(&selected).ok()
+        if mesh_secret.is_some() {
+            build_peer_hint_with_mesh_secret(&selected, mesh_secret).ok()
+        } else {
+            build_peer_hint(&selected).ok()
+        }
     }
 
     /// Apply a peer's hint frame and persist accepted candidates. The pure
@@ -268,7 +286,28 @@ impl DiscoveryService {
         sender: &[u8],
         now: Instant,
     ) -> Result<usize, HintError> {
-        let accepted = apply_received_hints(frame, sender, now, &mut self.candidates)?;
+        self.apply_received_hints_with_mesh_secret(frame, sender, now, None)
+    }
+
+    /// Apply a hint frame with an optional local-mesh membership secret.
+    pub fn apply_received_hints_with_mesh_secret(
+        &mut self,
+        frame: &PeerHintFrame,
+        sender: &[u8],
+        now: Instant,
+        mesh_secret: Option<&[u8]>,
+    ) -> Result<usize, HintError> {
+        let accepted = if mesh_secret.is_some() {
+            apply_received_hints_with_mesh_secret(
+                frame,
+                sender,
+                now,
+                &mut self.candidates,
+                mesh_secret,
+            )?
+        } else {
+            apply_received_hints(frame, sender, now, &mut self.candidates)?
+        };
         if accepted > 0 {
             if let Some(store) = &self.store {
                 for candidate in self.candidates() {
@@ -371,6 +410,40 @@ mod tests {
         let hint = service.build_hint(10, Instant(0)).expect("hint");
         assert_eq!(hint.entries.len(), 1);
         assert_eq!(hint.entries[0].temporary_peer_id, 4u64.to_be_bytes());
+    }
+
+    #[test]
+    fn mesh_secret_hint_round_trip_requires_membership() {
+        let secret = b"mesh-secret";
+        let mut sender = DiscoveryService::new(10);
+        sender
+            .record_candidate(
+                candidate(8, SharingPolicy::ShareGeneral, u64::MAX),
+                Instant(0),
+            )
+            .unwrap();
+        let frame = sender
+            .build_hint_with_mesh_secret(10, Instant(0), Some(secret))
+            .expect("mesh hint");
+        let mut receiver = DiscoveryService::new(10);
+        assert_eq!(
+            receiver.apply_received_hints_with_mesh_secret(
+                &frame,
+                b"peer-a",
+                Instant(0),
+                Some(secret)
+            ),
+            Ok(1)
+        );
+        assert_eq!(
+            DiscoveryService::new(10).apply_received_hints_with_mesh_secret(
+                &frame,
+                b"peer-a",
+                Instant(0),
+                None
+            ),
+            Err(HintError::MeshAuthentication)
+        );
     }
 
     fn temp_store() -> std::sync::Arc<umc_storage::sqlite::SqliteStore> {

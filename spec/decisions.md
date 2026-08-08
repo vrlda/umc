@@ -1566,3 +1566,9 @@ A–K gap-closure plan:
     policy, padding opt-in, and a deliberately coarse hop count. The v1
     registry reports the configured policy; exact negotiated profile and
     route-state snapshots remain deferred until session metadata is persisted.
+16. **Mesh hint membership.** When `mesh_secret` is configured, each
+    `PEER_HINT` entry carries an HMAC-BLAKE2s tag over a canonical, bounded
+    entry encoding and the `UMP-MESH-HINT-v1` domain. Receivers without the
+    secret reject authenticated frames; receivers with the secret reject any
+    entry whose tag does not validate. The secret is never returned by
+    `GetConfig`.
