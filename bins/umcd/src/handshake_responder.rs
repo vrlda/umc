@@ -329,6 +329,7 @@ pub(crate) fn expand(secret: &[u8; 32], label: &[u8], context: &[u8; 32]) -> [u8
 // The DH variable names follow handshake.md §14-18 (DH_ee, DH_es, DH_se,
 // DH_ss) as in the deterministic driver.
 #[allow(clippy::similar_names)]
+#[allow(clippy::too_many_lines)]
 pub fn respond_hello(
     state: &RuntimeState,
     carrier_binding: &[u8],
@@ -337,6 +338,15 @@ pub fn respond_hello(
     initial_dcid: &[u8],
     initial_scid: &[u8],
 ) -> Result<ResponderResponse, String> {
+    if state
+        .config
+        .carrier_disabled(std::str::from_utf8(carrier_binding).unwrap_or_default())
+    {
+        return Err(format!(
+            "disabled carrier: {}",
+            String::from_utf8_lossy(carrier_binding)
+        ));
+    }
     let hello = ClientHello::decode(hello_bytes).map_err(|e| format!("client hello: {e:?}"))?;
 
     // Version negotiation (compatibility.md §5.2, handshake.md §16): a
@@ -351,6 +361,21 @@ pub fn respond_hello(
             ),
         });
     };
+
+    // Emergency protocol disablement deliberately returns a VN packet with
+    // no usable versions. This is the wire-level UNSUPPORTED response: a
+    // peer cannot retry until the operator re-enables the version.
+    if state.config.protocol_version_disabled(selected_version) {
+        return Ok(ResponderResponse::VersionNegotiation {
+            bytes: build_version_negotiation(initial_scid, initial_dcid, &[]),
+        });
+    }
+    if state.config.crypto_profile_disabled(CRYPTO_PROFILE) {
+        return Err(format!(
+            "disabled crypto profile: {}",
+            String::from_utf8_lossy(CRYPTO_PROFILE)
+        ));
+    }
 
     // Capability negotiation (compatibility.md §5.4): the client's hash is
     // inside the transcript-bound CLIENT_HELLO; a mismatch is a protocol
@@ -855,6 +880,62 @@ mod tests {
                 assert_eq!(offered, vec![SELECTED_PROTOCOL_VERSION]);
             }
         }
+    }
+
+    #[test]
+    fn emergency_disablement_blocks_protocol_crypto_and_carrier() {
+        let (_identity, _static_key, client_ephemeral) = client_identity();
+        let hello = ClientHello::new(&TestEntropy, &client_ephemeral);
+        let hello_bytes = hello.encode().expect("hello");
+
+        let mut state = test_state();
+        state.config.disabled_protocol_versions = vec!["1".into()];
+        let response = respond_hello(
+            &state,
+            b"ump.tcp/1",
+            &hello_bytes,
+            &client_ephemeral.public(),
+            &[1u8; 8],
+            &[2u8; 8],
+        )
+        .expect("disabled protocol is negotiated away");
+        let bytes = match response {
+            ResponderResponse::VersionNegotiation { bytes } => bytes,
+            ResponderResponse::ServerHello { .. } => {
+                panic!("disabled protocol must not produce a SERVER_HELLO")
+            }
+        };
+        let (versions, _) = parse_version_negotiation(&bytes).expect("VN packet");
+        assert!(
+            versions.is_empty(),
+            "all locally supported versions are disabled"
+        );
+
+        let mut state = test_state();
+        state.config.disabled_crypto_profiles = vec!["UMP-CRYPTO-1".into()];
+        let error = respond_hello(
+            &state,
+            b"ump.tcp/1",
+            &hello_bytes,
+            &client_ephemeral.public(),
+            &[1u8; 8],
+            &[2u8; 8],
+        )
+        .expect_err("disabled crypto profile must be refused");
+        assert!(error.contains("disabled crypto profile"), "{error}");
+
+        let mut state = test_state();
+        state.config.disabled_carriers = vec!["ump.tcp/1".into()];
+        let error = respond_hello(
+            &state,
+            b"ump.tcp/1",
+            &hello_bytes,
+            &client_ephemeral.public(),
+            &[1u8; 8],
+            &[2u8; 8],
+        )
+        .expect_err("disabled carrier must be refused");
+        assert!(error.contains("disabled carrier"), "{error}");
     }
 
     /// The Version-Negotiation packet lists the responder's supported

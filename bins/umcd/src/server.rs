@@ -2166,6 +2166,11 @@ fn node_config_message(config: &NodeConfig) -> api::NodeConfig {
             sensitive_present: false,
         },
         api::ConfigEntry {
+            key: "disable_public_relay".into(),
+            value: config.disable_public_relay.to_string(),
+            sensitive_present: false,
+        },
+        api::ConfigEntry {
             key: "mesh".into(),
             value: config.mesh.to_string(),
             sensitive_present: false,
@@ -2180,11 +2185,26 @@ fn node_config_message(config: &NodeConfig) -> api::NodeConfig {
             value: config.carriers.join(","),
             sensitive_present: false,
         },
+        api::ConfigEntry {
+            key: "disabled_protocol_versions".into(),
+            value: config.disabled_protocol_versions.join(","),
+            sensitive_present: false,
+        },
+        api::ConfigEntry {
+            key: "disabled_crypto_profiles".into(),
+            value: config.disabled_crypto_profiles.join(","),
+            sensitive_present: false,
+        },
+        api::ConfigEntry {
+            key: "disabled_carriers".into(),
+            value: config.disabled_carriers.join(","),
+            sensitive_present: false,
+        },
     ];
     api::NodeConfig {
         resource_profile: config.profile.clone(),
         telemetry_enabled: config.telemetry_enabled,
-        public_relay_enabled: config.public_relay,
+        public_relay_enabled: config.public_relay && !config.disable_public_relay,
         entries,
         ..Default::default()
     }
@@ -2442,6 +2462,9 @@ fn open_circuit(state: &mut RuntimeState, request: &api::Request) -> (i32, Optio
     let Ok(open) = OpenCircuitRequest::decode(request.payload.as_slice()) else {
         return (api::StatusCode::InvalidArgument as i32, None);
     };
+    if state.config.disable_public_relay && !open.private_handling {
+        return (api::StatusCode::PermissionDenied as i32, None);
+    }
     let now = state.node.clock.as_ref().now();
     let circuit_request = CircuitOpenRequest {
         peer_circuits: usize::try_from(open.peer_circuits).unwrap_or(usize::MAX),
@@ -3473,6 +3496,9 @@ fn listen(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<
     let Some(carrier) = state.node.carrier(&listen.carrier_type) else {
         return (api::StatusCode::NotFound as i32, None);
     };
+    if state.config.carrier_disabled(&listen.carrier_type) {
+        return (api::StatusCode::FailedPrecondition as i32, None);
+    }
     let bind_address = listen.bind_address.clone();
     // Carrier binds are synchronous and block the runtime thread
     // (Handle::block_on); block_in_place moves off the async machinery
@@ -5026,6 +5052,52 @@ mod tests {
             .iter()
             .any(|e| e.key == "carriers" && e.value == "ump.udp/1"));
         assert!(config.entries.iter().any(|e| e.key == "public_relay"));
+        assert!(config
+            .entries
+            .iter()
+            .any(|e| e.key == "disabled_protocol_versions"));
+        assert!(config
+            .entries
+            .iter()
+            .any(|e| e.key == "disable_public_relay"));
+    }
+
+    #[test]
+    fn emergency_public_relay_disablement_refuses_public_opens() {
+        let (mut state, _tx) = test_state();
+        state.config.disable_public_relay = true;
+        let open = OpenCircuitRequest {
+            requested_lifetime_ms: 60_000,
+            requested_byte_quota: 1_024,
+            flags: 0,
+            bidirectional: true,
+            private_handling: false,
+            peer_circuits: 0,
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RelayService", "OpenCircuit", encode_request(&open)),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::PermissionDenied as i32
+        );
+
+        let private = OpenCircuitRequest {
+            private_handling: true,
+            ..open
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RelayService", "OpenCircuit", encode_request(&private)),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::Ok as i32,
+            "private relay handling remains available during a public-relay shutdown"
+        );
     }
 
     #[test]
