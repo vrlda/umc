@@ -269,11 +269,11 @@ impl ConnectionState {
 /// `(request_id, idempotency_key)` → stored response bytes, 10-minute TTL,
 /// FIFO eviction at 1,024 entries. A replay returns the stored bytes
 /// without re-dispatching.
-#[derive(Debug, Default)]
 /// Idempotency key: (service, method, client key) — scoped per
 /// control-api.md §18.
 type IdempotencyKey = (String, String, Vec<u8>);
 
+#[derive(Debug, Default)]
 struct IdempotencyCache {
     entries: HashMap<IdempotencyKey, (Vec<u8>, u64)>,
     order: VecDeque<IdempotencyKey>,
