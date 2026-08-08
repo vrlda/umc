@@ -984,7 +984,11 @@ fn block_peer(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<
     let Ok(endpoint) = <[u8; 32]>::try_from(block.endpoint_id.as_slice()) else {
         return (api::StatusCode::InvalidArgument as i32, None);
     };
-    let now = wall_now();
+    // The blocklist is checked with the node's MONOTONIC clock at admission
+    // (the accept loop's now); stamping with wall-clock epoch would make
+    // blocks never expire (monotonic < epoch always). In-memory state needs
+    // no epoch domain.
+    let now = state.node.clock.as_ref().now();
     state.blocklist.block(&endpoint, BlockReason::Operator, now);
     push_event(
         state,

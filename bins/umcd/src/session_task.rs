@@ -584,13 +584,10 @@ async fn reader_loop(
         }
     }
     ended.store(true, Ordering::Relaxed);
-    runtime
-        .lock()
-        .expect("runtime state")
-        .bus
-        .lock()
-        .expect("session bus")
-        .unregister(session_id);
+    // NOTE: the bus unregister lives in the WATCHER (main.rs), which runs on
+    // normal exit AND on abort; a task-local unregister would leak bus
+    // entries when the task is aborted (CloseSession). The watcher owns the
+    // JoinHandle and performs the cleanup after it resolves either way.
 }
 
 /// Process one inbound byte buffer — from the carrier pump or the session
