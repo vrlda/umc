@@ -17,7 +17,9 @@ pub struct NodeConfig {
     /// Keystore directory; defaults to `<data_dir>/keystore`.
     pub keystore: Option<PathBuf>,
     pub public_relay: bool,
-    pub telemetry: bool,
+    /// Telemetry opt-in (core.md §61, privacy.md §38): off by default. The
+    /// daemon dumps a bounded JSONL metrics file only when enabled.
+    pub telemetry_enabled: bool,
     /// Bearer credential for the control API (control-api.md §11.3).
     /// Development-only: honored when set, never persisted or exposed.
     pub development_token: Option<String>,
@@ -39,7 +41,7 @@ impl Default for NodeConfig {
             mesh: false,
             keystore: None,
             public_relay: false,
-            telemetry: false,
+            telemetry_enabled: false,
             development_token: None,
             config_path: None,
         }
@@ -61,7 +63,7 @@ impl NodeConfig {
         config.config_path = path.cloned();
         // Safety invariants (resource-limits.md §51): conservative defaults.
         config.public_relay = false;
-        config.telemetry = false;
+        config.telemetry_enabled = false;
         Ok(config)
     }
 
@@ -101,10 +103,10 @@ impl NodeConfig {
                     .parse::<bool>()
                     .map_err(|_| format!("mesh must be a bool, got {value:?}"))?;
             }
-            "telemetry" => {
-                self.telemetry = value
+            "telemetry_enabled" | "telemetry" => {
+                self.telemetry_enabled = value
                     .parse::<bool>()
-                    .map_err(|_| format!("telemetry must be a bool, got {value:?}"))?;
+                    .map_err(|_| format!("telemetry_enabled must be a bool, got {value:?}"))?;
             }
             "carriers" => {
                 let carriers: Vec<String> = value
@@ -170,7 +172,7 @@ mod tests {
     fn defaults_are_conservative() {
         let config = NodeConfig::default();
         assert!(!config.public_relay);
-        assert!(!config.telemetry);
+        assert!(!config.telemetry_enabled);
         assert!(!config.mesh);
         assert!(config.keystore.is_none());
     }
@@ -191,12 +193,12 @@ mod tests {
         let path = dir.join("node.json");
         std::fs::write(
             &path,
-            r#"{"public_relay": true, "telemetry": true, "profile": "standard"}"#,
+            r#"{"public_relay": true, "telemetry_enabled": true, "profile": "standard"}"#,
         )
         .unwrap();
         let config = NodeConfig::load(Some(&path)).unwrap();
         assert!(!config.public_relay);
-        assert!(!config.telemetry);
+        assert!(!config.telemetry_enabled);
     }
 
     #[test]
@@ -222,6 +224,13 @@ mod tests {
         assert!(config.mesh);
         config.set_entry("public_relay", "false").unwrap();
         assert!(!config.public_relay);
+        config.set_entry("telemetry_enabled", "true").unwrap();
+        assert!(config.telemetry_enabled);
+        config.set_entry("telemetry", "false").unwrap();
+        assert!(
+            !config.telemetry_enabled,
+            "legacy `telemetry` key aliases the same field"
+        );
         config
             .set_entry("carriers", "ump.tcp/1, ump.udp/1")
             .unwrap();

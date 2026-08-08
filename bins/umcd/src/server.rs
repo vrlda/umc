@@ -408,8 +408,8 @@ fn node_config_message(config: &NodeConfig) -> api::NodeConfig {
             sensitive_present: false,
         },
         api::ConfigEntry {
-            key: "telemetry".into(),
-            value: config.telemetry.to_string(),
+            key: "telemetry_enabled".into(),
+            value: config.telemetry_enabled.to_string(),
             sensitive_present: false,
         },
         api::ConfigEntry {
@@ -420,7 +420,7 @@ fn node_config_message(config: &NodeConfig) -> api::NodeConfig {
     ];
     api::NodeConfig {
         resource_profile: config.profile.clone(),
-        telemetry_enabled: config.telemetry,
+        telemetry_enabled: config.telemetry_enabled,
         public_relay_enabled: config.public_relay,
         entries,
         ..Default::default()
