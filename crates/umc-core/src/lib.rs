@@ -4,6 +4,7 @@ pub mod block;
 pub mod echo;
 pub mod mesh;
 pub mod node;
+pub mod privacy;
 pub mod rate_limiter;
 pub mod revocation;
 pub mod stream_dispatch;

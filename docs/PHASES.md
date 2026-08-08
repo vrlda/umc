@@ -16,7 +16,7 @@ This status is based on the code and tests in this checkout (2026-08-08), not on
 | H | Complete with compatibility notes | Live route forwarding, relay authorization, custody/chunked bundles, sealed envelopes, peer hints, static peers, and invitations are implemented. Empty relay authorization remains accepted for legacy phase-12 fixtures; peer-hint exchange is triggered by session traffic rather than a standalone timer. |
 | I | Implemented, experimental pieces | TLS-stream (varint framing), carrier registry, PSK-XX derivation, Sybil-group admission, Python stdlib bindings, and the experimental C ABI are present. TLS currently uses an ephemeral self-signed certificate per carrier instance; deployment trust configuration is still required for independent daemons. |
 | J | Partial / next gate | Existing parser and relay fuzzing plus deterministic smoke tests exist. The full 11-target fuzz corpus, simulator, 22-case adversarial suite, soak/bench/coverage CI, and SBOM job remain to be added. |
-| K | Documentation only / next gate | The privacy specification is present and the implementation has P0 protections plus several P1 building blocks. Privacy profiles, P2 onion routing, P3 padding, mesh-secret hints, and the privacy control surface remain future work. |
+| K | K1 implemented; K2–K8 pending | Privacy profiles are ordered and fail-safe by default (`p0`); a local policy may raise the effective profile and GetStatus/GetConfig expose it. Privacy negotiation, DCID rotation, mesh-secret hints, P2 onion routing, and P3 padding remain future work. |
 
 The workspace’s authoritative verification commands are:
 

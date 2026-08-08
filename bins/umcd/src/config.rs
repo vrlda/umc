@@ -1,6 +1,8 @@
 //! Node configuration (core.md §18 layering: defaults -> file -> CLI).
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::str::FromStr;
+use umc_core::privacy::PrivacyProfile;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -11,6 +13,11 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
     pub control_socket: PathBuf,
     pub profile: String,
+    /// Requested privacy profile. P0 is the secure-by-default baseline.
+    pub privacy_profile: String,
+    /// Optional local policy floor. It can raise, but never lower, the
+    /// requested profile (privacy.md §43).
+    pub privacy_policy_override: Option<String>,
     pub carriers: Vec<String>,
     pub tcp_listen: Option<String>,
     pub udp_listen: Option<String>,
@@ -64,6 +71,8 @@ impl Default for NodeConfig {
             data_dir: PathBuf::from("~/.local/share/umc"),
             control_socket: PathBuf::from("~/.local/run/umc.sock"),
             profile: "standard".to_string(),
+            privacy_profile: PrivacyProfile::P0.as_str().to_string(),
+            privacy_policy_override: None,
             carriers: vec!["ump.tcp/1".to_string(), "ump.udp/1".to_string()],
             tcp_listen: None,
             udp_listen: None,
@@ -97,6 +106,7 @@ impl NodeConfig {
             config = file_config;
         }
         config.config_path = path.cloned();
+        config.normalize_privacy_profiles()?;
         // Safety invariants (resource-limits.md §51): conservative defaults.
         config.public_relay = false;
         config.telemetry_enabled = false;
@@ -128,6 +138,20 @@ impl NodeConfig {
                     ));
                 }
                 self.profile = value.to_string();
+            }
+            "privacy_profile" => {
+                let profile =
+                    PrivacyProfile::from_str(value).map_err(|e| format!("privacy_profile: {e}"))?;
+                self.privacy_profile = profile.as_str().to_string();
+            }
+            "privacy_policy_override" => {
+                self.privacy_policy_override = if value.trim().is_empty() {
+                    None
+                } else {
+                    let profile = PrivacyProfile::from_str(value)
+                        .map_err(|e| format!("privacy_policy_override: {e}"))?;
+                    Some(profile.as_str().to_string())
+                };
             }
             "public_relay" => {
                 self.public_relay = value
@@ -186,6 +210,35 @@ impl NodeConfig {
                     .map_err(|e| format!("static_peers must be a JSON array: {e}"))?;
             }
             other => return Err(format!("unsupported config key {other:?}")),
+        }
+        Ok(())
+    }
+
+    /// Returns the configured privacy profile, falling back to P0 for an
+    /// invalid value on an in-memory configuration assembled by a caller.
+    #[must_use]
+    pub fn privacy_profile_value(&self) -> PrivacyProfile {
+        PrivacyProfile::from_str(&self.privacy_profile).unwrap_or(PrivacyProfile::P0)
+    }
+
+    /// Returns the effective profile after applying the local policy floor.
+    #[must_use]
+    pub fn effective_privacy_profile(&self) -> PrivacyProfile {
+        let policy = self
+            .privacy_policy_override
+            .as_deref()
+            .and_then(|value| PrivacyProfile::from_str(value).ok());
+        self.privacy_profile_value().effective(policy)
+    }
+
+    fn normalize_privacy_profiles(&mut self) -> Result<(), String> {
+        let requested =
+            PrivacyProfile::from_str(&self.privacy_profile).map_err(|e| format!("config: {e}"))?;
+        self.privacy_profile = requested.as_str().to_string();
+        if let Some(value) = self.privacy_policy_override.as_deref() {
+            let policy = PrivacyProfile::from_str(value)
+                .map_err(|e| format!("config privacy_policy_override: {e}"))?;
+            self.privacy_policy_override = Some(policy.as_str().to_string());
         }
         Ok(())
     }
@@ -285,6 +338,8 @@ mod tests {
         assert!(!config.public_relay);
         assert!(!config.telemetry_enabled);
         assert!(!config.mesh);
+        assert_eq!(config.privacy_profile_value(), PrivacyProfile::P0);
+        assert_eq!(config.effective_privacy_profile(), PrivacyProfile::P0);
         assert!(
             !config.allow_secret_export,
             "secret export is off by default"
@@ -353,6 +408,14 @@ mod tests {
         assert_eq!(config.static_peers.len(), 1);
         config.set_entry("mesh", "true").unwrap();
         assert!(config.mesh);
+        config.set_entry("privacy_profile", "P1").unwrap();
+        assert_eq!(config.privacy_profile, "p1");
+        config.set_entry("privacy_policy_override", "p2").unwrap();
+        assert_eq!(config.effective_privacy_profile(), PrivacyProfile::P2);
+        config.set_entry("privacy_policy_override", "p0").unwrap();
+        assert_eq!(config.effective_privacy_profile(), PrivacyProfile::P1);
+        config.set_entry("privacy_policy_override", "").unwrap();
+        assert!(config.privacy_policy_override.is_none());
         config.set_entry("public_relay", "false").unwrap();
         assert!(!config.public_relay);
         config.set_entry("telemetry_enabled", "true").unwrap();
@@ -372,6 +435,8 @@ mod tests {
 
         assert!(config.set_entry("profile", "bogus").is_err());
         assert!(config.set_entry("profile", "STANDARD").is_err());
+        assert!(config.set_entry("privacy_profile", "p4").is_err());
+        assert!(config.set_entry("privacy_policy_override", "p4").is_err());
         assert!(config.set_entry("mesh", "maybe").is_err());
         assert!(config.set_entry("carriers", ",").is_err());
         assert!(config.set_entry("no_such_key", "x").is_err());
@@ -423,5 +488,20 @@ mod tests {
         let reloaded = NodeConfig::load(Some(&path)).unwrap();
         assert_eq!(reloaded.profile, "constrained");
         assert!(reloaded.mesh);
+
+        let privacy_path = dir.join("privacy-node.json");
+        std::fs::write(
+            &privacy_path,
+            r#"{"privacy_profile":"P1","privacy_policy_override":"P2"}"#,
+        )
+        .unwrap();
+        let privacy = NodeConfig::load(Some(&privacy_path)).unwrap();
+        assert_eq!(privacy.privacy_profile, "p1");
+        assert_eq!(privacy.privacy_policy_override.as_deref(), Some("p2"));
+        assert_eq!(privacy.effective_privacy_profile(), PrivacyProfile::P2);
+
+        let invalid_path = dir.join("invalid-privacy-node.json");
+        std::fs::write(&invalid_path, r#"{"privacy_profile":"p9"}"#).unwrap();
+        assert!(NodeConfig::load(Some(&invalid_path)).is_err());
     }
 }
