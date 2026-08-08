@@ -1756,6 +1756,7 @@ fn get_session(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec
         session: Some(session_summary(session_id, &entry)),
         // The v1 registry does not track per-path state; the summary only.
         paths: Vec::new(),
+        privacy: Some(session_privacy_info(&state.config)),
     };
     let mut payload = Vec::new();
     Message::encode(&response, &mut payload).expect("encode");
@@ -1776,6 +1777,23 @@ fn session_summary(id: u64, entry: &crate::session_manager::SessionEntry) -> api
         active_paths: 1,
         created_at_unix_ms: i64::try_from(entry.established_at_ms).unwrap_or(i64::MAX),
         ..Default::default()
+    }
+}
+
+/// Privacy visibility for a control client. Route topology is intentionally
+/// not returned: `hop_count` is one for an allowed direct path and zero when
+/// a private profile requires route wiring that the v1 daemon has not yet
+/// attached to the session registry (privacy.md §57).
+fn session_privacy_info(config: &NodeConfig) -> api::SessionPrivacyInfo {
+    let requested = config.privacy_profile_value();
+    let effective = config.effective_privacy_profile();
+    let direct_path_allowed = !effective.includes(umc_core::privacy::PrivacyProfile::P2);
+    api::SessionPrivacyInfo {
+        requested_profile: requested.as_str().to_string(),
+        effective_profile: effective.as_str().to_string(),
+        direct_path_allowed,
+        traffic_padding_active: config.traffic_padding,
+        hop_count: u32::from(direct_path_allowed),
     }
 }
 
@@ -4192,11 +4210,16 @@ mod tests {
             response.status.as_ref().unwrap().code,
             api::StatusCode::Ok as i32
         );
-        let session = api::GetSessionResponse::decode(response.payload.as_slice())
-            .expect("payload")
-            .session
-            .expect("session");
+        let get_response =
+            api::GetSessionResponse::decode(response.payload.as_slice()).expect("payload");
+        let session = get_response.session.expect("session");
         assert_eq!(session.remote_endpoint_id, [9u8; 32]);
+        let privacy = get_response.privacy.expect("privacy info");
+        assert_eq!(privacy.requested_profile, "p0");
+        assert_eq!(privacy.effective_profile, "p0");
+        assert!(privacy.direct_path_allowed);
+        assert!(!privacy.traffic_padding_active);
+        assert_eq!(privacy.hop_count, 1);
 
         // An unknown handle is NotFound, not Ok.
         let get = api::GetSessionRequest {

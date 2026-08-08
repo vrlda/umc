@@ -833,6 +833,14 @@ fn register_session(
     // to every newly registered session so resumed and full handshakes share
     // the same policy.
     session.set_traffic_padding(state.config.traffic_padding);
+    // P2 is fail-closed until daemon route wiring is available: a private
+    // profile may establish only over a relay/route carrier, never by
+    // silently falling back to a direct path.
+    let private_profile = state
+        .config
+        .effective_privacy_profile()
+        .includes(umc_core::privacy::PrivacyProfile::P2);
+    session.set_direct_path_allowed(!private_profile);
     // Stateless-reset support (session.md §31): the token is derived from
     // the handshake's shared `stateless reset` secret (handshake.md §26).
     if let Some(secret) = stateless_reset_secret {

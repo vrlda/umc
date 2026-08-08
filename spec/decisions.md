@@ -1561,3 +1561,8 @@ A–K gap-closure plan:
     processing; the endpoint's identity is never encoded in the ID. Rotation
     is transport metadata only and does not claim full route or timing
     anonymity.
+15. **Privacy visibility shape.** `SessionService.GetSession` carries a
+    `SessionPrivacyInfo` with requested/effective profile labels, direct-path
+    policy, padding opt-in, and a deliberately coarse hop count. The v1
+    registry reports the configured policy; exact negotiated profile and
+    route-state snapshots remain deferred until session metadata is persisted.
