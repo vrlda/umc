@@ -2277,13 +2277,15 @@ These mechanisms are outside the stable core wire format.
 
 A node that receives a short-header packet for an unknown connection ID MAY send a stateless reset.
 
-A stateless reset:
+A stateless reset (canonical layout, v1):
 
 * MUST be indistinguishable from an ordinary protected packet to an observer lacking the reset token.
 * MUST contain an unpredictable body.
-* MUST end with the reset token associated with the connection ID.
+* MUST carry the 16-byte reset token associated with the connection ID in a
+  fixed slot: bytes 9..25 of a short-header packet (`0x00` header byte, 8
+  zero DCID bytes, token, then random tail).
 * MUST be no larger than the triggering packet.
-* MUST be rate-limited.
+* MUST be rate-limited (one per connection per minute).
 
 Small triggering packets SHOULD be silently discarded to avoid amplification and fingerprinting.
 

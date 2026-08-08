@@ -961,6 +961,7 @@ impl Session {
         &mut self,
         now: Instant,
         entropy: &dyn EntropySource,
+        trigger_len: usize,
     ) -> Option<Vec<u8>> {
         let secret = self.stateless_reset_secret?;
         if self
@@ -970,10 +971,16 @@ impl Session {
             return None;
         }
         self.last_reset_ms = Some(now.0);
-        Some(crate::reset::build_stateless_reset(
+        let mut reset = crate::reset::build_stateless_reset(
             &crate::reset::reset_token(&secret),
             entropy,
-        ))
+        );
+        // Amplification guard (wire-format.md §76): the reset must be no
+        // larger than the triggering packet; small triggers are answered
+        // with a shorter reset (never below the minimum packet size).
+        let max_len = trigger_len.clamp(crate::reset::MIN_RESET_LEN, reset.len());
+        reset.truncate(max_len);
+        Some(reset)
     }
 
     /// Replay-window footprint in bytes for `space` (session.md §8.2): a

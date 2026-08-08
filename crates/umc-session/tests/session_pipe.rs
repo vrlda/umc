@@ -1272,21 +1272,21 @@ fn reset_emission_is_rate_limited() {
 
     // First emission: builds a reset carrying the session's token.
     let first = server
-        .maybe_emit_stateless_reset(Instant(1_000_000), &TestEntropy)
+        .maybe_emit_stateless_reset(Instant(1_000_000), &TestEntropy, 64)
         .expect("first reset");
     assert!(umc_session::reset::token_matches(&first, &token));
     // Immediate second emission is suppressed by the 1-per-minute rate
     // limit (session.md §31).
     assert!(server
-        .maybe_emit_stateless_reset(Instant(1_000_001), &TestEntropy)
+        .maybe_emit_stateless_reset(Instant(1_000_001), &TestEntropy, 64)
         .is_none());
     // Still suppressed inside the minute.
     assert!(server
-        .maybe_emit_stateless_reset(Instant(1_059_999), &TestEntropy)
+        .maybe_emit_stateless_reset(Instant(1_059_999), &TestEntropy, 64)
         .is_none());
     // After a full minute the limit has elapsed: emitted again.
     let third = server
-        .maybe_emit_stateless_reset(Instant(1_060_000), &TestEntropy)
+        .maybe_emit_stateless_reset(Instant(1_060_000), &TestEntropy, 64)
         .expect("reset after the rate limit elapses");
     assert!(umc_session::reset::token_matches(&third, &token));
     // A session without a configured secret never emits.
@@ -1304,6 +1304,6 @@ fn reset_emission_is_rate_limited() {
     )
     .expect("session without a reset secret");
     assert!(plain
-        .maybe_emit_stateless_reset(Instant(1_000_000), &TestEntropy)
+        .maybe_emit_stateless_reset(Instant(1_000_000), &TestEntropy, 64)
         .is_none());
 }

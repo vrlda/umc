@@ -556,7 +556,7 @@ async fn process_inbound_packet(
                 // processing follows.
                 #[cfg(debug_assertions)]
                 println!("[session {session_id}] stateless reset received; session closed");
-                outbound = session.maybe_emit_stateless_reset(now, &OsEntropy);
+                outbound = session.maybe_emit_stateless_reset(now, &OsEntropy, bytes.len());
                 Vec::new()
             }
             Err(e) => {

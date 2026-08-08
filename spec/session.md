@@ -1003,12 +1003,14 @@ An endpoint may send a stateless reset for a short-header packet whose connectio
 
 The reset follows `wire-format.md` and MUST:
 
-* End in the token assigned to that connection ID
+* Carry the 16-byte token assigned to that connection ID in the canonical
+  fixed slot (see `wire-format.md` §76)
 * Be shorter than or equal to the triggering packet
 * Be indistinguishable in length and leading bytes from protected traffic
 * Be rate-limited
 
-An endpoint accepts a reset only when the packet cannot be authenticated and its trailing bytes match an active peer-provided token in constant time.
+An endpoint accepts a reset only when the packet cannot be authenticated and
+the token slot matches an active peer-provided token in constant time.
 
 A valid reset closes the session without sending a response.
 
