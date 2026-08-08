@@ -893,7 +893,9 @@ fn dispatch_request(
     state.metrics.incr(service_counter, 1);
     let (code, payload) = match (request.service.as_str(), request.method.as_str()) {
         ("NodeAdmin", "GetStatus") => get_status(state),
-        ("PeerService" | "DiscoveryService", "ListCandidates") => list_candidates(state),
+        ("PeerService" | "DiscoveryService", "ListCandidates") => {
+            list_candidates(state, presented_token)
+        }
         ("PeerService", "ListPeers") => list_peers(state, request),
         ("PeerService", "GetPeer") => get_peer(state, request),
         ("PeerService", "AddPeerHint") => add_peer_hint(state, request),
@@ -1124,7 +1126,25 @@ fn get_status(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
 }
 
 /// `PeerService.ListCandidates`: discovery table snapshot.
-fn list_candidates(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
+fn list_candidates(
+    state: &mut RuntimeState,
+    presented_token: Option<&[u8]>,
+) -> (i32, Option<Vec<u8>>) {
+    // Enumeration guard (discovery.md §18): a saturated principal receives
+    // the same empty result as a node with no shareable candidates.
+    let principal = presented_token.unwrap_or(b"anonymous-control");
+    if !state
+        .enumeration_guard
+        .step(principal, "query", wall_now().0)
+    {
+        let response = ListCandidatesResponse {
+            candidates: Vec::new(),
+            total: 0,
+        };
+        let mut payload = Vec::new();
+        Message::encode(&response, &mut payload).expect("encode");
+        return (api::StatusCode::Ok as i32, Some(payload));
+    }
     let snapshot = state.discovery.candidates();
     let candidates = snapshot
         .iter()
@@ -4054,6 +4074,32 @@ mod tests {
         let listing = ListCandidatesResponse::decode(response.payload.as_slice()).expect("payload");
         assert_eq!(listing.total, 1);
         assert_eq!(listing.candidates[0].candidate_id, 42);
+    }
+
+    #[test]
+    fn list_candidates_enumeration_budget_returns_empty_after_exhaustion() {
+        let (mut state, _tx) = test_state();
+        state.enumeration_guard.set_step_budget(b"principal", 1);
+        let first = dispatch_request(
+            &mut state,
+            &request("PeerService", "ListCandidates", vec![]),
+            Some(b"principal"),
+        );
+        let first_listing =
+            ListCandidatesResponse::decode(decode_response(&first).payload.as_slice())
+                .expect("first payload");
+        assert_eq!(first_listing.total, 0);
+
+        let second = dispatch_request(
+            &mut state,
+            &request("PeerService", "ListCandidates", vec![]),
+            Some(b"principal"),
+        );
+        let second_listing =
+            ListCandidatesResponse::decode(decode_response(&second).payload.as_slice())
+                .expect("second payload");
+        assert_eq!(second_listing.total, 0);
+        assert!(second_listing.candidates.is_empty());
     }
 
     fn register_session(state: &RuntimeState, id: u64, peer: [u8; 32]) {
