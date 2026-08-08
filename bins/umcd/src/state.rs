@@ -405,6 +405,10 @@ pub mod metric_names {
     pub const CONTROL_REQUESTS_PEERSERVICE: &str = "control_requests_peerservice";
     pub const CONTROL_REQUESTS_BUNDLE: &str = "control_requests_bundle";
     pub const CONTROL_REQUESTS_RELAY: &str = "control_requests_relay";
+    /// `SessionService`.
+    pub const CONTROL_REQUESTS_SESSION: &str = "control_requests_session";
+    /// `RouteService`.
+    pub const CONTROL_REQUESTS_ROUTE: &str = "control_requests_route";
     pub const CONTROL_REQUESTS_CONFIG: &str = "control_requests_config";
     pub const CONTROL_REQUESTS_DIAGNOSTICS: &str = "control_requests_diagnostics";
     pub const CONTROL_REQUESTS_OTHER: &str = "control_requests_other";
