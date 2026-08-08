@@ -257,7 +257,8 @@ fn handle_idle_timers(
 /// inbound packet carries control frames (relay/bundle/routing/key-update)
 /// or a delivery sweep is due, so contention with the control socket stays
 /// low. `remote_keys` is the daemon's copy of the peer's traffic keys for
-/// parsing the control frames the session layer does not expose.
+/// parsing the control frames the session layer does not expose, with
+/// `remote_hp_key` its header-protection key (wire-format §18).
 ///
 /// The session's bus channels are registered by the caller (which holds the
 /// runtime state lock at the spawn site) with the tx sides of
@@ -274,6 +275,7 @@ pub fn spawn_session_task(
     app_echo_rx: Arc<Mutex<HashMap<Vec<u8>, AppRx>>>,
     runtime: Arc<Mutex<RuntimeState>>,
     remote_keys: PacketKeys,
+    remote_hp_key: [u8; 32],
     ticket_material: Option<TicketMaterial>,
     bus_inbound_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     bus_outbound_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
@@ -338,6 +340,7 @@ pub fn spawn_session_task(
             &app_channels,
             &reader_runtime,
             &remote_keys,
+            &remote_hp_key,
             ticket_material,
             session_id,
             packet_rx,
@@ -387,6 +390,7 @@ async fn reader_loop(
     app_channels: &Arc<Mutex<HashMap<Vec<u8>, AppTx>>>,
     runtime: &Arc<Mutex<RuntimeState>>,
     remote_keys: &PacketKeys,
+    remote_hp_key: &[u8; 32],
     ticket_material: Option<TicketMaterial>,
     session_id: u64,
     mut packet_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
@@ -420,6 +424,7 @@ async fn reader_loop(
                             app_channels,
                             runtime,
                             remote_keys,
+                            remote_hp_key,
                             session_id,
                             &bytes,
                             &mut sweep,
@@ -442,6 +447,7 @@ async fn reader_loop(
                             app_channels,
                             runtime,
                             remote_keys,
+                            remote_hp_key,
                             session_id,
                             &bytes,
                             &mut sweep,
@@ -607,6 +613,7 @@ async fn process_inbound_packet(
     app_channels: &Arc<Mutex<HashMap<Vec<u8>, AppTx>>>,
     runtime: &Arc<Mutex<RuntimeState>>,
     remote_keys: &PacketKeys,
+    remote_hp_key: &[u8; 32],
     session_id: u64,
     bytes: &[u8],
     sweep: &mut SweepState,
@@ -614,7 +621,7 @@ async fn process_inbound_packet(
     let now = clock.now();
     // The control frames the session layer does not expose: relay,
     // bundle, routing, and key updates.
-    let frames = parse_control_frames(remote_keys, bytes);
+    let frames = parse_control_frames(remote_keys, remote_hp_key, bytes);
     let mut outbound = None;
     let mut retransmits: Vec<Vec<u8>> = Vec::new();
     let mut pending: Vec<(Vec<u8>, u64, Vec<u8>)> = Vec::new();
@@ -900,10 +907,11 @@ async fn process_inbound_packet(
 /// dispatch.
 fn parse_control_frames(
     remote_keys: &PacketKeys,
+    remote_hp_key: &[u8; 32],
     bytes: &[u8],
 ) -> Option<(ShortPacketSpace, u64, Vec<Frame>)> {
     let (space, _dcid, path_id, _pn, payload) =
-        umc_session::packet::parse_protected_packet(remote_keys, bytes).ok()?;
+        umc_session::packet::parse_protected_packet(remote_keys, remote_hp_key, bytes).ok()?;
     let parsed = parse_payload(&PacketContext::Protected(space), &payload).ok()?;
     Some((space, path_id, parsed.frames))
 }
@@ -2041,6 +2049,7 @@ mod tests {
         }));
         let remote_keys =
             umc_crypto::aead::PacketKeys::from_traffic_secret(&[2u8; 32]).expect("remote keys");
+        let remote_hp_key = umc_crypto::header_protection::header_protection_key(&[2u8; 32]);
 
         // The daemon's session sends four PING packets (pn 0..3).
         let mut client = test_session();
@@ -2077,6 +2086,7 @@ mod tests {
             &app_channels,
             &runtime,
             &remote_keys,
+            &remote_hp_key,
             1,
             &ack_pkt,
             &mut sweep,
@@ -2100,8 +2110,9 @@ mod tests {
         assert!(sent.len() >= 2, "ACK reply plus retransmit");
         let retransmitted = sent.last().expect("retransmit bytes");
         let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[1u8; 32]).unwrap();
+        let hp_key = umc_crypto::header_protection::header_protection_key(&[1u8; 32]);
         let (space, _dcid, _path, _pn, payload) =
-            umc_session::packet::parse_protected_packet(&keys, retransmitted).unwrap();
+            umc_session::packet::parse_protected_packet(&keys, &hp_key, retransmitted).unwrap();
         let parsed = umc_wire::packet::parse_payload(
             &umc_wire::packet::PacketContext::Protected(space),
             &payload,
@@ -2124,6 +2135,7 @@ mod tests {
             sent: recorded.clone(),
         }));
         let remote_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[2u8; 32]).unwrap();
+        let remote_hp_key = umc_crypto::header_protection::header_protection_key(&[2u8; 32]);
 
         // Fill the send window with stream data: in-flight reaches the
         // 10 × SMSS cwnd and the gate shuts.
@@ -2167,6 +2179,7 @@ mod tests {
             &app_channels,
             &runtime,
             &remote_keys,
+            &remote_hp_key,
             1,
             &ack_pkt,
             &mut sweep,
@@ -2267,6 +2280,7 @@ mod tests {
             sent: recorded.clone(),
         }));
         let remote_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[2u8; 32]).unwrap();
+        let remote_hp_key = umc_crypto::header_protection::header_protection_key(&[2u8; 32]);
 
         let mut client = test_session();
         client
@@ -2288,6 +2302,7 @@ mod tests {
             &app_channels,
             &runtime,
             &remote_keys,
+            &remote_hp_key,
             1,
             &ack_pkt,
             &mut sweep,
@@ -2322,6 +2337,7 @@ mod tests {
             &app_channels,
             &runtime,
             &remote_keys,
+            &remote_hp_key,
             1,
             &ack_pkt,
             &mut sweep,
@@ -2346,6 +2362,7 @@ mod tests {
             sent: recorded.clone(),
         }));
         let remote_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[2u8; 32]).unwrap();
+        let remote_hp_key = umc_crypto::header_protection::header_protection_key(&[2u8; 32]);
 
         let mut client = test_session();
         client
@@ -2367,6 +2384,7 @@ mod tests {
             &app_channels,
             &runtime,
             &remote_keys,
+            &remote_hp_key,
             1,
             &ack_pkt,
             &mut sweep,
@@ -2544,8 +2562,9 @@ mod tests {
         let sent = recorded.lock().expect("link sent");
         assert_eq!(sent.len(), 1, "exactly one idle close packet");
         let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[1u8; 32]).unwrap();
+        let hp_key = umc_crypto::header_protection::header_protection_key(&[1u8; 32]);
         let (space, _dcid, _path, _pn, payload) =
-            umc_session::packet::parse_protected_packet(&keys, &sent[0]).unwrap();
+            umc_session::packet::parse_protected_packet(&keys, &hp_key, &sent[0]).unwrap();
         let parsed = umc_wire::packet::parse_payload(
             &umc_wire::packet::PacketContext::Protected(space),
             &payload,
@@ -2593,8 +2612,9 @@ mod tests {
         assert_eq!(session.state, SessionState::Draining);
         let close_bytes = built.expect("idle close built");
         let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[1u8; 32]).unwrap();
+        let hp_key = umc_crypto::header_protection::header_protection_key(&[1u8; 32]);
         let (space, _dcid, _path, _pn, payload) =
-            umc_session::packet::parse_protected_packet(&keys, &close_bytes).unwrap();
+            umc_session::packet::parse_protected_packet(&keys, &hp_key, &close_bytes).unwrap();
         let parsed = umc_wire::packet::parse_payload(
             &umc_wire::packet::PacketContext::Protected(space),
             &payload,
@@ -2775,8 +2795,9 @@ mod tests {
         assert!(close.is_none(), "no close while idle not expired");
         let bytes = keepalive.expect("keepalive built at half idle");
         let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[1u8; 32]).unwrap();
+        let hp_key = umc_crypto::header_protection::header_protection_key(&[1u8; 32]);
         let (space, _dcid, _path, _pn, payload) =
-            umc_session::packet::parse_protected_packet(&keys, &bytes).unwrap();
+            umc_session::packet::parse_protected_packet(&keys, &hp_key, &bytes).unwrap();
         let parsed = umc_wire::packet::parse_payload(
             &umc_wire::packet::PacketContext::Protected(space),
             &payload,
@@ -2858,6 +2879,7 @@ mod tests {
             session.touch(t0);
         }
         let remote_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[2u8; 32]).unwrap();
+        let remote_hp_key = umc_crypto::header_protection::header_protection_key(&[2u8; 32]);
 
         // The reader loop's bus-outbound arm receives one relay payload; the
         // packet and inbound channels stay open (empty) so the select cannot
@@ -2884,6 +2906,7 @@ mod tests {
             &app_channels,
             &runtime,
             &remote_keys,
+            &remote_hp_key,
             None,
             1,
             packet_rx,
@@ -2924,6 +2947,7 @@ mod tests {
             sent: recorded.clone(),
         }));
         let remote_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[2u8; 32]).unwrap();
+        let remote_hp_key = umc_crypto::header_protection::header_protection_key(&[2u8; 32]);
 
         // A drained session is finalized as Closed; traffic on it must be
         // answered with a stateless reset (session.md §31).
@@ -2949,6 +2973,7 @@ mod tests {
             &app_channels,
             &runtime,
             &remote_keys,
+            &remote_hp_key,
             1,
             &reset_pkt,
             &mut sweep,
