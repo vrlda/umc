@@ -26,6 +26,17 @@ pub fn spawn_telemetry_dump(metrics: Arc<Registry>, path: PathBuf, clock: Arc<dy
     spawn_telemetry_dump_at(metrics, path, clock, Duration::from_secs(60));
 }
 
+/// Reactive enable path (core.md §61): spawns the dump without a clock
+/// (used by the runtime `SetConfig` handler when the flag flips true).
+pub fn spawn_telemetry_dump_no_clock(metrics: Arc<Registry>, path: PathBuf) {
+    spawn_telemetry_dump_at(
+        metrics,
+        path,
+        crate::runtime_adapters::TokioAdaptor,
+        Duration::from_secs(60),
+    );
+}
+
 /// Interval-parameterized spawn, used by [`spawn_telemetry_dump`] with the
 /// production 60 s cadence and by tests with a short interval.
 fn spawn_telemetry_dump_at(
