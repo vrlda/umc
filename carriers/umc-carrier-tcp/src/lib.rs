@@ -1,4 +1,5 @@
 //! TCP carrier profile (carriers/tcp.md): varint-length-framed UMP packets.
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener as TokioListener, TcpStream};
@@ -105,30 +106,43 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(20);
 pub struct TcpLink {
     stream: Arc<Mutex<(TcpStream, Vec<u8>)>>, // stream + partial-frame bytes
     outbound: mpsc::Sender<OutboundPacket>,
+    /// Bytes sitting in the outbound queue (congestion.md §16): incremented
+    /// on each accepted `try_send`, decremented by the writer task once the
+    /// bytes reach the stream. `properties().queue_bytes` reports the gauge
+    /// so the daemon can gate data sends on the real queue depth.
+    pending_bytes: Arc<AtomicUsize>,
 }
 
 impl TcpLink {
     pub fn new(stream: TcpStream) -> Self {
         let stream = Arc::new(Mutex::new((stream, Vec::new())));
+        let pending_bytes = Arc::new(AtomicUsize::new(0));
         let (tx, mut rx) = mpsc::channel::<OutboundPacket>(SEND_QUEUE_CAPACITY);
         let writer_stream = stream.clone();
+        let writer_pending = pending_bytes.clone();
         tokio::spawn(async move {
             while let Some(packet) = rx.recv().await {
                 let mut framed = Vec::with_capacity(packet.bytes.len() + 4);
                 if umc_wire_framing::push_length(&mut framed, packet.bytes.len()).is_err() {
+                    writer_pending.fetch_sub(packet.bytes.len(), AtomicOrdering::Relaxed);
                     break;
                 }
                 framed.extend_from_slice(&packet.bytes);
                 let mut guard = writer_stream.lock().await;
                 if guard.0.write_all(&framed).await.is_err() {
+                    writer_pending.fetch_sub(packet.bytes.len(), AtomicOrdering::Relaxed);
                     break;
                 }
                 let _ = guard.0.flush().await;
+                // The queued bytes leave the gauge once they are on the
+                // stream (congestion.md §16).
+                writer_pending.fetch_sub(packet.bytes.len(), AtomicOrdering::Relaxed);
             }
         });
         Self {
             stream,
             outbound: tx,
+            pending_bytes,
         }
     }
 }
@@ -184,7 +198,7 @@ impl Link for TcpLink {
             reliability: Reliability::ReliableUntilLinkFailure,
             ordering: Ordering::Ordered,
             current_mtu: MAX_PACKET_LEN,
-            queue_bytes: 0,
+            queue_bytes: self.pending_bytes.load(AtomicOrdering::Relaxed),
             queue_capacity: SEND_QUEUE_BYTES,
             estimated_rtt_ms: None,
             estimated_loss: None,
@@ -193,9 +207,13 @@ impl Link for TcpLink {
     }
 
     fn send(&self, packet: OutboundPacket) -> Result<SendResult, CarrierError> {
+        let bytes = packet.bytes.len();
         self.outbound
             .try_send(packet)
             .map_err(|_| CarrierError::new(CarrierErrorKind::QueueFull, "send"))?;
+        // Count the bytes into the queue gauge (congestion.md §16); the
+        // writer task decrements once they are on the stream.
+        self.pending_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
         Ok(SendResult::Accepted {
             queue_state: QueueState::QueuedBounded,
         })
@@ -305,5 +323,79 @@ mod tests {
             c.capabilities().reliability,
             Reliability::ReliableUntilLinkFailure
         );
+    }
+
+    #[test]
+    fn pending_bytes_tracks_queue() {
+        // A single-threaded runtime drives the spawned writer only while
+        // the test future yields, so the gauge is exact between sends and
+        // the drain is observable in the poll loop.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let accept = tokio::spawn(async move {
+                let (stream, _addr) = listener.accept().await.unwrap();
+                stream
+            });
+            let client = TcpStream::connect(addr).await.unwrap();
+            let server = accept.await.unwrap();
+            let link = TcpLink::new(server);
+            // Queue accounting (congestion.md §16): every accepted send
+            // counts its bytes into `queue_bytes`; the writer drains them
+            // asynchronously.
+            let sizes = [32usize, 48, 64];
+            for size in sizes {
+                link.send(OutboundPacket {
+                    bytes: vec![0xAB; size],
+                    control: false,
+                    deadline_ms: None,
+                })
+                .unwrap();
+            }
+            assert_eq!(
+                link.properties().queue_bytes,
+                sizes.iter().sum::<usize>(),
+                "queued bytes reported before the writer drains"
+            );
+            // Poll until the writer puts the packets on the stream and the
+            // gauge returns to zero.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while link.properties().queue_bytes > 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "writer did not drain the queue"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert_eq!(link.properties().queue_bytes, 0);
+            assert_eq!(
+                link.properties().queue_capacity,
+                SEND_QUEUE_BYTES,
+                "capacity reported from the send-queue budget"
+            );
+            // The peer received exactly the three frames.
+            let mut reader = client;
+            for size in sizes {
+                let mut len_buf = Vec::new();
+                loop {
+                    let mut b = [0u8; 1];
+                    reader.read_exact(&mut b).await.unwrap();
+                    len_buf.push(b[0]);
+                    if let Some((len, _used)) =
+                        umc_wire_framing::read_length(&len_buf).expect("valid length prefix")
+                    {
+                        assert_eq!(len, size, "frame length prefix");
+                        break;
+                    }
+                }
+                let mut payload = vec![0u8; size];
+                reader.read_exact(&mut payload).await.unwrap();
+                assert_eq!(payload, vec![0xAB; size]);
+            }
+        });
     }
 }

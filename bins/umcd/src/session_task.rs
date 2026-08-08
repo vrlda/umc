@@ -25,7 +25,7 @@ use umc_carrier::BoxLink;
 use umc_core::app_io::{AppRx, AppTx};
 use umc_crypto::aead::PacketKeys;
 use umc_session::loss::{detect_lost_packets, PtoState};
-use umc_session::session::{Session, SessionState, IDLE_TIMEOUT_MS};
+use umc_session::session::{payload_is_exempt, Session, SessionState, IDLE_TIMEOUT_MS};
 use umc_types::runtime::{Clock, Instant};
 use umc_wire::frame::Frame;
 use umc_wire::frames::bundle::BundleFrame;
@@ -578,11 +578,11 @@ async fn process_inbound_packet(
                         .iter()
                         .map(|p| (p.packet_number, p.size))
                         .collect();
-                    let sent_at_by_pn: HashMap<u64, Instant> = session
+                    let sent_at_by_pn: HashMap<u64, (Instant, bool)> = session
                         .sent_state()
                         .sent()
                         .iter()
-                        .map(|p| (p.packet_number, p.sent_at))
+                        .map(|p| (p.packet_number, (p.sent_at, p.ack_eliciting)))
                         .collect();
                     let lost = detect_lost_packets(
                         session.sent_state_mut(),
@@ -599,8 +599,20 @@ async fn process_inbound_packet(
                         // event. Migration is operator/daemon policy; the
                         // event is the hook, not an automatic switch.
                         let pto = detector.pto(&rtt);
-                        let oldest = lost.iter().filter_map(|pn| sent_at_by_pn.get(pn)).min();
-                        let newest = lost.iter().filter_map(|pn| sent_at_by_pn.get(pn)).max();
+                        // §14.4: the span endpoints must be ACK-ELICITING
+                        // packets; a late ack-only loss must not degrade.
+                        let oldest = lost
+                            .iter()
+                            .filter_map(|pn| sent_at_by_pn.get(pn))
+                            .filter(|(_sent_at, ack_eliciting)| *ack_eliciting)
+                            .map(|(sent_at, _)| sent_at)
+                            .min();
+                        let newest = lost
+                            .iter()
+                            .filter_map(|pn| sent_at_by_pn.get(pn))
+                            .filter(|(_sent_at, ack_eliciting)| *ack_eliciting)
+                            .map(|(sent_at, _)| sent_at)
+                            .max();
                         if let (Some(oldest), Some(newest)) = (oldest, newest) {
                             if detector.persistent_congestion(pto, *oldest, *newest)
                                 && session.mark_path_degraded(*path_id)
@@ -746,16 +758,26 @@ async fn process_inbound_packet(
         }
     }
     if let Some(outbound) = outbound {
-        let sent = tokio::task::block_in_place(|| {
-            link.send(OutboundPacket {
-                bytes: outbound,
-                control: false,
-                deadline_ms: None,
-            })
-        });
-        if let Err(e) = sent {
+        // Carrier backpressure (congestion.md §16): a combined payload
+        // without an ACK/PING lead frame (flow-control credit, bundle,
+        // key-update) is skipped when the carrier queue is past 80% — the
+        // next inbound round rebuilds it. ACK-led payloads are exempt and
+        // always sent, so the acknowledgment loop keeps running.
+        if should_backpressure(link, &outbound) {
             #[cfg(debug_assertions)]
-            println!("[session {session_id}] send error: {e:?}");
+            println!("[session {session_id}] combined outbound backpressured (carrier queue >80%)");
+        } else {
+            let sent = tokio::task::block_in_place(|| {
+                link.send(OutboundPacket {
+                    bytes: outbound,
+                    control: false,
+                    deadline_ms: None,
+                })
+            });
+            if let Err(e) = sent {
+                #[cfg(debug_assertions)]
+                println!("[session {session_id}] send error: {e:?}");
+            }
         }
     }
     for bytes in retransmits {
@@ -1229,6 +1251,21 @@ fn push_event(state: &mut RuntimeState, kind: &str, now: Instant, detail: String
         });
 }
 
+/// Carrier backpressure gate (congestion.md §16): when the link's carrier
+/// queue is past 80% of its capacity, non-exempt (data) payloads are held
+/// back from the wire so the queue can drain. ACK and PING payloads are
+/// always sent — refusing them would stall the acknowledgment loop or the
+/// PTO probe, and they are a few bytes at most. The dropped payload is a
+/// fresh packet the session already recorded (it was built by
+/// `build_outbound`): the peer re-requests stream data, or the session's
+/// loss/PTO path retransmits it, so no data is lost.
+fn should_backpressure(link: &BoxLink, payload: &[u8]) -> bool {
+    let props = link.properties();
+    !payload_is_exempt(payload)
+        && props.queue_capacity > 0
+        && props.queue_bytes > props.queue_capacity * 4 / 5
+}
+
 /// Session writer: drain the applications' outbound channels and send the
 /// echoed frames back on the same streams. Runs independently of the link
 /// recv so echoes reach the peer without further inbound traffic.
@@ -1308,6 +1345,17 @@ async fn writer_loop(
                 _ => continue,
             }
         };
+        // Carrier backpressure (congestion.md §16): when the carrier's
+        // outbound queue is past 80% of capacity, the fresh data packet is
+        // skipped rather than piled onto the queue. The session recorded
+        // the payload on `build_outbound`; the peer re-requests stream
+        // data, or the loss/PTO path retransmits it. ACK/PING payloads are
+        // exempt and always sent.
+        if should_backpressure(link, &outbound) {
+            #[cfg(debug_assertions)]
+            println!("[session {session_id}] echo send backpressured (carrier queue >80%)");
+            continue;
+        }
         // Sleep out the spacing interval (congestion.md §12.1): the wait is
         // `deficit / rate` past `now`, so the send lands on the pacing
         // schedule. Pacing is off until the session's RTT has a sample.
@@ -1452,6 +1500,56 @@ mod tests {
                 ordering: umc_carrier::types::Ordering::Ordered,
                 current_mtu: 65_535,
                 queue_bytes: 0,
+                queue_capacity: 2 * 1024 * 1024,
+                estimated_rtt_ms: None,
+                estimated_loss: None,
+                metered: false,
+            }
+        }
+        fn send(
+            &self,
+            p: umc_carrier::types::OutboundPacket,
+        ) -> Result<umc_carrier::types::SendResult, umc_carrier::error::CarrierError> {
+            self.sent.lock().expect("link sent").push(p.bytes);
+            Ok(umc_carrier::types::SendResult::Accepted {
+                queue_state: umc_carrier::types::QueueState::SentToMedium,
+            })
+        }
+        fn recv(
+            &self,
+        ) -> Result<umc_carrier::types::InboundPacket, umc_carrier::error::CarrierError> {
+            Err(umc_carrier::error::CarrierError::new(
+                umc_carrier::error::CarrierErrorKind::WouldBlock,
+                "recv",
+            ))
+        }
+        fn events(
+            &self,
+        ) -> Result<umc_carrier::types::LinkEvent, umc_carrier::error::CarrierError> {
+            Err(umc_carrier::error::CarrierError::new(
+                umc_carrier::error::CarrierErrorKind::WouldBlock,
+                "events",
+            ))
+        }
+        fn close(&self, _reason: &str) -> Result<(), umc_carrier::error::CarrierError> {
+            Ok(())
+        }
+    }
+
+    /// Link reporting a configurable queue fill (carrier backpressure,
+    /// congestion.md §16).
+    struct BackpressuredLink {
+        queue_bytes: usize,
+        sent: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl umc_carrier::Link for BackpressuredLink {
+        fn properties(&self) -> umc_carrier::types::LinkProperties {
+            umc_carrier::types::LinkProperties {
+                reliability: umc_carrier::types::Reliability::ReliableUntilLinkFailure,
+                ordering: umc_carrier::types::Ordering::Ordered,
+                current_mtu: 65_535,
+                queue_bytes: self.queue_bytes,
                 queue_capacity: 2 * 1024 * 1024,
                 estimated_rtt_ms: None,
                 estimated_loss: None,
@@ -2686,6 +2784,48 @@ mod tests {
             next.duration_since(t0).as_millis(),
             10,
             "empty bucket spaces a 1200-byte packet at 960,000 bits/s"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backpressured_data_send_skipped_ack_still_sent() {
+        // Carrier queue at 90% of capacity (congestion.md §16): the gate
+        // opens past 80%, so data payloads must be held back while the ACK
+        // loop keeps running.
+        let link: BoxLink = Box::new(BackpressuredLink {
+            queue_bytes: 2 * 1024 * 1024 * 9 / 10,
+            sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let data = umc_wire::varint::encode(umc_types::frame::FrameType::STREAM.0).unwrap();
+        let ack = umc_wire::frame::AckFrame {
+            largest_acknowledged: 3,
+            ack_delay: 0,
+            first_ack_range: 1,
+            additional_ranges: Vec::new(),
+        }
+        .encode()
+        .expect("ack frame");
+        let ping = umc_wire::varint::encode(umc_types::frame::FrameType::PING.0).unwrap();
+        assert!(
+            should_backpressure(&link, &data),
+            "data payload gated at 90% queue"
+        );
+        assert!(
+            !should_backpressure(&link, &ack),
+            "ACK payload always sent, even backpressured"
+        );
+        assert!(
+            !should_backpressure(&link, &ping),
+            "PING payload always sent, even backpressured"
+        );
+        // Under the threshold the same data payload goes through.
+        let open: BoxLink = Box::new(BackpressuredLink {
+            queue_bytes: 1024,
+            sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        assert!(
+            !should_backpressure(&open, &data),
+            "data payload below the 80% threshold is sent"
         );
     }
 }

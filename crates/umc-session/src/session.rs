@@ -420,7 +420,7 @@ impl Session {
         // unrestricted.
         if let Some(path) = self.paths.get(&super::packet::DEFAULT_PATH_ID) {
             if !path.validated
-                && !is_exempt_payload(payload)
+                && !payload_is_exempt(payload)
                 && payload.len() as u64 > path.send_allowance()
             {
                 return Err(SessionError::AmplificationLimit);
@@ -437,7 +437,7 @@ impl Session {
         // bounded by `payload.len() + PROTECTED_OVERHEAD_ESTIMATE` — the
         // wire bytes (which charge in-flight) always include the header,
         // dcid, path id, packet number, and the AEAD tag beyond the payload.
-        if !is_exempt_payload(payload)
+        if !payload_is_exempt(payload)
             && payload.len() + PROTECTED_OVERHEAD_ESTIMATE > self.congestion.send_allowance()
         {
             return Err(SessionError::CongestionLimited);
@@ -1142,9 +1142,11 @@ const PROTECTED_OVERHEAD_ESTIMATE: usize = 64;
 /// PING): the control reserve (congestion.md §7.3). Such payloads are a few
 /// bytes at most, so refusing them would stall the acknowledgment loop
 /// (ACK) or the PTO recovery probe (PING) instead of protecting the
-/// network; the anti-amplification gate (congestion.md §18) shares the same
-/// rationale.
-fn is_exempt_payload(payload: &[u8]) -> bool {
+/// network; the anti-amplification gate (congestion.md §18) and the
+/// carrier backpressure gate (congestion.md §16, daemon send path) share
+/// the same rationale.
+#[must_use]
+pub fn payload_is_exempt(payload: &[u8]) -> bool {
     umc_wire::varint::decode(payload).is_ok_and(|(frame_type, _)| {
         let frame_type = umc_types::frame::FrameType(frame_type);
         frame_type == umc_types::frame::FrameType::ACK
