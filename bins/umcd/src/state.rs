@@ -25,6 +25,7 @@ use umc_core::rate_limiter::RateLimiter;
 use umc_core::trust::{TrustLevel, TrustStore};
 use umc_core::well_known::WELL_KNOWN_APP;
 use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
+use umc_handshake::identity::IdentityBinding;
 use umc_metrics::Registry;
 use umc_storage::keystore::{KeyClass, Keystore, KeystoreError};
 use umc_storage::objects::ObjectStore;
@@ -37,6 +38,268 @@ pub(crate) const KEYSTORE_FILE: &str = "keystore.ks";
 /// Record name for the node identity: one 64-byte record
 /// `[identity_seed || static_seed]` under [`KeyClass::IdentitySigning`].
 pub(crate) const NODE_IDENTITY_RECORD: &[u8] = b"node-identity";
+/// Record name for the primary identity's signed binding (task F2): 56
+/// bytes `[sequence || not_before || not_after || capabilities_hash]`. The
+/// binding is stored separately from the 64-byte key record so
+/// [`load_or_create_identity`]'s format stays stable; the sequence is
+/// persisted so rotations stay monotonic across restarts (handshake.md
+/// §33).
+pub(crate) const BINDING_RECORD: &[u8] = b"node-identity/binding";
+/// Record name for the secondary-identity index (task F2): a JSON
+/// `SecondaryIndex` under [`KeyClass::IdentitySigning`].
+pub(crate) const SECONDARY_INDEX_RECORD: &[u8] = b"secondary-identities";
+/// Secondary identity record layout: 120 bytes
+/// `[identity_seed || static_seed || sequence || not_before || not_after
+/// || capabilities_hash]` under [`KeyClass::IdentitySigning`], named
+/// `secondary-<n>`.
+const SECONDARY_RECORD_LEN: usize = 64 + 8 + 8 + 8 + 32;
+/// Binding record layout: `[sequence || not_before || not_after ||
+/// capabilities_hash]`.
+const BINDING_RECORD_LEN: usize = 8 + 8 + 8 + 32;
+
+/// Serializes `UMC_KEYSTORE_PASSWORD` mutations across test modules that
+/// open keystores under a known password. Production code never touches it.
+#[cfg(test)]
+pub(crate) static KEYSTORE_PASSWORD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// One secondary identity (task F2): a keystore-backed identity keypair
+/// plus static handshake keypair with its own binding, kept out of the
+/// primary node identity path. Created via `IdentityService.CreateIdentity`
+/// or `ImportIdentity`; deletable; never the primary.
+#[derive(Debug)]
+pub struct SecondaryIdentity {
+    pub identity: NodeIdentity,
+    /// Keystore record name (`secondary-<n>`); also the control-surface
+    /// identity handle.
+    pub record_name: String,
+    /// Proto `IdentityKind` as stored on create.
+    pub kind: i32,
+    pub label: String,
+    pub binding: IdentityBinding,
+    pub created_at_ms: u64,
+}
+
+/// Persistent index of secondary identities (task F2): enough metadata to
+/// restore the registry at boot; the key material rides in per-identity
+/// keystore records.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct SecondaryIndex {
+    next_id: u64,
+    entries: Vec<SecondaryIndexEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SecondaryIndexEntry {
+    record_name: String,
+    kind: i32,
+    label: String,
+    created_at_ms: u64,
+}
+
+/// The ticket-key derivation (handshake.md §35): HKDF-Extract of the
+/// keystore identity seed. Re-run after identity-key rotation — a full
+/// identity change must re-seal future tickets under the new identity.
+pub(crate) fn ticket_key_for(identity: &NodeIdentity) -> [u8; 32] {
+    umc_crypto::hkdf::extract(&[0u8; 32], &identity.identity.to_seed())
+}
+
+/// Loads the full identity registry from the keystore (task F2): the
+/// primary node identity, its signed binding (persisted rotation state),
+/// and every secondary identity. A fresh keystore generates and persists
+/// all three.
+///
+/// # Errors
+/// Returns a message when the keystore cannot be opened, a record is
+/// malformed, or the password is wrong. Secondary restore failures are
+/// logged and skipped (never fatal), mirroring the other restore paths.
+pub(crate) fn load_identity_registry(
+    config: &NodeConfig,
+) -> Result<(NodeIdentity, IdentityBinding, Vec<SecondaryIdentity>), String> {
+    let path = config.resolved_keystore_dir().join(KEYSTORE_FILE);
+    let ks = Keystore::open(path, &keystore_password()).map_err(|e| format!("keystore: {e:?}"))?;
+    let identity = match ks.load(KeyClass::IdentitySigning, NODE_IDENTITY_RECORD) {
+        Ok(seeds) if seeds.len() == 64 => identity_from_seeds(&seeds),
+        Ok(_) => return Err("keystore: malformed node-identity record (expected 64 bytes)".into()),
+        Err(KeystoreError::UnsupportedClass) => {
+            let identity = NodeIdentity::generate(&OsEntropy);
+            let mut seeds = Vec::with_capacity(64);
+            seeds.extend_from_slice(&identity.identity.to_seed());
+            seeds.extend_from_slice(&identity.static_handshake.to_seed());
+            ks.store(KeyClass::IdentitySigning, NODE_IDENTITY_RECORD, &seeds)
+                .map_err(|e| format!("keystore store: {e:?}"))?;
+            identity
+        }
+        Err(e) => return Err(format!("keystore load: {e:?}")),
+    };
+    let binding = match ks.load(KeyClass::IdentitySigning, BINDING_RECORD) {
+        Ok(bytes) => binding_from_record(&identity, &bytes)
+            .ok_or_else(|| "keystore: malformed binding record".to_string())?,
+        Err(KeystoreError::UnsupportedClass) => {
+            let binding = default_binding(&identity);
+            persist_binding(&ks, &identity, &binding)?;
+            binding
+        }
+        Err(e) => return Err(format!("keystore binding load: {e:?}")),
+    };
+    let secondaries = load_secondary_index(&ks)
+        .map_err(|e| log::warn!("[identity] secondary index restore failed: {e}; ignoring"))
+        .unwrap_or_default()
+        .entries
+        .into_iter()
+        .filter_map(|entry| {
+            match ks.load(KeyClass::IdentitySigning, entry.record_name.as_bytes()) {
+                Ok(bytes) if bytes.len() == SECONDARY_RECORD_LEN => {
+                    let identity = identity_from_seeds(&bytes[..64]);
+                    let Some(binding) = binding_from_record(&identity, &bytes[64..]) else {
+                        log::warn!(
+                            "[identity] secondary {} has a malformed binding; skipping",
+                            entry.record_name
+                        );
+                        return None;
+                    };
+                    Some(SecondaryIdentity {
+                        identity,
+                        record_name: entry.record_name,
+                        kind: entry.kind,
+                        label: entry.label,
+                        binding,
+                        created_at_ms: entry.created_at_ms,
+                    })
+                }
+                Ok(_) => {
+                    log::warn!(
+                        "[identity] secondary {} record is malformed; skipping",
+                        entry.record_name
+                    );
+                    None
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[identity] secondary {} record load failed: {e:?}; skipping",
+                        entry.record_name
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
+    Ok((identity, binding, secondaries))
+}
+
+/// The primary node identity from the keystore, or a fresh persisted one
+/// (core.md §19/§63 — persistent endpoint identity). Thin wrapper over
+/// [`load_identity_registry`] kept for `init_node`.
+///
+/// # Errors
+/// See [`load_identity_registry`].
+pub(crate) fn load_or_create_identity(config: &NodeConfig) -> Result<NodeIdentity, String> {
+    load_identity_registry(config).map(|(identity, _, _)| identity)
+}
+
+/// The default binding for a fresh identity: sequence 0, valid from epoch
+/// through the maximum not-after, all-zero capabilities hash (the v1
+/// capability set is not yet computed — handshake.md §33).
+fn default_binding(identity: &NodeIdentity) -> IdentityBinding {
+    IdentityBinding::sign(
+        &identity.identity,
+        &identity.static_handshake.public(),
+        0,
+        u64::MAX,
+        0,
+        [0u8; 32],
+    )
+}
+
+/// Rebuilds a signed binding from its persisted parameters. Ed25519
+/// signatures are deterministic, so re-signing the same fields reproduces
+/// the binding exactly.
+fn binding_from_record(identity: &NodeIdentity, bytes: &[u8]) -> Option<IdentityBinding> {
+    if bytes.len() != BINDING_RECORD_LEN {
+        return None;
+    }
+    let sequence = u64::from_be_bytes(bytes[..8].try_into().ok()?);
+    let not_before = u64::from_be_bytes(bytes[8..16].try_into().ok()?);
+    let not_after = u64::from_be_bytes(bytes[16..24].try_into().ok()?);
+    let mut capabilities_hash = [0u8; 32];
+    capabilities_hash.copy_from_slice(&bytes[24..56]);
+    Some(IdentityBinding::sign(
+        &identity.identity,
+        &identity.static_handshake.public(),
+        not_before,
+        not_after,
+        sequence,
+        capabilities_hash,
+    ))
+}
+
+fn binding_bytes(binding: &IdentityBinding) -> Vec<u8> {
+    let mut out = Vec::with_capacity(BINDING_RECORD_LEN);
+    out.extend_from_slice(&binding.sequence.to_be_bytes());
+    out.extend_from_slice(&binding.not_before.to_be_bytes());
+    out.extend_from_slice(&binding.not_after.to_be_bytes());
+    out.extend_from_slice(&binding.capabilities_hash);
+    out
+}
+
+fn persist_binding(
+    ks: &Keystore,
+    identity: &NodeIdentity,
+    binding: &IdentityBinding,
+) -> Result<(), String> {
+    let mut seeds = Vec::with_capacity(64);
+    seeds.extend_from_slice(&identity.identity.to_seed());
+    seeds.extend_from_slice(&identity.static_handshake.to_seed());
+    // Delete + store: the keystore is append-only, so a second store under
+    // the same name would be shadowed by the first record.
+    ks.delete(KeyClass::IdentitySigning, NODE_IDENTITY_RECORD)
+        .map_err(|e| format!("keystore delete: {e:?}"))?;
+    ks.store(KeyClass::IdentitySigning, NODE_IDENTITY_RECORD, &seeds)
+        .map_err(|e| format!("keystore store: {e:?}"))?;
+    ks.delete(KeyClass::IdentitySigning, BINDING_RECORD)
+        .map_err(|e| format!("keystore delete: {e:?}"))?;
+    ks.store(
+        KeyClass::IdentitySigning,
+        BINDING_RECORD,
+        &binding_bytes(binding),
+    )
+    .map_err(|e| format!("keystore store: {e:?}"))?;
+    Ok(())
+}
+
+fn secondary_record_bytes(identity: &NodeIdentity, binding: &IdentityBinding) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SECONDARY_RECORD_LEN);
+    out.extend_from_slice(&identity.identity.to_seed());
+    out.extend_from_slice(&identity.static_handshake.to_seed());
+    out.extend_from_slice(&binding_bytes(binding));
+    out
+}
+
+fn persist_secondary(ks: &Keystore, secondary: &SecondaryIdentity) -> Result<(), String> {
+    ks.delete(KeyClass::IdentitySigning, secondary.record_name.as_bytes())
+        .map_err(|e| format!("keystore delete: {e:?}"))?;
+    ks.store(
+        KeyClass::IdentitySigning,
+        secondary.record_name.as_bytes(),
+        &secondary_record_bytes(&secondary.identity, &secondary.binding),
+    )
+    .map_err(|e| format!("keystore store: {e:?}"))
+}
+
+fn load_secondary_index(ks: &Keystore) -> Result<SecondaryIndex, String> {
+    match ks.load(KeyClass::IdentitySigning, SECONDARY_INDEX_RECORD) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("index parse: {e}")),
+        Err(KeystoreError::UnsupportedClass) => Ok(SecondaryIndex::default()),
+        Err(e) => Err(format!("index load: {e:?}")),
+    }
+}
+
+fn persist_secondary_index(ks: &Keystore, index: &SecondaryIndex) -> Result<(), String> {
+    let bytes = serde_json::to_vec(index).map_err(|e| e.to_string())?;
+    ks.delete(KeyClass::IdentitySigning, SECONDARY_INDEX_RECORD)
+        .map_err(|e| format!("keystore delete: {e:?}"))?;
+    ks.store(KeyClass::IdentitySigning, SECONDARY_INDEX_RECORD, &bytes)
+        .map_err(|e| format!("keystore store: {e:?}"))
+}
 
 /// Password for the node keystore (core.md §63). Read from the
 /// `UMC_KEYSTORE_PASSWORD` environment variable; when unset, the
@@ -65,33 +328,6 @@ pub(crate) fn keystore_password() -> Vec<u8> {
         return Vec::new();
     };
     pw.into_bytes()
-}
-
-/// Loads the node identity from the keystore, or generates a fresh one
-/// and persists it (core.md §19/§63 — persistent endpoint identity).
-/// Two runs against the same keystore with the same password produce the
-/// same endpoint id; a wrong password fails loudly.
-///
-/// # Errors
-/// Returns a message when the keystore cannot be opened, the identity
-/// record is malformed, or the password is wrong.
-pub(crate) fn load_or_create_identity(config: &NodeConfig) -> Result<NodeIdentity, String> {
-    let path = config.resolved_keystore_dir().join(KEYSTORE_FILE);
-    let ks = Keystore::open(path, &keystore_password()).map_err(|e| format!("keystore: {e:?}"))?;
-    match ks.load(KeyClass::IdentitySigning, NODE_IDENTITY_RECORD) {
-        Ok(seeds) if seeds.len() == 64 => Ok(identity_from_seeds(&seeds)),
-        Ok(_) => Err("keystore: malformed node-identity record (expected 64 bytes)".into()),
-        Err(KeystoreError::UnsupportedClass) => {
-            let identity = NodeIdentity::generate(&OsEntropy);
-            let mut seeds = Vec::with_capacity(64);
-            seeds.extend_from_slice(&identity.identity.to_seed());
-            seeds.extend_from_slice(&identity.static_handshake.to_seed());
-            ks.store(KeyClass::IdentitySigning, NODE_IDENTITY_RECORD, &seeds)
-                .map_err(|e| format!("keystore store: {e:?}"))?;
-            Ok(identity)
-        }
-        Err(e) => Err(format!("keystore load: {e:?}")),
-    }
 }
 
 fn identity_from_seeds(seeds: &[u8]) -> NodeIdentity {
@@ -166,6 +402,14 @@ pub struct RuntimeState {
     /// endpoint id survives restarts; a fresh identity is generated and
     /// persisted on first boot.
     pub node_identity: NodeIdentity,
+    /// The primary identity's current signed binding (handshake.md §33,
+    /// task F2): persisted sequence + validity window, re-signed on
+    /// `RotateHandshakeKey`/`RotateIdentityKey`. Sequence is monotonic
+    /// across restarts because the binding record lives in the keystore.
+    pub primary_binding: IdentityBinding,
+    /// Secondary identities (task F2): keystore-backed, created via
+    /// `CreateIdentity`/`ImportIdentity`, deletable. Never the primary.
+    pub secondaries: Vec<SecondaryIdentity>,
     /// Session-ticket key (handshake.md §35): HKDF-Extract of the keystore
     /// identity seed (the keystore-derived identity seed hash, SANCTIONED).
     /// Stable across restarts because the keystore identity is persistent;
@@ -251,7 +495,7 @@ impl RuntimeState {
             SqliteStore::open(&data_dir.join("node.db")).map_err(|e| format!("store: {e:?}"))?,
         );
 
-        let node_identity = load_or_create_identity(&config)?;
+        let (node_identity, primary_binding, secondaries) = load_identity_registry(&config)?;
         // The runtime node and the state share the same key material.
         let state_identity = NodeIdentity {
             identity: node_identity.identity.clone(),
@@ -260,7 +504,7 @@ impl RuntimeState {
         // Session-ticket key (handshake.md §35): the keystore identity
         // seed hash — persistent across restarts and bound to the node's
         // identity (see the field docs).
-        let ticket_key = umc_crypto::hkdf::extract(&[0u8; 32], &state_identity.identity.to_seed());
+        let ticket_key = ticket_key_for(&state_identity);
         let dcid = node_identity.endpoint_id()[..8].to_vec();
         let node = Node::new(
             NodeRuntimeConfig {
@@ -336,6 +580,8 @@ impl RuntimeState {
             blocklist: Blocklist::new(60),
             rate_limiter: RateLimiter::new(1_024),
             node_identity: state_identity,
+            primary_binding,
+            secondaries,
             ticket_key,
             ticket_replay_cache: std::sync::Mutex::new(TicketReplayCache::new()),
             mesh,
@@ -364,6 +610,362 @@ impl RuntimeState {
     #[allow(dead_code)]
     pub fn trust_store(&self) -> TrustStore<'_> {
         TrustStore::new(self.store.as_ref(), self.trust_default_level)
+    }
+
+    /// Resolve an identity handle (the keystore record name) to the primary
+    /// or a secondary (task F2). The primary's handle is the node-identity
+    /// record name; secondaries use their own record names.
+    #[must_use]
+    pub fn identity_by_handle(&self, handle: &[u8]) -> Option<IdentityRef<'_>> {
+        if handle == NODE_IDENTITY_RECORD {
+            return Some(IdentityRef::Primary);
+        }
+        let record_name = String::from_utf8(handle.to_vec()).ok()?;
+        self.secondaries
+            .iter()
+            .find(|entry| entry.record_name == record_name)
+            .map(IdentityRef::Secondary)
+    }
+
+    /// Resolve an endpoint id to the primary or a secondary identity
+    /// (task F2).
+    #[must_use]
+    pub fn identity_by_endpoint(&self, endpoint_id: &[u8]) -> Option<IdentityRef<'_>> {
+        if self.node_identity.endpoint_id().as_slice() == endpoint_id {
+            return Some(IdentityRef::Primary);
+        }
+        self.secondaries
+            .iter()
+            .find(|entry| entry.identity.endpoint_id().as_slice() == endpoint_id)
+            .map(IdentityRef::Secondary)
+    }
+
+    /// `IdentityService.RotateHandshakeKey` (task F2, handshake.md §33):
+    /// generate a fresh static handshake key, re-sign the identity binding
+    /// at sequence + 1, persist both to the keystore, and switch the node
+    /// to the new static key for future handshakes. The identity key (and
+    /// therefore the endpoint id) is unchanged. Applies to the primary or
+    /// to a secondary selected by handle.
+    ///
+    /// `lifetime_ms` bounds the binding's validity window; 0 means the
+    /// binding never expires.
+    ///
+    /// # Errors
+    /// Returns a message when the handle is unknown or the keystore write
+    /// fails.
+    pub fn rotate_handshake_key(
+        &mut self,
+        handle: &[u8],
+        lifetime_ms: u64,
+    ) -> Result<IdentityBinding, String> {
+        let now = wall_now().0;
+        // Resolve the target and copy the old binding/identity key before
+        // any mutation so the borrow ends.
+        let (is_primary, index) = self.resolve_target(handle)?;
+        let old_sequence = if is_primary {
+            self.primary_binding.sequence
+        } else {
+            self.secondaries[index].binding.sequence
+        };
+        let identity_key = if is_primary {
+            self.node_identity.identity.clone()
+        } else {
+            self.secondaries[index].identity.identity.clone()
+        };
+        let new_static = StaticHandshakeKeyPair::generate();
+        let binding = IdentityBinding::sign(
+            &identity_key,
+            &new_static.public(),
+            now,
+            if lifetime_ms == 0 {
+                u64::MAX
+            } else {
+                now.saturating_add(lifetime_ms)
+            },
+            old_sequence.saturating_add(1),
+            [0u8; 32],
+        );
+        let path = self.config.resolved_keystore_dir().join(KEYSTORE_FILE);
+        let ks =
+            Keystore::open(path, &keystore_password()).map_err(|e| format!("keystore: {e:?}"))?;
+        if is_primary {
+            let updated = NodeIdentity {
+                identity: identity_key,
+                static_handshake: new_static,
+            };
+            // Persist first: a keystore failure must leave the in-memory
+            // node untouched.
+            persist_binding(&ks, &updated, &binding)?;
+            self.node_identity = updated;
+            self.node.config.identity = NodeIdentity {
+                identity: self.node_identity.identity.clone(),
+                static_handshake: self.node_identity.static_handshake.clone(),
+            };
+            self.primary_binding = binding.clone();
+        } else {
+            let updated = SecondaryIdentity {
+                identity: NodeIdentity {
+                    identity: identity_key,
+                    static_handshake: new_static,
+                },
+                record_name: self.secondaries[index].record_name.clone(),
+                kind: self.secondaries[index].kind,
+                label: self.secondaries[index].label.clone(),
+                binding: binding.clone(),
+                created_at_ms: self.secondaries[index].created_at_ms,
+            };
+            persist_secondary(&ks, &updated)?;
+            self.secondaries[index] = updated;
+        }
+        Ok(binding)
+    }
+
+    /// `IdentityService.RotateIdentityKey` (task F2): generate a fresh
+    /// identity keypair AND static handshake keypair, re-sign the binding
+    /// at sequence + 1, and persist. For the primary this is a full
+    /// identity change — the endpoint id changes, the node's dcid and
+    /// session-ticket key follow, and existing session tickets stop being
+    /// redeemable (documented).
+    ///
+    /// # Errors
+    /// Returns a message when the handle is unknown or the keystore write
+    /// fails.
+    pub fn rotate_identity_key(&mut self, handle: &[u8]) -> Result<IdentityBinding, String> {
+        let now = wall_now().0;
+        let (is_primary, index) = self.resolve_target(handle)?;
+        let old_sequence = if is_primary {
+            self.primary_binding.sequence
+        } else {
+            self.secondaries[index].binding.sequence
+        };
+        let identity = NodeIdentity::generate(&OsEntropy);
+        let binding = IdentityBinding::sign(
+            &identity.identity,
+            &identity.static_handshake.public(),
+            now,
+            u64::MAX,
+            old_sequence.saturating_add(1),
+            [0u8; 32],
+        );
+        let path = self.config.resolved_keystore_dir().join(KEYSTORE_FILE);
+        let ks =
+            Keystore::open(path, &keystore_password()).map_err(|e| format!("keystore: {e:?}"))?;
+        if is_primary {
+            persist_binding(&ks, &identity, &binding)?;
+            self.node_identity = identity;
+            self.node.config.identity = NodeIdentity {
+                identity: self.node_identity.identity.clone(),
+                static_handshake: self.node_identity.static_handshake.clone(),
+            };
+            self.node.config.dcid = self.node_identity.endpoint_id()[..8].to_vec();
+            self.ticket_key = ticket_key_for(&self.node_identity);
+            self.primary_binding = binding.clone();
+        } else {
+            let updated = SecondaryIdentity {
+                identity: NodeIdentity {
+                    identity: identity.identity,
+                    static_handshake: identity.static_handshake,
+                },
+                record_name: self.secondaries[index].record_name.clone(),
+                kind: self.secondaries[index].kind,
+                label: self.secondaries[index].label.clone(),
+                binding: binding.clone(),
+                created_at_ms: self.secondaries[index].created_at_ms,
+            };
+            persist_secondary(&ks, &updated)?;
+            self.secondaries[index] = updated;
+        }
+        Ok(binding)
+    }
+
+    /// `IdentityService.CreateIdentity` (task F2): generate a fresh
+    /// secondary identity, store it in the keystore under a new record,
+    /// and register it. The primary node identity is never touched.
+    ///
+    /// # Errors
+    /// Returns a message when the keystore write fails.
+    pub fn create_secondary_identity(
+        &mut self,
+        kind: i32,
+        label: &str,
+        lifetime_ms: u64,
+    ) -> Result<SecondaryIdentity, String> {
+        let now = wall_now().0;
+        let identity = NodeIdentity::generate(&OsEntropy);
+        let binding = IdentityBinding::sign(
+            &identity.identity,
+            &identity.static_handshake.public(),
+            now,
+            if lifetime_ms == 0 {
+                u64::MAX
+            } else {
+                now.saturating_add(lifetime_ms)
+            },
+            0,
+            [0u8; 32],
+        );
+        let path = self.config.resolved_keystore_dir().join(KEYSTORE_FILE);
+        let ks =
+            Keystore::open(path, &keystore_password()).map_err(|e| format!("keystore: {e:?}"))?;
+        let mut index = load_secondary_index(&ks)?;
+        let secondary = SecondaryIdentity {
+            identity,
+            record_name: format!("secondary-{}", index.next_id),
+            kind,
+            label: label.to_string(),
+            binding,
+            created_at_ms: now,
+        };
+        persist_secondary(&ks, &secondary)?;
+        index.next_id = index.next_id.saturating_add(1);
+        index.entries.push(SecondaryIndexEntry {
+            record_name: secondary.record_name.clone(),
+            kind,
+            label: label.to_string(),
+            created_at_ms: now,
+        });
+        persist_secondary_index(&ks, &index)?;
+        let clone = secondary.clone_identity();
+        self.secondaries.push(secondary);
+        Ok(clone)
+    }
+
+    /// `IdentityService.DeleteIdentity` (task F2): remove a secondary
+    /// identity from the registry and the keystore. The primary cannot be
+    /// deleted (the caller rejects the primary handle).
+    ///
+    /// # Errors
+    /// Returns a message when the handle is unknown or the keystore write
+    /// fails.
+    pub fn delete_secondary_identity(&mut self, handle: &[u8]) -> Result<(), String> {
+        let record_name = String::from_utf8(handle.to_vec())
+            .map_err(|_| "identity: invalid handle".to_string())?;
+        let Some(index) = self
+            .secondaries
+            .iter()
+            .position(|entry| entry.record_name == record_name)
+        else {
+            return Err("identity: unknown handle".into());
+        };
+        let path = self.config.resolved_keystore_dir().join(KEYSTORE_FILE);
+        let ks =
+            Keystore::open(path, &keystore_password()).map_err(|e| format!("keystore: {e:?}"))?;
+        ks.delete(KeyClass::IdentitySigning, handle)
+            .map_err(|e| format!("keystore delete: {e:?}"))?;
+        let mut idx = load_secondary_index(&ks)?;
+        idx.entries.retain(|entry| entry.record_name != record_name);
+        persist_secondary_index(&ks, &idx)?;
+        self.secondaries.remove(index);
+        Ok(())
+    }
+
+    /// `IdentityService.ImportIdentity` (task F2): import raw
+    /// `[identity_seed || static_seed]` material as a NEW secondary
+    /// identity. The primary is never replaced by an import. When
+    /// `validate_only` is set the seeds are validated and the would-be
+    /// identity reported without touching the keystore or registry.
+    ///
+    /// # Errors
+    /// Returns a message when the seeds are malformed or the keystore
+    /// write fails.
+    pub fn import_secondary_identity(
+        &mut self,
+        seeds: &[u8],
+        label: &str,
+        validate_only: bool,
+    ) -> Result<SecondaryIdentity, String> {
+        let identity_seed: [u8; 32] = seeds
+            .get(..32)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| "identity: import requires 64 bytes of seeds".to_string())?;
+        let static_seed: [u8; 32] = seeds
+            .get(32..64)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| "identity: import requires 64 bytes of seeds".to_string())?;
+        let identity = NodeIdentity {
+            identity: IdentityKeyPair::from_seed(identity_seed),
+            static_handshake: StaticHandshakeKeyPair::from_seed(static_seed),
+        };
+        let now = wall_now().0;
+        let binding = IdentityBinding::sign(
+            &identity.identity,
+            &identity.static_handshake.public(),
+            now,
+            u64::MAX,
+            0,
+            [0u8; 32],
+        );
+        let path = self.config.resolved_keystore_dir().join(KEYSTORE_FILE);
+        let ks =
+            Keystore::open(path, &keystore_password()).map_err(|e| format!("keystore: {e:?}"))?;
+        let mut index = load_secondary_index(&ks)?;
+        let secondary = SecondaryIdentity {
+            identity,
+            record_name: format!("secondary-{}", index.next_id),
+            kind: 0,
+            label: label.to_string(),
+            binding,
+            created_at_ms: now,
+        };
+        if validate_only {
+            // Validate-only: report the identity the seeds would create
+            // without touching the keystore or registry.
+            return Ok(secondary);
+        }
+        persist_secondary(&ks, &secondary)?;
+        index.next_id = index.next_id.saturating_add(1);
+        index.entries.push(SecondaryIndexEntry {
+            record_name: secondary.record_name.clone(),
+            kind: secondary.kind,
+            label: label.to_string(),
+            created_at_ms: now,
+        });
+        persist_secondary_index(&ks, &index)?;
+        let clone = secondary.clone_identity();
+        self.secondaries.push(secondary);
+        Ok(clone)
+    }
+
+    /// Resolve an identity handle to `(is_primary, secondary_index)`.
+    ///
+    /// # Errors
+    /// Returns a message for unknown or non-UTF-8 handles.
+    fn resolve_target(&self, handle: &[u8]) -> Result<(bool, usize), String> {
+        if handle == NODE_IDENTITY_RECORD {
+            return Ok((true, 0));
+        }
+        let record_name = String::from_utf8(handle.to_vec())
+            .map_err(|_| "identity: invalid handle".to_string())?;
+        self.secondaries
+            .iter()
+            .position(|entry| entry.record_name == record_name)
+            .map(|index| (false, index))
+            .ok_or_else(|| "identity: unknown handle".into())
+    }
+}
+
+/// A resolved identity reference (task F2): the primary or a secondary.
+#[derive(Debug, Clone, Copy)]
+pub enum IdentityRef<'a> {
+    Primary,
+    Secondary(&'a SecondaryIdentity),
+}
+
+impl SecondaryIdentity {
+    /// A deep copy: `NodeIdentity` is not `Clone`, so the registry keeps
+    /// its own copy while the caller takes one.
+    fn clone_identity(&self) -> Self {
+        SecondaryIdentity {
+            identity: NodeIdentity {
+                identity: self.identity.identity.clone(),
+                static_handshake: self.identity.static_handshake.clone(),
+            },
+            record_name: self.record_name.clone(),
+            kind: self.kind,
+            label: self.label.clone(),
+            binding: self.binding.clone(),
+            created_at_ms: self.created_at_ms,
+        }
     }
 }
 
@@ -411,6 +1013,10 @@ pub mod metric_names {
     pub const CONTROL_REQUESTS_ROUTE: &str = "control_requests_route";
     pub const CONTROL_REQUESTS_CONFIG: &str = "control_requests_config";
     pub const CONTROL_REQUESTS_DIAGNOSTICS: &str = "control_requests_diagnostics";
+    /// `IdentityService` (task F2).
+    pub const CONTROL_REQUESTS_IDENTITY: &str = "control_requests_identity";
+    /// `CarrierService` (task F2).
+    pub const CONTROL_REQUESTS_CARRIER: &str = "control_requests_carrier";
     pub const CONTROL_REQUESTS_OTHER: &str = "control_requests_other";
 }
 
@@ -419,10 +1025,8 @@ mod tests {
     use super::*;
     use crate::config::NodeConfig;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn fresh_config() -> NodeConfig {
         let dir = std::env::temp_dir().join(format!(
@@ -438,9 +1042,11 @@ mod tests {
     }
 
     /// Runs `f` with `UMC_KEYSTORE_PASSWORD` set; env mutation is
-    /// serialized so parallel tests cannot observe each other's password.
+    /// serialized so parallel tests cannot observe each other's password
+    /// (shared with the server.rs keystore tests via
+    /// `KEYSTORE_PASSWORD_TEST_LOCK`).
     fn with_password(password: &str, f: impl FnOnce()) {
-        let _guard = ENV_LOCK
+        let _guard = KEYSTORE_PASSWORD_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("UMC_KEYSTORE_PASSWORD", password);
@@ -462,6 +1068,182 @@ mod tests {
             drop(first);
             let second = build(config);
             assert_eq!(endpoint_id, second.node_identity.endpoint_id());
+        });
+    }
+
+    #[test]
+    fn rotate_handshake_key_changes_static_key_and_round_trips() {
+        with_password("test-password", || {
+            let config = fresh_config();
+            let mut first = build(config.clone());
+            let old_static = first.node_identity.static_handshake.public();
+            let old_sequence = first.primary_binding.sequence;
+            let binding = first
+                .rotate_handshake_key(crate::state::NODE_IDENTITY_RECORD, 0)
+                .expect("rotation");
+            assert_eq!(binding.sequence, old_sequence + 1, "sequence increments");
+            assert_ne!(
+                first.node_identity.static_handshake.public(),
+                old_static,
+                "the node switches to the new static key"
+            );
+            assert_eq!(
+                first.node.config.identity.static_handshake.public(),
+                first.node_identity.static_handshake.public(),
+                "the runtime node follows"
+            );
+            assert_eq!(
+                first.node_identity.endpoint_id(),
+                first.primary_binding.endpoint_id,
+                "the identity key is unchanged"
+            );
+            drop(first);
+
+            // Keystore round-trip: a fresh daemon over the same data dir
+            // restores the rotated static key AND the binding sequence.
+            let second = build(config);
+            assert_ne!(
+                second.node_identity.static_handshake.public(),
+                old_static,
+                "the rotated static key survives restart"
+            );
+            assert_eq!(
+                second.primary_binding.static_handshake_public_key,
+                second.node_identity.static_handshake.public(),
+                "the restored binding matches the restored static key"
+            );
+            assert_eq!(second.primary_binding.sequence, old_sequence + 1);
+        });
+    }
+
+    #[test]
+    fn rotate_identity_key_changes_endpoint_and_round_trips() {
+        with_password("test-password", || {
+            let config = fresh_config();
+            let mut first = build(config.clone());
+            let old_endpoint = first.node_identity.endpoint_id();
+            first
+                .rotate_identity_key(crate::state::NODE_IDENTITY_RECORD)
+                .expect("rotation");
+            let new_endpoint = first.node_identity.endpoint_id();
+            assert_ne!(new_endpoint, old_endpoint, "a full identity change");
+            assert_eq!(
+                first.node.config.dcid,
+                new_endpoint[..8],
+                "the node dcid follows the new endpoint"
+            );
+            assert_eq!(
+                first.node.config.identity.endpoint_id(),
+                new_endpoint,
+                "the runtime node follows"
+            );
+            drop(first);
+
+            let second = build(config);
+            assert_eq!(second.node_identity.endpoint_id(), new_endpoint);
+            assert_eq!(second.primary_binding.sequence, 1);
+        });
+    }
+
+    #[test]
+    fn secondaries_create_delete_and_restore() {
+        with_password("test-password", || {
+            let config = fresh_config();
+            let mut first = build(config.clone());
+            let secondary = first
+                .create_secondary_identity(
+                    umc_control::proto::umc::api::v1::IdentityKind::UserEndpoint as i32,
+                    "alice",
+                    0,
+                )
+                .expect("create");
+            assert_eq!(first.secondaries.len(), 1);
+            assert_eq!(first.secondaries[0].record_name, "secondary-0");
+            assert_eq!(first.secondaries[0].label, "alice");
+            assert_eq!(
+                first.secondaries[0].binding.endpoint_id,
+                secondary.identity.endpoint_id()
+            );
+            assert!(
+                first
+                    .identity_by_handle(secondary.record_name.as_bytes())
+                    .is_some(),
+                "the secondary resolves by handle"
+            );
+            drop(first);
+
+            // Restore: the index + record round-trip through the keystore.
+            let mut second = build(config.clone());
+            assert_eq!(second.secondaries.len(), 1);
+            assert_eq!(second.secondaries[0].record_name, "secondary-0");
+            assert_eq!(
+                second.secondaries[0].identity.endpoint_id(),
+                secondary.identity.endpoint_id()
+            );
+            assert_eq!(second.secondaries[0].binding.sequence, 0);
+
+            // Delete removes it from the registry and the keystore; the
+            // next create reuses the slot without collision.
+            second
+                .delete_secondary_identity(secondary.record_name.as_bytes())
+                .expect("delete");
+            assert!(second.secondaries.is_empty());
+            drop(second);
+
+            let mut third = build(config);
+            assert!(third.secondaries.is_empty(), "deleted stays deleted");
+            let fresh = third
+                .create_secondary_identity(0, "bob", 0)
+                .expect("create after delete");
+            assert_eq!(fresh.record_name, "secondary-1", "next_id advances");
+        });
+    }
+
+    #[test]
+    fn import_creates_a_secondary_and_never_touches_the_primary() {
+        with_password("test-password", || {
+            let config = fresh_config();
+            let mut state = build(config.clone());
+            let primary_endpoint = state.node_identity.endpoint_id();
+            let source = NodeIdentity::generate(&OsEntropy);
+            let mut seeds = Vec::with_capacity(64);
+            seeds.extend_from_slice(&source.identity.to_seed());
+            seeds.extend_from_slice(&source.static_handshake.to_seed());
+            let imported = state
+                .import_secondary_identity(&seeds, "imported", false)
+                .expect("import");
+            assert_eq!(imported.identity.endpoint_id(), source.endpoint_id());
+            assert_eq!(state.node_identity.endpoint_id(), primary_endpoint);
+            assert_eq!(state.secondaries.len(), 1);
+            drop(state);
+
+            let reopened = build(config);
+            assert_eq!(reopened.node_identity.endpoint_id(), primary_endpoint);
+            assert_eq!(
+                reopened.secondaries[0].identity.endpoint_id(),
+                source.endpoint_id()
+            );
+
+            // validate_only reports without storing.
+            let mut only = reopened;
+            let validated = only
+                .import_secondary_identity(&seeds, "validate", true)
+                .expect("validate");
+            assert_eq!(validated.identity.endpoint_id(), source.endpoint_id());
+            assert_eq!(only.secondaries.len(), 1, "validate-only stores nothing");
+        });
+    }
+
+    #[test]
+    fn import_rejects_malformed_seeds() {
+        with_password("test-password", || {
+            let mut state = build(fresh_config());
+            assert!(state
+                .import_secondary_identity(&[1u8; 32], "short", false)
+                .is_err());
+            assert!(state
+                .import_secondary_identity(&[1u8; 63], "short", false)
+                .is_err());
         });
     }
 
