@@ -1544,3 +1544,8 @@ A–K gap-closure plan:
     `privacy-min` capability is transcript-bound. The v1 daemon advertises
     and selects at most P1; requests above P1 fail explicitly and are never
     silently downgraded. P0 remains the default request.
+12. **Onion route envelope.** P2 route layers use independent UMP packet-key
+    derivations with a fixed `UMP-PRIVACY-ROUTE-v1` AAD and bounded opaque
+    transition descriptors. The relay primitive exposes only the next layer
+    or terminal destination context; direct-path and rendezvous wiring remain
+    deferred until the route policy is complete.
