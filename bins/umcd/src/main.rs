@@ -801,9 +801,19 @@ fn register_session(
     // AbortHandle so shutdown can still cancel the task.
     let abort_handle = task.abort_handle();
     let session_events = state.events.clone();
+    let runtime = runtime.clone();
     let closed_at_ms = now.0;
     tokio::spawn(async move {
         let _ = task.await;
+        // Cleanup runs for BOTH normal exits and aborts (CloseSession):
+        // the bus must not keep stale entries pointing at a dead session.
+        runtime
+            .lock()
+            .expect("runtime state")
+            .bus
+            .lock()
+            .expect("session bus")
+            .unregister(session_id);
         session_events
             .lock()
             .expect("event log")
