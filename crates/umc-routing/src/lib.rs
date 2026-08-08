@@ -7,4 +7,5 @@ pub mod request;
 pub mod response;
 pub mod reverse;
 pub mod score;
+pub mod sybil;
 pub mod types;

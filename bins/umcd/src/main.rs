@@ -149,7 +149,10 @@ async fn run(config: NodeConfig) {
     // (carriers.rs pushes listeners in config order).
     let carrier_types = state.lock().expect("state").config.carriers.clone();
     for carrier_type in carrier_types {
-        if matches!(carrier_type.as_str(), "ump.tcp/1" | "ump.udp/1") {
+        if matches!(
+            carrier_type.as_str(),
+            "ump.tcp/1" | "ump.udp/1" | "ump.tls-stream/1"
+        ) {
             if state
                 .lock()
                 .expect("state")

@@ -106,9 +106,9 @@ impl Node {
         &mut self,
         carrier_type: &str,
         remote: String,
-        server_identity_public: &NodeIdentity,
+        _server_identity_public: &NodeIdentity,
     ) -> Result<u64, NodeError> {
-        self.connect_to_endpoint(carrier_type, remote, server_identity_public.endpoint_id())
+        self.connect_with_endpoint_check(carrier_type, remote, None)
             .await
     }
 
@@ -125,6 +125,16 @@ impl Node {
         carrier_type: &str,
         remote: String,
         expected_endpoint_id: [u8; 32],
+    ) -> Result<u64, NodeError> {
+        self.connect_with_endpoint_check(carrier_type, remote, Some(expected_endpoint_id))
+            .await
+    }
+
+    async fn connect_with_endpoint_check(
+        &mut self,
+        carrier_type: &str,
+        remote: String,
+        expected_endpoint_id: Option<[u8; 32]>,
     ) -> Result<u64, NodeError> {
         let mut retried = false;
         loop {
@@ -148,7 +158,7 @@ impl Node {
         &mut self,
         carrier_type: &str,
         remote: String,
-        expected_endpoint_id: [u8; 32],
+        expected_endpoint_id: Option<[u8; 32]>,
     ) -> Result<u64, NodeError> {
         let carrier = self
             .carrier(carrier_type)
@@ -245,7 +255,8 @@ impl Node {
             carrier_type.as_bytes(),
         )
         .map_err(NodeError::Handshake)?;
-        if handshake_out.server_endpoint_id != expected_endpoint_id {
+        if expected_endpoint_id.is_some_and(|expected| handshake_out.server_endpoint_id != expected)
+        {
             return Err(NodeError::Handshake(
                 "server endpoint id does not match static peer".into(),
             ));
@@ -389,7 +400,7 @@ impl Node {
             id,
             SessionEntry {
                 secrets: handshake_out.session_secrets,
-                peer_endpoint_id: expected_endpoint_id,
+                peer_endpoint_id: handshake_out.server_endpoint_id,
             },
         );
         Ok(id)

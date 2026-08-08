@@ -19,6 +19,7 @@ umc-wire = { path = "../../crates/umc-wire" }
 umc-session = { path = "../../crates/umc-session" }
 umc-crypto = { path = "../../crates/umc-crypto" }
 umc-carrier-tcp = { path = "../../carriers/umc-carrier-tcp" }
+umc-carrier-tls = { path = "../../carriers/umc-carrier-tls" }
 umc-carrier-udp = { path = "../../carriers/umc-carrier-udp" }
 umc-carrier-lan = { path = "../../carriers/umc-carrier-lan" }
 serde = { version = "1", features = ["derive"] }
