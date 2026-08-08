@@ -288,7 +288,7 @@ impl WaitFor {
 /// the status body is decoded directly.
 fn status_from_protected(keys: &PacketKeys, hp_key: &[u8; 32], bytes: &[u8]) -> Option<u64> {
     let (_space, _dcid, _path, _pn, payload) =
-        umc_session::packet::parse_protected_packet(keys, hp_key, bytes).ok()?;
+        umc_session::packet::parse_protected_packet(keys, hp_key, 0, bytes).ok()?;
     let mut pos = 0usize;
     while pos < payload.len() {
         let (ty, used) = umc_wire::varint::decode(&payload[pos..]).ok()?;
@@ -316,6 +316,7 @@ fn status_from_protected(keys: &PacketKeys, hp_key: &[u8; 32], bytes: &[u8]) -> 
 /// (bus-forwarded) frames the session layer refuses. Runs until `wait_for`
 /// is satisfied, then returns so the caller can release the link's stream
 /// mutex before the next send phase.
+#[allow(clippy::too_many_arguments)]
 async fn recv_until(
     link: &Arc<BoxLink>,
     session: &Arc<Mutex<Session>>,
