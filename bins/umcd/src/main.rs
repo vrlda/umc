@@ -141,6 +141,7 @@ async fn run(config: NodeConfig) {
     // the accept loops and the control socket both mutate it, so it rides
     // behind one mutex.
     let state = Arc::new(std::sync::Mutex::new(state));
+    state.lock().expect("state").self_arc = Arc::downgrade(&state);
 
     // One accept loop per bound listener, paired with its carrier type
     // (carriers.rs pushes listeners in config order).
@@ -183,7 +184,7 @@ async fn run(config: NodeConfig) {
 /// Per-listener accept loop (core.md §8): accept a link, hand it to the
 /// inbound handler, and keep accepting. The handshake tracker is shared
 /// across links so per-connection-id retry storms are capped.
-async fn accept_loop(
+pub(crate) async fn accept_loop(
     state: &Arc<std::sync::Mutex<state::RuntimeState>>,
     carrier_type: String,
     listener: Box<dyn Listener + Send + Sync>,
