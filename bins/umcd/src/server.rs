@@ -3,15 +3,19 @@
 use crate::config::NodeConfig;
 use crate::doctor;
 use crate::relay_service::CircuitOpenRequest;
-use crate::state::{metric_names, RuntimeState};
+use crate::runtime_adapters::OsEntropy;
+use crate::state::{metric_names, wall_now, RuntimeState};
 use prost::Message;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use umc_bundle::manager::BundleStatus;
+use umc_control::conn::SequenceTracker;
 use umc_control::framing::{frame_envelope, EnvelopeDecoder};
+use umc_control::pages::PageToken;
 use umc_control::proto::umc::api::v1 as api;
 use umc_storage::sqlite::SqliteStore;
 
@@ -20,6 +24,18 @@ const DEFAULT_ENVELOPE_MAX: usize = 4 * 1024 * 1024;
 /// Concurrent control connections are capped (control-api.md §16): the 65th
 /// connection is refused until an earlier one closes.
 pub const MAX_CONTROL_CONNECTIONS: usize = 64;
+
+/// Idempotency replay retention (control-api.md §18): the gap-closure plan
+/// calls for 10 minutes; the spec's 24-hour retention needs the persistent
+/// store that lands in a later phase.
+const IDEMPOTENCY_TTL_MS: u64 = 10 * 60 * 1000;
+/// Idempotency replay entries retained per connection (bounded FIFO).
+const IDEMPOTENCY_CACHE_CAP: usize = 1_024;
+/// Default list page size (control-api.md §37).
+const DEFAULT_PAGE_SIZE: usize = 100;
+/// Page-size cap for list methods (task F1): tighter than the spec's
+/// hard maximum of 1,000.
+const MAX_PAGE_SIZE: usize = 100;
 
 /// Wire request for `RelayService.OpenCircuit` (relay.md §13). No proto
 /// message exists yet; the control surface carries these fields until the
@@ -108,6 +124,13 @@ pub async fn run(state: Arc<Mutex<RuntimeState>>) {
     }
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).expect("bind socket");
+    // OS peer-credential authorization (control-api.md §11.1): the daemon's
+    // uid is the control socket's owner — the daemon bound it (std has no
+    // geteuid, so the socket owner stands in for the daemon's uid; the two
+    // differ only for a setuid daemon, which umcd does not support).
+    let daemon_uid = std::os::unix::fs::MetadataExt::uid(
+        &std::fs::metadata(&socket_path).expect("control socket metadata"),
+    );
     log::info!("control socket: {}", socket_path.display());
     log::info!("node initialized");
 
@@ -125,7 +148,7 @@ pub async fn run(state: Arc<Mutex<RuntimeState>>) {
             accepted = listener.accept() => {
                 if let Ok((stream, _)) = accepted {
                     let state = state.clone();
-                    if !admit_connection(&connections, stream, state) {
+                    if !admit_connection(&connections, stream, state, daemon_uid) {
                         log::warn!("control socket: connection refused (cap {MAX_CONTROL_CONNECTIONS})");
                     }
                 }
@@ -143,11 +166,12 @@ fn admit_connection(
     connections: &Arc<tokio::sync::Semaphore>,
     stream: UnixStream,
     state: Arc<Mutex<RuntimeState>>,
+    daemon_uid: u32,
 ) -> bool {
     let Ok(permit) = connections.clone().try_acquire_owned() else {
         return false;
     };
-    tokio::spawn(handle_connection(stream, state, permit));
+    tokio::spawn(handle_connection(stream, state, permit, daemon_uid));
     true
 }
 
@@ -155,12 +179,22 @@ async fn handle_connection(
     mut stream: UnixStream,
     state: Arc<Mutex<RuntimeState>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
+    daemon_uid: u32,
 ) {
+    // OS peer-credential authorization (control-api.md §11.1): the peer uid
+    // on the Unix control socket must equal the daemon's uid; any other
+    // local user's connection is refused before any envelope is read. The
+    // control socket is always a Unix stream socket (config.rs
+    // `control_socket`), so no TCP or non-Unix path exists to skip; a
+    // hypothetical loopback-TCP transport would have to bypass this check
+    // (control-api.md §48.7 — loopback TCP lacks peer credentials).
+    if !os_peer_authorized(&stream, daemon_uid) {
+        log::warn!("control socket: peer uid mismatch, refusing connection");
+        return;
+    }
     let mut decoder = EnvelopeDecoder::new(DEFAULT_ENVELOPE_MAX);
     let mut buf = [0u8; 8 * 1024];
-    // The credential presented at hello time gates every request on this
-    // connection (control-api.md §11, §23).
-    let mut presented_token: Option<Vec<u8>> = None;
+    let mut conn = ConnectionState::new();
     loop {
         let Ok(n) = stream.read(&mut buf).await else {
             break;
@@ -177,22 +211,179 @@ async fn handle_connection(
             };
             let response = {
                 let mut state = state.lock().expect("runtime state");
-                match msg.body {
-                    Some(api::envelope::Body::ClientHello(hello)) => {
-                        presented_token = hello_token(&hello);
-                        handle_hello(&hello, &state.store)
-                    }
-                    Some(api::envelope::Body::Request(request)) => {
-                        dispatch_request(&mut state, &request, presented_token.as_deref())
-                    }
-                    _ => continue,
-                }
+                handle_envelope(&mut conn, &mut state, msg)
+            };
+            let Some(response) = response else {
+                continue;
             };
             let mut out = Vec::new();
             if frame_envelope(&mut out, &response, DEFAULT_ENVELOPE_MAX).is_ok() {
                 let _ = stream.write_all(&out).await;
             }
         }
+        if conn.draining {
+            // GoAway: the current batch drained; close the connection
+            // (control-api.md §6.4).
+            log::info!("[control] connection drained after go-away, closing");
+            break;
+        }
+    }
+}
+
+/// Unix-socket peer-credential check (control-api.md §11.1): the peer must
+/// report the daemon's uid via `SO_PEERCRED` (tokio `peer_cred`).
+fn os_peer_authorized(stream: &UnixStream, daemon_uid: u32) -> bool {
+    match stream.peer_cred() {
+        Ok(peer) => peer.uid() == daemon_uid,
+        Err(_) => false,
+    }
+}
+
+/// Per-connection control protocol state (control-api.md §6-7): the
+/// credential presented at hello, the per-connection envelope sequence
+/// tracker, the draining flag set by a peer `GoAway`, and the bounded
+/// idempotency replay cache. Dispatch is strictly sequential — one
+/// envelope at a time — so `Cancel` and `GoAway` can only arrive between
+/// requests.
+#[derive(Debug)]
+struct ConnectionState {
+    presented_token: Option<Vec<u8>>,
+    sequences: SequenceTracker,
+    draining: bool,
+    idempotent: IdempotencyCache,
+}
+
+impl ConnectionState {
+    #[must_use]
+    fn new() -> Self {
+        Self {
+            presented_token: None,
+            sequences: SequenceTracker::new(),
+            draining: false,
+            idempotent: IdempotencyCache::new(),
+        }
+    }
+}
+
+/// Bounded per-connection idempotency replay cache (control-api.md §18):
+/// `(request_id, idempotency_key)` → stored response bytes, 10-minute TTL,
+/// FIFO eviction at 1,024 entries. A replay returns the stored bytes
+/// without re-dispatching.
+#[derive(Debug, Default)]
+struct IdempotencyCache {
+    entries: HashMap<(u64, Vec<u8>), (Vec<u8>, u64)>,
+    order: VecDeque<(u64, Vec<u8>)>,
+}
+
+impl IdempotencyCache {
+    #[must_use]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Store `response` for `key` stamped at `now_ms`; re-keying an existing
+    /// entry refreshes it, otherwise the oldest entry is evicted once the
+    /// FIFO cap is exceeded.
+    fn insert(&mut self, key: (u64, Vec<u8>), response: Vec<u8>, now_ms: u64) {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.0 = response;
+            entry.1 = now_ms;
+            return;
+        }
+        self.entries.insert(key.clone(), (response, now_ms));
+        self.order.push_back(key);
+        while self.order.len() > IDEMPOTENCY_CACHE_CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    /// The stored bytes for `key` when it is fresh at `now_ms`.
+    fn get(&self, key: &(u64, Vec<u8>), now_ms: u64) -> Option<Vec<u8>> {
+        let (response, inserted_at) = self.entries.get(key)?;
+        (now_ms < inserted_at + IDEMPOTENCY_TTL_MS).then(|| response.clone())
+    }
+}
+
+/// Handle one decoded envelope on a connection. Returns the response bytes
+/// to write back, or `None` when the envelope is dropped or produces no
+/// response.
+///
+/// Envelope sequences must be monotonic per connection (control-api.md §7):
+/// zero, reuse, or decrease drops the envelope silently (task F1 — the
+/// spec's close-on-conflict is softened because sequential dispatch makes
+/// conflicts harmless).
+///
+/// `Cancel` is a logged no-op: dispatch is sequential, so the request it
+/// targets already completed (control-api.md §21). `GoAway` sets the
+/// draining flag — later requests fail with `Unavailable` and the
+/// connection closes after the current batch.
+fn handle_envelope(
+    conn: &mut ConnectionState,
+    state: &mut RuntimeState,
+    envelope: api::Envelope,
+) -> Option<Vec<u8>> {
+    if conn.sequences.observe(envelope.sequence).is_err() {
+        log::debug!(
+            "[control] dropped envelope with sequence {}",
+            envelope.sequence
+        );
+        return None;
+    }
+    match envelope.body {
+        Some(api::envelope::Body::ClientHello(hello)) => {
+            conn.presented_token = hello_token(&hello);
+            Some(handle_hello(&hello, &state.store))
+        }
+        Some(api::envelope::Body::Request(request)) => {
+            if conn.draining {
+                // GoAway received: new requests fail (control-api.md §6.4).
+                return Some(response_envelope(
+                    &request,
+                    api::StatusCode::Unavailable as i32,
+                    None,
+                ));
+            }
+            if !request.idempotency_key.is_empty() {
+                let key = (request.request_id, request.idempotency_key.clone());
+                let now_ms = wall_now().0;
+                if let Some(stored) = conn.idempotent.get(&key, now_ms) {
+                    log::debug!(
+                        "[control] idempotent replay for request {}",
+                        request.request_id
+                    );
+                    return Some(stored);
+                }
+                let response = dispatch_request(state, &request, conn.presented_token.as_deref());
+                conn.idempotent.insert(key, response.clone(), now_ms);
+                return Some(response);
+            }
+            Some(dispatch_request(
+                state,
+                &request,
+                conn.presented_token.as_deref(),
+            ))
+        }
+        Some(api::envelope::Body::Cancel(cancel)) => {
+            // Sequential dispatch makes cancellation moot (control-api.md
+            // §21): the targeted request completed before this envelope was
+            // read. Logged, never answered.
+            log::debug!(
+                "[control] cancel for request {} ignored (sequential dispatch)",
+                cancel.request_id
+            );
+            None
+        }
+        Some(api::envelope::Body::GoAway(go_away)) => {
+            log::info!(
+                "[control] go-away received (reason {}): draining",
+                go_away.reason
+            );
+            conn.draining = true;
+            None
+        }
+        _ => None,
     }
 }
 
@@ -261,11 +452,11 @@ fn dispatch_request(
     let (code, payload) = match (request.service.as_str(), request.method.as_str()) {
         ("NodeAdmin", "GetStatus") => get_status(state),
         ("PeerService" | "DiscoveryService", "ListCandidates") => list_candidates(state),
-        ("PeerService", "ListPeers") => list_peers(state),
-        ("SessionService", "ListSessions") => list_sessions(state),
+        ("PeerService", "ListPeers") => list_peers(state, request),
+        ("SessionService", "ListSessions") => list_sessions(state, request),
         ("SessionService", "GetSession") => get_session(state, request),
-        ("RouteService", "ListRoutes") => list_routes(state),
-        ("BundleService", "GetBundles" | "ListBundles") => list_bundles(state),
+        ("RouteService", "ListRoutes") => list_routes(state, request),
+        ("BundleService", "GetBundles" | "ListBundles") => list_bundles(state, request),
         ("BundleService", "CreateBundle") => create_bundle(state, request),
         ("RelayService", "OpenCircuit") => open_circuit(state, request),
         ("RelayService", "CloseCircuit") => close_circuit(state, request),
@@ -346,14 +537,69 @@ fn list_candidates(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
     (api::StatusCode::Ok as i32, Some(payload))
 }
 
+/// Resolve the `(offset, page_size)` window for one list request
+/// (control-api.md §37): `page_size` 0 means the default, anything above
+/// the cap is clamped to 100, and the offset comes from the validated page
+/// token — bound to the placeholder principal 0 (no principal model exists
+/// yet) and the method name, expiring after 5 minutes.
+fn page_window(page: Option<&api::PageRequest>, method: &str) -> Result<(usize, usize), ()> {
+    let page = page.cloned().unwrap_or_default();
+    let page_size = if page.page_size == 0 {
+        DEFAULT_PAGE_SIZE
+    } else {
+        usize::try_from(page.page_size).unwrap_or(DEFAULT_PAGE_SIZE)
+    }
+    .min(MAX_PAGE_SIZE);
+    if page.page_token.is_empty() {
+        return Ok((0, page_size));
+    }
+    let token = PageToken::decode(&page.page_token).ok_or(())?;
+    if !token.validate(0, method, wall_now().0) {
+        return Err(());
+    }
+    let offset = usize::try_from(token.offset).unwrap_or(usize::MAX);
+    Ok((offset, page_size))
+}
+
+/// `PageInfo` for a windowed result (control-api.md §37): a fresh
+/// `next_page_token` when more items follow, the total as the size hint.
+fn page_info(total: usize, offset: usize, page_size: usize, method: &str) -> api::PageInfo {
+    let next_page_token = if offset + page_size < total {
+        PageToken::issue(
+            u64::try_from(offset + page_size).unwrap_or(u64::MAX),
+            0,
+            method,
+            wall_now().0,
+            &OsEntropy,
+        )
+        .encode()
+    } else {
+        Vec::new()
+    };
+    api::PageInfo {
+        next_page_token,
+        snapshot_token: Vec::new(),
+        total_size_hint: u64::try_from(total).unwrap_or(u64::MAX),
+    }
+}
+
 /// `PeerService.ListPeers`: the discovery candidate table snapshot
 /// (discovery.md §6) as the v1 peer table. The candidate id is the peer's
-/// provisional id; the carrier type doubles as the label.
-fn list_peers(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
-    let peers = state
-        .discovery
-        .candidates()
+/// provisional id; the carrier type doubles as the label. Paginated
+/// (control-api.md §37).
+fn list_peers(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(list) = api::ListPeersRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok((offset, page_size)) = page_window(list.page.as_ref(), "ListPeers") else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let all: Vec<_> = state.discovery.candidates();
+    let total = all.len();
+    let peers = all
         .into_iter()
+        .skip(offset)
+        .take(page_size)
         .map(|candidate| api::PeerSummary {
             endpoint_id: candidate.candidate_id.to_be_bytes().to_vec(),
             label: candidate.carrier_type.clone(),
@@ -365,7 +611,7 @@ fn list_peers(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
         .collect();
     let response = api::ListPeersResponse {
         peers,
-        ..Default::default()
+        page: Some(page_info(total, offset, page_size, "ListPeers")),
     };
     let mut payload = Vec::new();
     Message::encode(&response, &mut payload).expect("encode");
@@ -374,17 +620,26 @@ fn list_peers(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
 
 /// `SessionService.ListSessions`: the live session registry (core.md §9.5).
 /// The v1 registry tracks the carrier a session rides on, not a separate
-/// protocol id, so the carrier type rides in `protocol_id`.
-fn list_sessions(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
-    let sessions = state
-        .sessions
-        .snapshot()
+/// protocol id, so the carrier type rides in `protocol_id`. Paginated
+/// (control-api.md §37).
+fn list_sessions(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(list) = api::ListSessionsRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok((offset, page_size)) = page_window(list.page.as_ref(), "ListSessions") else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let all = state.sessions.snapshot();
+    let total = all.len();
+    let sessions = all
         .into_iter()
+        .skip(offset)
+        .take(page_size)
         .map(|(id, entry)| session_summary(id, &entry))
         .collect();
     let response = api::ListSessionsResponse {
         sessions,
-        ..Default::default()
+        page: Some(page_info(total, offset, page_size, "ListSessions")),
     };
     let mut payload = Vec::new();
     Message::encode(&response, &mut payload).expect("encode");
@@ -437,8 +692,15 @@ fn session_summary(id: u64, entry: &crate::session_manager::SessionEntry) -> api
 
 /// `RouteService.ListRoutes`: the persisted route snapshots (storage.md
 /// §15.1) — the same table the cache restores from at startup (§15.2), so
-/// restored routes list as `candidate` until revalidated.
-fn list_routes(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
+/// restored routes list as `candidate` until revalidated. Paginated
+/// (control-api.md §37).
+fn list_routes(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(list) = api::ListRoutesRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok((offset, page_size)) = page_window(list.page.as_ref(), "ListRoutes") else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
     let snapshots = match umc_storage::records::list_routes(state.store.as_ref()) {
         Ok(snapshots) => snapshots,
         Err(e) => {
@@ -446,8 +708,11 @@ fn list_routes(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
             return (api::StatusCode::Internal as i32, None);
         }
     };
+    let total = snapshots.len();
     let routes = snapshots
         .into_iter()
+        .skip(offset)
+        .take(page_size)
         .map(|snapshot| api::RouteSummary {
             route_handle: Some(api::OpaqueHandle {
                 value: snapshot.key_hash.clone(),
@@ -467,7 +732,7 @@ fn list_routes(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
         .collect();
     let response = api::ListRoutesResponse {
         routes,
-        ..Default::default()
+        page: Some(page_info(total, offset, page_size, "ListRoutes")),
     };
     let mut payload = Vec::new();
     Message::encode(&response, &mut payload).expect("encode");
@@ -487,12 +752,21 @@ fn route_scope_from_u8(scope: u8) -> i32 {
     }
 }
 
-/// `BundleService.ListBundles`: bundle listing, bounded to 100.
-fn list_bundles(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
-    let bundles = state
-        .bundle
-        .list()
+/// `BundleService.ListBundles`: bundle listing, bounded to 100 per page
+/// (control-api.md §37).
+fn list_bundles(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(list) = api::ListBundlesRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok((offset, page_size)) = page_window(list.page.as_ref(), "ListBundles") else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let all: Vec<_> = state.bundle.list();
+    let total = all.len();
+    let bundles = all
         .into_iter()
+        .skip(offset)
+        .take(page_size)
         .map(|(id, size, status)| api::BundleSummary {
             bundle_id: id,
             payload_size: u64::try_from(size).unwrap_or(u64::MAX),
@@ -502,7 +776,7 @@ fn list_bundles(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
         .collect();
     let response = api::ListBundlesResponse {
         bundles,
-        ..Default::default()
+        page: Some(page_info(total, offset, page_size, "ListBundles")),
     };
     let mut payload = Vec::new();
     Message::encode(&response, &mut payload).expect("encode");
@@ -1870,6 +2144,12 @@ mod tests {
         let (state, _tx) = test_state();
         let state = Arc::new(Mutex::new(state));
         let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONTROL_CONNECTIONS));
+        // The daemon uid for the peer-credential check: a file this process
+        // created is owned by its own uid.
+        let daemon_uid = std::os::unix::fs::MetadataExt::uid(
+            &std::fs::metadata(&state.lock().expect("runtime state").config.data_dir)
+                .expect("data dir metadata"),
+        );
         // Fill the cap: every admitted connection holds a permit while its
         // peer end stays open.
         let mut peers = Vec::new();
@@ -1877,14 +2157,14 @@ mod tests {
             let (stream, peer) = UnixStream::pair().expect("pair");
             peers.push(peer);
             assert!(
-                admit_connection(&connections, stream, state.clone()),
+                admit_connection(&connections, stream, state.clone(), daemon_uid),
                 "connection {MAX_CONTROL_CONNECTIONS} within cap must be admitted"
             );
         }
         // The 65th connection is refused while the cap is full.
         let (stream, peer) = UnixStream::pair().expect("pair");
         assert!(
-            !admit_connection(&connections, stream, state.clone()),
+            !admit_connection(&connections, stream, state.clone(), daemon_uid),
             "65th control connection must be refused"
         );
         drop(peer);
@@ -1904,6 +2184,341 @@ mod tests {
         .expect("permit released after connection close");
         let (stream, peer) = UnixStream::pair().expect("pair");
         peers.push(peer);
-        assert!(admit_connection(&connections, stream, state.clone()));
+        assert!(admit_connection(
+            &connections,
+            stream,
+            state.clone(),
+            daemon_uid
+        ));
+    }
+
+    // --- Task F1: envelope-level protocol completion ---
+
+    fn envelope(sequence: u64, body: api::envelope::Body) -> api::Envelope {
+        api::Envelope {
+            api_version: Some(api::ApiVersion { major: 1, minor: 0 }),
+            sequence,
+            body: Some(body),
+        }
+    }
+
+    fn request_envelope(sequence: u64, req: api::Request) -> api::Envelope {
+        envelope(sequence, api::envelope::Body::Request(req))
+    }
+
+    #[test]
+    fn duplicate_or_stale_envelope_sequence_is_dropped_silently() {
+        let (mut state, _tx) = test_state();
+        let mut conn = ConnectionState::new();
+        // Sequence 1 (hello) is accepted; replaying it is a duplicate and
+        // must not produce any response (control-api.md §7).
+        assert!(handle_envelope(
+            &mut conn,
+            &mut state,
+            envelope(
+                1,
+                api::envelope::Body::ClientHello(api::ClientHello::default())
+            ),
+        )
+        .is_some());
+        let req = request("NodeAdmin", "GetStatus", vec![]);
+        assert!(handle_envelope(&mut conn, &mut state, request_envelope(2, req.clone())).is_some());
+        assert!(
+            handle_envelope(&mut conn, &mut state, request_envelope(2, req)).is_none(),
+            "a reused sequence must be dropped silently"
+        );
+        assert!(
+            handle_envelope(
+                &mut conn,
+                &mut state,
+                request_envelope(1, request("NodeAdmin", "GetStatus", vec![])),
+            )
+            .is_none(),
+            "a stale (decreasing) sequence must be dropped silently"
+        );
+        // Gaps are tolerated: 9 after 2 advances the tracker.
+        assert!(handle_envelope(
+            &mut conn,
+            &mut state,
+            request_envelope(9, request("NodeAdmin", "GetStatus", vec![])),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn go_away_drains_then_rejects_new_requests() {
+        let (mut state, _tx) = test_state();
+        let mut conn = ConnectionState::new();
+        assert!(!conn.draining);
+        assert!(handle_envelope(
+            &mut conn,
+            &mut state,
+            envelope(
+                1,
+                api::envelope::Body::GoAway(api::GoAway {
+                    reason: api::GoAwayReason::Normal as i32,
+                    ..Default::default()
+                }),
+            ),
+        )
+        .is_none());
+        assert!(conn.draining, "go-away sets the draining flag");
+        // New requests after GoAway fail with Unavailable (control-api.md
+        // §6.4).
+        let bytes = handle_envelope(
+            &mut conn,
+            &mut state,
+            request_envelope(2, request("NodeAdmin", "GetStatus", vec![])),
+        )
+        .expect("draining request response");
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::Unavailable as i32
+        );
+    }
+
+    #[test]
+    fn idempotent_replay_returns_stored_bytes_without_redispatch() {
+        let (mut state, _tx) = test_state();
+        let mut conn = ConnectionState::new();
+        let mut req = request("NodeAdmin", "GetStatus", vec![]);
+        req.idempotency_key = b"retry-key".to_vec();
+        let first = handle_envelope(&mut conn, &mut state, request_envelope(1, req.clone()))
+            .expect("first dispatch");
+        assert_eq!(
+            state
+                .metrics
+                .get(crate::state::metric_names::CONTROL_REQUESTS_NODEADMIN),
+            Some(1)
+        );
+        let replay = handle_envelope(&mut conn, &mut state, request_envelope(2, req))
+            .expect("replay response");
+        assert_eq!(
+            first, replay,
+            "a replay must return the byte-identical stored response"
+        );
+        assert_eq!(
+            state
+                .metrics
+                .get(crate::state::metric_names::CONTROL_REQUESTS_NODEADMIN),
+            Some(1),
+            "a replay must not re-dispatch"
+        );
+        // A different key is a fresh request.
+        let mut other = request("NodeAdmin", "GetStatus", vec![]);
+        other.idempotency_key = b"another-key".to_vec();
+        handle_envelope(&mut conn, &mut state, request_envelope(3, other));
+        assert_eq!(
+            state
+                .metrics
+                .get(crate::state::metric_names::CONTROL_REQUESTS_NODEADMIN),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn unauthenticated_responses_are_byte_identical_across_services() {
+        let (mut state, _tx) = test_state();
+        state.development_token = Some(b"dev-token".to_vec());
+        let mut conn = ConnectionState::new();
+        // Same request_id against a real service, a private service, and a
+        // nonexistent service: byte-identical Unauthenticated responses so
+        // service existence cannot be enumerated (privacy.md §68).
+        let real = handle_envelope(
+            &mut conn,
+            &mut state,
+            request_envelope(1, request("NodeAdmin", "GetStatus", vec![])),
+        )
+        .expect("response");
+        let private = handle_envelope(
+            &mut conn,
+            &mut state,
+            request_envelope(2, request("SessionService", "ListSessions", vec![])),
+        )
+        .expect("response");
+        let nonexistent = handle_envelope(
+            &mut conn,
+            &mut state,
+            request_envelope(3, request("NoSuchService", "NoSuchMethod", vec![])),
+        )
+        .expect("response");
+        assert_eq!(
+            real, private,
+            "a private service must not be distinguishable"
+        );
+        assert_eq!(
+            real, nonexistent,
+            "a nonexistent service must not be distinguishable"
+        );
+        assert_eq!(
+            decode_response(&real).status.unwrap().code,
+            api::StatusCode::Unauthenticated as i32
+        );
+        // An invalid credential gets the identical response too.
+        let hello = api::ClientHello {
+            authentication: Some(api::ClientAuthentication {
+                method: Some(api::client_authentication::Method::Development(
+                    api::DevelopmentAuthentication {
+                        token: b"wrong".to_vec(),
+                    },
+                )),
+            }),
+            ..Default::default()
+        };
+        handle_envelope(
+            &mut conn,
+            &mut state,
+            envelope(4, api::envelope::Body::ClientHello(hello)),
+        );
+        let wrong_cred = handle_envelope(
+            &mut conn,
+            &mut state,
+            request_envelope(5, request("NodeAdmin", "GetStatus", vec![])),
+        )
+        .expect("response");
+        assert_eq!(
+            real, wrong_cred,
+            "an invalid credential must be indistinguishable"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sessions_paginates_with_cap_and_next_token() {
+        let (mut state, _tx) = test_state();
+        for _ in 0..250 {
+            register_session(&state, state.sessions.next_id(), [7u8; 32]);
+        }
+        let mut payload = Vec::new();
+        api::ListSessionsRequest {
+            page: Some(api::PageRequest {
+                page_size: 500,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut payload)
+        .expect("encode");
+        let bytes = dispatch_request(
+            &mut state,
+            &request("SessionService", "ListSessions", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let list = api::ListSessionsResponse::decode(response.payload.as_slice()).expect("payload");
+        assert_eq!(list.sessions.len(), 100, "page_size is capped at 100");
+        let page = list.page.expect("page info");
+        assert_eq!(page.total_size_hint, 250);
+        assert!(!page.next_page_token.is_empty(), "more pages remain");
+
+        // Follow the token to page 2 (offset 100).
+        let mut payload = Vec::new();
+        api::ListSessionsRequest {
+            page: Some(api::PageRequest {
+                page_token: page.next_page_token,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut payload)
+        .expect("encode");
+        let bytes = dispatch_request(
+            &mut state,
+            &request("SessionService", "ListSessions", payload),
+            None,
+        );
+        let list = api::ListSessionsResponse::decode(decode_response(&bytes).payload.as_slice())
+            .expect("payload");
+        assert_eq!(list.sessions.len(), 100);
+        let page = list.page.expect("page info");
+        assert_eq!(page.total_size_hint, 250);
+        assert!(!page.next_page_token.is_empty());
+
+        // Page 3 (offset 200) returns the remaining 50 and no next token.
+        let mut payload = Vec::new();
+        api::ListSessionsRequest {
+            page: Some(api::PageRequest {
+                page_token: page.next_page_token,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut payload)
+        .expect("encode");
+        let bytes = dispatch_request(
+            &mut state,
+            &request("SessionService", "ListSessions", payload),
+            None,
+        );
+        let list = api::ListSessionsResponse::decode(decode_response(&bytes).payload.as_slice())
+            .expect("payload");
+        assert_eq!(list.sessions.len(), 50);
+        assert!(list.page.expect("page info").next_page_token.is_empty());
+
+        // A garbage token is InvalidArgument, not a silent reset.
+        let mut payload = Vec::new();
+        api::ListSessionsRequest {
+            page: Some(api::PageRequest {
+                page_token: b"garbage".to_vec(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(&mut payload)
+        .expect("encode");
+        let bytes = dispatch_request(
+            &mut state,
+            &request("SessionService", "ListSessions", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::InvalidArgument as i32
+        );
+    }
+
+    #[test]
+    fn idempotency_cache_evicts_fifo_and_expires() {
+        let mut cache = IdempotencyCache::new();
+        let key = |n: u64| (n, vec![u8::try_from(n).unwrap_or(u8::MAX)]);
+        for i in 0..(IDEMPOTENCY_CACHE_CAP + 5) as u64 {
+            cache.insert(key(i), vec![0xAA], 1_000);
+        }
+        assert!(
+            cache.get(&key(0), 1_000).is_none(),
+            "the oldest entry is evicted once the FIFO cap is exceeded"
+        );
+        assert!(
+            cache
+                .get(&key((IDEMPOTENCY_CACHE_CAP + 4) as u64), 1_000)
+                .is_some(),
+            "the newest entry survives"
+        );
+        // TTL: an entry older than 10 minutes is a miss.
+        cache.insert(key(9_999), vec![0xBB], 5_000);
+        assert!(cache.get(&key(9_999), 5_000 + IDEMPOTENCY_TTL_MS).is_none());
+        assert!(cache
+            .get(&key(9_999), 5_000 + IDEMPOTENCY_TTL_MS - 1)
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn os_peer_authorized_matches_daemon_uid() {
+        let (stream, _peer) = UnixStream::pair().expect("pair");
+        // A file this process just created is owned by its own uid, which
+        // equals the uid the pair's peer reports (control-api.md §11.1).
+        let dir = std::env::temp_dir().join(format!("umcd-peercred-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let own_uid =
+            std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&dir).expect("metadata"));
+        assert!(os_peer_authorized(&stream, own_uid));
+        assert!(
+            !os_peer_authorized(&stream, own_uid ^ 1),
+            "a foreign uid must be refused"
+        );
     }
 }
