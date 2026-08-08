@@ -659,7 +659,11 @@ async fn process_inbound_packet(
         // Until the first RTT sample the rate stays 0 = unlimited, so
         // pacing changes nothing (the default controller runs un-paced).
         let smoothed_rtt = session.rtt().smoothed_rtt;
-        session.congestion_mut().set_smoothed_rtt(smoothed_rtt);
+        // `now` anchors the re-rate: the pending pacing refill is credited
+        // at the old rate up to the current instant before the bucket
+        // re-rates (congestion.md §12) — elapsed before the sample must not
+        // be refunded at the new rate.
+        session.congestion_mut().set_smoothed_rtt(smoothed_rtt, now);
         let mut combined = ack_payload;
         // Flow-control credit (session.md §20): MAX_DATA / MAX_STREAM_DATA /
         // MAX_STREAMS payloads are emitted when a local watermark is crossed.
@@ -2740,7 +2744,7 @@ mod tests {
         // A sampled RTT activates pacing (congestion.md §12): the 12,000-
         // byte window over a 100 ms RTT paces at 960,000 bits/s with a
         // 6,000-byte burst.
-        client.congestion_mut().set_smoothed_rtt(100);
+        client.congestion_mut().set_smoothed_rtt(100, t0);
         assert_eq!(client.congestion_mut().pacing_rate_bps(), 960_000);
         // Exhaust the bucket: the next echo send must wait out its spacing
         // interval (~8 ms for a ~1 KB packet) instead of going out at once.
@@ -2774,7 +2778,12 @@ mod tests {
             "paced send waits out its spacing interval (elapsed {elapsed:?})"
         );
         // The tokens were consumed at the real send time: a follow-up send
-        // must wait again — the accessor reports the full delay.
+        // must wait again — the accessor reports the full delay. The fixed
+        // test clock never advances past t0, so the 1,036-byte wire send
+        // earned no refill during its sleep: the bucket honestly carries
+        // the overdraw as debt (congestion.md §12 fractional-token
+        // accounting), and the next 1,200-byte packet waits
+        // (1200 + 1036) × 8000 / 960000 ≈ 18 ms to repay it.
         let mut session = session.lock().await;
         let next = session
             .congestion_mut()
@@ -2782,8 +2791,8 @@ mod tests {
             .expect("pacing active after a sample");
         assert_eq!(
             next.duration_since(t0).as_millis(),
-            10,
-            "empty bucket spaces a 1200-byte packet at 960,000 bits/s"
+            18,
+            "empty bucket with overdraw debt spaces a 1200-byte packet at 960,000 bits/s"
         );
     }
 
