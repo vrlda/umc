@@ -358,15 +358,64 @@ fn handle_inbound_link_locked(
         }
     };
     let auth_bytes = decode_client_auth(&auth_packet)?;
-    let state = state.lock().expect("state");
-    let (_server_finished, secrets, peer) = pending
-        .complete(&state, &auth_bytes, now.0)
-        .map_err(|e| format!("client auth refused: {e}"))?;
+    let (server_finished, secrets, peer) = {
+        let state = state.lock().expect("state");
+        pending
+            .complete(&state, &auth_bytes, now.0)
+            .map_err(|e| format!("client auth refused: {e}"))?
+    };
     // The peer identity recovered from CLIENT_AUTH: the real endpoint id
     // from the client's identity binding (the provisional hello derivation
     // is gone; the session registers under the verified identity).
     let peer_endpoint_id = peer.binding.endpoint_id;
 
+    // SERVER_FINISHED (handshake.md §19): the daemon's reply after a
+    // verified CLIENT_AUTH — the server signature + finished MAC, as a raw
+    // framed handshake message on the transitional wire path.
+    let mut server_finished_frame = Vec::new();
+    umc_handshake::encoding::encode_message(
+        &mut server_finished_frame,
+        umc_handshake::encoding::SERVER_FINISHED,
+        &server_finished,
+    )
+    .map_err(|e| format!("server finished framing: {e:?}"))?;
+    if let Err(e) = tokio::task::block_in_place(|| {
+        link.send(OutboundPacket {
+            bytes: server_finished_frame,
+            control: true,
+            deadline_ms: Some(3_000),
+        })
+    }) {
+        return Err(format!("send server finished: {e:?}"));
+    }
+
+    // CLIENT_FINISHED (handshake.md §20): the client's confirmation MAC
+    // over the transcript INCLUDING SERVER_FINISHED, as a raw framed
+    // message. The TCP carrier's recv yields WouldBlock while no frame is
+    // buffered, so poll briefly — the same bounded-wait pattern as the
+    // CLIENT_AUTH read. A missing or tampered confirmation refuses the
+    // session BEFORE anything is registered.
+    let finished_packet = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match tokio::task::block_in_place(|| link.recv()) {
+                Ok(packet) => break packet.bytes,
+                Err(e)
+                    if e.kind == umc_carrier::error::CarrierErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(format!("recv client finished: {e:?}")),
+            }
+        }
+    };
+    let client_finished = decode_client_finished(&finished_packet)?;
+    pending
+        .verify_client_finished(&auth_bytes, &server_finished, &client_finished)
+        .map_err(|e| format!("client finished refused: {e}"))?;
+
+    let state = state.lock().expect("state");
     let mut session = umc_session::session::Session::new(
         umc_session::session::SessionConfig {
             role: umc_session::session::Role::Server,
@@ -490,6 +539,27 @@ fn decode_client_auth(bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(message.body)
 }
 
+/// Extract the `CLIENT_FINISHED` message body from the third inbound
+/// packet: a raw framed handshake message on the transitional path (the
+/// client's confirmation MAC, handshake.md §20; mirroring
+/// [`decode_client_auth`]).
+///
+/// # Errors
+///
+/// Returns a message when the bytes do not decode as a handshake message,
+/// or the message type is not `CLIENT_FINISHED`.
+fn decode_client_finished(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let (message, _) = umc_handshake::encoding::decode_message(bytes)
+        .map_err(|e| format!("client finished framing: {e:?}"))?;
+    if message.message_type != umc_handshake::encoding::CLIENT_FINISHED {
+        return Err(format!(
+            "expected CLIENT_FINISHED, got message type {}",
+            message.message_type
+        ));
+    }
+    Ok(message.body)
+}
+
 fn init_node(config: &NodeConfig, config_path: Option<&PathBuf>) {
     let data_dir = config.resolved_data_dir();
     std::fs::create_dir_all(data_dir.join("objects")).expect("create data dir");
@@ -523,12 +593,15 @@ mod tests {
     };
     use umc_carrier::Link;
     use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
-    use umc_handshake::encoding::{CLIENT_AUTH, CLIENT_HELLO, SERVER_HELLO};
+    use umc_handshake::encoding::{
+        CLIENT_AUTH, CLIENT_FINISHED, CLIENT_HELLO, SERVER_FINISHED, SERVER_HELLO,
+    };
     use umc_handshake::identity::{endpoint_id, IdentityBinding};
     use umc_handshake::transcript::Transcript;
     use umc_handshake::xx::{
         build_client_auth_plaintext, client_signature_input, decrypt_server_auth,
-        encrypt_client_auth, ClientHello, ServerHello, CRYPTO_PROFILE, MODE_XX,
+        encrypt_client_auth, verify_server_finished_and_build_confirmation, ClientHello,
+        ServerHello, CRYPTO_PROFILE, MODE_XX,
     };
     use umc_types::runtime::Instant as RuntimeInstant;
 
@@ -554,8 +627,12 @@ mod tests {
     /// A link that plays the client's side of the wire: `recv` returns the
     /// `CLIENT_HELLO` first, then — once `send` captured the daemon's
     /// `SERVER_HELLO` — the client's real `CLIENT_AUTH` (built exactly like
-    /// `Node::connect`), then fails. `tamper` flips a byte inside the
-    /// client signature before sealing so the daemon must refuse the auth.
+    /// `Node::connect`), then — once `send` captured the daemon's
+    /// `SERVER_FINISHED` — the `CLIENT_FINISHED` confirmation MAC, then
+    /// fails. `tamper` flips a byte inside the client signature before
+    /// sealing so the daemon must refuse the auth; `tamper_finished` flips
+    /// a byte in the confirmation MAC so the daemon must refuse the
+    /// finished exchange.
     struct AuthScriptedLink {
         client_identity: IdentityKeyPair,
         client_static: StaticHandshakeKeyPair,
@@ -565,11 +642,20 @@ mod tests {
         server_binding: IdentityBinding,
         stage: StdMutex<usize>,
         server_hello_bytes: StdMutex<Vec<u8>>,
+        server_finished_bytes: StdMutex<Vec<u8>>,
+        sends: StdMutex<usize>,
+        auth_body: StdMutex<Vec<u8>>,
+        secret4: StdMutex<[u8; 32]>,
         tamper: bool,
+        tamper_finished: bool,
     }
 
     impl AuthScriptedLink {
-        fn new(server_binding: IdentityBinding, tamper: bool) -> (Self, [u8; 32]) {
+        fn new(
+            server_binding: IdentityBinding,
+            tamper: bool,
+            tamper_finished: bool,
+        ) -> (Self, [u8; 32]) {
             let client_identity = IdentityKeyPair::generate();
             let client_static = StaticHandshakeKeyPair::generate();
             let client_ephemeral = StaticHandshakeKeyPair::generate();
@@ -586,7 +672,12 @@ mod tests {
                     server_binding,
                     stage: StdMutex::new(0),
                     server_hello_bytes: StdMutex::new(Vec::new()),
+                    server_finished_bytes: StdMutex::new(Vec::new()),
+                    sends: StdMutex::new(0),
+                    auth_body: StdMutex::new(Vec::new()),
+                    secret4: StdMutex::new([0u8; 32]),
                     tamper,
+                    tamper_finished,
                 },
                 client_eid,
             )
@@ -637,6 +728,11 @@ mod tests {
             let secret3 = umc_crypto::hkdf::extract(&secret2, &dh_se); // provisional chain
             let auth_key =
                 handshake_responder::expand(&secret3, b"client auth key", &transcript.hash);
+            // The provisional DH_ss: the ephemeral stands in for the static
+            // on both sides, so secret4 matches the responder's and derives
+            // the finished keys for the CLIENT_FINISHED confirmation.
+            let dh_ss = self.client_ephemeral.diffie_hellman(&server_static_pub);
+            let secret4 = umc_crypto::hkdf::extract(&secret3, &dh_ss);
             let client_eid = endpoint_id(&self.client_identity.public());
             let server_eid = endpoint_id(&self.server_binding.identity_public_key);
             let sig_input = client_signature_input(
@@ -670,8 +766,62 @@ mod tests {
             let mut auth_body = Vec::new();
             umc_wire::bytes::encode(&mut auth_body, &ciphertext, 16_384)
                 .map_err(|_| "bytes".to_string())?;
+            *self.auth_body.lock().expect("auth body") = auth_body.clone();
+            *self.secret4.lock().expect("secret4") = secret4;
             let mut frame = Vec::new();
             umc_handshake::encoding::encode_message(&mut frame, CLIENT_AUTH, &auth_body)
+                .map_err(|e| format!("{e:?}"))?;
+            Ok(frame)
+        }
+
+        /// The client's `CLIENT_FINISHED` confirmation against the captured
+        /// `SERVER_FINISHED`: verify the daemon's finished MAC and signature
+        /// (handshake.md §19) and return the confirmation MAC over the
+        /// transcript including `SERVER_FINISHED` (handshake.md §20),
+        /// framed as a raw handshake message. `tamper_finished` flips a
+        /// byte in the MAC so the daemon must refuse the exchange.
+        fn build_client_finished(&self) -> Result<Vec<u8>, String> {
+            let server_hello_bytes = self.server_hello_bytes.lock().expect("captured");
+            let server_hello =
+                ServerHello::decode(&server_hello_bytes).expect("captured server hello");
+            let mut transcript = Transcript::new(MODE_XX, CRYPTO_PROFILE, b"ump.tcp/1");
+            transcript
+                .update_message(CLIENT_HELLO, &self.hello_bytes)
+                .map_err(|e| format!("{e:?}"))?;
+            transcript
+                .update_message(SERVER_HELLO, &server_hello.encode().expect("server hello"))
+                .map_err(|e| format!("{e:?}"))?;
+            let auth_body = self.auth_body.lock().expect("auth body").clone();
+            let secret4 = self.secret4.lock().expect("secret4");
+            let server_eid = endpoint_id(&self.server_binding.identity_public_key);
+            let client_eid = endpoint_id(&self.client_identity.public());
+            let server_finished_bytes = self.server_finished_bytes.lock().expect("captured");
+            let (finished_message, _) =
+                umc_handshake::encoding::decode_message(&server_finished_bytes)
+                    .map_err(|e| format!("{e:?}"))?;
+            if finished_message.message_type != SERVER_FINISHED {
+                return Err(format!(
+                    "expected SERVER_FINISHED, got message type {}",
+                    finished_message.message_type
+                ));
+            }
+            let mut confirmation = verify_server_finished_and_build_confirmation(
+                &mut transcript,
+                &secret4,
+                &self.server_binding.identity_public_key,
+                &server_eid,
+                &client_eid,
+                &self.server_binding.static_handshake_public_key.0,
+                &self.client_static.public().0,
+                &auth_body,
+                &finished_message.body,
+            )
+            .map_err(|e| format!("server finished refused: {e}"))?;
+            if self.tamper_finished {
+                confirmation[0] ^= 0x01;
+            }
+            let mut frame = Vec::new();
+            umc_handshake::encoding::encode_message(&mut frame, CLIENT_FINISHED, &confirmation)
                 .map_err(|e| format!("{e:?}"))?;
             Ok(frame)
         }
@@ -692,7 +842,13 @@ mod tests {
         }
 
         fn send(&self, packet: OutboundPacket) -> Result<SendResult, CarrierError> {
-            *self.server_hello_bytes.lock().expect("server hello") = packet.bytes;
+            let mut sends = self.sends.lock().expect("sends");
+            if *sends == 0 {
+                *self.server_hello_bytes.lock().expect("server hello") = packet.bytes;
+            } else {
+                *self.server_finished_bytes.lock().expect("server finished") = packet.bytes;
+            }
+            *sends += 1;
             Ok(SendResult::Accepted {
                 queue_state: QueueState::SentToMedium,
             })
@@ -714,6 +870,14 @@ mod tests {
                     let server_hello =
                         ServerHello::decode(&server_hello_bytes).expect("captured server hello");
                     let frame = self.build_client_auth(&server_hello).expect("client auth");
+                    Ok(InboundPacket {
+                        bytes: frame,
+                        received_at: RuntimeInstant(0),
+                    })
+                }
+                2 => {
+                    *stage += 1;
+                    let frame = self.build_client_finished().expect("client finished");
                     Ok(InboundPacket {
                         bytes: frame,
                         received_at: RuntimeInstant(0),
@@ -752,7 +916,7 @@ mod tests {
         };
         let server_binding =
             IdentityBinding::sign(&server_identity, &server_static, 0, u64::MAX, 0, [0u8; 32]);
-        let (link, client_eid) = AuthScriptedLink::new(server_binding, false);
+        let (link, client_eid) = AuthScriptedLink::new(server_binding, false, false);
         let tracker = StdMutex::new(HandshakeTracker::new());
         handle_inbound_link(&state, "ump.tcp/1", Box::new(link), &tracker).expect("accept");
 
@@ -780,6 +944,82 @@ mod tests {
         );
     }
 
+    /// The daemon sends `SERVER_FINISHED` and the client answers with a
+    /// verified `CLIENT_FINISHED` confirmation: only then does the session
+    /// activate. The `session_active` event fires after the confirmation
+    /// MAC is verified (handshake.md §20).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_loop_verifies_client_finished() {
+        let state = test_state();
+        let (server_identity, server_static) = {
+            let state = state.lock().expect("state");
+            (
+                state.node_identity.identity.clone(),
+                state.node_identity.static_handshake.public(),
+            )
+        };
+        let server_binding =
+            IdentityBinding::sign(&server_identity, &server_static, 0, u64::MAX, 0, [0u8; 32]);
+        let (link, client_eid) = AuthScriptedLink::new(server_binding, false, false);
+        let tracker = StdMutex::new(HandshakeTracker::new());
+        handle_inbound_link(&state, "ump.tcp/1", Box::new(link), &tracker).expect("accept");
+
+        let session_id = state
+            .lock()
+            .expect("state")
+            .sessions
+            .lookup(1)
+            .expect("session registered");
+        assert_eq!(session_id.peer_endpoint_id, client_eid);
+        let events = state.lock().expect("state").events.clone();
+        assert!(
+            events
+                .lock()
+                .expect("event log")
+                .recent(10)
+                .iter()
+                .any(|e| e.kind == "session_active"),
+            "session_active must fire once the confirmation is verified"
+        );
+    }
+
+    /// A `CLIENT_FINISHED` whose confirmation MAC is tampered with fails
+    /// the daemon's verification: the accept loop refuses the session and
+    /// registers nothing (no `session_active` event).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_loop_refuses_tampered_client_finished() {
+        let state = test_state();
+        let (server_identity, server_static) = {
+            let state = state.lock().expect("state");
+            (
+                state.node_identity.identity.clone(),
+                state.node_identity.static_handshake.public(),
+            )
+        };
+        let server_binding =
+            IdentityBinding::sign(&server_identity, &server_static, 0, u64::MAX, 0, [0u8; 32]);
+        let (link, _client_eid) = AuthScriptedLink::new(server_binding, false, true);
+        let tracker = StdMutex::new(HandshakeTracker::new());
+        let err = handle_inbound_link(&state, "ump.tcp/1", Box::new(link), &tracker)
+            .expect_err("tampered confirmation must be refused");
+        assert!(err.contains("client finished"), "{err}");
+        assert_eq!(
+            state.lock().expect("state").sessions.count(),
+            0,
+            "no session may be registered for a refused confirmation"
+        );
+        let events = state.lock().expect("state").events.clone();
+        assert!(
+            !events
+                .lock()
+                .expect("event log")
+                .recent(10)
+                .iter()
+                .any(|e| e.kind == "session_active"),
+            "no session_active event may fire for a refused session"
+        );
+    }
+
     /// A `CLIENT_AUTH` whose transcript signature is tampered with passes
     /// the AEAD open (it was sealed honestly) but fails identity
     /// verification: the accept loop refuses the session and registers
@@ -796,7 +1036,7 @@ mod tests {
         };
         let server_binding =
             IdentityBinding::sign(&server_identity, &server_static, 0, u64::MAX, 0, [0u8; 32]);
-        let (link, _client_eid) = AuthScriptedLink::new(server_binding, true);
+        let (link, _client_eid) = AuthScriptedLink::new(server_binding, true, false);
         let tracker = StdMutex::new(HandshakeTracker::new());
         let err = handle_inbound_link(&state, "ump.tcp/1", Box::new(link), &tracker)
             .expect_err("tampered auth must be refused");

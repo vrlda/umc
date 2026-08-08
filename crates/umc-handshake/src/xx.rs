@@ -419,6 +419,84 @@ pub fn client_signature_input(
     hasher.finalize().into()
 }
 
+/// Server authentication signature input (handshake.md §19.1): the
+/// transcript hash BEFORE `SERVER_FINISHED` is appended, both endpoint
+/// ids, and both static handshake keys.
+#[must_use]
+fn server_auth_signature_input(
+    transcript_before: &[u8; 32],
+    server_endpoint_id: &[u8; 32],
+    client_endpoint_id: &[u8; 32],
+    server_static_public_key: &[u8; 32],
+    client_static_public_key: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Blake2s256::new();
+    hasher.update(b"UMP-SERVER-AUTH-v1");
+    hasher.update(transcript_before);
+    hasher.update(server_endpoint_id);
+    hasher.update(client_endpoint_id);
+    hasher.update(server_static_public_key);
+    hasher.update(client_static_public_key);
+    hasher.finalize().into()
+}
+
+/// Verifies the server's `SERVER_FINISHED` signature (handshake.md §19.1):
+/// the T13 driver's `server_sig_input_client`, checked against the
+/// server's identity public key recovered from its auth block.
+#[must_use]
+pub fn verify_server_auth_signature(
+    server_identity_key: &IdentityPublicKey,
+    transcript_before: &[u8; 32],
+    server_endpoint_id: &[u8; 32],
+    client_endpoint_id: &[u8; 32],
+    server_static_public_key: &[u8; 32],
+    client_static_public_key: &[u8; 32],
+    signature: &[u8; 64],
+) -> bool {
+    let sig_input = server_auth_signature_input(
+        transcript_before,
+        server_endpoint_id,
+        client_endpoint_id,
+        server_static_public_key,
+        client_static_public_key,
+    );
+    server_identity_key.verify(&sig_input, signature)
+}
+
+/// Builds `SERVER_FINISHED` (handshake.md §19): the 64-byte server
+/// signature followed by the 32-byte server finished MAC. Both bind the
+/// transcript hash AFTER `CLIENT_AUTH` and BEFORE `SERVER_FINISHED` is
+/// appended (the T13 driver's snapshot).
+#[must_use]
+pub fn build_server_finished(
+    handshake_secret4: &[u8; 32],
+    transcript_after_client_auth: &[u8; 32],
+    server_identity: &IdentityKeyPair,
+    server_endpoint_id: &[u8; 32],
+    client_endpoint_id: &[u8; 32],
+    server_static_public_key: &[u8; 32],
+    client_static_public_key: &[u8; 32],
+) -> Vec<u8> {
+    let server_finished_key = finished_key(
+        handshake_secret4,
+        b"server finished",
+        transcript_after_client_auth,
+    );
+    let server_mac = finished_mac(&server_finished_key, transcript_after_client_auth);
+    let sig_input = server_auth_signature_input(
+        transcript_after_client_auth,
+        server_endpoint_id,
+        client_endpoint_id,
+        server_static_public_key,
+        client_static_public_key,
+    );
+    let server_signature = server_identity.sign(&sig_input);
+    let mut out = Vec::with_capacity(96);
+    out.extend_from_slice(&server_signature);
+    out.extend_from_slice(&server_mac);
+    out
+}
+
 fn expand(secret: &[u8; 32], label: &[u8], context: &[u8; 32]) -> [u8; 32] {
     let out =
         umc_crypto::label::expand_label(secret, label, context, 32).expect("32-byte expansion");
@@ -431,14 +509,17 @@ use crate::traffic::SessionSecrets;
 use crate::transcript::Transcript;
 
 /// Client-side material from [`complete_client_side`]: the session
-/// secrets, the `CLIENT_FINISHED` key, and the inputs the client needs to
-/// build and seal its `CLIENT_AUTH` message (handshake.md §18).
+/// secrets, the handshake secret4, and the inputs the client needs to
+/// build and seal its `CLIENT_AUTH` message and verify `SERVER_FINISHED`
+/// (handshake.md §18-19).
 #[derive(Debug, Clone)]
 pub struct ClientHandshakeOutput {
     /// Session secrets (client and server traffic secrets).
     pub session_secrets: SessionSecrets,
-    /// The `CLIENT_FINISHED` confirmation MAC key (handshake.md §20).
-    pub client_finished_key: [u8; 32],
+    /// The handshake secret4 (the `DH_ss` extract): derives the finished
+    /// keys over the transcript hash AFTER `CLIENT_AUTH` is appended
+    /// (handshake.md §19.2).
+    pub handshake_secret4: [u8; 32],
     /// The client-auth key sealing `CLIENT_AUTH` (handshake.md §18).
     pub client_auth_key: [u8; 32],
     /// The transcript hash BEFORE `CLIENT_AUTH` is appended: the AEAD AAD
@@ -446,6 +527,10 @@ pub struct ClientHandshakeOutput {
     pub transcript_hash: [u8; 32],
     /// The server's endpoint id, recovered from its identity binding.
     pub server_endpoint_id: [u8; 32],
+    /// The server's identity public key, recovered from its binding: the
+    /// key the `SERVER_FINISHED` signature verifies against (handshake.md
+    /// §19.1).
+    pub server_identity_public_key: IdentityPublicKey,
     /// The server's static handshake public key, from its auth block.
     pub server_static_public_key: [u8; 32],
 }
@@ -617,28 +702,23 @@ pub fn run_xx_handshake(
     let dh_ss = client_static.diffie_hellman(&server_static_pub);
     let handshake_secret4 = umc_crypto::hkdf::extract(&handshake_secret3, &dh_ss);
 
-    // Finished messages.
+    // Finished messages (handshake.md §19): the finished keys bind the
+    // transcript hash AFTER CLIENT_AUTH and BEFORE SERVER_FINISHED is
+    // appended.
     let client_finished_key =
         finished_key(&handshake_secret4, b"client finished", &transcript.hash);
     let server_finished_key =
         finished_key(&handshake_secret4, b"server finished", &transcript.hash);
-    let server_finished_mac = finished_mac(&server_finished_key, &transcript.hash);
-
     // Server sends SERVER_FINISHED with signature + MAC.
-    let server_sig_input: [u8; 32] = {
-        let mut hasher = Blake2s256::new();
-        hasher.update(b"UMP-SERVER-AUTH-v1");
-        hasher.update(transcript.hash);
-        hasher.update(server_eid);
-        hasher.update(client_eid);
-        hasher.update(server_static_pub.0);
-        hasher.update(client_static.public().0);
-        hasher.finalize().into()
-    };
-    let server_signature = server_identity.sign(&server_sig_input);
-    let mut server_finished = Vec::new();
-    server_finished.extend_from_slice(&server_signature);
-    server_finished.extend_from_slice(&server_finished_mac);
+    let server_finished = build_server_finished(
+        &handshake_secret4,
+        &transcript.hash,
+        server_identity,
+        &server_eid,
+        &client_eid,
+        &server_static_pub.0,
+        &client_static.public().0,
+    );
     // Client verifies the server finished MAC and signature against the
     // transcript hash BEFORE SERVER_FINISHED is appended (handshake.md §19).
     let server_finished_transcript = transcript.hash;
@@ -655,20 +735,18 @@ pub fn run_xx_handshake(
     if client_verify_finished_key != server_finished_key {
         return Err("server finished key mismatch".into());
     }
-    let server_sig_input_client: [u8; 32] = {
-        let mut hasher = Blake2s256::new();
-        hasher.update(b"UMP-SERVER-AUTH-v1");
-        hasher.update(server_finished_transcript);
-        hasher.update(server_eid);
-        hasher.update(client_eid);
-        hasher.update(server_static_pub.0);
-        hasher.update(client_static.public().0);
-        hasher.finalize().into()
-    };
-    if !binding
-        .identity_public_key
-        .verify(&server_sig_input_client, &server_signature)
-    {
+    let server_signature: [u8; 64] = server_finished[..64]
+        .try_into()
+        .map_err(|_| "server finished truncated")?;
+    if !verify_server_auth_signature(
+        &binding.identity_public_key,
+        &server_finished_transcript,
+        &server_eid,
+        &client_eid,
+        &server_static_pub.0,
+        &client_static.public().0,
+        &server_signature,
+    ) {
         return Err("server signature invalid".into());
     }
 
@@ -786,19 +864,134 @@ pub fn complete_client_side(
 
     // The client-auth key derives from the transcript hash BEFORE the
     // CLIENT_AUTH message is appended (handshake.md §18) — the same hash
-    // the client signs over and seals with.
+    // the client signs over and seals with. The finished keys instead bind
+    // the hash AFTER CLIENT_AUTH is appended (handshake.md §19.2), so
+    // secret4 rides in the output and the caller derives them once the
+    // auth body is known (see [`verify_server_finished_and_build_confirmation`]).
     let transcript_hash = transcript.hash;
     let client_auth_key = expand(&secret3, b"client auth key", &transcript_hash);
-    let client_finished_key = finished_key(&secret4, b"client finished", &transcript_hash);
     let client_secrets = crate::traffic::derive_session_secrets(&secret4, &transcript_hash);
     Ok(ClientHandshakeOutput {
         session_secrets: client_secrets,
-        client_finished_key,
+        handshake_secret4: secret4,
         client_auth_key,
         transcript_hash,
         server_endpoint_id,
+        server_identity_public_key: IdentityPublicKey(server_identity_key),
         server_static_public_key: server_static_pub.0,
     })
+}
+
+/// Verifies the server's `SERVER_FINISHED` message and builds the
+/// `CLIENT_FINISHED` confirmation MAC (handshake.md §19-20), mirroring the
+/// T13 driver's snapshot order:
+///
+/// 1. append `CLIENT_AUTH` (its length-prefixed ciphertext body) to the
+///    client's transcript — `transcript` must already hold `CLIENT_HELLO`
+///    and `SERVER_HELLO` with the same bytes both sides exchanged;
+/// 2. verify the server's finished MAC with the server finished key over
+///    the transcript hash BEFORE `SERVER_FINISHED` is appended;
+/// 3. verify the server signature over `"UMP-SERVER-AUTH-v1"` and that
+///    same pre-append hash (the driver's `server_sig_input_client`);
+/// 4. append `SERVER_FINISHED` and return
+///    `finished_mac(client_finished_key, hash_after_server_finished)` —
+///    the confirmation the client transmits in `CLIENT_FINISHED`.
+///
+/// # Errors
+///
+/// Returns a message when the transcript cannot be updated, the message is
+/// truncated, or the MAC or signature does not verify (the handshake is
+/// refused).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_server_finished_and_build_confirmation(
+    transcript: &mut Transcript,
+    handshake_secret4: &[u8; 32],
+    server_identity_key: &IdentityPublicKey,
+    server_endpoint_id: &[u8; 32],
+    client_endpoint_id: &[u8; 32],
+    server_static_public_key: &[u8; 32],
+    client_static_public_key: &[u8; 32],
+    client_auth_body: &[u8],
+    server_finished: &[u8],
+) -> Result<[u8; 32], String> {
+    transcript
+        .update_message(crate::encoding::CLIENT_AUTH, client_auth_body)
+        .map_err(|e| format!("transcript: {e:?}"))?;
+    let transcript_before_server_finished = transcript.hash;
+    let signature: [u8; 64] = server_finished
+        .get(..64)
+        .and_then(|s| s.try_into().ok())
+        .ok_or("server finished truncated")?;
+    let server_mac: [u8; 32] = server_finished
+        .get(64..96)
+        .and_then(|s| s.try_into().ok())
+        .ok_or("server finished truncated")?;
+    let server_finished_key = finished_key(
+        handshake_secret4,
+        b"server finished",
+        &transcript_before_server_finished,
+    );
+    if finished_mac(&server_finished_key, &transcript_before_server_finished) != server_mac {
+        return Err("server finished MAC invalid".into());
+    }
+    if !verify_server_auth_signature(
+        server_identity_key,
+        &transcript_before_server_finished,
+        server_endpoint_id,
+        client_endpoint_id,
+        server_static_public_key,
+        client_static_public_key,
+        &signature,
+    ) {
+        return Err("server finished signature invalid".into());
+    }
+    transcript
+        .update_message(crate::encoding::SERVER_FINISHED, server_finished)
+        .map_err(|e| format!("transcript: {e:?}"))?;
+    let client_finished_key = finished_key(
+        handshake_secret4,
+        b"client finished",
+        &transcript_before_server_finished,
+    );
+    Ok(finished_mac(&client_finished_key, &transcript.hash))
+}
+
+/// Verifies the client's `CLIENT_FINISHED` confirmation MAC (handshake.md
+/// §20): the client finished key derives from the transcript hash BEFORE
+/// `SERVER_FINISHED` is appended, and the confirmation MAC covers the hash
+/// AFTER `SERVER_FINISHED` (the driver's snapshot order). `transcript`
+/// must hold `CLIENT_HELLO` and `SERVER_HELLO` with the same bytes the
+/// counterpart appended; `CLIENT_AUTH` and `SERVER_FINISHED` are appended
+/// here.
+///
+/// # Errors
+///
+/// Returns a message when the transcript cannot be updated or the
+/// confirmation MAC does not match (the session is refused).
+pub fn verify_client_finished(
+    handshake_secret4: &[u8; 32],
+    transcript: &mut Transcript,
+    client_auth_body: &[u8],
+    server_finished: &[u8],
+    client_finished: &[u8],
+) -> Result<(), String> {
+    transcript
+        .update_message(crate::encoding::CLIENT_AUTH, client_auth_body)
+        .map_err(|e| format!("transcript: {e:?}"))?;
+    let transcript_before_server_finished = transcript.hash;
+    let client_finished_key = finished_key(
+        handshake_secret4,
+        b"client finished",
+        &transcript_before_server_finished,
+    );
+    transcript
+        .update_message(crate::encoding::SERVER_FINISHED, server_finished)
+        .map_err(|e| format!("transcript: {e:?}"))?;
+    let expected = finished_mac(&client_finished_key, &transcript.hash);
+    if expected.as_slice() != client_finished {
+        return Err("client finished MAC mismatch".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

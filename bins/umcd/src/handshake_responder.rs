@@ -188,6 +188,33 @@ impl HandshakePending {
         server_finished.extend_from_slice(&server_mac);
         Ok((server_finished, self.session_secrets.clone(), peer))
     }
+
+    /// Verify the client's `CLIENT_FINISHED` confirmation MAC (handshake.md
+    /// §20) against the transcript including `SERVER_FINISHED`, mirroring
+    /// the T13 driver's snapshot order: the client finished key derives
+    /// from the transcript hash AFTER `CLIENT_AUTH` is appended (the hash
+    /// BEFORE `SERVER_FINISHED`), and the confirmation MAC covers the hash
+    /// AFTER `SERVER_FINISHED` is appended.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the confirmation MAC does not match (the
+    /// session is refused and nothing is registered).
+    pub fn verify_client_finished(
+        &self,
+        auth_bytes: &[u8],
+        server_finished: &[u8],
+        client_finished: &[u8],
+    ) -> Result<(), String> {
+        let mut transcript = self.transcript.clone();
+        umc_handshake::xx::verify_client_finished(
+            &self.secret4,
+            &mut transcript,
+            auth_bytes,
+            server_finished,
+            client_finished,
+        )
+    }
 }
 
 /// Reassemble an [`IdentityBinding`] from the canonical signed bytes plus
