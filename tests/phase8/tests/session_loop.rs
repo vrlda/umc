@@ -17,7 +17,11 @@ use umc_carrier::BoxLink;
 use umc_control::proto::umc::api::v1 as api;
 use umc_core::node::{Node, NodeConfig, NodeIdentity};
 use umc_crypto::signatures::StaticHandshakeKeyPair;
-use umc_handshake::xx::{complete_client_side, ClientHello, ServerHello};
+use umc_handshake::identity::{endpoint_id, IdentityBinding};
+use umc_handshake::xx::{
+    build_client_auth_plaintext, client_signature_input, complete_client_side, encrypt_client_auth,
+    ClientHandshakeOutput, ClientHello, ServerHello,
+};
 use umc_types::runtime::{Clock, EntropySource, Instant};
 
 /// Wire shape of the daemon's `PeerService.ListCandidates` payload. No proto
@@ -183,9 +187,55 @@ fn send_packet(link: &(dyn umc_carrier::Link + Send + Sync), bytes: &[u8]) -> Re
     .map_err(|e| format!("send: {e:?}"))
 }
 
+/// Send the client's `CLIENT_AUTH` message (handshake.md §18) — the REAL
+/// static key plus identity binding and transcript-bound signature, sealed
+/// with the provisional-chain client-auth key (the daemon's DH chain
+/// stands the ephemeral in for the static, so the auth key matches on both
+/// sides) and framed as a raw handshake message.
+fn send_client_auth(
+    node: &Node,
+    link: &(dyn umc_carrier::Link + Send + Sync),
+    out: &ClientHandshakeOutput,
+) -> Result<(), String> {
+    let binding = IdentityBinding::sign(
+        &node.config.identity.identity,
+        &node.config.identity.static_handshake.public(),
+        0,
+        u64::MAX,
+        0,
+        [0u8; 32],
+    );
+    let client_eid = endpoint_id(&node.config.identity.identity.public());
+    let sig_input = client_signature_input(
+        &out.transcript_hash,
+        &client_eid,
+        &out.server_endpoint_id,
+        &node.config.identity.static_handshake.public().0,
+        &out.server_static_public_key,
+    );
+    let signature = node.config.identity.identity.sign(&sig_input);
+    let plaintext = build_client_auth_plaintext(
+        &node.config.identity.static_handshake.public().0,
+        &binding,
+        &signature,
+    );
+    let ciphertext = encrypt_client_auth(&out.client_auth_key, &out.transcript_hash, &plaintext);
+    let mut auth_body = Vec::new();
+    umc_wire::bytes::encode(&mut auth_body, &ciphertext, 16_384)
+        .map_err(|e| format!("auth body: {e:?}"))?;
+    let mut frame = Vec::new();
+    umc_handshake::encoding::encode_message(
+        &mut frame,
+        umc_handshake::encoding::CLIENT_AUTH,
+        &auth_body,
+    )
+    .map_err(|e| format!("auth frame: {e:?}"))?;
+    send_packet(link, &frame)
+}
+
 /// Synchronous analogue of `Node::connect` over TCP: dial, send
-/// `CLIENT_HELLO`, receive `SERVER_HELLO`, derive the client session
-/// secrets.
+/// `CLIENT_HELLO`, receive `SERVER_HELLO`, send `CLIENT_AUTH`, derive the
+/// client session secrets.
 ///
 /// The TCP carrier serializes reads and writes behind one mutex and a
 /// background writer task, so a blocking `recv` must not start until the
@@ -204,9 +254,13 @@ fn tcp_handshake(node: &Node, remote: &str) -> Result<u64, String> {
     let server_hello_bytes = link.recv().map_err(|e| format!("recv: {e:?}"))?.bytes;
     let server_hello =
         ServerHello::decode(&server_hello_bytes).map_err(|e| format!("server hello: {e:?}"))?;
-    let (secrets, _) = complete_client_side(
+    let out = complete_client_side(
         &node.config.identity.identity,
-        &node.config.identity.static_handshake,
+        // The daemon stands the client's ephemeral in for the static in the
+        // DH chain (the real static rides CLIENT_AUTH); mirror that here so
+        // the derived session secrets AND the client-auth key match on both
+        // sides.
+        &client_ephemeral,
         &client_ephemeral,
         &hello,
         &server_hello,
@@ -214,8 +268,9 @@ fn tcp_handshake(node: &Node, remote: &str) -> Result<u64, String> {
         "ump.tcp/1".as_bytes(),
     )
     .map_err(|e| format!("client side: {e}"))?;
+    send_client_auth(node, link.as_ref(), &out)?;
     assert_ne!(
-        secrets.client, [0u8; 32],
+        out.session_secrets.client, [0u8; 32],
         "derived client traffic secret must be non-trivial"
     );
     Ok(1)
@@ -238,9 +293,11 @@ fn udp_handshake(node: &Node, link: &BoxLink) -> Result<u64, String> {
     let server_hello_bytes = link.recv().map_err(|e| format!("recv: {e:?}"))?.bytes;
     let server_hello =
         ServerHello::decode(&server_hello_bytes).map_err(|e| format!("server hello: {e:?}"))?;
-    let (secrets, _) = complete_client_side(
+    let out = complete_client_side(
         &node.config.identity.identity,
-        &node.config.identity.static_handshake,
+        // Provisional static (the ephemeral), mirroring the daemon's DH
+        // chain; the real static rides CLIENT_AUTH.
+        &client_ephemeral,
         &client_ephemeral,
         &hello,
         &server_hello,
@@ -248,8 +305,9 @@ fn udp_handshake(node: &Node, link: &BoxLink) -> Result<u64, String> {
         "ump.udp/1".as_bytes(),
     )
     .map_err(|e| format!("client side: {e}"))?;
+    send_client_auth(node, link.as_ref(), &out)?;
     assert_ne!(
-        secrets.client, [0u8; 32],
+        out.session_secrets.client, [0u8; 32],
         "derived client traffic secret must be non-trivial"
     );
     Ok(1)

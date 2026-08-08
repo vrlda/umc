@@ -9,9 +9,10 @@
 //! daemon forwards `RELAY_DATA` accepted on A's circuit into session B via
 //! the session bus.
 //!
-//! The peer endpoint id the daemon registers for a session is provisional
-//! (derived deterministically from the client's hello ephemeral), so the
-//! test computes it with the same derivation as the daemon's accept path.
+//! The peer endpoint id the daemon registers for a session is the client's
+//! REAL endpoint id, verified from the identity binding carried in
+//! `CLIENT_AUTH` (handshake.md §18), so the test uses each node's own
+//! `endpoint_id()` for the hints.
 //!
 //! The TCP carrier serializes reads and writes behind one mutex
 //! (carriers/tcp.md): a recv in flight starves the link's background
@@ -27,7 +28,11 @@ use umc_carrier::BoxLink;
 use umc_core::node::{Node, NodeConfig, NodeIdentity};
 use umc_crypto::aead::PacketKeys;
 use umc_crypto::signatures::StaticHandshakeKeyPair;
-use umc_handshake::xx::{complete_client_side, ClientHello, ServerHello};
+use umc_handshake::identity::{endpoint_id, IdentityBinding};
+use umc_handshake::xx::{
+    build_client_auth_plaintext, client_signature_input, complete_client_side, encrypt_client_auth,
+    ClientHandshakeOutput, ClientHello, ServerHello,
+};
 use umc_session::session::{Role, Session, SessionConfig};
 use umc_types::frame::FrameType;
 use umc_types::runtime::{Clock, EntropySource, Instant};
@@ -51,18 +56,61 @@ impl EntropySource for TestEntropy {
     }
 }
 
-/// The provisional peer endpoint id the daemon registers for a session:
-/// `HKDF("UMP-PEER-PROVISIONAL-v1" || hello ephemeral)` (main.rs).
-fn provisional_peer_id(ephemeral_public: &[u8; 32]) -> [u8; 32] {
-    let mut ikm = Vec::with_capacity(32);
-    ikm.extend_from_slice(b"UMP-PEER-PROVISIONAL-v1");
-    ikm.extend_from_slice(ephemeral_public);
-    umc_crypto::hkdf::extract(&[0u8; 32], &ikm)
+/// Send the client's `CLIENT_AUTH` message (handshake.md §18) — the REAL
+/// static key plus identity binding and transcript-bound signature, sealed
+/// with the provisional-chain client-auth key (the daemon's DH chain
+/// stands the ephemeral in for the static, so the auth key matches on both
+/// sides) and framed as a raw handshake message.
+fn send_client_auth(
+    node: &umc_core::node::Node,
+    link: &(dyn umc_carrier::Link + Send + Sync),
+    out: &ClientHandshakeOutput,
+) -> Result<(), String> {
+    let binding = IdentityBinding::sign(
+        &node.config.identity.identity,
+        &node.config.identity.static_handshake.public(),
+        0,
+        u64::MAX,
+        0,
+        [0u8; 32],
+    );
+    let client_eid = endpoint_id(&node.config.identity.identity.public());
+    let sig_input = client_signature_input(
+        &out.transcript_hash,
+        &client_eid,
+        &out.server_endpoint_id,
+        &node.config.identity.static_handshake.public().0,
+        &out.server_static_public_key,
+    );
+    let signature = node.config.identity.identity.sign(&sig_input);
+    let plaintext = build_client_auth_plaintext(
+        &node.config.identity.static_handshake.public().0,
+        &binding,
+        &signature,
+    );
+    let ciphertext = encrypt_client_auth(&out.client_auth_key, &out.transcript_hash, &plaintext);
+    let mut auth_body = Vec::new();
+    umc_wire::bytes::encode(&mut auth_body, &ciphertext, 16_384)
+        .map_err(|e| format!("auth body: {e:?}"))?;
+    let mut frame = Vec::new();
+    umc_handshake::encoding::encode_message(
+        &mut frame,
+        umc_handshake::encoding::CLIENT_AUTH,
+        &auth_body,
+    )
+    .map_err(|e| format!("auth frame: {e:?}"))?;
+    link.send(OutboundPacket {
+        bytes: frame,
+        control: true,
+        deadline_ms: Some(3_000),
+    })
+    .map_err(|e| format!("send client auth: {e:?}"))?;
+    Ok(())
 }
 
 /// Client-side TCP handshake over `Node`'s carrier, returning the live
-/// link, the client session, the hello ephemeral's public key (from which
-/// the daemon derives the session's peer endpoint id), and the client's
+/// link, the client session, the client's REAL peer endpoint id (which the
+/// daemon registers from the `CLIENT_AUTH` binding), and the client's
 /// remote packet keys for parsing the daemon's protected replies.
 #[allow(clippy::type_complexity)]
 fn tcp_handshake(
@@ -75,7 +123,6 @@ fn tcp_handshake(
         .map_err(|e| format!("dial: {e:?}"))?;
     let client_ephemeral = StaticHandshakeKeyPair::generate();
     let hello = ClientHello::new(node.entropy.as_ref(), &client_ephemeral);
-    let ephemeral_public = hello.client_ephemeral_public_key;
     let hello_bytes = hello.encode().map_err(|e| format!("hello: {e:?}"))?;
     link.send(OutboundPacket {
         bytes: hello_bytes,
@@ -87,11 +134,12 @@ fn tcp_handshake(
     let server_hello_bytes = link.recv().map_err(|e| format!("recv: {e:?}"))?.bytes;
     let server_hello =
         ServerHello::decode(&server_hello_bytes).map_err(|e| format!("server hello: {e:?}"))?;
-    let (secrets, _) = complete_client_side(
+    let out = complete_client_side(
         &node.config.identity.identity,
-        // The daemon stands the client's ephemeral in for the static until
-        // the CLIENT_AUTH wire path lands; mirror that here so the derived
-        // session secrets match on both sides.
+        // The daemon stands the client's ephemeral in for the static in the
+        // DH chain (the real static rides CLIENT_AUTH); mirror that here so
+        // the derived session secrets AND the client-auth key match on both
+        // sides.
         &client_ephemeral,
         &client_ephemeral,
         &hello,
@@ -100,6 +148,8 @@ fn tcp_handshake(
         "ump.tcp/1".as_bytes(),
     )
     .map_err(|e| format!("client side: {e}"))?;
+    send_client_auth(node, link.as_ref(), &out)?;
+    let secrets = out.session_secrets;
     let session = Session::new(
         SessionConfig {
             role: Role::Client,
@@ -115,7 +165,12 @@ fn tcp_handshake(
     .map_err(|e| format!("session: {e:?}"))?;
     let remote_keys = PacketKeys::from_traffic_secret(&secrets.server)
         .map_err(|e| format!("remote keys: {e:?}"))?;
-    Ok((link, session, ephemeral_public, remote_keys))
+    Ok((
+        link,
+        session,
+        node.config.identity.endpoint_id(),
+        remote_keys,
+    ))
 }
 
 /// Send one encoded frame as a protected packet over a client session.
@@ -420,7 +475,7 @@ async fn relay_data_forwarded_between_two_live_sessions() {
         let remote = remote.clone();
         move || tcp_handshake(&node_a, &remote)
     });
-    let (link_a, session_a, ephemeral_a, keys_a) =
+    let (link_a, session_a, peer_a_id, keys_a) =
         tokio::time::timeout(Duration::from_secs(20), handshake_a)
             .await
             .expect("A handshake timed out")
@@ -430,16 +485,17 @@ async fn relay_data_forwarded_between_two_live_sessions() {
         let remote = remote.clone();
         move || tcp_handshake(&node_b, &remote)
     });
-    let (link_b, session_b, ephemeral_b, keys_b) =
+    let (link_b, session_b, peer_b_eid, keys_b) =
         tokio::time::timeout(Duration::from_secs(20), handshake_b)
             .await
             .expect("B handshake timed out")
             .expect("B handshake panicked")
             .expect("B handshake failed");
 
-    // The daemon registers each session under its provisional peer id.
-    let peer_a = provisional_peer_id(&ephemeral_a).to_vec();
-    let peer_b = provisional_peer_id(&ephemeral_b).to_vec();
+    // The daemon registers each session under its real peer endpoint id,
+    // verified from the identity binding carried in CLIENT_AUTH.
+    let peer_a = peer_a_id.to_vec();
+    let peer_b = peer_b_eid.to_vec();
 
     let link_a = Arc::new(link_a);
     let link_b = Arc::new(link_b);
@@ -570,12 +626,13 @@ async fn relay_data_forwarded_between_two_live_sessions() {
     drop(daemon);
 }
 
-/// D1 end-to-end proof: `Node::connect` over a live TCP carrier speaks
-/// Initial-protected `CLIENT_HELLO`/`SERVER_HELLO` (wire-format §13) — the
-/// client seals the hello with the client initial keys, the daemon
-/// decrypts it and answers with an Initial-protected `SERVER_HELLO`, and
-/// the client decrypts that with the server initial keys before
-/// completing the XX handshake.
+/// D1+D2 end-to-end proof over a live TCP carrier: `Node::connect` speaks
+/// Initial-protected `CLIENT_HELLO`/`SERVER_HELLO` (wire-format §13) and
+/// then sends the real `CLIENT_AUTH` (handshake.md §18). The daemon
+/// decrypts the Initial, answers with an Initial-protected `SERVER_HELLO`,
+/// completes the two-step responder against `CLIENT_AUTH`, and registers
+/// the session under the client's REAL endpoint id (verified from the
+/// client's identity binding) — the `session_active` event records it.
 #[tokio::test(flavor = "multi_thread")]
 async fn node_connect_completes_protected_handshake() {
     let tcp_port = free_tcp_port();
@@ -592,6 +649,7 @@ async fn node_connect_completes_protected_handshake() {
         Arc::new(TestEntropy),
     );
     node.register_carrier(Box::new(umc_carrier_tcp::TcpCarrier));
+    let client_eid = node.config.identity.endpoint_id();
     let server_identity = NodeIdentity::generate(&TestEntropy);
     let handshake =
         tokio::task::spawn_blocking(move || drive_connect(&mut node, &remote, &server_identity));
@@ -602,10 +660,42 @@ async fn node_connect_completes_protected_handshake() {
         .expect("protected handshake failed");
     assert_eq!(session_id, 0);
 
-    // The daemon accepted the protected Initial and registered the session.
+    // The daemon accepted the protected Initial, verified CLIENT_AUTH, and
+    // registered the session under the client's REAL peer endpoint id.
     wait_for_event(&socket, "session_active").await;
+    let events = get_events(&socket).await;
+    let active = events
+        .iter()
+        .find(|e| e.kind == "session_active")
+        .expect("session_active event");
+    assert!(
+        active.detail.contains(&format!("{client_eid:02x?}")),
+        "session_active must record the real peer endpoint id; detail: {}",
+        active.detail
+    );
 
     drop(daemon);
+}
+
+/// Fetch the daemon's current event log.
+async fn get_events(
+    socket: &std::path::Path,
+) -> Vec<umc_control::proto::umc::api::v1::EventRecord> {
+    let mut client =
+        umc_sdk::client::Client::connect(socket.to_str().expect("socket path"), "phase12-bus")
+            .await
+            .expect("control connect");
+    let response = client
+        .request("NodeAdmin", "GetEvents", Vec::new())
+        .await
+        .expect("get events");
+    assert_eq!(
+        response.status.as_ref().unwrap().code,
+        umc_control::proto::umc::api::v1::StatusCode::Ok as i32
+    );
+    umc_control::proto::umc::api::v1::GetEventsResponse::decode(response.payload.as_slice())
+        .expect("payload")
+        .events
 }
 
 /// Drive `Node::connect` to completion on a blocking thread without a

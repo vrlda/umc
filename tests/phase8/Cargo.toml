@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 umc-core = { path = "../../crates/umc-core" }
 umc-handshake = { path = "../../crates/umc-handshake" }
+umc-wire = { path = "../../crates/umc-wire" }
 umc-crypto = { path = "../../crates/umc-crypto" }
 umc-carrier = { path = "../../crates/umc-carrier" }
 umc-carrier-tcp = { path = "../../carriers/umc-carrier-tcp" }

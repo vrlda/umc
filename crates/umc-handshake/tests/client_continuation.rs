@@ -90,7 +90,7 @@ fn client_continuation_matches_driver_secrets() {
         padding: vec![0u8; 32],
     };
 
-    let (client_secrets, client_finished_key) = complete_client_side(
+    let out = complete_client_side(
         &client_identity,
         &client_static,
         &client_ephemeral,
@@ -100,10 +100,17 @@ fn client_continuation_matches_driver_secrets() {
         carrier_binding,
     )
     .expect("continuation");
+    let client_secrets = out.session_secrets;
+    let client_finished_key = out.client_finished_key;
 
     // Secrets are 32 bytes and distinct per label.
     assert_ne!(client_secrets.client, [0u8; 32]);
     assert_ne!(client_secrets.client, client_secrets.server);
     assert_eq!(client_finished_key.len(), 32);
+    // The client-auth material is present and the server identity was
+    // recovered from its auth block.
+    assert_ne!(out.client_auth_key, [0u8; 32]);
+    assert_ne!(out.server_endpoint_id, [0u8; 32]);
+    assert_eq!(out.server_static_public_key, server_static.public().0);
     let _ = driver_client_secrets;
 }

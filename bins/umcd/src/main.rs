@@ -239,7 +239,7 @@ fn handle_inbound_link(
     handle_inbound_link_locked(state, carrier_type, link, tracker)
 }
 
-#[allow(clippy::too_many_lines)] // one connection setup path: hello, session, registry
+#[allow(clippy::too_many_lines)] // one connection setup path: hello, auth, session, registry
 fn handle_inbound_link_locked(
     state: &Arc<std::sync::Mutex<state::RuntimeState>>,
     carrier_type: &str,
@@ -247,7 +247,10 @@ fn handle_inbound_link_locked(
     tracker: &std::sync::Mutex<handshake_timeout::HandshakeTracker>,
 ) -> Result<(), String> {
     let runtime = state.clone();
-    let state = state.lock().expect("state");
+    // The state lock is held only for the responder + registration steps:
+    // the wire waits (hello, then CLIENT_AUTH) happen WITHOUT it, so one
+    // slow handshake cannot stall the other accept loops or the control
+    // socket.
     // The first framed packet is the CLIENT_HELLO: an Initial long-header
     // packet (wire-format §13), or — on the transitional raw path kept for
     // the pre-D1 test harnesses — the hello body itself. The raw path is
@@ -272,9 +275,8 @@ fn handle_inbound_link_locked(
         Some((header_dcid, _, _, _)) if header_dcid.len() == 8 => header_dcid.clone(),
         _ => session_dcid(&hello),
     };
-    let peer_endpoint_id = provisional_peer_id(&hello);
 
-    let now = state.node.clock.as_ref().now();
+    let now = state.lock().expect("state").node.clock.as_ref().now();
     tracker
         .lock()
         .expect("handshake tracker")
@@ -282,18 +284,21 @@ fn handle_inbound_link_locked(
         .map_err(|e| format!("handshake rejected: {e}"))?;
 
     // The client's static handshake key arrives in CLIENT_AUTH (handshake.md
-    // §18); the accept loop's CLIENT_AUTH read lands with the wire wiring,
-    // so the client's ephemeral stands in for it to keep the DH chain
-    // (es/se/ss) symmetric on both sides (the SERVER_HELLO itself binds only
-    // DH_ee and the transcript).
-    let client_static = StaticHandshakePublicKey(hello.client_ephemeral_public_key);
-    let (server_hello_bytes, pending) = handshake_responder::respond_hello(
-        &state,
-        carrier_type.as_bytes(),
-        &hello_bytes,
-        &client_static,
-    )?;
-    let secrets = pending.session_secrets();
+    // §18); until the accept loop reads it (below), the client's ephemeral
+    // stands in for it so the DH chain (es/se/ss) and the client-auth key
+    // stay symmetric on both sides (the SERVER_HELLO itself binds only
+    // DH_ee and the transcript). The CLIENT_AUTH payload carries the REAL
+    // static + identity binding + signature, which complete() verifies.
+    let (server_hello_bytes, pending) = {
+        let state = state.lock().expect("state");
+        let client_static = StaticHandshakePublicKey(hello.client_ephemeral_public_key);
+        handshake_responder::respond_hello(
+            &state,
+            carrier_type.as_bytes(),
+            &hello_bytes,
+            &client_static,
+        )?
+    };
     // SERVER_HELLO travels in the same form as the request: Initial-
     // protected when the client spoke Initial, raw on the transitional
     // path. For the protected response the keys derive from the client's
@@ -326,6 +331,41 @@ fn handle_inbound_link_locked(
         .lock()
         .expect("handshake tracker")
         .record(&dcid, now);
+
+    // The client's CLIENT_AUTH completes the two-step responder
+    // (handshake.md §18): a second packet in the same form as the hello —
+    // Initial-protected on the live path, raw on the transitional path.
+    // The TCP carrier's recv yields WouldBlock while no frame is buffered
+    // (carriers/tcp.md), and the client sends CLIENT_AUTH only after
+    // processing the SERVER_HELLO, so poll briefly for it instead of
+    // refusing the link. `complete` decrypts the auth with the client-auth
+    // key, verifies the real client static key against the identity
+    // binding, validates the binding and the transcript-bound signature; a
+    // refusal drops the link and no session is registered.
+    let auth_packet = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match tokio::task::block_in_place(|| link.recv()) {
+                Ok(packet) => break packet.bytes,
+                Err(e)
+                    if e.kind == umc_carrier::error::CarrierErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(format!("recv client auth: {e:?}")),
+            }
+        }
+    };
+    let auth_bytes = decode_client_auth(&auth_packet)?;
+    let state = state.lock().expect("state");
+    let (_server_finished, secrets, peer) = pending
+        .complete(&state, &auth_bytes, now.0)
+        .map_err(|e| format!("client auth refused: {e}"))?;
+    // The peer identity recovered from CLIENT_AUTH: the real endpoint id
+    // from the client's identity binding (the provisional hello derivation
+    // is gone; the session registers under the verified identity).
+    let peer_endpoint_id = peer.binding.endpoint_id;
 
     let mut session = umc_session::session::Session::new(
         umc_session::session::SessionConfig {
@@ -426,13 +466,28 @@ fn session_dcid(hello: &umc_handshake::xx::ClientHello) -> Vec<u8> {
     umc_crypto::hkdf::extract(&[0u8; 32], &ikm)[..8].to_vec()
 }
 
-/// Provisional peer endpoint id until the client's identity binding arrives
-/// in `CLIENT_AUTH` (handshake.md §18).
-fn provisional_peer_id(hello: &umc_handshake::xx::ClientHello) -> [u8; 32] {
-    let mut ikm = Vec::with_capacity(32);
-    ikm.extend_from_slice(b"UMP-PEER-PROVISIONAL-v1");
-    ikm.extend_from_slice(&hello.client_ephemeral_public_key);
-    umc_crypto::hkdf::extract(&[0u8; 32], &ikm)
+/// Extract the `CLIENT_AUTH` message body from the second inbound packet:
+/// either the decrypted Initial payload or the raw framed message (the
+/// transitional dual-mode, mirroring [`decode_client_hello`]).
+///
+/// # Errors
+///
+/// Returns a message when the bytes decode to neither an Initial packet nor
+/// a handshake message, or the message type is not `CLIENT_AUTH`.
+fn decode_client_auth(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let body = match initial::try_parse_initial(bytes) {
+        Some((_dcid, _pn, payload, _scid)) => payload,
+        None => bytes.to_vec(),
+    };
+    let (message, _) = umc_handshake::encoding::decode_message(&body)
+        .map_err(|e| format!("client auth framing: {e:?}"))?;
+    if message.message_type != umc_handshake::encoding::CLIENT_AUTH {
+        return Err(format!(
+            "expected CLIENT_AUTH, got message type {}",
+            message.message_type
+        ));
+    }
+    Ok(message.body)
 }
 
 fn init_node(config: &NodeConfig, config_path: Option<&PathBuf>) {
@@ -455,4 +510,301 @@ fn init_node(config: &NodeConfig, config_path: Option<&PathBuf>) {
     println!("node endpoint: {:02x?}", identity.endpoint_id());
     println!("public relay: disabled (default)");
     println!("telemetry: disabled (default)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handshake_timeout::HandshakeTracker;
+    use std::sync::Mutex as StdMutex;
+    use umc_carrier::error::{CarrierError, CarrierErrorKind};
+    use umc_carrier::types::{
+        InboundPacket, LinkEvent, LinkProperties, Ordering, QueueState, Reliability, SendResult,
+    };
+    use umc_carrier::Link;
+    use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
+    use umc_handshake::encoding::{CLIENT_AUTH, CLIENT_HELLO, SERVER_HELLO};
+    use umc_handshake::identity::{endpoint_id, IdentityBinding};
+    use umc_handshake::transcript::Transcript;
+    use umc_handshake::xx::{
+        build_client_auth_plaintext, client_signature_input, decrypt_server_auth,
+        encrypt_client_auth, ClientHello, ServerHello, CRYPTO_PROFILE, MODE_XX,
+    };
+    use umc_types::runtime::Instant as RuntimeInstant;
+
+    fn test_state() -> Arc<std::sync::Mutex<state::RuntimeState>> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "umcd-accept-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = NodeConfig {
+            data_dir: dir,
+            ..NodeConfig::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        Arc::new(std::sync::Mutex::new(
+            state::RuntimeState::new(config, tx).expect("state"),
+        ))
+    }
+
+    /// A link that plays the client's side of the wire: `recv` returns the
+    /// `CLIENT_HELLO` first, then — once `send` captured the daemon's
+    /// `SERVER_HELLO` — the client's real `CLIENT_AUTH` (built exactly like
+    /// `Node::connect`), then fails. `tamper` flips a byte inside the
+    /// client signature before sealing so the daemon must refuse the auth.
+    struct AuthScriptedLink {
+        client_identity: IdentityKeyPair,
+        client_static: StaticHandshakeKeyPair,
+        client_ephemeral: StaticHandshakeKeyPair,
+        hello: ClientHello,
+        hello_bytes: Vec<u8>,
+        server_binding: IdentityBinding,
+        stage: StdMutex<usize>,
+        server_hello_bytes: StdMutex<Vec<u8>>,
+        tamper: bool,
+    }
+
+    impl AuthScriptedLink {
+        fn new(server_binding: IdentityBinding, tamper: bool) -> (Self, [u8; 32]) {
+            let client_identity = IdentityKeyPair::generate();
+            let client_static = StaticHandshakeKeyPair::generate();
+            let client_ephemeral = StaticHandshakeKeyPair::generate();
+            let hello = ClientHello::new(&crate::runtime_adapters::OsEntropy, &client_ephemeral);
+            let hello_bytes = hello.encode().expect("hello");
+            let client_eid = endpoint_id(&client_identity.public());
+            (
+                Self {
+                    client_identity,
+                    client_static,
+                    client_ephemeral,
+                    hello,
+                    hello_bytes,
+                    server_binding,
+                    stage: StdMutex::new(0),
+                    server_hello_bytes: StdMutex::new(Vec::new()),
+                    tamper,
+                },
+                client_eid,
+            )
+        }
+
+        /// The client's `CLIENT_AUTH` against the captured `SERVER_HELLO`:
+        /// the real static + the client's own identity binding + the
+        /// transcript-bound signature, sealed with the provisional-chain
+        /// client-auth key (the ephemeral stood in for the static in the DH
+        /// chain on both sides, so the key matches the responder's).
+        #[allow(clippy::similar_names)]
+        fn build_client_auth(&self, server_hello: &ServerHello) -> Result<Vec<u8>, String> {
+            let mut transcript = Transcript::new(MODE_XX, CRYPTO_PROFILE, b"ump.tcp/1");
+            transcript
+                .update_message(CLIENT_HELLO, &self.hello.encode().expect("hello"))
+                .expect("transcript");
+            let server_auth_transcript = transcript.hash;
+            let dh_ee = self
+                .client_ephemeral
+                .diffie_hellman(&StaticHandshakePublicKey(
+                    server_hello.server_ephemeral_public_key,
+                ));
+            let extract1 = umc_crypto::hkdf::extract(&[0u8; 32], &dh_ee);
+            let server_block = decrypt_server_auth(
+                &extract1,
+                &server_auth_transcript,
+                &server_hello.encrypted_server_authentication,
+                &server_hello.server_ephemeral_public_key,
+                &server_hello.server_random,
+                &server_hello.selected_crypto_profile,
+            )
+            .map_err(|e| format!("{e:?}"))?;
+            let server_static_pub = StaticHandshakePublicKey(server_block.server_static_public_key);
+            transcript
+                .update_message(SERVER_HELLO, &server_hello.encode().expect("server hello"))
+                .expect("transcript");
+            // The provisional chain: the ephemeral stands in for the static
+            // (the responder's DH chain used the hello ephemeral), so the
+            // client-auth key matches on both sides; the REAL static rides
+            // only in the plaintext below.
+            let dh_es = self.client_ephemeral.diffie_hellman(&server_static_pub);
+            let secret2 = umc_crypto::hkdf::extract(&extract1, &dh_es);
+            let dh_se = self
+                .client_ephemeral
+                .diffie_hellman(&StaticHandshakePublicKey(
+                    server_hello.server_ephemeral_public_key,
+                ));
+            let secret3 = umc_crypto::hkdf::extract(&secret2, &dh_se); // provisional chain
+            let auth_key =
+                handshake_responder::expand(&secret3, b"client auth key", &transcript.hash);
+            let client_eid = endpoint_id(&self.client_identity.public());
+            let server_eid = endpoint_id(&self.server_binding.identity_public_key);
+            let sig_input = client_signature_input(
+                &transcript.hash,
+                &client_eid,
+                &server_eid,
+                &self.client_static.public().0,
+                &server_static_pub.0,
+            );
+            let signature = self.client_identity.sign(&sig_input);
+            let client_binding = IdentityBinding::sign(
+                &self.client_identity,
+                &self.client_static.public(),
+                0,
+                u64::MAX,
+                0,
+                [0u8; 32],
+            );
+            let mut plaintext = build_client_auth_plaintext(
+                &self.client_static.public().0,
+                &client_binding,
+                &signature,
+            );
+            if self.tamper {
+                // Flip a byte INSIDE the transcript signature section so
+                // the AEAD still opens but the identity proof fails.
+                let last = plaintext.len() - 1;
+                plaintext[last] ^= 0x01;
+            }
+            let ciphertext = encrypt_client_auth(&auth_key, &transcript.hash, &plaintext);
+            let mut auth_body = Vec::new();
+            umc_wire::bytes::encode(&mut auth_body, &ciphertext, 16_384)
+                .map_err(|_| "bytes".to_string())?;
+            let mut frame = Vec::new();
+            umc_handshake::encoding::encode_message(&mut frame, CLIENT_AUTH, &auth_body)
+                .map_err(|e| format!("{e:?}"))?;
+            Ok(frame)
+        }
+    }
+
+    impl Link for AuthScriptedLink {
+        fn properties(&self) -> LinkProperties {
+            LinkProperties {
+                reliability: Reliability::ReliableUntilLinkFailure,
+                ordering: Ordering::Ordered,
+                current_mtu: 65_535,
+                queue_bytes: 0,
+                queue_capacity: 2 * 1024 * 1024,
+                estimated_rtt_ms: None,
+                estimated_loss: None,
+                metered: false,
+            }
+        }
+
+        fn send(&self, packet: OutboundPacket) -> Result<SendResult, CarrierError> {
+            *self.server_hello_bytes.lock().expect("server hello") = packet.bytes;
+            Ok(SendResult::Accepted {
+                queue_state: QueueState::SentToMedium,
+            })
+        }
+
+        fn recv(&self) -> Result<InboundPacket, CarrierError> {
+            let mut stage = self.stage.lock().expect("stage");
+            match *stage {
+                0 => {
+                    *stage += 1;
+                    Ok(InboundPacket {
+                        bytes: self.hello_bytes.clone(),
+                        received_at: RuntimeInstant(0),
+                    })
+                }
+                1 => {
+                    *stage += 1;
+                    let server_hello_bytes = self.server_hello_bytes.lock().expect("captured");
+                    let server_hello =
+                        ServerHello::decode(&server_hello_bytes).expect("captured server hello");
+                    let frame = self.build_client_auth(&server_hello).expect("client auth");
+                    Ok(InboundPacket {
+                        bytes: frame,
+                        received_at: RuntimeInstant(0),
+                    })
+                }
+                _ => Err(CarrierError::new(
+                    CarrierErrorKind::LinkFailed,
+                    "script exhausted",
+                )),
+            }
+        }
+
+        fn events(&self) -> Result<LinkEvent, CarrierError> {
+            Err(CarrierError::new(CarrierErrorKind::WouldBlock, "events"))
+        }
+
+        fn close(&self, _reason: &str) -> Result<(), CarrierError> {
+            Ok(())
+        }
+    }
+
+    /// The accept loop (`handle_inbound_link`) reads the client's `CLIENT_AUTH`
+    /// after the `SERVER_HELLO`, completes the two-step responder with it,
+    /// and registers the session under the client's REAL endpoint id from
+    /// the verified identity binding (handshake.md §18) — not a derivation
+    /// of the hello ephemeral.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_loop_verifies_client_auth() {
+        let state = test_state();
+        let (server_identity, server_static) = {
+            let state = state.lock().expect("state");
+            (
+                state.node_identity.identity.clone(),
+                state.node_identity.static_handshake.public(),
+            )
+        };
+        let server_binding =
+            IdentityBinding::sign(&server_identity, &server_static, 0, u64::MAX, 0, [0u8; 32]);
+        let (link, client_eid) = AuthScriptedLink::new(server_binding, false);
+        let tracker = StdMutex::new(HandshakeTracker::new());
+        handle_inbound_link(&state, "ump.tcp/1", Box::new(link), &tracker).expect("accept");
+
+        let session_id = state
+            .lock()
+            .expect("state")
+            .sessions
+            .lookup(1)
+            .expect("session registered");
+        assert_eq!(
+            session_id.peer_endpoint_id, client_eid,
+            "the session registers the real peer endpoint id from CLIENT_AUTH"
+        );
+        // The session bus is reachable under the real peer id (the relay
+        // path keys cross-session delivery on it).
+        assert_eq!(
+            state
+                .lock()
+                .expect("state")
+                .bus
+                .lock()
+                .expect("bus")
+                .lookup(&client_eid),
+            Some(1)
+        );
+    }
+
+    /// A `CLIENT_AUTH` whose transcript signature is tampered with passes
+    /// the AEAD open (it was sealed honestly) but fails identity
+    /// verification: the accept loop refuses the session and registers
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_loop_refuses_tampered_client_auth() {
+        let state = test_state();
+        let (server_identity, server_static) = {
+            let state = state.lock().expect("state");
+            (
+                state.node_identity.identity.clone(),
+                state.node_identity.static_handshake.public(),
+            )
+        };
+        let server_binding =
+            IdentityBinding::sign(&server_identity, &server_static, 0, u64::MAX, 0, [0u8; 32]);
+        let (link, _client_eid) = AuthScriptedLink::new(server_binding, true);
+        let tracker = StdMutex::new(HandshakeTracker::new());
+        let err = handle_inbound_link(&state, "ump.tcp/1", Box::new(link), &tracker)
+            .expect_err("tampered auth must be refused");
+        assert!(err.contains("client auth"), "{err}");
+        assert_eq!(
+            state.lock().expect("state").sessions.count(),
+            0,
+            "no session may be registered for a refused auth"
+        );
+    }
 }
