@@ -208,12 +208,17 @@ impl Link for TcpLink {
 
     fn send(&self, packet: OutboundPacket) -> Result<SendResult, CarrierError> {
         let bytes = packet.bytes.len();
+        // Count BEFORE the enqueue so a writer that drains concurrently can
+        // never decrement past the increment (atomic wrap would trip the
+        // backpressure gate permanently); on rejection the count is
+        // compensated.
+        self.pending_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
         self.outbound
             .try_send(packet)
-            .map_err(|_| CarrierError::new(CarrierErrorKind::QueueFull, "send"))?;
-        // Count the bytes into the queue gauge (congestion.md §16); the
-        // writer task decrements once they are on the stream.
-        self.pending_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
+            .map_err(|_| {
+                self.pending_bytes.fetch_sub(bytes, AtomicOrdering::Relaxed);
+                CarrierError::new(CarrierErrorKind::QueueFull, "send")
+            })?;
         Ok(SendResult::Accepted {
             queue_state: QueueState::QueuedBounded,
         })
