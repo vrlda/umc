@@ -28,7 +28,7 @@ pub struct Subscription {
     pub id: u64,
     pub next_sequence: u64,
     pub out_of_sync: bool,
-    pub queue: VecDeque<UmpEvent>,
+    pub queue: VecDeque<(u64, UmpEvent)>,
     pub queue_bytes: usize,
     pub max_backlog: usize,
 }
@@ -68,14 +68,20 @@ impl Subscription {
             return Err(EventError::OutOfSync);
         }
         self.queue_bytes += event.payload.len();
-        self.queue.push_back(event);
+        self.queue.push_back((sequence, event));
         Ok(sequence)
     }
 
     pub fn pop(&mut self) -> Option<UmpEvent> {
-        let event = self.queue.pop_front()?;
+        self.pop_with_sequence().map(|(_, event)| event)
+    }
+
+    /// Removes the oldest queued event and returns its per-subscription
+    /// sequence alongside the payload for wire framing.
+    pub fn pop_with_sequence(&mut self) -> Option<(u64, UmpEvent)> {
+        let (sequence, event) = self.queue.pop_front()?;
         self.queue_bytes = self.queue_bytes.saturating_sub(event.payload.len());
-        Some(event)
+        Some((sequence, event))
     }
 
     pub fn ack(&mut self, highest_contiguous: u64) {
