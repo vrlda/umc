@@ -30,6 +30,7 @@ use umc_core::trust::{TrustLevel, TrustState, TrustStore};
 use umc_core::well_known::WELL_KNOWN_APP;
 use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
 use umc_discovery::invitation::InvitationStore;
+use umc_discovery::limit::EnumerationGuard;
 use umc_handshake::identity::IdentityBinding;
 use umc_metrics::Registry;
 use umc_storage::keystore::{KeyClass, Keystore, KeystoreError};
@@ -412,6 +413,10 @@ pub struct RuntimeState {
     /// Task 20+.
     #[allow(dead_code)]
     pub rate_limiter: RateLimiter,
+    /// Per-control-principal enumeration budget (discovery.md §18): list and
+    /// query surfaces consume bounded work without revealing whether a
+    /// hidden candidate exists after the budget is exhausted.
+    pub enumeration_guard: EnumerationGuard,
     /// Node identity. Loaded from the keystore (core.md §19/§63), so the
     /// endpoint id survives restarts; a fresh identity is generated and
     /// persisted on first boot.
@@ -615,6 +620,7 @@ impl RuntimeState {
             trust_default_level: TrustLevel::Unknown,
             blocklist: Blocklist::new(60),
             rate_limiter: RateLimiter::new(1_024),
+            enumeration_guard: EnumerationGuard::new(1_024),
             node_identity: state_identity,
             primary_binding,
             secondaries,
