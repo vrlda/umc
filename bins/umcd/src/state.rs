@@ -126,6 +126,13 @@ pub struct RuntimeState {
     /// endpoint id survives restarts; a fresh identity is generated and
     /// persisted on first boot.
     pub node_identity: NodeIdentity,
+    /// Session-ticket key (handshake.md §35): HKDF-Extract of the keystore
+    /// identity seed (the keystore-derived identity seed hash, SANCTIONED).
+    /// Stable across restarts because the keystore identity is persistent;
+    /// secret because the seed never leaves the daemon. Tickets sealed with
+    /// it are opaque to peers — the ticket only carries its nonce in the
+    /// clear (v1 wire format).
+    pub ticket_key: [u8; 32],
     /// Operating mode profile (local mesh vs endpoint).
     pub mesh: MeshConfig,
     /// The runtime node: registered carriers, sessions (core.md §8).
@@ -203,6 +210,10 @@ impl RuntimeState {
             identity: node_identity.identity.clone(),
             static_handshake: node_identity.static_handshake.clone(),
         };
+        // Session-ticket key (handshake.md §35): the keystore identity
+        // seed hash — persistent across restarts and bound to the node's
+        // identity (see the field docs).
+        let ticket_key = umc_crypto::hkdf::extract(&[0u8; 32], &state_identity.identity.to_seed());
         let dcid = node_identity.endpoint_id()[..8].to_vec();
         let node = Node::new(
             NodeRuntimeConfig {
@@ -278,6 +289,7 @@ impl RuntimeState {
             blocklist: Blocklist::new(60),
             rate_limiter: RateLimiter::new(1_024),
             node_identity: state_identity,
+            ticket_key,
             mesh,
             node,
             listeners: Vec::new(),
