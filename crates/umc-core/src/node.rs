@@ -371,6 +371,204 @@ impl Node {
         );
         Ok(id)
     }
+
+    /// Resume a session with a session ticket (handshake.md §35, IK mode):
+    /// the client keeps the ticket it received when the previous session
+    /// closed, plus that session's resumption secret (derived by
+    /// `derive_session_secrets`). The ticket is opaque — sealed with the
+    /// server's ticket key — but its v1 wire format carries the nonce in
+    /// the clear, so the client derives the same resumption PSK the server
+    /// does. The resume runs `CLIENT_HELLO` (mode IK, the ticket in
+    /// `retry_token` — the SANCTIONED v1 ticket carrier) and
+    /// `SERVER_HELLO` (mode IK, no auth block); both sides skip the
+    /// `CLIENT_AUTH`/`SERVER_FINISHED` exchange and derive the resumed
+    /// traffic secrets from the ephemeral DH under the PSK.
+    ///
+    /// Version negotiation retries once with a fresh connection, mirroring
+    /// [`Node::connect`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::CarrierUnknown`] when no carrier of the given
+    /// type is registered, [`NodeError::Carrier`] when dialing or
+    /// exchanging packets fails, and [`NodeError::Handshake`] when the
+    /// ticket is malformed, the server does not select IK mode (a stale or
+    /// invalid ticket makes the daemon fall back to the full XX path — the
+    /// caller should retry with [`Node::connect`]), or the secrets cannot
+    /// be derived.
+    pub async fn connect_resumed(
+        &mut self,
+        carrier_type: &str,
+        remote: String,
+        ticket: &[u8],
+        resumption_secret: &[u8; 32],
+    ) -> Result<u64, NodeError> {
+        let mut retried = false;
+        loop {
+            match self
+                .connect_resumed_attempt(carrier_type, remote.clone(), ticket, resumption_secret)
+                .await
+            {
+                Err(NodeError::VersionNegotiation) if !retried => {
+                    // The VN listed a supported version: retry once with a
+                    // fresh connection.
+                    retried = true;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// One resume attempt (see [`Node::connect_resumed`] for the retry
+    /// policy).
+    #[allow(clippy::too_many_lines)] // one wire resume path: hello, server hello, secrets
+    async fn connect_resumed_attempt(
+        &mut self,
+        carrier_type: &str,
+        remote: String,
+        ticket: &[u8],
+        resumption_secret: &[u8; 32],
+    ) -> Result<u64, NodeError> {
+        let carrier = self
+            .carrier(carrier_type)
+            .ok_or(NodeError::CarrierUnknown)?;
+        let link = carrier.dial(remote).map_err(NodeError::Carrier)?;
+
+        // The resume hello offers only the IK mode and carries the ticket
+        // in `retry_token` (the SANCTIONED v1 ticket carrier).
+        let client_ephemeral = StaticHandshakeKeyPair::generate();
+        let mut hello =
+            umc_handshake::xx::ClientHello::new(self.entropy.as_ref(), &client_ephemeral);
+        hello.supported_handshake_modes = vec![umc_handshake::ik::MODE_IK.to_vec()];
+        hello.retry_token = ticket.to_vec();
+        let hello_bytes = hello
+            .encode()
+            .map_err(|e| NodeError::Handshake(format!("{e:?}")))?;
+
+        // The ticket's clear nonce prefix (v1 wire format): the client
+        // cannot open the seal but needs the nonce for the PSK derivation.
+        let nonce = umc_handshake::ticket::ticket_nonce(ticket)
+            .ok_or_else(|| NodeError::Handshake("ticket malformed (no clear nonce)".into()))?;
+
+        let mut dcid = [0u8; 8];
+        self.entropy.fill(&mut dcid);
+        let mut scid = [0u8; 8];
+        self.entropy.fill(&mut scid);
+        let keys = umc_handshake::initial::derive_initial_keys(&dcid);
+        let hello_packet = build_initial_packet(&dcid, &scid, 0, &hello_bytes, &keys.client)?;
+        send_packet(link.as_ref(), &hello_packet).map_err(NodeError::Carrier)?;
+        std::thread::sleep(Duration::from_millis(100));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let server_packet = loop {
+            match link.recv() {
+                Ok(packet) => break packet.bytes,
+                Err(e)
+                    if e.kind == CarrierErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(NodeError::Carrier(e)),
+            }
+        };
+        // Version negotiation (compatibility.md §5.2): identical to the
+        // full connect path.
+        if let Some((offered, vn_dcid)) =
+            umc_handshake::xx::parse_version_negotiation(&server_packet)
+        {
+            if vn_dcid != scid {
+                return Err(NodeError::Handshake(
+                    "version negotiation: DCID echo mismatch".into(),
+                ));
+            }
+            if umc_handshake::xx::select_version(&offered).is_none() {
+                return Err(NodeError::Handshake(
+                    "version negotiation: server offers no supported protocol version".into(),
+                ));
+            }
+            return Err(NodeError::VersionNegotiation);
+        }
+        let server_hello_bytes = parse_initial_response(&server_packet, &keys.server)?;
+        let server_hello = umc_handshake::xx::ServerHello::decode(&server_hello_bytes)
+            .map_err(|e| NodeError::Handshake(format!("{e:?}")))?;
+        // The resume server hello must select IK: a mode-XX answer means
+        // the daemon fell back to the full path (stale or invalid ticket)
+        // and the caller must retry with a full connect.
+        if server_hello.selected_handshake_mode != umc_handshake::ik::MODE_IK {
+            return Err(NodeError::Handshake(
+                "resume refused: server selected the full XX handshake (stale ticket?)".into(),
+            ));
+        }
+        // Capability negotiation (compatibility.md §5.4): the server's
+        // canonical hash rides in the padding prefix, as on the XX path.
+        if server_hello.server_capabilities_hash()
+            != Some(umc_handshake::xx::capabilities_hash(
+                &umc_handshake::xx::canonical_capabilities(),
+            ))
+        {
+            return Err(NodeError::Handshake(
+                "server capabilities hash mismatch".into(),
+            ));
+        }
+
+        // The resume transcript binds both hello messages under the IK mode
+        // (handshake.md §35) — the exact context the daemon derives with.
+        // Re-encode the canonical SERVER_HELLO, mirroring the XX path.
+        let mut transcript = umc_handshake::transcript::Transcript::new(
+            umc_handshake::ik::MODE_IK,
+            umc_handshake::xx::CRYPTO_PROFILE,
+            carrier_type.as_bytes(),
+        );
+        transcript
+            .update_message(umc_handshake::encoding::CLIENT_HELLO, &hello_bytes)
+            .map_err(|e| NodeError::Handshake(format!("transcript: {e:?}")))?;
+        let server_hello_canonical = server_hello
+            .encode()
+            .map_err(|e| NodeError::Handshake(format!("server hello: {e:?}")))?;
+        transcript
+            .update_message(
+                umc_handshake::encoding::SERVER_HELLO,
+                &server_hello_canonical,
+            )
+            .map_err(|e| NodeError::Handshake(format!("transcript: {e:?}")))?;
+
+        // The resumed traffic secrets: both sides derive the same PSK from
+        // the previous session's resumption secret and the ticket's clear
+        // nonce, then the ephemeral DH under the PSK.
+        let psk = umc_session::ticket::resumption_psk(resumption_secret, &nonce);
+        let resume = umc_handshake::ik::derive_resumption_secrets(
+            &psk,
+            &client_ephemeral,
+            &server_hello.server_ephemeral_public_key,
+            &transcript.hash,
+        );
+
+        let id = self.next_session;
+        self.next_session += 1;
+        // The v1 resume derives only the two traffic secrets; the remaining
+        // `SessionSecrets` fields are unused by resumed sessions (the
+        // stateless-reset and resumption chains of the resumed session are
+        // documented as not derived). The peer identity is not re-established
+        // by the resume (no identity exchange): it is unknown until a full
+        // handshake.
+        self.sessions.lock().await.insert(
+            id,
+            SessionEntry {
+                secrets: SessionSecrets {
+                    client: resume.client,
+                    server: resume.server,
+                    exporter: [0u8; 32],
+                    resumption: [0u8; 32],
+                    path_validation: [0u8; 32],
+                    connection_id: [0u8; 32],
+                    stateless_reset: [0u8; 32],
+                },
+                peer_endpoint_id: [0u8; 32],
+            },
+        );
+        Ok(id)
+    }
 }
 
 fn send_packet(
@@ -878,6 +1076,65 @@ mod tests {
             assert!(
                 umc_handshake::initial::try_parse_initial(&sent[1]).is_some(),
                 "the retry re-sends an Initial hello on the fresh link"
+            );
+        });
+    }
+
+    /// The resume hello (`connect_resumed`) travels as an Initial packet
+    /// whose payload is a `CLIENT_HELLO` offering ONLY the IK mode and
+    /// carrying the ticket in `retry_token` — the SANCTIONED v1 ticket
+    /// carrier (handshake.md §35). The recording link answers recv with a
+    /// failure, so the resume fails after the send; the sent bytes carry
+    /// the evidence.
+    #[test]
+    fn connect_resumed_sends_ik_hello_with_ticket() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let sent = Arc::new(StdMutex::new(Vec::new()));
+            let mut node = Node::new(
+                NodeConfig {
+                    identity: NodeIdentity::generate(&TestEntropy),
+                    dcid: vec![1u8; 8],
+                },
+                Arc::new(TestClock),
+                Arc::new(TestEntropy),
+            );
+            node.register_carrier(Box::new(RecordingCarrier { sent: sent.clone() }));
+            let ticket = umc_handshake::ticket::issue_ticket(&[1u8; 32], &{
+                use umc_handshake::ticket::TicketPayload;
+                TicketPayload {
+                    version: 1,
+                    ticket_id: [2u8; 16],
+                    client_endpoint_id_hash: [3u8; 32],
+                    server_endpoint_id_hash: [4u8; 32],
+                    resumption_secret: [5u8; 32],
+                    issued_at_ms: 0,
+                    expires_at_ms: 86_400_000,
+                    protocol_version: 1,
+                    crypto_profile: umc_handshake::xx::CRYPTO_PROFILE.to_vec(),
+                    nonce: [6u8; 16],
+                }
+            });
+            let _ = node
+                .connect_resumed("rec.1", "recorder".into(), &ticket, &[7u8; 32])
+                .await;
+            let packet = sent.lock().expect("sent").clone();
+            assert!(!packet.is_empty(), "a resume hello must have been sent");
+            let (_dcid, _pn, payload, _scid) = umc_handshake::initial::try_parse_initial(&packet)
+                .expect("sent bytes are a parseable Initial packet");
+            let hello = umc_handshake::xx::ClientHello::decode(&payload)
+                .expect("decrypted payload is a CLIENT_HELLO");
+            assert_eq!(
+                hello.supported_handshake_modes,
+                vec![umc_handshake::ik::MODE_IK.to_vec()],
+                "the resume hello offers only IK mode"
+            );
+            assert_eq!(
+                hello.retry_token, ticket,
+                "the ticket rides the retry_token carrier"
             );
         });
     }

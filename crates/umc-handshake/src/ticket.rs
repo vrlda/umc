@@ -76,7 +76,18 @@ impl TicketPayload {
     }
 }
 
-/// Encrypts a ticket payload under the server's current ticket key.
+/// Encrypts a ticket payload under the server's current ticket key,
+/// wrapping it in the v1 ticket wire format:
+///
+/// ```text
+/// [version(1) || nonce(16) || sealed(payload.encode())]
+/// ```
+///
+/// The nonce rides in the clear BEFORE the seal (SANCTIONED v1 format,
+/// handshake.md §35): the bearer must be able to derive the resumption PSK
+/// (`resumption_psk(resumption_secret, nonce)`) without opening the seal,
+/// and the sealed payload authenticates the whole ticket — a swapped nonce
+/// fails `validate_ticket` because the sealed copy must match.
 ///
 /// # Panics
 /// Panics if the 32-byte ticket key cannot be expanded into keys or the
@@ -84,11 +95,35 @@ impl TicketPayload {
 #[must_use]
 pub fn issue_ticket(ticket_key: &[u8; 32], payload: &TicketPayload) -> Vec<u8> {
     let keys = PacketKeys::from_traffic_secret(ticket_key).expect("32-byte key");
-    keys.seal(0, b"UMP-SESSION-TICKET-v1", &payload.encode())
-        .expect("seal")
+    let seal = keys
+        .seal(0, b"UMP-SESSION-TICKET-v1", &payload.encode())
+        .expect("seal");
+    let mut out = Vec::with_capacity(1 + TICKET_ENTROPY + seal.len());
+    out.push(TICKET_VERSION);
+    out.extend_from_slice(&payload.nonce);
+    out.extend_from_slice(&seal);
+    out
 }
 
-/// Decrypts and validates a ticket issued by this server.
+/// The v1 ticket wire-format version byte.
+pub const TICKET_VERSION: u8 = 1;
+
+/// Reads the ticket's clear nonce prefix (v1 wire format: `[version(1) ||
+/// nonce(16) || sealed(...)]`). The bearer cannot open the seal (the ticket
+/// is sealed with the server's key) but needs the nonce to derive the
+/// resumption PSK; the seal authenticates the whole ticket, so a forged
+/// prefix is rejected server-side.
+#[must_use]
+pub fn ticket_nonce(ticket: &[u8]) -> Option<[u8; TICKET_ENTROPY]> {
+    if ticket.first().copied()? != TICKET_VERSION {
+        return None;
+    }
+    ticket.get(1..1 + TICKET_ENTROPY)?.try_into().ok()
+}
+
+/// Decrypts and validates a ticket issued by this server (v1 wire format:
+/// `[version(1) || nonce(16) || sealed(payload.encode())]` — the clear
+/// nonce prefix must match the nonce sealed inside).
 ///
 /// # Errors
 /// Returns [`TicketError::Invalid`] for an undecryptable, malformed, or
@@ -99,12 +134,19 @@ pub fn validate_ticket(
     ticket: &[u8],
     now_ms: u64,
 ) -> Result<TicketPayload, TicketError> {
+    let nonce = ticket_nonce(ticket).ok_or(TicketError::Invalid)?;
+    let seal = ticket
+        .get(1 + TICKET_ENTROPY..)
+        .ok_or(TicketError::Invalid)?;
     let keys = PacketKeys::from_traffic_secret(ticket_key).map_err(|_| TicketError::Invalid)?;
     let plaintext = keys
-        .open(0, b"UMP-SESSION-TICKET-v1", ticket)
+        .open(0, b"UMP-SESSION-TICKET-v1", seal)
         .map_err(|_| TicketError::Invalid)?;
     let payload = TicketPayload::decode(&plaintext).ok_or(TicketError::Invalid)?;
-    if payload.version != 1 {
+    if payload.version != TICKET_VERSION {
+        return Err(TicketError::Invalid);
+    }
+    if payload.nonce != nonce {
         return Err(TicketError::Invalid);
     }
     if payload.expires_at_ms <= now_ms {
@@ -170,6 +212,39 @@ mod tests {
             validate_ticket(&[2u8; 32], &ticket, now),
             Err(TicketError::Invalid)
         );
+    }
+
+    /// The v1 wire format (handshake.md §35): the nonce rides in the clear
+    /// prefix `[version(1) || nonce(16) || seal]` so the bearer can derive
+    /// the resumption PSK without opening the seal; `validate_ticket`
+    /// returns the same payload and the seal authenticates the whole
+    /// ticket — a tampered prefix fails, as does the wrong key.
+    #[test]
+    fn ticket_nonce_round_trip() {
+        let key = [3u8; 32];
+        let now = 1_700_000_000_000;
+        let ticket = issue_ticket(&key, &payload(now));
+        assert_eq!(ticket.first(), Some(&TICKET_VERSION));
+        assert_eq!(
+            ticket_nonce(&ticket),
+            Some([5u8; TICKET_ENTROPY]),
+            "the nonce must be readable in the clear prefix"
+        );
+        let back = validate_ticket(&key, &ticket, now + 60_000).expect("valid ticket");
+        assert_eq!(back.nonce, [5u8; TICKET_ENTROPY]);
+        assert_eq!(back.resumption_secret, [4u8; 32]);
+
+        // A tampered clear nonce fails validation (the sealed copy must
+        // match the prefix) — the bearer cannot forge a PSK nonce.
+        let mut forged = ticket.clone();
+        forged[1] ^= 0x01;
+        assert_eq!(
+            validate_ticket(&key, &forged, now + 60_000),
+            Err(TicketError::Invalid)
+        );
+        // A truncated ticket has no readable nonce.
+        assert!(ticket_nonce(&ticket[..10]).is_none());
+        assert!(ticket_nonce(b"\x02garbage").is_none());
     }
 
     #[test]

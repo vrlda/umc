@@ -71,6 +71,62 @@ pub const BUNDLE_PACKET_HEADROOM: usize = 256;
 pub const RELAY_STATUS_ACCEPTED: u64 = 1;
 pub const RELAY_STATUS_REFUSED: u64 = 2;
 
+/// Ticket-issuance material for one session (handshake.md §35): the daemon
+/// seals the session's resumption secret into a session ticket when the
+/// session closes cleanly (the idle-close path) so the peer can resume with
+/// IK mode. `None` for resumed sessions: the v1 scheme issues no tickets on
+/// resumed sessions (a single resumption hop; a fresh full handshake
+/// re-arms the chain).
+#[derive(Debug, Clone)]
+pub struct TicketMaterial {
+    /// The daemon's session-ticket key (`RuntimeState::ticket_key`).
+    pub ticket_key: [u8; 32],
+    /// The session's shared resumption secret (handshake.md §26).
+    pub resumption_secret: [u8; 32],
+    /// The peer's endpoint id, bound into the ticket.
+    pub peer_endpoint_id: [u8; 32],
+    /// This node's endpoint id, bound into the ticket.
+    pub server_endpoint_id: [u8; 32],
+}
+
+/// Build the encoded `SESSION_TICKET` frame for a session's clean close
+/// (handshake.md §35): a fresh ticket sealing the session's resumption
+/// secret under the daemon's ticket key, one per session close. The frame's
+/// own nonce field stays empty — the ticket carries its nonce in the v1
+/// clear prefix.
+#[must_use]
+fn build_session_ticket(
+    material: &TicketMaterial,
+    now_ms: u64,
+    entropy: &dyn umc_types::runtime::EntropySource,
+) -> Option<Vec<u8>> {
+    let mut nonce = [0u8; umc_handshake::ticket::TICKET_ENTROPY];
+    entropy.fill(&mut nonce);
+    let mut ticket_id = [0u8; 16];
+    entropy.fill(&mut ticket_id);
+    let payload = umc_handshake::ticket::TicketPayload {
+        version: umc_handshake::ticket::TICKET_VERSION,
+        ticket_id,
+        client_endpoint_id_hash: material.peer_endpoint_id,
+        server_endpoint_id_hash: material.server_endpoint_id,
+        resumption_secret: material.resumption_secret,
+        issued_at_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(umc_handshake::ticket::MAX_TICKET_LIFETIME_MS),
+        protocol_version: umc_handshake::xx::SUPPORTED_PROTOCOL_VERSION,
+        crypto_profile: umc_handshake::xx::CRYPTO_PROFILE.to_vec(),
+        nonce,
+    };
+    let ticket = umc_handshake::ticket::issue_ticket(&material.ticket_key, &payload);
+    umc_wire::frames::handshake::SessionTicketFrame {
+        lifetime: umc_handshake::ticket::MAX_TICKET_LIFETIME_MS,
+        age_add: 0,
+        nonce: Vec::new(),
+        ticket,
+    }
+    .encode()
+    .ok()
+}
+
 /// Sleep until the PTO deadline, or forever when no deadline is armed.
 async fn pto_sleep(deadline: Option<tokio::time::Instant>) {
     match deadline {
@@ -130,11 +186,12 @@ fn pto_deadline_after(
 
 /// One idle/draining sweep on the reader's 1 s interval arm (session.md
 /// §6.4, §22): when the session has been idle past the timeout while still
-/// `Active`, build a `CONNECTION_CLOSE` packet and enter draining; once the
-/// draining deadline has passed, finalize the close. Returns the built idle
-/// close packet and the built keepalive ping (the caller sends them after
-/// dropping the session guard) and whether the reader loop should exit (the
-/// draining period ended).
+/// `Active`, build a `CONNECTION_CLOSE` packet — carrying the session
+/// ticket (handshake.md §35) when `ticket_material` is present — and enter
+/// draining; once the draining deadline has passed, finalize the close.
+/// Returns the built idle close packet and the built keepalive ping (the
+/// caller sends them after dropping the session guard) and whether the
+/// reader loop should exit (the draining period ended).
 ///
 /// When the session is `Active` but not yet idle-expired, an idle time of at
 /// least half the timeout builds a `PING` keepalive (session.md §22) and
@@ -145,14 +202,23 @@ fn handle_idle_timers(
     session: &mut Session,
     clock: &dyn Clock,
     now: Instant,
+    ticket_material: Option<&TicketMaterial>,
 ) -> (Option<Vec<u8>>, Option<Vec<u8>>, bool) {
     if session.draining_expired(now) {
         session.finalize_close();
         return (None, None, true);
     }
     if session.state == SessionState::Active && session.idle_expired(now) {
-        let built = session
-            .build_idle_close(now)
+        // The clean-close path (handshake.md §35): one ticket rides the
+        // final `CONNECTION_CLOSE` packet, so the peer can resume after the
+        // close. Issued once — the session is closed right after.
+        let mut close_payload = session.build_idle_close(now);
+        if let (Some(payload), Some(material)) = (&mut close_payload, ticket_material) {
+            if let Some(ticket_frame) = build_session_ticket(material, now.0, &OsEntropy) {
+                payload.extend_from_slice(&ticket_frame);
+            }
+        }
+        let built = close_payload
             .and_then(|payload| session.build_outbound(clock, now, &payload).ok().flatten());
         session.close(now);
         return (built, None, false);
@@ -208,6 +274,7 @@ pub fn spawn_session_task(
     app_echo_rx: Arc<Mutex<HashMap<Vec<u8>, AppRx>>>,
     runtime: Arc<Mutex<RuntimeState>>,
     remote_keys: PacketKeys,
+    ticket_material: Option<TicketMaterial>,
     bus_inbound_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     bus_outbound_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 ) -> JoinHandle<()> {
@@ -271,6 +338,7 @@ pub fn spawn_session_task(
             &app_channels,
             &reader_runtime,
             &remote_keys,
+            ticket_material,
             session_id,
             packet_rx,
             bus_inbound_rx,
@@ -319,6 +387,7 @@ async fn reader_loop(
     app_channels: &Arc<Mutex<HashMap<Vec<u8>, AppTx>>>,
     runtime: &Arc<Mutex<RuntimeState>>,
     remote_keys: &PacketKeys,
+    ticket_material: Option<TicketMaterial>,
     session_id: u64,
     mut packet_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     mut bus_inbound_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
@@ -416,10 +485,16 @@ async fn reader_loop(
                 let now = clock.now();
                 // Build the idle close / keepalive (if any) under the guard;
                 // the sends happen after it is dropped — the carrier API is
-                // blocking.
+                // blocking. The clean close carries the session ticket
+                // (handshake.md §35) when this session is ticket-bearing.
                 let (built_close, built_keepalive, done) = {
                     let mut session = session.lock().await;
-                    handle_idle_timers(&mut session, clock.as_ref(), now)
+                    handle_idle_timers(
+                        &mut session,
+                        clock.as_ref(),
+                        now,
+                        ticket_material.as_ref(),
+                    )
                 };
                 if let Some(bytes) = built_close {
                     let sent = tokio::task::block_in_place(|| {
@@ -1094,6 +1169,22 @@ fn handle_control_frames(
                         format!("sequence {}: {e:?}", update.update_sequence),
                     );
                 }
+            }
+            Frame::SessionTicket(ticket) => {
+                // A ticket from the peer's daemon (handshake.md §35): the
+                // credential for resuming THIS daemon as a client. The v1
+                // daemon has no dial path, so the ticket is recorded — a
+                // future resume attempt consumes it.
+                push_event(
+                    state,
+                    "session_ticket_received",
+                    now,
+                    format!(
+                        "lifetime {} ms, {} ticket bytes",
+                        ticket.lifetime,
+                        ticket.ticket.len()
+                    ),
+                );
             }
             _ => {}
         }
@@ -2424,6 +2515,7 @@ mod tests {
             &mut session,
             &clock,
             Instant(1_000_000 + IDLE_TIMEOUT_MS / 2 - 1),
+            None,
         );
         assert!(!done);
         assert!(built.is_none());
@@ -2435,7 +2527,7 @@ mod tests {
         // enters draining; the caller sends the bytes and the loop keeps
         // running.
         let now = Instant(1_000_000 + IDLE_TIMEOUT_MS);
-        let (built, keepalive, done) = handle_idle_timers(&mut session, &clock, now);
+        let (built, keepalive, done) = handle_idle_timers(&mut session, &clock, now, None);
         assert!(!done);
         assert!(
             keepalive.is_none(),
@@ -2472,10 +2564,76 @@ mod tests {
         // ...and once draining expires the loop must exit with the session
         // finalized as closed.
         let (built, _keepalive, done) =
-            handle_idle_timers(&mut session, &clock, Instant(now.0 + 3 * 1_000));
+            handle_idle_timers(&mut session, &clock, Instant(now.0 + 3 * 1_000), None);
         assert!(built.is_none());
         assert!(done);
         assert_eq!(session.state, SessionState::Closed);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_close_carries_session_ticket() {
+        let material = TicketMaterial {
+            ticket_key: [11u8; 32],
+            resumption_secret: [12u8; 32],
+            peer_endpoint_id: [13u8; 32],
+            server_endpoint_id: [14u8; 32],
+        };
+        let t0 = Instant(1_000_000);
+        let clock = FixedClock(t0.0);
+        let mut session = test_session();
+        session.touch(t0);
+        let (built, keepalive, done) = handle_idle_timers(
+            &mut session,
+            &clock,
+            t0 + ms(IDLE_TIMEOUT_MS),
+            Some(&material),
+        );
+        assert!(keepalive.is_none(), "close path takes precedence");
+        assert!(!done);
+        assert_eq!(session.state, SessionState::Draining);
+        let close_bytes = built.expect("idle close built");
+        let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[1u8; 32]).unwrap();
+        let (space, _dcid, _path, _pn, payload) =
+            umc_session::packet::parse_protected_packet(&keys, &close_bytes).unwrap();
+        let parsed = umc_wire::packet::parse_payload(
+            &umc_wire::packet::PacketContext::Protected(space),
+            &payload,
+        )
+        .unwrap();
+        let ticket_frame = parsed
+            .frames
+            .iter()
+            .find_map(|f| match f {
+                WireFrame::SessionTicket(t) => Some(t),
+                _ => None,
+            })
+            .expect("the close packet carries a SESSION_TICKET frame");
+        // The ticket validates under the daemon's key and restores the
+        // session's resumption secret and endpoint bindings.
+        let back = umc_handshake::ticket::validate_ticket(
+            &material.ticket_key,
+            &ticket_frame.ticket,
+            t0.0 + IDLE_TIMEOUT_MS + 1,
+        )
+        .expect("ticket validates under the daemon's key");
+        assert_eq!(back.resumption_secret, [12u8; 32]);
+        assert_eq!(back.client_endpoint_id_hash, [13u8; 32]);
+        assert_eq!(back.server_endpoint_id_hash, [14u8; 32]);
+        // The v1 clear nonce prefix lets the bearer derive the PSK without
+        // the key; a wrong key cannot open the seal.
+        assert_eq!(
+            ticket_frame.ticket.first(),
+            Some(&umc_handshake::ticket::TICKET_VERSION)
+        );
+        let nonce =
+            umc_handshake::ticket::ticket_nonce(&ticket_frame.ticket).expect("clear nonce prefix");
+        assert_eq!(nonce.len(), umc_handshake::ticket::TICKET_ENTROPY);
+        let psk = umc_session::ticket::resumption_psk(&back.resumption_secret, &nonce);
+        assert_ne!(psk, [0u8; 32]);
+        assert!(
+            umc_handshake::ticket::validate_ticket(&[0u8; 32], &ticket_frame.ticket, t0.0).is_err(),
+            "a wrong ticket key must not open the ticket"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2515,7 +2673,8 @@ mod tests {
         // A later sweep, inside the drain window with the idle timer expired
         // (close sends do not touch): must not re-send the close or re-extend
         // the draining deadline.
-        let (built, _keepalive, done) = handle_idle_timers(&mut session, &clock, t0 + ms(30_000));
+        let (built, _keepalive, done) =
+            handle_idle_timers(&mut session, &clock, t0 + ms(30_000), None);
         assert!(built.is_none(), "no second idle close while draining");
         assert!(!done);
         assert!(
@@ -2523,7 +2682,7 @@ mod tests {
             "draining deadline must not be re-extended by an idle sweep"
         );
         // Finalization still happens at the original deadline.
-        let (built, _keepalive, done) = handle_idle_timers(&mut session, &clock, d);
+        let (built, _keepalive, done) = handle_idle_timers(&mut session, &clock, d, None);
         assert!(built.is_none());
         assert!(
             done,
@@ -2611,7 +2770,7 @@ mod tests {
         // for the caller to send (same drop-guard pattern as the close);
         // the session stays Active and no close is produced.
         let (close, keepalive, done) =
-            handle_idle_timers(&mut session, &clock, t0 + ms(IDLE_TIMEOUT_MS / 2));
+            handle_idle_timers(&mut session, &clock, t0 + ms(IDLE_TIMEOUT_MS / 2), None);
         assert!(!done);
         assert!(close.is_none(), "no close while idle not expired");
         let bytes = keepalive.expect("keepalive built at half idle");
@@ -2640,7 +2799,7 @@ mod tests {
         // The keepalive at half idle touches the session: the idle deadline
         // moves out by another full timeout, suppressing the idle close.
         let (close, keepalive, done) =
-            handle_idle_timers(&mut session, &clock, t0 + ms(IDLE_TIMEOUT_MS / 2));
+            handle_idle_timers(&mut session, &clock, t0 + ms(IDLE_TIMEOUT_MS / 2), None);
         assert!(close.is_none());
         assert!(keepalive.is_some(), "keepalive built at half idle");
         assert!(!done);
@@ -2654,6 +2813,7 @@ mod tests {
             &mut session,
             &clock,
             t0 + ms(IDLE_TIMEOUT_MS + IDLE_TIMEOUT_MS / 2),
+            None,
         );
         assert!(close.is_some(), "idle close after a full timeout");
         assert!(
@@ -2675,7 +2835,7 @@ mod tests {
         // is produced — the keepalive branch only fires while not
         // idle-expired.
         let (close, keepalive, done) =
-            handle_idle_timers(&mut session, &clock, t0 + ms(IDLE_TIMEOUT_MS));
+            handle_idle_timers(&mut session, &clock, t0 + ms(IDLE_TIMEOUT_MS), None);
         assert!(!done);
         assert!(close.is_some(), "close path runs at the idle timeout");
         assert!(keepalive.is_none(), "no keepalive when idle expired");
@@ -2724,6 +2884,7 @@ mod tests {
             &app_channels,
             &runtime,
             &remote_keys,
+            None,
             1,
             packet_rx,
             bus_inbound_rx,

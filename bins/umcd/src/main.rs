@@ -246,7 +246,6 @@ fn handle_inbound_link_locked(
     link: BoxLink,
     tracker: &std::sync::Mutex<handshake_timeout::HandshakeTracker>,
 ) -> Result<(), String> {
-    let runtime = state.clone();
     // The state lock is held only for the responder + registration steps:
     // the wire waits (hello, then CLIENT_AUTH) happen WITHOUT it, so one
     // slow handshake cannot stall the other accept loops or the control
@@ -289,6 +288,39 @@ fn handle_inbound_link_locked(
         .expect("handshake tracker")
         .check(&dcid, now)
         .map_err(|e| format!("handshake rejected: {e}"))?;
+
+    // Session resumption (handshake.md §35, IK mode): a hello offering the
+    // IK handshake mode carries a session ticket in `retry_token` (the
+    // SANCTIONED v1 ticket carrier — the field is otherwise unused). A
+    // ticket that validates under the daemon's key takes the short resume
+    // path (handle_resumed_link); an invalid or expired ticket falls back
+    // to the full XX path below — the client then sees a mode-XX
+    // `SERVER_HELLO` and must fall back to a full connect.
+    let resumed_ticket = if hello
+        .supported_handshake_modes
+        .iter()
+        .any(|m| m.as_slice() == umc_handshake::ik::MODE_IK)
+    {
+        let state = state.lock().expect("state");
+        umc_handshake::ticket::validate_ticket(&state.ticket_key, &hello.retry_token, now.0).ok()
+    } else {
+        None
+    };
+    if let Some(ticket) = resumed_ticket {
+        return handle_resumed_link(
+            state,
+            carrier_type,
+            link,
+            &hello,
+            &hello_bytes,
+            parsed_initial.as_ref(),
+            &dcid,
+            &vn_scid,
+            now,
+            tracker,
+            &ticket,
+        );
+    }
 
     // The client's static handshake key arrives in CLIENT_AUTH (handshake.md
     // §18); until the accept loop reads it (below), the client's ephemeral
@@ -446,13 +478,216 @@ fn handle_inbound_link_locked(
         .verify_client_finished(&auth_bytes, &server_finished, &client_finished)
         .map_err(|e| format!("client finished refused: {e}"))?;
 
+    // Register the verified session (the full XX path). The peer identity
+    // was recovered from CLIENT_AUTH; the session carries its stateless-
+    // reset secret and its resumption secret for ticket issuance at the
+    // clean close.
+    register_session(
+        state,
+        carrier_type,
+        link,
+        dcid,
+        secrets.server,
+        secrets.client,
+        Some(secrets.stateless_reset),
+        Some(secrets.resumption),
+        peer_endpoint_id,
+        now,
+    )
+}
+
+/// The resume path (handshake.md §35, IK mode): the hello offered the IK
+/// handshake mode and its `retry_token` validated as a session ticket under
+/// the daemon's ticket key. Answers with a `SERVER_HELLO` that selects IK
+/// and carries NO encrypted server auth, derives the resumed session
+/// secrets (the ticket's PSK replaces the identity binding), and registers
+/// the session DIRECTLY — the `CLIENT_AUTH`/`SERVER_FINISHED` exchange is
+/// skipped for resumed sessions (the ticket is the credential; the resumed
+/// secrets ARE the traffic keys). Resumed sessions issue no further tickets
+/// (the v1 scheme is a single resumption hop).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one resume path: hello, secrets, registration
+fn handle_resumed_link(
+    state: &Arc<std::sync::Mutex<state::RuntimeState>>,
+    carrier_type: &str,
+    link: BoxLink,
+    hello: &umc_handshake::xx::ClientHello,
+    hello_bytes: &[u8],
+    parsed_initial: Option<&umc_handshake::initial::ParsedInitial>,
+    dcid: &[u8],
+    vn_scid: &[u8],
+    now: umc_types::runtime::Instant,
+    tracker: &std::sync::Mutex<handshake_timeout::HandshakeTracker>,
+    ticket: &umc_handshake::ticket::TicketPayload,
+) -> Result<(), String> {
+    let server_eid = {
+        let state = state.lock().expect("state");
+        state.node_identity.endpoint_id()
+    };
+    // Version negotiation (compatibility.md §5.2): a resume hello offering
+    // no supported version gets the same Version-Negotiation answer as the
+    // XX path.
+    if umc_handshake::xx::select_version(&hello.supported_protocol_versions).is_none() {
+        let bytes = umc_handshake::xx::build_version_negotiation(
+            vn_scid,
+            dcid,
+            &[umc_handshake::xx::SUPPORTED_PROTOCOL_VERSION],
+        );
+        if let Err(e) = tokio::task::block_in_place(|| {
+            link.send(OutboundPacket {
+                bytes,
+                control: true,
+                deadline_ms: Some(3_000),
+            })
+        }) {
+            return Err(format!("send version negotiation: {e:?}"));
+        }
+        return Err("version negotiation: resume hello offered no supported version".into());
+    }
+    // Capability negotiation (compatibility.md §5.4): the resume hello must
+    // bind the canonical capability set like any other hello.
+    if hello.capabilities_hash
+        != umc_handshake::xx::capabilities_hash(&umc_handshake::xx::canonical_capabilities())
+    {
+        return Err("client capabilities hash mismatch".into());
+    }
+    // The ticket must belong to this node and this protocol: an endpoint or
+    // profile mismatch refuses the resume (the accept loop already fell
+    // back to the XX path only for invalid/expired tickets).
+    if ticket.server_endpoint_id_hash != server_eid {
+        return Err("ticket not issued by this node".into());
+    }
+    if ticket.protocol_version != umc_handshake::xx::SUPPORTED_PROTOCOL_VERSION {
+        return Err("ticket protocol version mismatch".into());
+    }
+    if ticket.crypto_profile != umc_handshake::xx::CRYPTO_PROFILE.to_vec() {
+        return Err("ticket crypto profile mismatch".into());
+    }
+
+    let server_ephemeral = umc_crypto::signatures::StaticHandshakeKeyPair::generate();
+    let mut server_random = [0u8; 32];
+    umc_types::runtime::EntropySource::fill(&runtime_adapters::OsEntropy, &mut server_random);
+    // The resume transcript binds both hello messages under the IK mode
+    // (handshake.md §35); the client derives the same context.
+    let mut transcript = umc_handshake::transcript::Transcript::new(
+        umc_handshake::ik::MODE_IK,
+        umc_handshake::xx::CRYPTO_PROFILE,
+        carrier_type.as_bytes(),
+    );
+    transcript
+        .update_message(umc_handshake::encoding::CLIENT_HELLO, hello_bytes)
+        .map_err(|e| format!("transcript: {e:?}"))?;
+    let server_hello = umc_handshake::xx::ServerHello {
+        server_random,
+        server_ephemeral_public_key: server_ephemeral.public().0,
+        selected_protocol_version: umc_handshake::xx::SUPPORTED_PROTOCOL_VERSION,
+        selected_crypto_profile: umc_handshake::xx::CRYPTO_PROFILE.to_vec(),
+        selected_handshake_mode: umc_handshake::ik::MODE_IK.to_vec(),
+        // No encrypted server auth: the resumed session skips the identity
+        // exchange entirely (the ticket is the credential).
+        encrypted_server_authentication: Vec::new(),
+        // The server's capabilities hash rides in the padding prefix, as on
+        // the XX path (compatibility.md §5.4).
+        padding: {
+            let mut padding = Vec::with_capacity(64);
+            padding.extend_from_slice(&umc_handshake::xx::capabilities_hash(
+                &umc_handshake::xx::canonical_capabilities(),
+            ));
+            padding.extend_from_slice(&[0u8; 32]);
+            padding
+        },
+    };
+    let server_hello_bytes = server_hello
+        .encode()
+        .map_err(|e| format!("server hello: {e:?}"))?;
+    transcript
+        .update_message(umc_handshake::encoding::SERVER_HELLO, &server_hello_bytes)
+        .map_err(|e| format!("transcript: {e:?}"))?;
+    let final_transcript = transcript.hash;
+
+    // The resumed traffic secrets: ee = DH(eph, eph) extracted under the
+    // PSK (which both sides derive from the previous session's resumption
+    // secret and the ticket's clear nonce).
+    let psk = umc_session::ticket::resumption_psk(&ticket.resumption_secret, &ticket.nonce);
+    let resume = umc_handshake::ik::derive_resumption_secrets(
+        &psk,
+        &server_ephemeral,
+        &hello.client_ephemeral_public_key,
+        &final_transcript,
+    );
+
+    // The `SERVER_HELLO` travels in the same form as the request (Initial-
+    // protected or raw), mirroring the XX path.
+    let response_bytes = match parsed_initial {
+        Some((origin, _pn, _payload, return_to)) => {
+            let keys = umc_handshake::initial::derive_initial_keys(origin).server;
+            initial::build_initial_packet(
+                return_to,
+                &session_dcid(hello),
+                0,
+                &server_hello_bytes,
+                &keys,
+            )?
+        }
+        None => server_hello_bytes,
+    };
+    if let Err(e) = tokio::task::block_in_place(|| {
+        link.send(OutboundPacket {
+            bytes: response_bytes,
+            control: true,
+            deadline_ms: Some(3_000),
+        })
+    }) {
+        return Err(format!("send server hello: {e:?}"));
+    }
+    tracker.lock().expect("handshake tracker").record(dcid, now);
+    // The resumed session registers under the identity the ticket binds —
+    // the ticket's client endpoint hash (the v1 resume carries no identity
+    // proof; the ticket is the credential).
+    register_session(
+        state,
+        carrier_type,
+        link,
+        dcid.to_vec(),
+        resume.server,
+        resume.client,
+        None,
+        None,
+        ticket.client_endpoint_id_hash,
+        now,
+    )
+}
+
+/// Register a session with the runtime (core.md §8-9): build the session
+/// state from the traffic secrets, spawn the wire task, and register the
+/// session, its bus channels, and its events. Shared by the full XX path
+/// and the IK resume path.
+///
+/// `stateless_reset_secret` is `Some` for XX sessions (session.md §31) and
+/// `None` for resumed sessions (the v1 resume derives no stateless-reset
+/// secret — documented). `resumption_secret` is `Some` for XX sessions —
+/// the daemon issues one ticket at the session's clean close (handshake.md
+/// §35) — and `None` for resumed sessions (no ticket re-issuance).
+#[allow(clippy::too_many_arguments)]
+fn register_session(
+    state: &Arc<std::sync::Mutex<state::RuntimeState>>,
+    carrier_type: &str,
+    link: BoxLink,
+    dcid: Vec<u8>,
+    local_traffic_secret: [u8; 32],
+    remote_traffic_secret: [u8; 32],
+    stateless_reset_secret: Option<[u8; 32]>,
+    resumption_secret: Option<[u8; 32]>,
+    peer_endpoint_id: [u8; 32],
+    now: umc_types::runtime::Instant,
+) -> Result<(), String> {
+    let runtime = state.clone();
     let state = state.lock().expect("state");
     let mut session = umc_session::session::Session::new(
         umc_session::session::SessionConfig {
             role: umc_session::session::Role::Server,
             dcid,
-            local_traffic_secret: secrets.server,
-            remote_traffic_secret: secrets.client,
+            local_traffic_secret,
+            remote_traffic_secret,
             initial_max_data: umc_session::session::DEFAULT_INITIAL_MAX_DATA,
             initial_max_stream_data: umc_session::session::DEFAULT_INITIAL_MAX_STREAM_DATA,
             max_ack_delay_ms: 25,
@@ -462,7 +697,9 @@ fn handle_inbound_link_locked(
     .map_err(|e| format!("session: {e:?}"))?;
     // Stateless-reset support (session.md §31): the token is derived from
     // the handshake's shared `stateless reset` secret (handshake.md §26).
-    session.set_stateless_reset_secret(secrets.stateless_reset);
+    if let Some(secret) = stateless_reset_secret {
+        session.set_stateless_reset_secret(secret);
+    }
     // Register the default data path so the anti-amplification budget is
     // active on the session's primary path (session.md §26).
     session
@@ -475,8 +712,17 @@ fn handle_inbound_link_locked(
         )
         .map_err(|e| format!("add path 0: {e:?}"))?;
     let session_id = state.sessions.next_id();
-    let remote_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&secrets.client)
+    let remote_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&remote_traffic_secret)
         .map_err(|e| format!("remote keys: {e:?}"))?;
+    // Ticket-issuance material (handshake.md §35): XX sessions carry their
+    // resumption secret to the clean-close path; resumed sessions issue no
+    // ticket (single resumption hop).
+    let ticket_material = resumption_secret.map(|resumption_secret| session_task::TicketMaterial {
+        ticket_key: state.ticket_key,
+        resumption_secret,
+        peer_endpoint_id,
+        server_endpoint_id: state.node_identity.endpoint_id(),
+    });
     // The session's bus channels: created here so the registration can
     // happen under the state lock the caller already holds (the task itself
     // must not re-lock it); the rx sides move into the wire loop.
@@ -492,6 +738,7 @@ fn handle_inbound_link_locked(
         state.app_echo_rx.clone(),
         runtime,
         remote_keys,
+        ticket_material,
         bus_inbound_rx,
         bus_outbound_rx,
     );
@@ -1051,6 +1298,176 @@ mod tests {
                 .iter()
                 .any(|e| e.kind == "session_active"),
             "no session_active event may fire for a refused session"
+        );
+    }
+
+    /// A link that plays the client's side of a RESUMED handshake
+    /// (handshake.md §35): `recv` returns the resume `CLIENT_HELLO` (IK
+    /// mode, the ticket in `retry_token`) exactly once, then fails loud —
+    /// the accept loop's resume path must NOT ask for `CLIENT_AUTH` or
+    /// `CLIENT_FINISHED`. `send` captures the daemon's `SERVER_HELLO`.
+    struct ResumeScriptedLink {
+        hello_bytes: Vec<u8>,
+        server_hello_bytes: Arc<StdMutex<Vec<u8>>>,
+        stage: StdMutex<usize>,
+    }
+
+    impl Link for ResumeScriptedLink {
+        fn properties(&self) -> LinkProperties {
+            LinkProperties {
+                reliability: Reliability::ReliableUntilLinkFailure,
+                ordering: Ordering::Ordered,
+                current_mtu: 65_535,
+                queue_bytes: 0,
+                queue_capacity: 2 * 1024 * 1024,
+                estimated_rtt_ms: None,
+                estimated_loss: None,
+                metered: false,
+            }
+        }
+
+        fn send(&self, packet: OutboundPacket) -> Result<SendResult, CarrierError> {
+            *self.server_hello_bytes.lock().expect("server hello") = packet.bytes;
+            Ok(SendResult::Accepted {
+                queue_state: QueueState::SentToMedium,
+            })
+        }
+
+        fn recv(&self) -> Result<InboundPacket, CarrierError> {
+            let mut stage = self.stage.lock().expect("stage");
+            match *stage {
+                0 => {
+                    *stage += 1;
+                    Ok(InboundPacket {
+                        bytes: self.hello_bytes.clone(),
+                        received_at: RuntimeInstant(0),
+                    })
+                }
+                _ => Err(CarrierError::new(
+                    CarrierErrorKind::LinkFailed,
+                    "script exhausted — the resume path must not read again",
+                )),
+            }
+        }
+
+        fn events(&self) -> Result<LinkEvent, CarrierError> {
+            Err(CarrierError::new(CarrierErrorKind::WouldBlock, "events"))
+        }
+
+        fn close(&self, _reason: &str) -> Result<(), CarrierError> {
+            Ok(())
+        }
+    }
+
+    /// A ticket sealed with the daemon's own ticket key, bound to the
+    /// daemon's endpoint id (the shape the clean-close path issues).
+    fn daemon_ticket(state: &Arc<std::sync::Mutex<state::RuntimeState>>) -> Vec<u8> {
+        let state = state.lock().expect("state");
+        umc_handshake::ticket::issue_ticket(
+            &state.ticket_key,
+            &umc_handshake::ticket::TicketPayload {
+                version: 1,
+                ticket_id: [0x11u8; 16],
+                client_endpoint_id_hash: [0xAAu8; 32],
+                server_endpoint_id_hash: state.node_identity.endpoint_id(),
+                resumption_secret: [0x42u8; 32],
+                issued_at_ms: state.node.clock.as_ref().now().0,
+                expires_at_ms: state.node.clock.as_ref().now().0 + 3_600_000,
+                protocol_version: 1,
+                crypto_profile: umc_handshake::xx::CRYPTO_PROFILE.to_vec(),
+                nonce: [0x55u8; 16],
+            },
+        )
+    }
+
+    /// The accept loop's resume path (handshake.md §35): a `CLIENT_HELLO`
+    /// offering IK mode with a valid ticket in `retry_token` gets a
+    /// `SERVER_HELLO` selecting IK, the session registers WITHOUT the
+    /// `CLIENT_AUTH`/`SERVER_FINISHED` exchange, and the peer identity is
+    /// the ticket's client endpoint hash.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_loop_resumes_without_client_auth() {
+        let state = test_state();
+        let ticket = daemon_ticket(&state);
+        let client_ephemeral = umc_crypto::signatures::StaticHandshakeKeyPair::generate();
+        let mut hello = ClientHello::new(&crate::runtime_adapters::OsEntropy, &client_ephemeral);
+        hello.supported_handshake_modes = vec![umc_handshake::ik::MODE_IK.to_vec()];
+        hello.retry_token = ticket;
+        let hello_bytes = hello.encode().expect("hello");
+        let server_hello_bytes = Arc::new(StdMutex::new(Vec::new()));
+        let link = ResumeScriptedLink {
+            hello_bytes,
+            server_hello_bytes: server_hello_bytes.clone(),
+            stage: StdMutex::new(0),
+        };
+        let tracker = StdMutex::new(HandshakeTracker::new());
+        handle_inbound_link(&state, "ump.tcp/1", Box::new(link), &tracker).expect("resume accept");
+
+        // The daemon answered with a mode-IK `SERVER_HELLO` carrying no
+        // encrypted server auth.
+        let captured = server_hello_bytes.lock().expect("captured");
+        let server_hello = ServerHello::decode(&captured).expect("captured server hello");
+        assert_eq!(
+            server_hello.selected_handshake_mode,
+            umc_handshake::ik::MODE_IK.to_vec(),
+            "the resume server hello must select IK mode"
+        );
+        assert!(
+            server_hello.encrypted_server_authentication.is_empty(),
+            "the resumed session skips the server auth block"
+        );
+        drop(captured);
+
+        let session_id = state
+            .lock()
+            .expect("state")
+            .sessions
+            .lookup(1)
+            .expect("resumed session registered");
+        assert_eq!(
+            session_id.peer_endpoint_id, [0xAAu8; 32],
+            "the resumed session registers under the ticket's client endpoint hash"
+        );
+        let events = state.lock().expect("state").events.clone();
+        assert!(
+            events
+                .lock()
+                .expect("event log")
+                .recent(10)
+                .iter()
+                .any(|e| e.kind == "session_active"),
+            "the resumed session activates without CLIENT_AUTH"
+        );
+    }
+
+    /// An invalid ticket (garbage in `retry_token`) falls back to the full
+    /// XX path: the daemon answers with a mode-XX `SERVER_HELLO` and then
+    /// expects the `CLIENT_AUTH` continuation — the scripted link fails
+    /// there, proving the short path was NOT taken.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_loop_falls_back_to_xx_on_invalid_ticket() {
+        let state = test_state();
+        let client_ephemeral = umc_crypto::signatures::StaticHandshakeKeyPair::generate();
+        let mut hello = ClientHello::new(&crate::runtime_adapters::OsEntropy, &client_ephemeral);
+        hello.supported_handshake_modes = vec![umc_handshake::ik::MODE_IK.to_vec()];
+        hello.retry_token = b"not-a-ticket".to_vec();
+        let hello_bytes = hello.encode().expect("hello");
+        let link = ResumeScriptedLink {
+            hello_bytes,
+            server_hello_bytes: Arc::new(StdMutex::new(Vec::new())),
+            stage: StdMutex::new(0),
+        };
+        let tracker = StdMutex::new(HandshakeTracker::new());
+        let err = handle_inbound_link(&state, "ump.tcp/1", Box::new(link), &tracker)
+            .expect_err("the fallback must continue into the XX path");
+        assert!(
+            err.contains("client auth"),
+            "the daemon must have awaited CLIENT_AUTH on the XX path: {err}"
+        );
+        assert_eq!(
+            state.lock().expect("state").sessions.count(),
+            0,
+            "no session may be registered for an invalid ticket"
         );
     }
 
