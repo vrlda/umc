@@ -11,7 +11,7 @@ pub struct Client {
     request_id: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientError {
     Io(String),
     Framing(umc_control::framing::FramingError),
@@ -21,6 +21,67 @@ pub enum ClientError {
     Unauthenticated,
     Unimplemented(String),
     Status(i32),
+    Authentication,
+    PermissionDenied,
+    InvalidArgument,
+    NotFound,
+    AlreadyExists,
+    DeadlineExceeded,
+    Cancelled,
+    ResourceExhausted,
+    FlowControl,
+    StreamReset { stream_id: u64, error_code: u64 },
+    StreamClosed,
+    SessionClosed,
+    SessionSuspended,
+    Transport(String),
+    Unavailable,
+    DataLoss,
+    Conflict,
+    Internal(String),
+    WouldBlock,
+    Unsupported(String),
+    HandleGenerationMismatch { expected: u64, actual: u64 },
+    HandleTypeMismatch { expected: String, actual: String },
+}
+
+impl ClientError {
+    /// Maps a Control API status into the SDK's stable error categories.
+    #[must_use]
+    pub fn from_status(code: i32) -> Self {
+        match api::StatusCode::try_from(code).unwrap_or(api::StatusCode::Unknown) {
+            api::StatusCode::Ok => Self::Internal("OK is not an error".into()),
+            api::StatusCode::Cancelled => Self::Cancelled,
+            api::StatusCode::InvalidArgument => Self::InvalidArgument,
+            api::StatusCode::DeadlineExceeded => Self::DeadlineExceeded,
+            api::StatusCode::NotFound => Self::NotFound,
+            api::StatusCode::AlreadyExists => Self::AlreadyExists,
+            api::StatusCode::PermissionDenied => Self::PermissionDenied,
+            api::StatusCode::Unauthenticated => Self::Authentication,
+            api::StatusCode::ResourceExhausted => Self::ResourceExhausted,
+            api::StatusCode::Unimplemented => Self::Unimplemented("control-api".into()),
+            api::StatusCode::Unavailable => Self::Unavailable,
+            api::StatusCode::DataLoss => Self::DataLoss,
+            api::StatusCode::Conflict => Self::Conflict,
+            api::StatusCode::Unknown
+            | api::StatusCode::FailedPrecondition
+            | api::StatusCode::Aborted
+            | api::StatusCode::OutOfRange
+            | api::StatusCode::Internal
+            | api::StatusCode::IdempotencyConflict => Self::Status(code),
+        }
+    }
+
+    /// Maps a non-success response while preserving the operation name in
+    /// the two legacy variants used by the original daemon client.
+    #[must_use]
+    pub fn from_status_for_method(code: i32, method: &str) -> Self {
+        match api::StatusCode::try_from(code).unwrap_or(api::StatusCode::Unknown) {
+            api::StatusCode::Unimplemented => Self::Unimplemented(method.to_string()),
+            api::StatusCode::Unauthenticated => Self::Unauthenticated,
+            _ => Self::from_status(code),
+        }
+    }
 }
 
 impl Client {
@@ -54,7 +115,28 @@ impl Client {
         method: &str,
         payload: Vec<u8>,
     ) -> Result<api::Response, ClientError> {
-        let (code, response_payload) = self.daemon.request_raw(service, method, payload).await?;
+        self.request_with_deadline(service, method, payload, None)
+            .await
+    }
+
+    /// Sends a typed request with an optional absolute wall-clock deadline.
+    /// `None` retains the legacy request behavior; callers performing work
+    /// that can wait MUST pass a deadline to avoid an unbounded operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, framing, protocol, or mapped status errors.
+    pub async fn request_with_deadline(
+        &mut self,
+        service: &str,
+        method: &str,
+        payload: Vec<u8>,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<api::Response, ClientError> {
+        let (code, response_payload) = self
+            .daemon
+            .request_raw_with_deadline(service, method, payload, deadline_unix_ms)
+            .await?;
         // Mirrors the daemon's request_id echo (server.rs `response_envelope`).
         self.request_id += 1;
         if code == api::StatusCode::Unimplemented as i32 {

@@ -55,13 +55,32 @@ impl DaemonClient {
         method: &str,
         payload: Vec<u8>,
     ) -> Result<(i32, Vec<u8>), ClientError> {
+        self.request_raw_with_deadline(service, method, payload, None)
+            .await
+    }
+
+    /// Sends a request with an absolute wall-clock deadline in the Control
+    /// API envelope. The daemon rejects expired work instead of allowing an
+    /// unbounded operation to occupy the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, framing, or protocol decoding errors.
+    pub async fn request_raw_with_deadline(
+        &mut self,
+        service: &str,
+        method: &str,
+        payload: Vec<u8>,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<(i32, Vec<u8>), ClientError> {
         self.request_id += 1;
-        let request = request_envelope(
+        let request = request_envelope_with_deadline(
             self.next_sequence(),
             self.request_id,
             service,
             method,
             payload,
+            deadline_unix_ms,
         );
         self.send(&request).await?;
         let reply = self.recv_envelope().await?;
@@ -138,12 +157,13 @@ impl DaemonClient {
     }
 }
 
-fn request_envelope(
+fn request_envelope_with_deadline(
     sequence: u64,
     request_id: u64,
     service: &str,
     method: &str,
     payload: Vec<u8>,
+    deadline_unix_ms: Option<i64>,
 ) -> api::Envelope {
     api::Envelope {
         api_version: Some(api::ApiVersion { major: 1, minor: 0 }),
@@ -152,6 +172,7 @@ fn request_envelope(
             request_id,
             service: service.to_string(),
             method: method.to_string(),
+            deadline_unix_ms: deadline_unix_ms.unwrap_or_default(),
             payload,
             ..Default::default()
         })),
@@ -172,9 +193,30 @@ pub(crate) fn encode_request(
     method: &str,
     payload: Vec<u8>,
 ) -> Result<Vec<u8>, ClientError> {
+    encode_request_with_deadline(sequence, request_id, service, method, payload, None)
+}
+
+/// Encodes a request with a deadline for SDK request-shape tests and backend
+/// adapters.
+#[cfg(test)]
+pub(crate) fn encode_request_with_deadline(
+    sequence: u64,
+    request_id: u64,
+    service: &str,
+    method: &str,
+    payload: Vec<u8>,
+    deadline_unix_ms: Option<i64>,
+) -> Result<Vec<u8>, ClientError> {
     let mut bytes = Vec::new();
     Message::encode(
-        &request_envelope(sequence, request_id, service, method, payload),
+        &request_envelope_with_deadline(
+            sequence,
+            request_id,
+            service,
+            method,
+            payload,
+            deadline_unix_ms,
+        ),
         &mut bytes,
     )
     .map_err(|e| ClientError::Proto(e.to_string()))?;
