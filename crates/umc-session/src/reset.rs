@@ -22,6 +22,9 @@ use umc_types::runtime::EntropySource;
 
 /// Length of the stateless-reset token (session.md §30.1, §31).
 pub const RESET_TOKEN_LEN: usize = 16;
+/// Minimum reset length: still looks like a short-header packet and carries
+/// the token slot.
+pub const MIN_RESET_LEN: usize = 25;
 /// Bytes of random tail appended after the token: the reset must be at least
 /// as long as the smallest protected packet and the tail hides the token
 /// from off-path observers (session.md §31).
