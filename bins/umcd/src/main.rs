@@ -18,6 +18,7 @@ mod session_bus;
 mod session_manager;
 mod session_task;
 mod state;
+mod telemetry;
 
 use clap::Parser;
 use config::NodeConfig;
@@ -118,6 +119,19 @@ async fn run(config: NodeConfig) {
             "endpoint"
         }
     );
+
+    // Telemetry opt-in (core.md §61, privacy.md §38): off by default; with
+    // `telemetry_enabled` the daemon appends a bounded JSONL metrics file
+    // every 60 s.
+    if state.config.telemetry_enabled {
+        let metrics = state.metrics.clone();
+        let path = state.config.resolved_data_dir().join("telemetry.jsonl");
+        let clock = state.node.clock.clone();
+        telemetry::spawn_telemetry_dump(metrics, path.clone(), clock);
+        log::info!("[telemetry] enabled → {}", path.display());
+    } else {
+        log::info!("[telemetry] disabled (default)");
+    }
 
     carriers::wire_carriers(&mut state);
     let mut listeners: std::collections::VecDeque<Box<dyn Listener + Send + Sync>> =

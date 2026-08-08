@@ -24,7 +24,7 @@ umc-carrier-lan = { path = "../../carriers/umc-carrier-lan" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "test-util"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 prost = "0.13"
 umc-bundle = { path = "../../crates/umc-bundle" }
