@@ -15,6 +15,22 @@ pub const SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 
 pub const CLIENT_RANDOM_LEN: usize = 32;
 pub const MAX_SUPPORTED_PARAMETERS: usize = 16;
+/// Maximum privacy profile this v1 implementation can negotiate.
+pub const MAX_SUPPORTED_PRIVACY_PROFILE: &[u8] = b"p1";
+/// Secure-by-default privacy profile requested by a new client.
+pub const DEFAULT_MINIMUM_PRIVACY_PROFILE: &[u8] = b"p0";
+
+/// Returns the ordered numeric level for a wire privacy profile.
+#[must_use]
+pub fn privacy_profile_level(profile: &[u8]) -> Option<u8> {
+    match profile {
+        b"p0" => Some(0),
+        b"p1" => Some(1),
+        b"p2" => Some(2),
+        b"p3" => Some(3),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClientHello {
@@ -25,6 +41,9 @@ pub struct ClientHello {
     pub supported_handshake_modes: Vec<Vec<u8>>,
     pub supported_protocol_versions: Vec<u32>,
     pub capabilities_hash: [u8; 32],
+    /// Minimum privacy profile requested by the client. The value is
+    /// transcript-bound through [`capabilities_hash_for_minimum_privacy`].
+    pub minimum_privacy: Vec<u8>,
     pub destination_hint: Vec<u8>,
     pub retry_token: Vec<u8>,
     pub invitation_authenticator: Vec<u8>,
@@ -33,6 +52,16 @@ pub struct ClientHello {
 
 impl ClientHello {
     pub fn new(entropy: &dyn EntropySource, ephemeral: &StaticHandshakeKeyPair) -> Self {
+        Self::new_with_minimum_privacy(entropy, ephemeral, DEFAULT_MINIMUM_PRIVACY_PROFILE)
+    }
+
+    /// Builds a hello requesting a minimum privacy profile.
+    #[must_use]
+    pub fn new_with_minimum_privacy(
+        entropy: &dyn EntropySource,
+        ephemeral: &StaticHandshakeKeyPair,
+        minimum_privacy: &[u8],
+    ) -> Self {
         let mut client_random = [0u8; CLIENT_RANDOM_LEN];
         entropy.fill(&mut client_random);
         Self {
@@ -45,12 +74,20 @@ impl ClientHello {
             // Capability negotiation (compatibility.md §5.4): the client
             // binds its capability set with the canonical hash, replacing
             // the placeholder zero hash (audit B.17).
-            capabilities_hash: capabilities_hash(&canonical_capabilities()),
+            capabilities_hash: capabilities_hash_for_minimum_privacy(minimum_privacy),
+            minimum_privacy: minimum_privacy.to_vec(),
             destination_hint: Vec::new(),
             retry_token: Vec::new(),
             invitation_authenticator: Vec::new(),
             padding: vec![0u8; 64],
         }
+    }
+
+    /// Returns the requested privacy level, or `None` for an invalid wire
+    /// value. Validation is performed by the responder before DH work.
+    #[must_use]
+    pub fn minimum_privacy_level(&self) -> Option<u8> {
+        privacy_profile_level(&self.minimum_privacy)
     }
 
     /// Encodes the client hello body (handshake.md §15).
@@ -83,6 +120,8 @@ impl ClientHello {
                 .map_err(|_| EncodeError::Varint)?;
         }
         out.extend_from_slice(&self.capabilities_hash);
+        umc_wire::bytes::encode(&mut out, &self.minimum_privacy, 8)
+            .map_err(|_| EncodeError::Bytes)?;
         umc_wire::bytes::encode(&mut out, &self.destination_hint, 512)
             .map_err(|_| EncodeError::Bytes)?;
         umc_wire::bytes::encode(&mut out, &self.retry_token, 1_024)
@@ -154,6 +193,7 @@ impl ClientHello {
         let mut capabilities_hash = [0u8; 32];
         capabilities_hash.copy_from_slice(body.get(pos..pos + 32).ok_or(EncodeError::Truncated)?);
         pos += 32;
+        let minimum_privacy = read_bytes(&mut pos, 8)?;
         let destination_hint = read_bytes(&mut pos, 512)?;
         let retry_token = read_bytes(&mut pos, 1_024)?;
         let invitation_authenticator = read_bytes(&mut pos, 64)?;
@@ -166,6 +206,7 @@ impl ClientHello {
             supported_handshake_modes,
             supported_protocol_versions,
             capabilities_hash,
+            minimum_privacy,
             destination_hint,
             retry_token,
             invitation_authenticator,
@@ -272,6 +313,14 @@ impl ServerHello {
     pub fn server_capabilities_hash(&self) -> Option<[u8; 32]> {
         self.padding.get(..32)?.try_into().ok()
     }
+
+    /// Returns the selected privacy level from the transcript-bound padding
+    /// extension. Missing extension bytes are interpreted as P0 for v1
+    /// compatibility with pre-profile peers.
+    #[must_use]
+    pub fn selected_privacy_level(&self) -> Option<u8> {
+        self.padding.get(32).copied().or(Some(0))
+    }
 }
 
 /// Select the protocol version from the client's offered list
@@ -300,6 +349,7 @@ pub const CANONICAL_CAPABILITY_IDS: &[&[u8]] = &[
     b"bundle",
     b"route",
     b"mobility",
+    b"privacy=p1",
 ];
 
 /// The canonical capability set serialized for hashing (compatibility.md
@@ -313,12 +363,30 @@ pub const CANONICAL_CAPABILITY_IDS: &[&[u8]] = &[
 /// (the canonical list is small and bounded — it never does).
 #[must_use]
 pub fn canonical_capabilities() -> Vec<u8> {
+    canonical_capabilities_with_extra(None)
+}
+
+/// The canonical capability set plus the client's requested privacy floor.
+/// Keeping the request in the hashed set makes a tampered minimum fail before
+/// any handshake secret is derived.
+#[must_use]
+pub fn canonical_capabilities_for_minimum_privacy(minimum_privacy: &[u8]) -> Vec<u8> {
+    canonical_capabilities_with_extra(Some(minimum_privacy))
+}
+
+fn canonical_capabilities_with_extra(minimum_privacy: Option<&[u8]>) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"UMP-CAPABILITIES-v1");
-    umc_wire::varint::encode_into(&mut out, CANONICAL_CAPABILITY_IDS.len() as u64)
+    let extra = usize::from(minimum_privacy.is_some());
+    umc_wire::varint::encode_into(&mut out, (CANONICAL_CAPABILITY_IDS.len() + extra) as u64)
         .expect("bounded count");
     for id in CANONICAL_CAPABILITY_IDS {
         umc_wire::bytes::encode(&mut out, id, 64).expect("bounded identifier");
+    }
+    if let Some(minimum_privacy) = minimum_privacy {
+        let mut requested = b"privacy-min=".to_vec();
+        requested.extend_from_slice(minimum_privacy);
+        umc_wire::bytes::encode(&mut out, &requested, 64).expect("bounded identifier");
     }
     out
 }
@@ -334,6 +402,12 @@ pub fn capabilities_hash(caps: &[u8]) -> [u8; 32] {
     let mut hasher = Blake2s256::new();
     hasher.update(caps);
     hasher.finalize().into()
+}
+
+/// Hashes a canonical capability set carrying a requested privacy floor.
+#[must_use]
+pub fn capabilities_hash_for_minimum_privacy(minimum_privacy: &[u8]) -> [u8; 32] {
+    capabilities_hash(&canonical_capabilities_for_minimum_privacy(minimum_privacy))
 }
 
 /// Build a minimal Version-Negotiation packet (wire-format §25): the long
@@ -713,7 +787,9 @@ pub fn run_xx_handshake(
     // Capability negotiation (compatibility.md §5.4): the driver's server
     // half verifies the client's capabilities hash against the canonical
     // set, exactly as the responder does.
-    if client_hello.capabilities_hash != capabilities_hash(&canonical_capabilities()) {
+    if client_hello.capabilities_hash
+        != capabilities_hash_for_minimum_privacy(&client_hello.minimum_privacy)
+    {
         return Err("client capabilities hash mismatch".into());
     }
 
@@ -792,6 +868,20 @@ pub fn run_xx_handshake(
     if server_hello.server_capabilities_hash() != Some(capabilities_hash(&canonical_capabilities()))
     {
         return Err("server capabilities hash mismatch".into());
+    }
+    let requested_privacy = client_hello
+        .minimum_privacy_level()
+        .ok_or_else(|| "invalid minimum privacy profile".to_string())?;
+    let selected_privacy = server_hello
+        .selected_privacy_level()
+        .ok_or_else(|| "missing selected privacy profile".to_string())?;
+    let max_privacy = privacy_profile_level(MAX_SUPPORTED_PRIVACY_PROFILE)
+        .ok_or_else(|| "invalid implementation maximum privacy profile".to_string())?;
+    if selected_privacy > max_privacy {
+        return Err("server selected unsupported privacy profile".into());
+    }
+    if selected_privacy < requested_privacy {
+        return Err("server selected privacy profile below requested minimum".into());
     }
     let client_extract1 = umc_crypto::hkdf::extract(&[0u8; 32], &client_dh_ee);
     let server_block = decrypt_server_auth(
@@ -1197,8 +1287,22 @@ mod tests {
         assert_eq!(dec.supported_crypto_profiles, vec![CRYPTO_PROFILE.to_vec()]);
         assert_eq!(
             dec.capabilities_hash,
-            capabilities_hash(&canonical_capabilities()),
+            capabilities_hash_for_minimum_privacy(b"p0"),
             "the hello must carry the canonical capabilities hash, not zeros"
+        );
+        assert_eq!(dec.minimum_privacy, b"p0");
+    }
+
+    #[test]
+    fn minimum_privacy_is_bound_into_capabilities_hash() {
+        let eph = StaticHandshakeKeyPair::generate();
+        let p0 = ClientHello::new(&TestEntropy, &eph);
+        let p2 = ClientHello::new_with_minimum_privacy(&TestEntropy, &eph, b"p2");
+        assert_eq!(p2.minimum_privacy, b"p2");
+        assert_ne!(p0.capabilities_hash, p2.capabilities_hash);
+        assert_eq!(
+            p2.capabilities_hash,
+            capabilities_hash_for_minimum_privacy(b"p2")
         );
     }
 
@@ -1223,13 +1327,14 @@ mod tests {
         assert_eq!(a, b, "the canonical serialization must be deterministic");
         assert_eq!(capabilities_hash(&a), capabilities_hash(&b));
         assert_ne!(capabilities_hash(&a), capabilities_hash(b"other"));
-        let expected: [&[u8]; 6] = [
+        let expected: [&[u8]; 7] = [
             b"stream",
             b"datagram",
             b"relay",
             b"bundle",
             b"route",
             b"mobility",
+            b"privacy=p1",
         ];
         assert_eq!(CANONICAL_CAPABILITY_IDS, expected.as_slice());
     }

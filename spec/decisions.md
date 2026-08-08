@@ -1540,3 +1540,7 @@ A–K gap-closure plan:
 10. **Deferred capabilities.** 0-RTT, internet-scale discovery, dynamic
     process plugins, multi-hop relay construction, anonymous credentials,
     PSI/PIR, and mix modes remain explicit non-goals for v0.1.
+11. **Privacy negotiation.** `ClientHello` carries a minimum profile whose
+    `privacy-min` capability is transcript-bound. The v1 daemon advertises
+    and selects at most P1; requests above P1 fail explicitly and are never
+    silently downgraded. P0 remains the default request.

@@ -26,9 +26,11 @@ use umc_handshake::identity::{endpoint_id, IdentityBinding};
 use umc_handshake::traffic::{derive_session_secrets, SessionSecrets};
 use umc_handshake::transcript::Transcript;
 use umc_handshake::xx::{
-    build_version_negotiation, canonical_capabilities, capabilities_hash, client_signature_input,
-    decrypt_client_auth, encrypt_server_auth, finished_key, finished_mac, select_version,
-    ClientHello, ServerAuthBlock, ServerHello, CRYPTO_PROFILE, MODE_XX, SUPPORTED_PROTOCOL_VERSION,
+    build_version_negotiation, canonical_capabilities, capabilities_hash,
+    capabilities_hash_for_minimum_privacy, client_signature_input, decrypt_client_auth,
+    encrypt_server_auth, finished_key, finished_mac, privacy_profile_level, select_version,
+    ClientHello, ServerAuthBlock, ServerHello, CRYPTO_PROFILE, MAX_SUPPORTED_PRIVACY_PROFILE,
+    MODE_XX, SUPPORTED_PROTOCOL_VERSION,
 };
 use umc_types::runtime::EntropySource;
 
@@ -378,10 +380,21 @@ pub fn respond_hello(
     }
 
     // Capability negotiation (compatibility.md §5.4): the client's hash is
-    // inside the transcript-bound CLIENT_HELLO; a mismatch is a protocol
-    // violation (or a peer speaking a different capability set) and the
-    // handshake is refused.
-    if hello.capabilities_hash != capabilities_hash(&canonical_capabilities()) {
+    // inside the transcript-bound CLIENT_HELLO; it includes the requested
+    // privacy floor so a tampered minimum is refused before DH work.
+    let requested_privacy = hello
+        .minimum_privacy_level()
+        .ok_or_else(|| "invalid minimum privacy profile".to_string())?;
+    let max_privacy = privacy_profile_level(MAX_SUPPORTED_PRIVACY_PROFILE)
+        .expect("the implementation maximum is a valid profile");
+    if requested_privacy > max_privacy {
+        return Err(format!(
+            "privacy profile {} unsupported; maximum is {}",
+            String::from_utf8_lossy(&hello.minimum_privacy),
+            String::from_utf8_lossy(MAX_SUPPORTED_PRIVACY_PROFILE)
+        ));
+    }
+    if hello.capabilities_hash != capabilities_hash_for_minimum_privacy(&hello.minimum_privacy) {
         return Err("client capabilities hash mismatch".into());
     }
 
@@ -439,7 +452,8 @@ pub fn respond_hello(
         padding: {
             let mut padding = Vec::with_capacity(64);
             padding.extend_from_slice(&capabilities_hash(&canonical_capabilities()));
-            padding.extend_from_slice(&[0u8; 32]);
+            padding.push(max_privacy);
+            padding.extend_from_slice(&[0u8; 31]);
             padding
         },
     };
@@ -989,6 +1003,42 @@ mod tests {
         assert!(error.contains("capabilities"), "{error}");
     }
 
+    #[test]
+    fn respond_hello_refuses_privacy_above_supported_profile() {
+        let state = test_state();
+        let (_identity, _static_key, client_ephemeral) = client_identity();
+        let hello = ClientHello::new_with_minimum_privacy(&TestEntropy, &client_ephemeral, b"p2");
+        let error = respond_hello(
+            &state,
+            b"ump.tcp/1",
+            &hello.encode().expect("hello"),
+            &client_ephemeral.public(),
+            &[1u8; 8],
+            &[2u8; 8],
+        )
+        .expect_err("p2 must fail closed while the daemon supports p1");
+        assert!(error.contains("privacy profile"), "{error}");
+        assert!(error.contains("p1"), "{error}");
+    }
+
+    #[test]
+    fn respond_hello_refuses_tampered_privacy_floor() {
+        let state = test_state();
+        let (_identity, _static_key, client_ephemeral) = client_identity();
+        let mut hello = ClientHello::new(&TestEntropy, &client_ephemeral);
+        hello.minimum_privacy = b"p1".to_vec();
+        let error = respond_hello(
+            &state,
+            b"ump.tcp/1",
+            &hello.encode().expect("hello"),
+            &client_ephemeral.public(),
+            &[1u8; 8],
+            &[2u8; 8],
+        )
+        .expect_err("changing the privacy floor without its hash must fail");
+        assert!(error.contains("capabilities"), "{error}");
+    }
+
     /// The server's canonical capabilities hash rides in the first 32
     /// bytes of the `SERVER_HELLO` padding (the documented convention):
     /// the client reads it from the padding prefix, exactly as
@@ -1019,5 +1069,6 @@ mod tests {
             server_hello.server_capabilities_hash().expect("hash"),
             capabilities_hash(&canonical_capabilities())
         );
+        assert_eq!(server_hello.selected_privacy_level(), Some(1));
     }
 }
