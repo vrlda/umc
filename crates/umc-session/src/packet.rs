@@ -7,6 +7,7 @@ pub const DEFAULT_PATH_ID: u64 = 0;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PacketBuildError {
     Header(umc_wire::header::HeaderError),
+    Pn(umc_wire::pn::PnError),
     Aead(umc_crypto::aead::AeadError),
     TooLarge,
 }
@@ -85,6 +86,7 @@ pub fn build_protected_packet(
 pub fn parse_protected_packet(
     keys: &PacketKeys,
     hp_key: &[u8; 32],
+    expected_pn: u64,
     bytes: &[u8],
 ) -> Result<(ShortPacketSpace, Vec<u8>, u64, u64, Vec<u8>), PacketBuildError> {
     let protected_first = *bytes.first().ok_or(PacketBuildError::TooLarge)?;
@@ -124,6 +126,11 @@ pub fn parse_protected_packet(
     let mut pn_full = [0u8; 8];
     pn_full[8 - pn_len..].copy_from_slice(&unprotected_pn);
     let truncated_pn = u64::from_be_bytes(pn_full);
+    // Reconstruct the FULL packet number before the AEAD open: the sender
+    // seals with the full pn, so opening with the truncated value would
+    // diverge after pn 65 535 (nonce mismatch, session breakage).
+    let pn = umc_wire::pn::reconstruct(truncated_pn, hb.pn_bits, expected_pn)
+        .map_err(PacketBuildError::Pn)?;
     // Associated data: the complete UNPROTECTED header (handshake.md §28):
     // the masked first byte and pn are restored before the AEAD open.
     let mut aad = bytes[..pos].to_vec();
@@ -131,9 +138,9 @@ pub fn parse_protected_packet(
     aad.extend_from_slice(&unprotected_pn);
     pos += pn_len;
     let payload = keys
-        .open(truncated_pn, &aad, &bytes[pos..])
+        .open(pn, &aad, &bytes[pos..])
         .map_err(PacketBuildError::Aead)?;
-    Ok((space, dcid, path_id, truncated_pn, payload))
+    Ok((space, dcid, path_id, pn, payload))
 }
 
 #[cfg(test)]
@@ -161,7 +168,7 @@ mod tests {
         )
         .unwrap();
         let (space, d, path, pn, payload) =
-            parse_protected_packet(&keys, &hp(&secret), &pkt).unwrap();
+            parse_protected_packet(&keys, &hp(&secret), 0, &pkt).unwrap();
         assert_eq!(space, ShortPacketSpace::SessionData);
         assert_eq!(d, dcid);
         assert_eq!(path, 0);
@@ -185,7 +192,7 @@ mod tests {
             b"x",
         )
         .unwrap();
-        assert!(parse_protected_packet(&b, &hp(&[2u8; 32]), &pkt).is_err());
+        assert!(parse_protected_packet(&b, &hp(&[2u8; 32]), 0, &pkt).is_err());
     }
 
     #[test]
@@ -214,7 +221,7 @@ mod tests {
         );
         // The round trip still recovers the plaintext packet number.
         let (_space, _d, _path, pn, _payload) =
-            parse_protected_packet(&keys, &hp(&secret), &pkt).unwrap();
+            parse_protected_packet(&keys, &hp(&secret), 0, &pkt).unwrap();
         assert_eq!(pn, 42);
     }
 
@@ -236,6 +243,6 @@ mod tests {
         .unwrap();
         // Same AEAD keys, wrong hp key: the pn misreads, so the nonce and
         // AAD no longer match and the open must fail.
-        assert!(parse_protected_packet(&keys, &hp(&[2u8; 32]), &pkt).is_err());
+        assert!(parse_protected_packet(&keys, &hp(&[2u8; 32]), 0, &pkt).is_err());
     }
 }

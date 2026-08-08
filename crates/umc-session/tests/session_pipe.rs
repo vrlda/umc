@@ -513,7 +513,7 @@ fn lost_packet_payload_retransmitted() {
     let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&client_secrets.client).unwrap();
     let hp_key = umc_crypto::header_protection::header_protection_key(&client_secrets.client);
     let (space, _dcid, _path, _pn, payload) =
-        umc_session::packet::parse_protected_packet(&keys, &hp_key, &retransmitted).unwrap();
+        umc_session::packet::parse_protected_packet(&keys, &hp_key, 0, &retransmitted).unwrap();
     let parsed = umc_wire::packet::parse_payload(
         &umc_wire::packet::PacketContext::Protected(space),
         &payload,
