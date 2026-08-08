@@ -56,6 +56,12 @@ pub struct BundleMeta {
     pub priority: u64,
     pub replication_limit: u64,
     pub custody: bool,
+    /// Added after the initial metadata format; absent means the ordinary
+    /// expiration is also the custody deadline.
+    #[serde(default)]
+    pub custody_deadline_ms: Option<u64>,
+    #[serde(default)]
+    pub transfer_chunk_index: u64,
 }
 
 impl BundleMeta {
@@ -77,6 +83,8 @@ impl BundleMeta {
             priority: record.priority,
             replication_limit: record.replication_limit,
             custody: record.custody,
+            custody_deadline_ms: record.custody_deadline.map(|deadline| deadline.0),
+            transfer_chunk_index: record.transfer_chunk_index,
         }
     }
 
@@ -98,6 +106,8 @@ impl BundleMeta {
             replication_count: 0,
             replication_limit: self.replication_limit,
             custody: self.custody,
+            custody_deadline: self.custody_deadline_ms.map(Instant),
+            transfer_chunk_index: self.transfer_chunk_index,
             status: status_from_code(self.status)?,
         })
     }
@@ -330,7 +340,7 @@ mod tests {
                 DEFAULT_LIFETIME_MS,
                 3,
                 false,
-                Instant(0)
+                Instant(DEFAULT_LIFETIME_MS + 1)
             )
             .is_ok());
     }

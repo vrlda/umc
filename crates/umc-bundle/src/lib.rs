@@ -6,3 +6,4 @@ pub mod id;
 pub mod manager;
 pub mod persist;
 pub mod replicate;
+pub mod transfer;

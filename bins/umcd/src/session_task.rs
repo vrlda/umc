@@ -30,7 +30,7 @@ use umc_session::session::{
 };
 use umc_types::runtime::{Clock, Instant};
 use umc_wire::frame::Frame;
-use umc_wire::frames::bundle::BundleFrame;
+use umc_wire::frames::bundle::{BundleFrame, MAX_BUNDLE_PAYLOAD};
 use umc_wire::frames::relay::RelayStatusFrame;
 use umc_wire::frames::routing::RouteResponseFrame;
 use umc_wire::header::ShortPacketSpace;
@@ -67,6 +67,9 @@ pub const BUNDLES_PER_FLUSH: usize = 1;
 /// Headroom reserved for packet headers and AEAD tags when fitting a
 /// `BUNDLE` frame into a protected packet (wire-format §17).
 pub const BUNDLE_PACKET_HEADROOM: usize = 256;
+/// Leave room for the bundle header, destination hint, and AEAD overhead so
+/// every packet-sized chunk remains encodable on the wire.
+pub const BUNDLE_FRAME_CHUNK_SIZE: usize = MAX_BUNDLE_PAYLOAD.saturating_sub(1_024);
 
 /// `RELAY_STATUS` result codes (relay.md §12.2).
 pub const RELAY_STATUS_ACCEPTED: u64 = 1;
@@ -1127,19 +1130,9 @@ fn handle_control_frames(
                 }
             }
             Frame::Bundle(bundle) => {
-                let lifetime = bundle.expiration_time.saturating_sub(bundle.creation_time);
-                let admitted = state.bundle.admit(
-                    &bundle.payload,
-                    &peer_endpoint_id,
-                    &bundle.destination_hint,
-                    bundle.priority,
-                    lifetime.max(1_000),
-                    bundle.replication_limit,
-                    bundle.custody_requested,
-                    now,
-                );
+                let admitted = state.bundle.admit_frame(bundle, &peer_endpoint_id, now);
                 match admitted {
-                    Ok(id) => {
+                    Ok(Some(id)) => {
                         state.metrics.incr(metric_names::BUNDLES_ADMITTED, 1);
                         push_event(
                             state,
@@ -1153,6 +1146,16 @@ fn handle_control_frames(
                             ),
                         );
                     }
+                    Ok(None) => push_event(
+                        state,
+                        "bundle_chunk_received",
+                        now,
+                        format!(
+                            "frame id {} chunk {}",
+                            String::from_utf8_lossy(&bundle.bundle_id),
+                            bundle.chunk_index
+                        ),
+                    ),
                     Err(e) => push_event(
                         state,
                         "bundle_rejected",
@@ -1178,7 +1181,11 @@ fn handle_control_frames(
                     let mut id = [0u8; 32];
                     id.copy_from_slice(&ack.bundle_id);
                     if state.bundle.record(&id).is_some() {
-                        state.bundle.mark_status(&id, status);
+                        if status == umc_bundle::manager::BundleStatus::Delivered {
+                            let _ = state.bundle.manager.release_custody(&id);
+                        } else {
+                            state.bundle.mark_status(&id, status);
+                        }
                     }
                 }
             }
@@ -1415,10 +1422,10 @@ fn flush_pending_bundles(state: &mut RuntimeState, now: Instant) -> Vec<u8> {
         .incr(metric_names::BUNDLES_EXPIRED, expired.len() as u64);
     let pending = state.bundle.pending_delivery(now);
     for id in pending.into_iter().take(BUNDLES_PER_FLUSH) {
-        let Some(record) = state.bundle.record(&id) else {
-            continue;
-        };
-        let Some(payload) = state.bundle.payload(&id) else {
+        let Ok(Some((record, payload, chunk_index, chunk_final))) = state
+            .bundle
+            .next_delivery_chunk(&id, BUNDLE_FRAME_CHUNK_SIZE)
+        else {
             continue;
         };
         let frame = BundleFrame {
@@ -1435,6 +1442,8 @@ fn flush_pending_bundles(state: &mut RuntimeState, now: Instant) -> Vec<u8> {
             destination_hint: record.destination_hint.clone(),
             payload,
             bundle_auth: Vec::new(),
+            chunk_index,
+            chunk_final,
         };
         let Ok(encoded) = frame.encode() else {
             continue;
@@ -1444,12 +1453,14 @@ fn flush_pending_bundles(state: &mut RuntimeState, now: Instant) -> Vec<u8> {
         if encoded.len() + BUNDLE_PACKET_HEADROOM > umc_types::version::MAX_PACKET_SIZE {
             continue;
         }
-        state.bundle.mark_forwarded(&id);
+        if chunk_final {
+            state.bundle.mark_forwarded(&id);
+        }
         push_event(
             state,
             "bundle_forwarded",
             now,
-            format!("bundle {} over session", hex_id(&id)),
+            format!("bundle {} chunk {} over session", hex_id(&id), chunk_index),
         );
         outbound.extend_from_slice(&encoded);
         break;
@@ -2061,6 +2072,8 @@ mod tests {
             destination_hint: b"dest".to_vec(),
             payload: b"ciphertext".to_vec(),
             bundle_auth: Vec::new(),
+            chunk_index: 0,
+            chunk_final: true,
         };
         let mut session = test_session();
         let outbound = handle_control_frames(
