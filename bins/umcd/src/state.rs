@@ -25,6 +25,7 @@ use umc_core::rate_limiter::RateLimiter;
 use umc_core::trust::{TrustLevel, TrustStore};
 use umc_core::well_known::WELL_KNOWN_APP;
 use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
+use umc_discovery::invitation::InvitationStore;
 use umc_handshake::identity::IdentityBinding;
 use umc_metrics::Registry;
 use umc_storage::keystore::{KeyClass, Keystore, KeystoreError};
@@ -394,12 +395,14 @@ pub struct RuntimeState {
     pub control_socket: PathBuf,
     /// Node database (namespaces: config, trust, records).
     pub store: Arc<SqliteStore>,
-    /// Default trust level for unseen endpoints. Placeholder: trust queries
-    /// wire into session admission in Task 20+.
-    #[allow(dead_code)]
+    /// Default trust level for unseen endpoints. Consumed by
+    /// [`Self::trust_store`]; `PeerService.SetTrustState` changes it per
+    /// endpoint (identity-trust.md §13).
     pub trust_default_level: TrustLevel,
-    /// Endpoint blocklist. Placeholder: wired into admission paths in Task 20+.
-    #[allow(dead_code)]
+    /// Endpoint blocklist (core.md §44, security-operations.md §16.2):
+    /// `PeerService.BlockPeer`/`UnblockPeer` wire it, and the accept loop
+    /// refuses sessions from blocked endpoints
+    /// ([`Self::refuse_if_blocked`]).
     pub blocklist: Blocklist,
     /// Per-peer rate limiter. Placeholder: wired into admission paths in
     /// Task 20+.
@@ -444,6 +447,10 @@ pub struct RuntimeState {
     pub bus: Arc<Mutex<SessionBus>>,
     /// Discovery service: candidate table + `PEER_HINT` builder.
     pub discovery: DiscoveryService,
+    /// Invitation store (discovery.md §14): issued invitations and their
+    /// validation keys, backing `PeerService.CreateInvitation`,
+    /// `ImportInvitation`, and `RevokeInvitation`.
+    pub invitations: InvitationStore,
     /// Relay service: circuit registry, admission, forwarding.
     pub relay: RelayService,
     /// Bundle service: object-store-backed bundle admission and expiry.
@@ -601,6 +608,7 @@ impl RuntimeState {
             self_arc: std::sync::Weak::new(),
             bus: Arc::new(Mutex::new(SessionBus::new())),
             discovery,
+            invitations: InvitationStore::new(),
             relay: RelayService::new(events.clone()),
             bundle,
             routing,
@@ -615,12 +623,25 @@ impl RuntimeState {
         })
     }
 
-    /// Trust store over the shared node database. Placeholder: wired into
-    /// session admission in Task 20+.
+    /// Trust store over the shared node database: per-endpoint persisted
+    /// levels, backing `PeerService.SetTrustState`.
     #[must_use]
-    #[allow(dead_code)]
     pub fn trust_store(&self) -> TrustStore<'_> {
         TrustStore::new(self.store.as_ref(), self.trust_default_level)
+    }
+
+    /// Refuses the endpoint while the blocklist holds an active block
+    /// (security-operations.md §16.2). The accept loop consults this before
+    /// registering any session, so `PeerService.BlockPeer` stops future
+    /// sessions from the endpoint.
+    ///
+    /// # Errors
+    /// Returns a message when `peer_endpoint_id` is blocked at `now`.
+    pub fn refuse_if_blocked(&self, peer_endpoint_id: &[u8], now: Instant) -> Result<(), String> {
+        match self.blocklist.is_blocked(peer_endpoint_id, now) {
+            Some(expires_at) => Err(format!("peer blocked until {expires_at:?}")),
+            None => Ok(()),
+        }
     }
 
     /// Resolve an identity handle (the keystore record name) to the primary

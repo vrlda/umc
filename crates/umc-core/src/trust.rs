@@ -126,6 +126,21 @@ impl<'a> TrustStore<'a> {
             .is_some_and(|metadata| metadata.direct_tooling))
     }
 
+    /// Sets the persisted level for `endpoint` (a direct-tooling record).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Corrupt`] on backend failure.
+    pub fn set_level(
+        &self,
+        endpoint: &[u8],
+        level: TrustLevel,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        let metadata = TrustMetadata::new(level, true, now_ms);
+        self.store
+            .put(Namespace::Trust, endpoint, &encode(&metadata))
+    }
+
     /// Marks `endpoint` distrusted (a direct-tooling record).
     ///
     /// # Errors
@@ -188,6 +203,27 @@ mod tests {
 
     fn open_store(path: &Path) -> umc_storage::sqlite::SqliteStore {
         umc_storage::sqlite::SqliteStore::open(path).unwrap()
+    }
+
+    #[test]
+    fn set_level_persists_any_level() {
+        let path = temp_path();
+        let store = open_store(&path);
+        let trust = TrustStore::new(&store, TrustLevel::Unknown);
+        trust
+            .set_level(b"peer-2", TrustLevel::Familiar, 200)
+            .unwrap();
+        assert_eq!(
+            trust.effective_trust_level(b"peer-2").unwrap(),
+            TrustLevel::Familiar
+        );
+        assert!(trust.direct_tooling(b"peer-2").unwrap());
+        // Overwriting replaces, not duplicates.
+        trust.set_level(b"peer-2", TrustLevel::Basic, 300).unwrap();
+        assert_eq!(
+            trust.effective_trust_level(b"peer-2").unwrap(),
+            TrustLevel::Basic
+        );
     }
 
     #[test]
