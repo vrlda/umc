@@ -2235,6 +2235,11 @@ fn node_config_message(config: &NodeConfig) -> api::NodeConfig {
             sensitive_present: false,
         },
         api::ConfigEntry {
+            key: "mesh_secret".into(),
+            value: String::new(),
+            sensitive_present: config.mesh_secret.is_some(),
+        },
+        api::ConfigEntry {
             key: "telemetry_enabled".into(),
             value: config.telemetry_enabled.to_string(),
             sensitive_present: false,
@@ -5163,6 +5168,7 @@ mod tests {
         state.config.carriers = vec!["ump.udp/1".into()];
         state.config.privacy_profile = "p1".into();
         state.config.privacy_policy_override = Some("p2".into());
+        state.config.mesh_secret = Some("do-not-leak".into());
         let bytes = dispatch_request(&mut state, &request("NodeAdmin", "GetConfig", vec![]), None);
         let response = decode_response(&bytes);
         assert_eq!(
@@ -5199,6 +5205,13 @@ mod tests {
             .entries
             .iter()
             .any(|e| e.key == "privacy_policy_override" && e.value == "p2"));
+        let mesh = config
+            .entries
+            .iter()
+            .find(|e| e.key == "mesh_secret")
+            .expect("mesh secret presence entry");
+        assert!(mesh.sensitive_present);
+        assert!(mesh.value.is_empty());
     }
 
     #[test]

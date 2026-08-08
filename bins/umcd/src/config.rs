@@ -30,6 +30,9 @@ pub struct NodeConfig {
     /// Local mesh mode (core.md §23.3). Conservative default: off
     /// (decisions.md §3.2).
     pub mesh: bool,
+    /// Optional membership secret for authenticated local-mesh peer hints.
+    /// The value is operator-provided and is never included in status output.
+    pub mesh_secret: Option<String>,
     /// Keystore directory; defaults to `<data_dir>/keystore`.
     pub keystore: Option<PathBuf>,
     pub public_relay: bool,
@@ -83,6 +86,7 @@ impl Default for NodeConfig {
             udp_listen: None,
             tls_listen: None,
             mesh: false,
+            mesh_secret: None,
             keystore: None,
             public_relay: false,
             disabled_protocol_versions: Vec::new(),
@@ -177,6 +181,13 @@ impl NodeConfig {
                 self.mesh = value
                     .parse::<bool>()
                     .map_err(|_| format!("mesh must be a bool, got {value:?}"))?;
+            }
+            "mesh_secret" => {
+                self.mesh_secret = if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
             }
             "telemetry_enabled" | "telemetry" => {
                 self.telemetry_enabled = value
@@ -348,6 +359,7 @@ mod tests {
         assert!(!config.public_relay);
         assert!(!config.telemetry_enabled);
         assert!(!config.mesh);
+        assert!(config.mesh_secret.is_none());
         assert_eq!(config.privacy_profile_value(), PrivacyProfile::P0);
         assert_eq!(config.effective_privacy_profile(), PrivacyProfile::P0);
         assert!(!config.traffic_padding);
@@ -419,6 +431,10 @@ mod tests {
         assert_eq!(config.static_peers.len(), 1);
         config.set_entry("mesh", "true").unwrap();
         assert!(config.mesh);
+        config.set_entry("mesh_secret", "mesh-secret").unwrap();
+        assert_eq!(config.mesh_secret.as_deref(), Some("mesh-secret"));
+        config.set_entry("mesh_secret", "").unwrap();
+        assert!(config.mesh_secret.is_none());
         config.set_entry("privacy_profile", "P1").unwrap();
         assert_eq!(config.privacy_profile, "p1");
         config.set_entry("privacy_policy_override", "p2").unwrap();

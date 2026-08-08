@@ -1,5 +1,6 @@
 //! `PEER_HINT` exchange (discovery.md §13, wire-format.md §51).
 use crate::provider::{CandidateAuth, CandidateSource, PeerCandidate, SharingPolicy};
+use blake2::{Blake2s256, Digest};
 use umc_types::runtime::Instant;
 use umc_wire::frames::misc::{PeerHintEntry, PeerHintFrame};
 use umc_wire::frames::misc::{
@@ -14,6 +15,7 @@ pub enum HintError {
     ReshareForbidden,
     RateLimited,
     FieldLimit,
+    MeshAuthentication,
 }
 
 /// Select hints to share: public, fresh, successful, diverse (discovery.md §13.3).
@@ -43,10 +45,26 @@ pub fn select_for_share(
 /// Returns [`HintError::TooManyHints`] if more than
 /// [`MAX_HINTS_PER_FRAME`] candidates are supplied.
 pub fn build_peer_hint(candidates: &[PeerCandidate]) -> Result<PeerHintFrame, HintError> {
+    build_peer_hint_with_mesh_secret(candidates, None)
+}
+
+/// Convert candidates into a `PEER_HINT` frame and authenticate each entry
+/// with the optional local-mesh secret. The authenticator is an HMAC-BLAKE2s
+/// tag over a canonical entry encoding; it is intentionally per-entry so a
+/// receiver can reject a forged candidate without exposing any table data.
+///
+/// # Errors
+///
+/// Returns [`HintError::TooManyHints`] if more than
+/// [`MAX_HINTS_PER_FRAME`] candidates are supplied.
+pub fn build_peer_hint_with_mesh_secret(
+    candidates: &[PeerCandidate],
+    mesh_secret: Option<&[u8]>,
+) -> Result<PeerHintFrame, HintError> {
     if candidates.len() > MAX_HINTS_PER_FRAME {
         return Err(HintError::TooManyHints);
     }
-    let entries = candidates
+    let entries: Vec<PeerHintEntry> = candidates
         .iter()
         .map(|c| PeerHintEntry {
             temporary_peer_id: c.candidate_id.to_be_bytes().to_vec(),
@@ -59,6 +77,15 @@ pub fn build_peer_hint(candidates: &[PeerCandidate]) -> Result<PeerHintFrame, Hi
             ephemeral: c.source == CandidateSource::LocalDiscovery,
             do_not_reshare: c.sharing_policy == SharingPolicy::DoNotReshare,
             authenticator: Vec::new(),
+        })
+        .collect();
+    let entries = entries
+        .into_iter()
+        .map(|mut entry| {
+            if let Some(secret) = mesh_secret {
+                entry.authenticator = mesh_authenticator(secret, &entry).to_vec();
+            }
+            entry
         })
         .collect();
     Ok(PeerHintFrame { entries })
@@ -83,6 +110,26 @@ pub fn apply_received_hints(
     now: Instant,
     table: &mut crate::table::CandidateTable,
 ) -> Result<usize, HintError> {
+    apply_received_hints_with_mesh_secret(frame, sender, now, table, None)
+}
+
+/// Apply received hints with optional local-mesh authentication. When a
+/// secret is configured, every entry must carry a valid tag; when no secret
+/// is configured, authenticated mesh entries are rejected rather than being
+/// accepted by a node that could not validate the mesh membership.
+///
+/// # Errors
+///
+/// Returns [`HintError::TooManyHints`] or [`HintError::FieldLimit`] for a
+/// malformed frame and [`HintError::MeshAuthentication`] when the configured
+/// membership secret does not validate every entry.
+pub fn apply_received_hints_with_mesh_secret(
+    frame: &PeerHintFrame,
+    sender: &[u8],
+    now: Instant,
+    table: &mut crate::table::CandidateTable,
+    mesh_secret: Option<&[u8]>,
+) -> Result<usize, HintError> {
     if frame.entries.len() > MAX_HINTS_PER_FRAME {
         return Err(HintError::TooManyHints);
     }
@@ -94,6 +141,18 @@ pub fn apply_received_hints(
             || entry.authenticator.len() > MAX_AUTHENTICATOR
         {
             return Err(HintError::FieldLimit);
+        }
+        match mesh_secret {
+            Some(secret) => {
+                let expected = mesh_authenticator(secret, entry);
+                if !constant_time_equal(&entry.authenticator, &expected) {
+                    return Err(HintError::MeshAuthentication);
+                }
+            }
+            None if !entry.authenticator.is_empty() => {
+                return Err(HintError::MeshAuthentication);
+            }
+            _ => {}
         }
     }
     let mut accepted = 0;
@@ -133,6 +192,62 @@ pub fn apply_received_hints(
         }
     }
     Ok(accepted)
+}
+
+const MESH_HINT_DOMAIN: &[u8] = b"UMP-MESH-HINT-v1";
+const BLAKE2_BLOCK: usize = 64;
+
+fn mesh_authenticator(secret: &[u8], entry: &PeerHintEntry) -> [u8; 32] {
+    let mut data = Vec::with_capacity(128);
+    data.extend_from_slice(MESH_HINT_DOMAIN);
+    append_bytes(&mut data, &entry.temporary_peer_id);
+    append_bytes(&mut data, &entry.carrier_type);
+    append_bytes(&mut data, &entry.connection_hint);
+    data.extend_from_slice(&entry.expiration_time.to_be_bytes());
+    data.push(u8::from(entry.public));
+    data.push(u8::from(entry.introduced));
+    data.push(u8::from(entry.local));
+    data.push(u8::from(entry.ephemeral));
+    data.push(u8::from(entry.do_not_reshare));
+
+    let mut key = [0u8; BLAKE2_BLOCK];
+    if secret.len() > BLAKE2_BLOCK {
+        let digest = Blake2s256::digest(secret);
+        key[..digest.len()].copy_from_slice(&digest);
+    } else {
+        key[..secret.len()].copy_from_slice(secret);
+    }
+    let mut inner = [0u8; BLAKE2_BLOCK];
+    let mut outer = [0u8; BLAKE2_BLOCK];
+    for (index, byte) in key.iter().enumerate() {
+        inner[index] = *byte ^ 0x36;
+        outer[index] = *byte ^ 0x5C;
+    }
+    let mut inner_hasher = Blake2s256::new();
+    inner_hasher.update(inner);
+    inner_hasher.update(&data);
+    let inner_digest = inner_hasher.finalize();
+    let mut outer_hasher = Blake2s256::new();
+    outer_hasher.update(outer);
+    outer_hasher.update(inner_digest);
+    outer_hasher.finalize().into()
+}
+
+fn append_bytes(out: &mut Vec<u8>, value: &[u8]) {
+    #[allow(clippy::cast_possible_truncation)]
+    let len = value.len() as u32;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(value);
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
 }
 
 #[cfg(test)]
@@ -188,6 +303,46 @@ mod tests {
         assert_eq!(frame.entries.len(), 1);
         assert!(frame.entries[0].public);
         assert!(!frame.entries[0].do_not_reshare);
+    }
+
+    #[test]
+    fn mesh_secret_authenticates_each_hint() {
+        let candidate = candidate(9, SharingPolicy::ShareGeneral, u64::MAX);
+        let secret = b"mesh-secret";
+        let frame = build_peer_hint_with_mesh_secret(&[candidate], Some(secret)).unwrap();
+        assert_eq!(frame.entries[0].authenticator.len(), 32);
+
+        let mut table = CandidateTable::new(10);
+        assert_eq!(
+            apply_received_hints_with_mesh_secret(
+                &frame,
+                b"peer-a",
+                Instant(0),
+                &mut table,
+                Some(secret)
+            ),
+            Ok(1)
+        );
+        assert_eq!(
+            apply_received_hints_with_mesh_secret(
+                &frame,
+                b"peer-a",
+                Instant(0),
+                &mut CandidateTable::new(10),
+                Some(b"wrong")
+            ),
+            Err(HintError::MeshAuthentication)
+        );
+        assert_eq!(
+            apply_received_hints_with_mesh_secret(
+                &frame,
+                b"peer-a",
+                Instant(0),
+                &mut CandidateTable::new(10),
+                None
+            ),
+            Err(HintError::MeshAuthentication)
+        );
     }
 
     #[test]
