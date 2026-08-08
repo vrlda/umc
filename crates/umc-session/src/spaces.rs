@@ -74,7 +74,6 @@ impl PacketSpaceState {
     ///
     /// Returns [`SpaceError::DuplicateOrStale`] for replayed or below-window
     /// packet numbers.
-    #[must_use]
     pub fn admit_reconstructed(&mut self, pn: u64) -> Result<u64, SpaceError> {
         if !self.replay.check_and_mark(pn) {
             return Err(SpaceError::DuplicateOrStale);
@@ -85,6 +84,7 @@ impl PacketSpaceState {
         Ok(pn)
     }
 
+    #[must_use]
     pub fn largest_received(&self) -> u64 {
         self.largest_received
     }
