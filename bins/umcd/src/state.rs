@@ -251,10 +251,13 @@ fn persist_binding(
     seeds.extend_from_slice(&identity.static_handshake.to_seed());
     // Delete + store: the keystore is append-only, so a second store under
     // the same name would be shadowed by the first record.
-    ks.delete(KeyClass::IdentitySigning, NODE_IDENTITY_RECORD)
-        .map_err(|e| format!("keystore delete: {e:?}"))?;
-    ks.store(KeyClass::IdentitySigning, NODE_IDENTITY_RECORD, &seeds)
-        .map_err(|e| format!("keystore store: {e:?}"))?;
+    // Order matters for crash consistency: write the BINDING first. A crash
+    // between the two rewrites then leaves a new binding sequence with the
+    // OLD static key — `binding_from_record` re-signs over the current
+    // static, so the sequence would silently regress and peers would reject
+    // the rotated binding (is_newer_than). Writing the binding first makes
+    // the crash state recover to the old key with the new sequence, which
+    // re-signs deterministically over the CURRENT static on load.
     ks.delete(KeyClass::IdentitySigning, BINDING_RECORD)
         .map_err(|e| format!("keystore delete: {e:?}"))?;
     ks.store(
@@ -263,6 +266,10 @@ fn persist_binding(
         &binding_bytes(binding),
     )
     .map_err(|e| format!("keystore store: {e:?}"))?;
+    ks.delete(KeyClass::IdentitySigning, NODE_IDENTITY_RECORD)
+        .map_err(|e| format!("keystore delete: {e:?}"))?;
+    ks.store(KeyClass::IdentitySigning, NODE_IDENTITY_RECORD, &seeds)
+        .map_err(|e| format!("keystore store: {e:?}"))?;
     Ok(())
 }
 
