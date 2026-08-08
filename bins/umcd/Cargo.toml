@@ -32,6 +32,8 @@ umc-discovery = { path = "../../crates/umc-discovery" }
 umc-relay = { path = "../../crates/umc-relay" }
 umc-routing = { path = "../../crates/umc-routing" }
 blake2 = "0.10"
+log = "0.4"
+env_logger = "0.11"
 
 [lints]
 workspace = true

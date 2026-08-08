@@ -306,8 +306,7 @@ pub fn spawn_session_task(
         let inbound = pump_link.recv();
         match inbound {
             Ok(packet) => {
-                #[cfg(debug_assertions)]
-                println!("[session {session_id}] recv {} bytes", packet.bytes.len());
+                log::debug!("[session {session_id}] recv {} bytes", packet.bytes.len());
                 if packet_tx.send(packet.bytes).is_err() {
                     break;
                 }
@@ -317,8 +316,7 @@ pub fn spawn_session_task(
                 std::thread::sleep(RECV_POLL_INTERVAL);
             }
             Err(e) => {
-                #[cfg(debug_assertions)]
-                println!("[session {session_id}] recv error: {e:?}");
+                log::debug!("[session {session_id}] recv error: {e:?}");
                 break;
             }
         }
@@ -480,8 +478,7 @@ async fn reader_loop(
                             let mut session = session.lock().await;
                             session.touch(now);
                         } else if let Err(e) = sent {
-                            #[cfg(debug_assertions)]
-                            println!("[session {session_id}] send error: {e:?}");
+                            log::debug!("[session {session_id}] send error: {e:?}");
                         }
                     }
                     None => break,
@@ -511,8 +508,7 @@ async fn reader_loop(
                         })
                     });
                     if let Err(e) = sent {
-                        #[cfg(debug_assertions)]
-                        println!("[session {session_id}] idle close send error: {e:?}");
+                        log::debug!("[session {session_id}] idle close send error: {e:?}");
                     }
                 }
                 if let Some(bytes) = built_keepalive {
@@ -524,13 +520,11 @@ async fn reader_loop(
                         })
                     });
                     if let Err(e) = sent {
-                        #[cfg(debug_assertions)]
-                        println!("[session {session_id}] keepalive send error: {e:?}");
+                        log::debug!("[session {session_id}] keepalive send error: {e:?}");
                     }
                 }
                 if done {
-                    #[cfg(debug_assertions)]
-                    println!("[session {session_id}] draining period ended, closing session");
+                    log::debug!("[session {session_id}] draining period ended, closing session");
                     break;
                 }
             }
@@ -568,8 +562,7 @@ async fn reader_loop(
                         // state unchanged.
                         pto_state.on_expiry();
                     } else if let Err(e) = sent {
-                        #[cfg(debug_assertions)]
-                        println!("[session {session_id}] PTO probe send error: {e:?}");
+                        log::debug!("[session {session_id}] PTO probe send error: {e:?}");
                     }
                 }
                 // The deadline just fired: re-arm from now while ack-eliciting
@@ -636,14 +629,12 @@ async fn process_inbound_packet(
                 // rate-limited stateless reset so the peer learns the
                 // connection is dead from its side too; no ACK or frame
                 // processing follows.
-                #[cfg(debug_assertions)]
-                println!("[session {session_id}] stateless reset received; session closed");
+                log::debug!("[session {session_id}] stateless reset received; session closed");
                 outbound = session.maybe_emit_stateless_reset(now, &OsEntropy, bytes.len());
                 Vec::new()
             }
             Err(e) => {
-                #[cfg(debug_assertions)]
-                println!("[session {session_id}] inbound error: {e:?}");
+                log::debug!("[session {session_id}] inbound error: {e:?}");
                 return false;
             }
         };
@@ -741,8 +732,7 @@ async fn process_inbound_packet(
                                 // survive for the next detection pass or PTO
                                 // (session.md §14.3). Pruning here would
                                 // destroy the only copy of the data.
-                                #[cfg(debug_assertions)]
-                                println!(
+                                log::debug!(
                                     "[session {session_id}] retransmit of pn {pn} deferred ({e:?}); payload kept"
                                 );
                             }
@@ -811,8 +801,7 @@ async fn process_inbound_packet(
                     outbound
                 }
                 Err(e) => {
-                    #[cfg(debug_assertions)]
-                    println!("[session {session_id}] ack build error: {e:?}");
+                    log::debug!("[session {session_id}] ack build error: {e:?}");
                     None
                 }
             };
@@ -848,8 +837,7 @@ async fn process_inbound_packet(
             .get(&protocol_id)
             .expect("channel exists")
             .clone();
-        #[cfg(debug_assertions)]
-        println!(
+        log::debug!(
             "[session {session_id}] dispatch stream {stream_id} to {:?} ({} bytes)",
             protocol_id,
             data.len()
@@ -865,8 +853,9 @@ async fn process_inbound_packet(
         // next inbound round rebuilds it. ACK-led payloads are exempt and
         // always sent, so the acknowledgment loop keeps running.
         if should_backpressure(link, &outbound) {
-            #[cfg(debug_assertions)]
-            println!("[session {session_id}] combined outbound backpressured (carrier queue >80%)");
+            log::debug!(
+                "[session {session_id}] combined outbound backpressured (carrier queue >80%)"
+            );
         } else {
             let sent = tokio::task::block_in_place(|| {
                 link.send(OutboundPacket {
@@ -876,8 +865,7 @@ async fn process_inbound_packet(
                 })
             });
             if let Err(e) = sent {
-                #[cfg(debug_assertions)]
-                println!("[session {session_id}] send error: {e:?}");
+                log::debug!("[session {session_id}] send error: {e:?}");
             }
         }
     }
@@ -890,8 +878,7 @@ async fn process_inbound_packet(
             })
         });
         if let Err(e) = sent {
-            #[cfg(debug_assertions)]
-            println!("[session {session_id}] retransmit send error: {e:?}");
+            log::debug!("[session {session_id}] retransmit send error: {e:?}");
         }
     }
     frames
@@ -911,7 +898,7 @@ fn parse_control_frames(
     bytes: &[u8],
 ) -> Option<(ShortPacketSpace, u64, Vec<Frame>)> {
     let (space, _dcid, path_id, _pn, payload) =
-        umc_session::packet::parse_protected_packet(remote_keys, remote_hp_key, bytes).ok()?;
+        umc_session::packet::parse_protected_packet(remote_keys, remote_hp_key, 0, bytes).ok()?;
     let parsed = parse_payload(&PacketContext::Protected(space), &payload).ok()?;
     Some((space, path_id, parsed.frames))
 }
@@ -1439,8 +1426,7 @@ async fn writer_loop(
             match session.send_stream_data(stream_id, &data, false) {
                 Ok(payload) => payload,
                 Err(e) => {
-                    #[cfg(debug_assertions)]
-                    println!("[session {session_id}] echo send error: {e:?}");
+                    log::debug!("[session {session_id}] echo send error: {e:?}");
                     continue;
                 }
             }
@@ -1470,8 +1456,7 @@ async fn writer_loop(
         // data, or the loss/PTO path retransmits it. ACK/PING payloads are
         // exempt and always sent.
         if should_backpressure(link, &outbound) {
-            #[cfg(debug_assertions)]
-            println!("[session {session_id}] echo send backpressured (carrier queue >80%)");
+            log::debug!("[session {session_id}] echo send backpressured (carrier queue >80%)");
             continue;
         }
         // Sleep out the spacing interval (congestion.md §12.1): the wait is
@@ -1483,8 +1468,7 @@ async fn writer_loop(
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
         }
-        #[cfg(debug_assertions)]
-        println!(
+        log::debug!(
             "[session {session_id}] echo stream {stream_id} ({} bytes)",
             data.len()
         );
@@ -1504,8 +1488,7 @@ async fn writer_loop(
                 .congestion_mut()
                 .consume_pacing(wire_bytes, clock.now());
         } else if let Err(e) = sent {
-            #[cfg(debug_assertions)]
-            println!("[session {session_id}] echo send error: {e:?}");
+            log::debug!("[session {session_id}] echo send error: {e:?}");
         }
     }
 }
@@ -2112,7 +2095,7 @@ mod tests {
         let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[1u8; 32]).unwrap();
         let hp_key = umc_crypto::header_protection::header_protection_key(&[1u8; 32]);
         let (space, _dcid, _path, _pn, payload) =
-            umc_session::packet::parse_protected_packet(&keys, &hp_key, retransmitted).unwrap();
+            umc_session::packet::parse_protected_packet(&keys, &hp_key, 0, retransmitted).unwrap();
         let parsed = umc_wire::packet::parse_payload(
             &umc_wire::packet::PacketContext::Protected(space),
             &payload,
@@ -2564,7 +2547,7 @@ mod tests {
         let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[1u8; 32]).unwrap();
         let hp_key = umc_crypto::header_protection::header_protection_key(&[1u8; 32]);
         let (space, _dcid, _path, _pn, payload) =
-            umc_session::packet::parse_protected_packet(&keys, &hp_key, &sent[0]).unwrap();
+            umc_session::packet::parse_protected_packet(&keys, &hp_key, 0, &sent[0]).unwrap();
         let parsed = umc_wire::packet::parse_payload(
             &umc_wire::packet::PacketContext::Protected(space),
             &payload,
@@ -2614,7 +2597,7 @@ mod tests {
         let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[1u8; 32]).unwrap();
         let hp_key = umc_crypto::header_protection::header_protection_key(&[1u8; 32]);
         let (space, _dcid, _path, _pn, payload) =
-            umc_session::packet::parse_protected_packet(&keys, &hp_key, &close_bytes).unwrap();
+            umc_session::packet::parse_protected_packet(&keys, &hp_key, 0, &close_bytes).unwrap();
         let parsed = umc_wire::packet::parse_payload(
             &umc_wire::packet::PacketContext::Protected(space),
             &payload,
@@ -2797,7 +2780,7 @@ mod tests {
         let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[1u8; 32]).unwrap();
         let hp_key = umc_crypto::header_protection::header_protection_key(&[1u8; 32]);
         let (space, _dcid, _path, _pn, payload) =
-            umc_session::packet::parse_protected_packet(&keys, &hp_key, &bytes).unwrap();
+            umc_session::packet::parse_protected_packet(&keys, &hp_key, 0, &bytes).unwrap();
         let parsed = umc_wire::packet::parse_payload(
             &umc_wire::packet::PacketContext::Protected(space),
             &payload,

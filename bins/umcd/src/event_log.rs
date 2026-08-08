@@ -77,7 +77,7 @@ impl DaemonEvents {
         let entries = match store.scan(Namespace::Api) {
             Ok(entries) => entries,
             Err(e) => {
-                eprintln!("[events] failed to scan persisted events: {e:?}");
+                log::error!("[events] failed to scan persisted events: {e:?}");
                 return;
             }
         };
@@ -85,14 +85,14 @@ impl DaemonEvents {
         for entry in entries {
             let key = String::from_utf8_lossy(&entry.key);
             let Ok(seq) = key.parse::<u64>() else {
-                eprintln!("[events] skipping persisted event with non-numeric key {key:?}");
+                log::warn!("[events] skipping persisted event with non-numeric key {key:?}");
                 continue;
             };
             max_seq = max_seq.max(seq);
             match serde_json::from_slice::<DaemonEvent>(&entry.value) {
                 Ok(event) => self.log.push(event),
                 Err(e) => {
-                    eprintln!("[events] skipping corrupt persisted event {key}: {e}");
+                    log::warn!("[events] skipping corrupt persisted event {key}: {e}");
                 }
             }
         }
@@ -128,17 +128,17 @@ impl DaemonEvents {
         let value = match serde_json::to_vec(event).map_err(|_| StoreError::Serialization) {
             Ok(value) => value,
             Err(e) => {
-                eprintln!("[events] failed to serialize event: {e:?}");
+                log::error!("[events] failed to serialize event: {e:?}");
                 return;
             }
         };
         if let Err(e) = store.put(Namespace::Api, key.as_bytes(), &value) {
-            eprintln!("[events] failed to persist event {seq}: {e:?}");
+            log::error!("[events] failed to persist event {seq}: {e:?}");
         }
         if seq > PERSISTED_MAX_ENTRIES {
             let stale = format!("{:020}", seq - PERSISTED_MAX_ENTRIES);
             if let Err(e) = store.delete(Namespace::Api, stale.as_bytes()) {
-                eprintln!("[events] failed to trim persisted event {stale}: {e:?}");
+                log::error!("[events] failed to trim persisted event {stale}: {e:?}");
             }
         }
     }

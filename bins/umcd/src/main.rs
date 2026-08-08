@@ -9,6 +9,7 @@ mod event_log;
 mod handshake_responder;
 mod handshake_timeout;
 mod initial;
+mod logging;
 mod relay_service;
 mod routing_service;
 mod runtime_adapters;
@@ -52,6 +53,7 @@ struct Args {
 }
 
 fn main() {
+    logging::init_logging();
     let args = Args::parse();
     let mut config = NodeConfig::load(args.config.as_ref()).expect("valid config");
     if let Some(socket) = args.socket {
@@ -64,7 +66,7 @@ fn main() {
     if args.doctor {
         let report = doctor::run_doctor(&config);
         for check in report.checks {
-            println!(
+            log::info!(
                 "{}: {} ({})",
                 if check.passed { "[ok]" } else { "[FAIL]" },
                 check.name,
@@ -74,17 +76,17 @@ fn main() {
         return;
     }
     if args.backup.is_some() && args.restore.is_some() {
-        eprintln!("--backup and --restore are mutually exclusive");
+        log::error!("--backup and --restore are mutually exclusive");
         std::process::exit(2);
     }
     if let Some(out_dir) = args.backup {
         backup::backup(&config, &out_dir).expect("backup failed");
-        println!("backup written to {}", out_dir.display());
+        log::info!("backup written to {}", out_dir.display());
         return;
     }
     if let Some(in_dir) = args.restore {
         backup::restore(&config, &in_dir).expect("restore failed");
-        println!("restore complete from {}", in_dir.display());
+        log::info!("restore complete from {}", in_dir.display());
         return;
     }
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -99,13 +101,16 @@ async fn run(config: NodeConfig) {
     // The echo application's channels and task are installed at startup
     // (core.md §9.6); registration happened inside the runtime state.
     app_layer::install_echo_app(&mut state);
-    println!(
+    log::info!(
         "data directory: {}",
         state.config.resolved_data_dir().display()
     );
-    println!("started at: {}ms", state.started_at.0);
-    println!("node endpoint: {:02x?}", state.node_identity.endpoint_id());
-    println!(
+    log::info!("started at: {}ms", state.started_at.0);
+    log::info!(
+        "node endpoint: {}",
+        logging::redact(&state.node_identity.endpoint_id())
+    );
+    log::info!(
         "mesh mode: {}",
         if state.mesh.enable_lan_discovery {
             "local"
@@ -117,7 +122,7 @@ async fn run(config: NodeConfig) {
     carriers::wire_carriers(&mut state);
     let mut listeners: std::collections::VecDeque<Box<dyn Listener + Send + Sync>> =
         state.listeners.drain(..).collect();
-    println!("carrier listeners: {} bound", listeners.len());
+    log::info!("carrier listeners: {} bound", listeners.len());
     // The runtime state is the daemon's shared mutable context (core.md §8):
     // the accept loops and the control socket both mutate it, so it rides
     // behind one mutex.
@@ -150,13 +155,13 @@ async fn run(config: NodeConfig) {
     };
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
-        println!("shutdown: signal received");
+        log::info!("shutdown: signal received");
         shutdown_flag.store(true, Ordering::Relaxed);
         let _ = shutdown_tx.send(()).await;
     });
 
     let _ = shutdown_rx.recv().await;
-    println!("shutdown: complete");
+    log::info!("shutdown: complete");
     // Wait for the control socket to finish closing before exiting.
     let _ = server_task.await;
 }
@@ -194,14 +199,14 @@ async fn accept_loop(
             // accept(), otherwise a second accept() steals it from the
             // link's recv() (both pull from the same socket).
             if let Err(e) = handle_inbound_link(&link_state, &link_carrier, link, &link_tracker) {
-                println!("[session] link rejected: {e}");
+                log::warn!("[session] link rejected: {e}");
                 record_handshake_failure(&link_state, e);
             }
         } else {
             tokio::spawn(async move {
                 if let Err(e) = handle_inbound_link(&link_state, &link_carrier, link, &link_tracker)
                 {
-                    println!("[session] link rejected: {e}");
+                    log::warn!("[session] link rejected: {e}");
                     record_handshake_failure(&link_state, e);
                 }
             });
@@ -799,7 +804,7 @@ fn register_session(
             at_ms: now.0,
             detail: format!("session {session_id} peer {peer_endpoint_id:02x?} via {carrier_type}"),
         });
-    println!("[session] active with peer {peer_endpoint_id:02x?}");
+    log::info!("{}", logging::session_active_line(&peer_endpoint_id));
     Ok(())
 }
 
@@ -871,12 +876,15 @@ fn init_node(config: &NodeConfig, config_path: Option<&PathBuf>) {
         .unwrap_or_else(|| data_dir.join("node.json"));
     let json = serde_json::to_string_pretty(config).expect("serialize config");
     std::fs::write(&config_file, json).expect("write config");
-    println!("node data directory: {}", data_dir.display());
-    println!("keystore directory: {}", keystore_dir.display());
-    println!("config file: {}", config_file.display());
-    println!("node endpoint: {:02x?}", identity.endpoint_id());
-    println!("public relay: disabled (default)");
-    println!("telemetry: disabled (default)");
+    log::info!("node data directory: {}", data_dir.display());
+    log::info!("keystore directory: {}", keystore_dir.display());
+    log::info!("config file: {}", config_file.display());
+    log::info!(
+        "node endpoint: {}",
+        logging::redact(&identity.endpoint_id())
+    );
+    log::info!("public relay: disabled (default)");
+    log::info!("telemetry: disabled (default)");
 }
 
 #[cfg(test)]

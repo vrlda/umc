@@ -69,7 +69,7 @@ impl RoutingService {
         let snapshots = match records::list_routes(store) {
             Ok(snapshots) => snapshots,
             Err(e) => {
-                eprintln!("[routing] failed to restore persisted routes: {e:?}");
+                log::error!("[routing] failed to restore persisted routes: {e:?}");
                 return;
             }
         };
@@ -82,11 +82,11 @@ impl RoutingService {
                 continue;
             }
             let Ok(hash) = <[u8; 32]>::try_from(snapshot.key_hash) else {
-                eprintln!("[routing] skipping persisted route with a non-32-byte key hash");
+                log::warn!("[routing] skipping persisted route with a non-32-byte key hash");
                 continue;
             };
             let Some(scope) = scope_from_u8(snapshot.scope) else {
-                eprintln!(
+                log::warn!(
                     "[routing] skipping persisted route with unknown scope {}",
                     snapshot.scope
                 );
@@ -132,7 +132,7 @@ impl RoutingService {
             scope: scope_to_u8(record.scope),
         };
         if let Err(e) = records::save_route(store.as_ref(), &snapshot) {
-            eprintln!("[routing] failed to persist route: {e:?}");
+            log::error!("[routing] failed to persist route: {e:?}");
         }
     }
 
