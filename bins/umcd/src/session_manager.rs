@@ -58,16 +58,28 @@ impl SessionManager {
             .insert(session_id, Arc::new(entry));
     }
 
-    /// Look up a live session by id. Placeholder: consumed by the
-    /// control-socket session API in Task 20+.
+    /// Look up a live session by id. Consumed by the control-socket
+    /// `SessionService.GetSession` handler.
     #[must_use]
-    #[allow(dead_code)]
     pub fn lookup(&self, session_id: u64) -> Option<Arc<SessionEntry>> {
         self.sessions
             .lock()
             .expect("session registry")
             .get(&session_id)
             .cloned()
+    }
+
+    /// Snapshot of every live session, ordered by session id. Consumed by
+    /// the control-socket `SessionService.ListSessions` handler.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<(u64, Arc<SessionEntry>)> {
+        let registry = self.sessions.lock().expect("session registry");
+        let mut entries: Vec<(u64, Arc<SessionEntry>)> = registry
+            .iter()
+            .map(|(id, entry)| (*id, entry.clone()))
+            .collect();
+        entries.sort_by_key(|(id, _)| *id);
+        entries
     }
 
     /// Number of registered sessions. Placeholder: consumed by the
@@ -104,5 +116,26 @@ mod tests {
         assert_eq!(entry.carrier_type, "ump.tcp/1");
         assert_eq!(entry.established_at_ms, 1_000);
         assert!(manager.lookup(99).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_orders_by_id() {
+        let manager = SessionManager::new();
+        for (id, peer) in [(2u64, [8u8; 32]), (1, [7u8; 32])] {
+            manager.register(
+                id,
+                SessionEntry {
+                    peer_endpoint_id: peer,
+                    carrier_type: "ump.tcp/1".to_string(),
+                    task: tokio::spawn(async {}).abort_handle(),
+                    established_at_ms: 1_000,
+                },
+            );
+        }
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].0, 1, "snapshot is ordered by session id");
+        assert_eq!(snapshot[0].1.peer_endpoint_id, [7u8; 32]);
+        assert_eq!(snapshot[1].0, 2);
     }
 }

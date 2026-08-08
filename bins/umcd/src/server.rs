@@ -251,6 +251,8 @@ fn dispatch_request(
         "PeerService" | "DiscoveryService" => metric_names::CONTROL_REQUESTS_PEERSERVICE,
         "BundleService" => metric_names::CONTROL_REQUESTS_BUNDLE,
         "RelayService" => metric_names::CONTROL_REQUESTS_RELAY,
+        "SessionService" => metric_names::CONTROL_REQUESTS_SESSION,
+        "RouteService" => metric_names::CONTROL_REQUESTS_ROUTE,
         "ConfigService" => metric_names::CONTROL_REQUESTS_CONFIG,
         "DiagnosticsService" => metric_names::CONTROL_REQUESTS_DIAGNOSTICS,
         _ => metric_names::CONTROL_REQUESTS_OTHER,
@@ -259,6 +261,10 @@ fn dispatch_request(
     let (code, payload) = match (request.service.as_str(), request.method.as_str()) {
         ("NodeAdmin", "GetStatus") => get_status(state),
         ("PeerService" | "DiscoveryService", "ListCandidates") => list_candidates(state),
+        ("PeerService", "ListPeers") => list_peers(state),
+        ("SessionService", "ListSessions") => list_sessions(state),
+        ("SessionService", "GetSession") => get_session(state, request),
+        ("RouteService", "ListRoutes") => list_routes(state),
         ("BundleService", "GetBundles" | "ListBundles") => list_bundles(state),
         ("BundleService", "CreateBundle") => create_bundle(state, request),
         ("RelayService", "OpenCircuit") => open_circuit(state, request),
@@ -338,6 +344,147 @@ fn list_candidates(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
     let mut payload = Vec::new();
     Message::encode(&response, &mut payload).expect("encode");
     (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `PeerService.ListPeers`: the discovery candidate table snapshot
+/// (discovery.md §6) as the v1 peer table. The candidate id is the peer's
+/// provisional id; the carrier type doubles as the label.
+fn list_peers(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
+    let peers = state
+        .discovery
+        .candidates()
+        .into_iter()
+        .map(|candidate| api::PeerSummary {
+            endpoint_id: candidate.candidate_id.to_be_bytes().to_vec(),
+            label: candidate.carrier_type.clone(),
+            trust_state: api::TrustState::Observed as i32,
+            last_seen_unix_ms: i64::try_from(candidate.expires_at.0).unwrap_or(i64::MAX),
+            carrier_hint_count: 1,
+            ..Default::default()
+        })
+        .collect();
+    let response = api::ListPeersResponse {
+        peers,
+        ..Default::default()
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `SessionService.ListSessions`: the live session registry (core.md §9.5).
+/// The v1 registry tracks the carrier a session rides on, not a separate
+/// protocol id, so the carrier type rides in `protocol_id`.
+fn list_sessions(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
+    let sessions = state
+        .sessions
+        .snapshot()
+        .into_iter()
+        .map(|(id, entry)| session_summary(id, &entry))
+        .collect();
+    let response = api::ListSessionsResponse {
+        sessions,
+        ..Default::default()
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `SessionService.GetSession`: one registry entry by handle. Unknown
+/// handles are `NotFound`.
+fn get_session(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(get) = api::GetSessionRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(session_id) = get
+        .session_handle
+        .as_ref()
+        .and_then(|handle| <[u8; 8]>::try_from(handle.value.as_slice()).ok())
+        .map(u64::from_be_bytes)
+    else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(entry) = state.sessions.lookup(session_id) else {
+        return (api::StatusCode::NotFound as i32, None);
+    };
+    let response = api::GetSessionResponse {
+        session: Some(session_summary(session_id, &entry)),
+        // The v1 registry does not track per-path state; the summary only.
+        paths: Vec::new(),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// One `SessionSummary` from a registry entry (core.md §9.5): the session
+/// id as the opaque handle, the peer endpoint id, the carrier as
+/// `protocol_id` (see [`list_sessions`]), and the established-at stamp.
+fn session_summary(id: u64, entry: &crate::session_manager::SessionEntry) -> api::SessionSummary {
+    api::SessionSummary {
+        session_handle: Some(api::OpaqueHandle {
+            value: id.to_be_bytes().to_vec(),
+        }),
+        remote_endpoint_id: entry.peer_endpoint_id.to_vec(),
+        state: api::SessionState::Active as i32,
+        protocol_id: entry.carrier_type.clone(),
+        active_paths: 1,
+        created_at_unix_ms: i64::try_from(entry.established_at_ms).unwrap_or(i64::MAX),
+        ..Default::default()
+    }
+}
+
+/// `RouteService.ListRoutes`: the persisted route snapshots (storage.md
+/// §15.1) — the same table the cache restores from at startup (§15.2), so
+/// restored routes list as `candidate` until revalidated.
+fn list_routes(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
+    let snapshots = match umc_storage::records::list_routes(state.store.as_ref()) {
+        Ok(snapshots) => snapshots,
+        Err(e) => {
+            log::error!("[routing] route listing failed: {e:?}");
+            return (api::StatusCode::Internal as i32, None);
+        }
+    };
+    let routes = snapshots
+        .into_iter()
+        .map(|snapshot| api::RouteSummary {
+            route_handle: Some(api::OpaqueHandle {
+                value: snapshot.key_hash.clone(),
+            }),
+            destination_hint_hash: snapshot.key_hash,
+            scope: route_scope_from_u8(snapshot.scope),
+            state: "candidate".into(),
+            // The proto has no next-hop field; the hop label rides in
+            // `carrier_class` (the v1 snapshot's only other string field).
+            carrier_class: String::from_utf8_lossy(&snapshot.next_hop).into_owned(),
+            expires_at_unix_ms: i64::try_from(
+                snapshot.learned_at_ms.saturating_add(snapshot.lifetime_ms),
+            )
+            .unwrap_or(i64::MAX),
+            ..Default::default()
+        })
+        .collect();
+    let response = api::ListRoutesResponse {
+        routes,
+        ..Default::default()
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// Stable route-scope encoding (storage.md §15.1), matching the variant
+/// order declared in `umc-routing` `types.rs` (see `scope_from_u8` in
+/// `routing_service.rs`).
+fn route_scope_from_u8(scope: u8) -> i32 {
+    match scope {
+        0 => api::RouteScope::LinkLocal as i32,
+        1 => api::RouteScope::LocalMesh as i32,
+        2 => api::RouteScope::Introduced as i32,
+        3 => api::RouteScope::General as i32,
+        _ => api::RouteScope::Unspecified as i32,
+    }
 }
 
 /// `BundleService.ListBundles`: bundle listing, bounded to 100.
@@ -1169,6 +1316,198 @@ mod tests {
         let listing = ListCandidatesResponse::decode(response.payload.as_slice()).expect("payload");
         assert_eq!(listing.total, 1);
         assert_eq!(listing.candidates[0].candidate_id, 42);
+    }
+
+    fn register_session(state: &RuntimeState, id: u64, peer: [u8; 32]) {
+        state.sessions.register(
+            id,
+            crate::session_manager::SessionEntry {
+                peer_endpoint_id: peer,
+                carrier_type: "ump.tcp/1".into(),
+                task: tokio::spawn(async {}).abort_handle(),
+                established_at_ms: 1_000,
+            },
+        );
+    }
+
+    fn route_key(n: u8) -> umc_routing::types::RouteKey {
+        umc_routing::types::RouteKey {
+            destination_profile: 0,
+            destination_hash: [n; 32],
+            scope: umc_routing::types::RouteScope::General,
+            policy_class: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_sessions_round_trip() {
+        let (mut state, _tx) = test_state();
+        register_session(&state, state.sessions.next_id(), [7u8; 32]);
+        register_session(&state, state.sessions.next_id(), [8u8; 32]);
+        let bytes = dispatch_request(
+            &mut state,
+            &request("SessionService", "ListSessions", vec![]),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let sessions = api::ListSessionsResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .sessions;
+        assert_eq!(sessions.len(), 2);
+        let first = &sessions[0];
+        let handle = first
+            .session_handle
+            .as_ref()
+            .expect("handle")
+            .value
+            .as_slice();
+        let id = u64::from_be_bytes(handle.try_into().expect("8-byte handle"));
+        assert_eq!(id, 1, "handles round-trip the session id");
+        assert_eq!(first.remote_endpoint_id, [7u8; 32]);
+        assert_eq!(
+            first.protocol_id, "ump.tcp/1",
+            "carrier rides in protocol_id"
+        );
+        assert_eq!(first.created_at_unix_ms, 1_000);
+        assert_eq!(
+            first.state,
+            api::SessionState::Active as i32,
+            "registry entries are active sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_session_by_handle_and_not_found() {
+        let (mut state, _tx) = test_state();
+        let id = state.sessions.next_id();
+        register_session(&state, id, [9u8; 32]);
+
+        let get = api::GetSessionRequest {
+            session_handle: Some(api::OpaqueHandle {
+                value: id.to_be_bytes().to_vec(),
+            }),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&get, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("SessionService", "GetSession", payload),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let session = api::GetSessionResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .session
+            .expect("session");
+        assert_eq!(session.remote_endpoint_id, [9u8; 32]);
+
+        // An unknown handle is NotFound, not Ok.
+        let get = api::GetSessionRequest {
+            session_handle: Some(api::OpaqueHandle {
+                value: 999u64.to_be_bytes().to_vec(),
+            }),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&get, &mut payload).unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("SessionService", "GetSession", payload),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::NotFound as i32
+        );
+    }
+
+    #[test]
+    fn list_routes_round_trip_from_persisted_table() {
+        let (mut state, _tx) = test_state();
+        // Learn a route through the routing service: it persists to the
+        // node database, which is the route listing's backing table.
+        let rid = [1u8; 16];
+        let now = state.node.clock.as_ref().now();
+        state
+            .routing
+            .admit_route_request(&rid, b"upstream", 0, 8, 30_000, &[], now)
+            .unwrap();
+        let _ =
+            state
+                .routing
+                .record_route_response(route_key(3), rid, "hop-a".into(), 600_000, now);
+
+        let bytes = dispatch_request(
+            &mut state,
+            &request("RouteService", "ListRoutes", vec![]),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let routes = api::ListRoutesResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .routes;
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].destination_hint_hash, [3u8; 32]);
+        assert_eq!(routes[0].scope, api::RouteScope::General as i32);
+        assert_eq!(
+            routes[0].state, "candidate",
+            "persisted routes list as candidates"
+        );
+        assert_eq!(routes[0].carrier_class, "hop-a");
+    }
+
+    #[test]
+    fn list_peers_round_trip_from_candidate_table() {
+        let (mut state, _tx) = test_state();
+        state
+            .discovery
+            .record_candidate(
+                umc_discovery::provider::PeerCandidate {
+                    candidate_id: 42,
+                    carrier_type: "ump.udp/1".into(),
+                    connection_hint: vec![],
+                    source: umc_discovery::provider::CandidateSource::PeerHint,
+                    created_at: state.node.clock.as_ref().now(),
+                    expires_at: state.node.clock.as_ref().now(),
+                    sharing_policy: umc_discovery::provider::SharingPolicy::ShareGeneral,
+                    authentication: umc_discovery::provider::CandidateAuth::Unauthenticated,
+                    local: false,
+                },
+                state.node.clock.as_ref().now(),
+            )
+            .unwrap();
+        let bytes = dispatch_request(
+            &mut state,
+            &request("PeerService", "ListPeers", vec![]),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let peers = api::ListPeersResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .peers;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0].endpoint_id,
+            42u64.to_be_bytes(),
+            "the candidate id is the v1 peer id"
+        );
+        assert_eq!(peers[0].label, "ump.udp/1");
+        assert_eq!(peers[0].trust_state, api::TrustState::Observed as i32);
     }
 
     #[test]
