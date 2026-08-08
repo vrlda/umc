@@ -10,6 +10,7 @@ mod handshake_responder;
 mod handshake_timeout;
 mod initial;
 mod logging;
+mod relay_auth;
 mod relay_service;
 mod routing_service;
 mod runtime_adapters;

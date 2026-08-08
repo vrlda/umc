@@ -4,7 +4,7 @@
 //! after a restart the table is restored so operational hints survive.
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use umc_discovery::hints::{build_peer_hint, select_for_share};
+use umc_discovery::hints::{apply_received_hints, build_peer_hint, select_for_share, HintError};
 use umc_discovery::provider::{CandidateAuth, CandidateSource, PeerCandidate, SharingPolicy};
 use umc_discovery::table::{CandidateTable, TableError};
 use umc_storage::sqlite::SqliteStore;
@@ -257,6 +257,31 @@ impl DiscoveryService {
             return None;
         }
         build_peer_hint(&selected).ok()
+    }
+
+    /// Apply a peer's hint frame and persist accepted candidates. The pure
+    /// discovery helper validates the whole frame before mutating the table;
+    /// persistence happens only after that validation succeeds.
+    pub fn apply_received_hints(
+        &mut self,
+        frame: &PeerHintFrame,
+        sender: &[u8],
+        now: Instant,
+    ) -> Result<usize, HintError> {
+        let accepted = apply_received_hints(frame, sender, now, &mut self.candidates)?;
+        if accepted > 0 {
+            if let Some(store) = &self.store {
+                for candidate in self.candidates() {
+                    if let Err(error) = save_candidate(store.as_ref(), &candidate) {
+                        log::warn!(
+                            "[discovery] failed to persist hinted candidate {}: {error:?}",
+                            candidate.candidate_id
+                        );
+                    }
+                }
+            }
+        }
+        Ok(accepted)
     }
 }
 
