@@ -26,13 +26,21 @@ use umc_handshake::identity::{endpoint_id, IdentityBinding};
 use umc_handshake::traffic::{derive_session_secrets, SessionSecrets};
 use umc_handshake::transcript::Transcript;
 use umc_handshake::xx::{
-    client_signature_input, decrypt_client_auth, encrypt_server_auth, finished_key, finished_mac,
-    ClientHello, ServerAuthBlock, ServerHello, CRYPTO_PROFILE, MODE_XX,
+    build_version_negotiation, canonical_capabilities, capabilities_hash, client_signature_input,
+    decrypt_client_auth, encrypt_server_auth, finished_key, finished_mac, select_version,
+    ClientHello, ServerAuthBlock, ServerHello, CRYPTO_PROFILE, MODE_XX, SUPPORTED_PROTOCOL_VERSION,
 };
 use umc_types::runtime::EntropySource;
 
-/// Protocol version selected by the responder (handshake.md §16).
-pub const SELECTED_PROTOCOL_VERSION: u32 = 1;
+#[cfg(test)]
+use umc_handshake::xx::parse_version_negotiation;
+
+/// Protocol version selected by the responder (handshake.md §16,
+/// compatibility.md §5.2): the single version this implementation
+/// supports. The selection itself is `select_version` over the client's
+/// offered list; a list that excludes it gets a Version-Negotiation
+/// packet instead.
+pub const SELECTED_PROTOCOL_VERSION: u32 = SUPPORTED_PROTOCOL_VERSION;
 
 /// Clock skew tolerated when checking a binding's validity window
 /// (handshake.md §4.4).
@@ -67,6 +75,26 @@ pub struct HandshakePending {
 pub struct PeerIdentity {
     pub client_static_public_key: StaticHandshakePublicKey,
     pub binding: IdentityBinding,
+}
+
+/// The responder's answer to a `CLIENT_HELLO` (handshake.md §16): either a
+/// `SERVER_HELLO` plus the pending handshake state for the `CLIENT_AUTH`
+/// continuation, or a Version-Negotiation packet when the client's offered
+/// protocol versions exclude the supported one (compatibility.md §5.2).
+#[derive(Debug)]
+pub enum ResponderResponse {
+    /// A `SERVER_HELLO` and the pending state for the client's
+    /// `CLIENT_AUTH` continuation.
+    ServerHello {
+        bytes: Vec<u8>,
+        pending: Box<HandshakePending>,
+    },
+    /// A Version-Negotiation packet (wire-format §25): the client's
+    /// `supported_protocol_versions` excludes
+    /// [`SUPPORTED_PROTOCOL_VERSION`]. The accept loop sends the raw VN
+    /// bytes and closes the connection — the client retries with a fresh
+    /// connection offering a supported version (compatibility.md §5.2).
+    VersionNegotiation { bytes: Vec<u8> },
 }
 
 impl HandshakePending {
@@ -276,11 +304,28 @@ pub(crate) fn expand(secret: &[u8; 32], label: &[u8], context: &[u8; 32]) -> [u8
 /// arrives inside `CLIENT_AUTH`, so both sides derive the same chain and
 /// the client-auth key on the provisional inputs.
 ///
+/// Negotiation runs before any secret derivation:
+/// - Version (compatibility.md §5.2, handshake.md §16): the protocol
+///   version is [`select_version`] over the client's offered list; a list
+///   that excludes [`SUPPORTED_PROTOCOL_VERSION`] answers with a
+///   Version-Negotiation packet (`ResponderResponse::VersionNegotiation`)
+///   and the handshake does NOT continue. The VN echoes the client's
+///   connection IDs (VN DCID ← client SCID, VN SCID ← client DCID, RFC
+///   9000 §17.2.1) and lists our supported versions; the accept loop sends
+///   it and closes the connection.
+/// - Capabilities (compatibility.md §5.4): the client's capabilities hash
+///   (inside the transcript-bound `CLIENT_HELLO`) must equal the
+///   canonical set's hash; a mismatch refuses the handshake. The server's
+///   own canonical hash rides in the first 32 bytes of the `SERVER_HELLO`
+///   padding (the documented convention the client verifies), so both
+///   sides' capability sets are transcript-bound and the session's
+///   effective set is their intersection (v1: the canonical set).
+///
 /// # Errors
 ///
-/// Returns a message when the hello body cannot be decoded, a transcript
-/// update or the auth-block encryption fails, or the hello cannot be
-/// encoded.
+/// Returns a message when the hello body cannot be decoded, the client's
+/// capabilities hash mismatches the canonical set, a transcript update or
+/// the auth-block encryption fails, or the hello cannot be encoded.
 // The DH variable names follow handshake.md §14-18 (DH_ee, DH_es, DH_se,
 // DH_ss) as in the deterministic driver.
 #[allow(clippy::similar_names)]
@@ -289,8 +334,32 @@ pub fn respond_hello(
     carrier_binding: &[u8],
     hello_bytes: &[u8],
     client_static_public_key: &StaticHandshakePublicKey,
-) -> Result<(Vec<u8>, HandshakePending), String> {
+    initial_dcid: &[u8],
+    initial_scid: &[u8],
+) -> Result<ResponderResponse, String> {
     let hello = ClientHello::decode(hello_bytes).map_err(|e| format!("client hello: {e:?}"))?;
+
+    // Version negotiation (compatibility.md §5.2, handshake.md §16): a
+    // client offering no supported version gets a Version-Negotiation
+    // packet and NO SERVER_HELLO — the handshake stops here.
+    let Some(selected_version) = select_version(&hello.supported_protocol_versions) else {
+        return Ok(ResponderResponse::VersionNegotiation {
+            bytes: build_version_negotiation(
+                initial_scid,
+                initial_dcid,
+                &[SELECTED_PROTOCOL_VERSION],
+            ),
+        });
+    };
+
+    // Capability negotiation (compatibility.md §5.4): the client's hash is
+    // inside the transcript-bound CLIENT_HELLO; a mismatch is a protocol
+    // violation (or a peer speaking a different capability set) and the
+    // handshake is refused.
+    if hello.capabilities_hash != capabilities_hash(&canonical_capabilities()) {
+        return Err("client capabilities hash mismatch".into());
+    }
+
     let server_ephemeral = StaticHandshakeKeyPair::generate();
     let mut server_random = [0u8; 32];
     OsEntropy.fill(&mut server_random);
@@ -332,11 +401,22 @@ pub fn respond_hello(
     let server_hello = ServerHello {
         server_random,
         server_ephemeral_public_key: server_ephemeral.public().0,
-        selected_protocol_version: SELECTED_PROTOCOL_VERSION,
+        selected_protocol_version: selected_version,
         selected_crypto_profile: CRYPTO_PROFILE.to_vec(),
         selected_handshake_mode: MODE_XX.to_vec(),
         encrypted_server_authentication: encrypted_auth,
-        padding: vec![0u8; 32],
+        // The server's capabilities hash rides in the first 32 bytes of
+        // the padding (compatibility.md §5.4, documented convention): the
+        // client reads it from the padding prefix and verifies it against
+        // the canonical set. The padding is inside the encoded
+        // SERVER_HELLO, so the hash is transcript-bound like every other
+        // hello field.
+        padding: {
+            let mut padding = Vec::with_capacity(64);
+            padding.extend_from_slice(&capabilities_hash(&canonical_capabilities()));
+            padding.extend_from_slice(&[0u8; 32]);
+            padding
+        },
     };
     let server_hello_bytes = server_hello
         .encode()
@@ -371,7 +451,10 @@ pub fn respond_hello(
         server_eid,
         session_secrets: derive_session_secrets(&secret4, &final_transcript),
     };
-    Ok((server_hello_bytes, pending))
+    Ok(ResponderResponse::ServerHello {
+        bytes: server_hello_bytes,
+        pending: Box::new(pending),
+    })
 }
 
 #[cfg(test)]
@@ -491,6 +574,17 @@ mod tests {
         auth_bytes
     }
 
+    /// The `SERVER_HELLO` half of a responder response; panics when the
+    /// responder answered with a Version-Negotiation packet instead.
+    fn expect_server_hello(response: ResponderResponse) -> (Vec<u8>, HandshakePending) {
+        match response {
+            ResponderResponse::ServerHello { bytes, pending } => (bytes, *pending),
+            ResponderResponse::VersionNegotiation { .. } => {
+                panic!("expected a SERVER_HELLO, got a Version-Negotiation packet")
+            }
+        }
+    }
+
     /// Test binding with a finite validity window (`u64::MAX` would overflow
     /// `IdentityBinding::validate`'s skew arithmetic in debug builds).
     fn client_binding(
@@ -514,9 +608,17 @@ mod tests {
         let hello = ClientHello::new(&TestEntropy, &client_ephemeral);
         let hello_bytes = hello.encode().expect("hello");
 
-        let (server_hello_bytes, pending) =
-            respond_hello(&state, b"ump.tcp/1", &hello_bytes, &client_static.public())
-                .expect("responder");
+        let (server_hello_bytes, pending) = expect_server_hello(
+            respond_hello(
+                &state,
+                b"ump.tcp/1",
+                &hello_bytes,
+                &client_static.public(),
+                &[1u8; 8],
+                &[2u8; 8],
+            )
+            .expect("responder"),
+        );
         let server_hello = ServerHello::decode(&server_hello_bytes).expect("server hello");
         assert_eq!(
             server_hello.selected_protocol_version,
@@ -583,9 +685,17 @@ mod tests {
         let (_client_identity, client_static, client_ephemeral) = client_identity();
         let hello = ClientHello::new(&TestEntropy, &client_ephemeral);
         let hello_bytes = hello.encode().expect("hello");
-        let (server_hello_bytes, pending) =
-            respond_hello(&state, b"ump.tcp/1", &hello_bytes, &client_static.public())
-                .expect("responder");
+        let (server_hello_bytes, pending) = expect_server_hello(
+            respond_hello(
+                &state,
+                b"ump.tcp/1",
+                &hello_bytes,
+                &client_static.public(),
+                &[1u8; 8],
+                &[2u8; 8],
+            )
+            .expect("responder"),
+        );
         let server_hello = ServerHello::decode(&server_hello_bytes).expect("server hello");
         let server_binding = IdentityBinding::sign(
             &state.node_identity.identity,
@@ -625,9 +735,17 @@ mod tests {
         let hello = ClientHello::new(&TestEntropy, &client_ephemeral);
         let hello_bytes = hello.encode().expect("hello");
 
-        let (server_hello_bytes, pending) =
-            respond_hello(&state, b"ump.tcp/1", &hello_bytes, &client_static.public())
-                .expect("responder");
+        let (server_hello_bytes, pending) = expect_server_hello(
+            respond_hello(
+                &state,
+                b"ump.tcp/1",
+                &hello_bytes,
+                &client_static.public(),
+                &[1u8; 8],
+                &[2u8; 8],
+            )
+            .expect("responder"),
+        );
         let server_hello = ServerHello::decode(&server_hello_bytes).expect("server hello");
         let server_binding = IdentityBinding::sign(
             &state.node_identity.identity,
@@ -666,9 +784,159 @@ mod tests {
         let (_identity, client_static, client_ephemeral) = client_identity();
         let hello = ClientHello::new(&TestEntropy, &client_ephemeral);
         let hello_bytes = hello.encode().expect("hello");
-        let (_server_hello_bytes, pending) =
-            respond_hello(&state, b"ump.tcp/1", &hello_bytes, &client_static.public())
-                .expect("responder");
+        let (_server_hello_bytes, pending) = expect_server_hello(
+            respond_hello(
+                &state,
+                b"ump.tcp/1",
+                &hello_bytes,
+                &client_static.public(),
+                &[1u8; 8],
+                &[2u8; 8],
+            )
+            .expect("responder"),
+        );
         assert!(pending.complete(&state, b"garbage", 1_000).is_err());
+    }
+
+    /// Version negotiation (compatibility.md §5.2, handshake.md §16): a
+    /// hello offering the supported version gets a `SERVER_HELLO` selecting
+    /// it; a hello offering only unsupported versions gets a
+    /// Version-Negotiation packet instead and NO `SERVER_HELLO` — the
+    /// handshake does not continue.
+    #[test]
+    fn respond_hello_negotiates_version() {
+        let state = test_state();
+        let (_identity, _static_key, client_ephemeral) = client_identity();
+        let mut hello = ClientHello::new(&TestEntropy, &client_ephemeral);
+        hello.supported_protocol_versions = vec![1];
+        let hello_bytes = hello.encode().expect("hello");
+        let response = respond_hello(
+            &state,
+            b"ump.tcp/1",
+            &hello_bytes,
+            &client_ephemeral.public(),
+            &[1u8; 8],
+            &[2u8; 8],
+        )
+        .expect("responder");
+        let server_hello = match response {
+            ResponderResponse::ServerHello { bytes, .. } => {
+                ServerHello::decode(&bytes).expect("server hello")
+            }
+            ResponderResponse::VersionNegotiation { .. } => {
+                panic!("version 1 must be selected from the offered list")
+            }
+        };
+        assert_eq!(
+            server_hello.selected_protocol_version,
+            SELECTED_PROTOCOL_VERSION
+        );
+
+        // Offering only version 2: a VN packet listing our supported
+        // version, never a SERVER_HELLO.
+        let mut hello = ClientHello::new(&TestEntropy, &client_ephemeral);
+        hello.supported_protocol_versions = vec![2];
+        let hello_bytes = hello.encode().expect("hello");
+        let response = respond_hello(
+            &state,
+            b"ump.tcp/1",
+            &hello_bytes,
+            &client_ephemeral.public(),
+            &[1u8; 8],
+            &[2u8; 8],
+        )
+        .expect("responder");
+        match response {
+            ResponderResponse::ServerHello { .. } => {
+                panic!("an unsupported offer must get a VN packet, not a SERVER_HELLO")
+            }
+            ResponderResponse::VersionNegotiation { bytes } => {
+                let offered = parse_version_negotiation(&bytes).expect("a VN packet");
+                assert_eq!(offered, vec![SELECTED_PROTOCOL_VERSION]);
+            }
+        }
+    }
+
+    /// The Version-Negotiation packet lists the responder's supported
+    /// protocol versions as big-endian u32s (wire-format §25): parsing the
+    /// daemon's VN yields exactly version 1.
+    #[test]
+    fn vn_packet_lists_supported_versions() {
+        let state = test_state();
+        let (_identity, _static_key, client_ephemeral) = client_identity();
+        let mut hello = ClientHello::new(&TestEntropy, &client_ephemeral);
+        hello.supported_protocol_versions = vec![2, 3];
+        let hello_bytes = hello.encode().expect("hello");
+        let response = respond_hello(
+            &state,
+            b"ump.tcp/1",
+            &hello_bytes,
+            &client_ephemeral.public(),
+            &[0xAA; 8],
+            &[0xBB; 8],
+        )
+        .expect("responder");
+        let bytes = match response {
+            ResponderResponse::ServerHello { .. } => panic!("expected a VN packet"),
+            ResponderResponse::VersionNegotiation { bytes } => bytes,
+        };
+        assert_eq!(
+            parse_version_negotiation(&bytes).expect("vn"),
+            vec![SELECTED_PROTOCOL_VERSION]
+        );
+    }
+
+    /// Capability negotiation (compatibility.md §5.4): the responder
+    /// refuses a hello whose capabilities hash does not match the
+    /// canonical set.
+    #[test]
+    fn respond_hello_refuses_bad_capabilities_hash() {
+        let state = test_state();
+        let (_identity, _static_key, client_ephemeral) = client_identity();
+        let mut hello = ClientHello::new(&TestEntropy, &client_ephemeral);
+        hello.capabilities_hash = [0u8; 32];
+        let hello_bytes = hello.encode().expect("hello");
+        let error = respond_hello(
+            &state,
+            b"ump.tcp/1",
+            &hello_bytes,
+            &client_ephemeral.public(),
+            &[1u8; 8],
+            &[2u8; 8],
+        )
+        .expect_err("a bad capabilities hash must be refused");
+        assert!(error.contains("capabilities"), "{error}");
+    }
+
+    /// The server's canonical capabilities hash rides in the first 32
+    /// bytes of the `SERVER_HELLO` padding (the documented convention):
+    /// the client reads it from the padding prefix, exactly as
+    /// `complete_client_side` verifies it.
+    #[test]
+    fn server_hello_carries_server_hash() {
+        let state = test_state();
+        let (_identity, _static_key, client_ephemeral) = client_identity();
+        let hello = ClientHello::new(&TestEntropy, &client_ephemeral);
+        let hello_bytes = hello.encode().expect("hello");
+        let response = respond_hello(
+            &state,
+            b"ump.tcp/1",
+            &hello_bytes,
+            &client_ephemeral.public(),
+            &[1u8; 8],
+            &[2u8; 8],
+        )
+        .expect("responder");
+        let bytes = match response {
+            ResponderResponse::ServerHello { bytes, .. } => bytes,
+            ResponderResponse::VersionNegotiation { .. } => {
+                panic!("expected a SERVER_HELLO")
+            }
+        };
+        let server_hello = ServerHello::decode(&bytes).expect("server hello");
+        assert_eq!(
+            server_hello.server_capabilities_hash().expect("hash"),
+            capabilities_hash(&canonical_capabilities())
+        );
     }
 }

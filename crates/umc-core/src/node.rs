@@ -88,15 +88,45 @@ impl Node {
     /// confirmation MAC), and derives session secrets from the transcript
     /// (handshake.md §14-20).
     ///
+    /// Version negotiation (compatibility.md §5.2): a Version-Negotiation
+    /// response means the server does not support the offered versions.
+    /// The connect retries ONCE with a fresh connection when the VN lists
+    /// our version (the retry Initial is identical — version 1 is the only
+    /// version we support); a VN listing only unsupported versions aborts.
+    ///
     /// # Errors
     ///
     /// Returns [`NodeError::CarrierUnknown`] when no carrier of the given type
     /// is registered, [`NodeError::Carrier`] when dialing or exchanging
     /// packets fails, and [`NodeError::Handshake`] when the XX handshake
     /// fails (including a `SERVER_FINISHED` whose MAC or signature does not
-    /// verify).
-    #[allow(clippy::too_many_lines)] // one wire handshake path: hello, auth, finished, confirmation
+    /// verify, and a Version-Negotiation response listing no supported
+    /// version).
     pub async fn connect(
+        &mut self,
+        carrier_type: &str,
+        remote: String,
+        server_identity_public: &NodeIdentity,
+    ) -> Result<u64, NodeError> {
+        let mut retried = false;
+        loop {
+            match self
+                .connect_attempt(carrier_type, remote.clone(), server_identity_public)
+                .await
+            {
+                Err(NodeError::VersionNegotiation) if !retried => {
+                    // The VN listed a supported version: retry once with a
+                    // fresh connection.
+                    retried = true;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// One handshake attempt (see [`Node::connect`] for the retry policy).
+    #[allow(clippy::too_many_lines)] // one wire handshake path: hello, auth, finished, confirmation
+    async fn connect_attempt(
         &mut self,
         carrier_type: &str,
         remote: String,
@@ -153,6 +183,21 @@ impl Node {
                 Err(e) => return Err(NodeError::Carrier(e)),
             }
         };
+        // Version negotiation (compatibility.md §5.2): a Version-
+        // Negotiation packet (long-header type VN, version 0) means the
+        // server does not support our offered versions. It is never
+        // protected (no keys exist before version agreement), so it is
+        // recognized here, before the Initial decrypt. A VN listing our
+        // version signals the caller to retry once; one listing only
+        // unsupported versions is a hard error.
+        if let Some(offered) = umc_handshake::xx::parse_version_negotiation(&server_packet) {
+            if umc_handshake::xx::select_version(&offered).is_none() {
+                return Err(NodeError::Handshake(
+                    "version negotiation: server offers no supported protocol version".into(),
+                ));
+            }
+            return Err(NodeError::VersionNegotiation);
+        }
         let server_hello_bytes = parse_initial_response(&server_packet, &keys.server)?;
         let server_hello = umc_handshake::xx::ServerHello::decode(&server_hello_bytes)
             .map_err(|e| NodeError::Handshake(format!("{e:?}")))?;
@@ -443,6 +488,10 @@ pub enum NodeError {
     CarrierUnknown,
     Carrier(CarrierError),
     Handshake(String),
+    /// A Version-Negotiation response listing a supported protocol version
+    /// (compatibility.md §5.2): the caller retries the connect with a
+    /// fresh connection.
+    VersionNegotiation,
 }
 
 impl std::fmt::Display for NodeError {
@@ -456,6 +505,7 @@ impl std::error::Error for NodeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
     use umc_carrier::types::{
         CarrierCapabilities, CarrierTypeId, ConnectionModel, InboundPacket, LinkEvent,
@@ -564,6 +614,146 @@ mod tests {
         }
     }
 
+    /// A carrier whose `dial` yields links that replay scripted responses
+    /// and record every sent packet: each recv pops the front of the queue
+    /// (a later recv fails loud). One link per dial, so a version-
+    /// negotiation retry consumes the next response on a fresh link.
+    struct ScriptedCarrier {
+        responses: Arc<StdMutex<VecDeque<Vec<u8>>>>,
+        sent: Arc<StdMutex<Vec<Vec<u8>>>>,
+    }
+
+    impl Carrier for ScriptedCarrier {
+        fn type_id(&self) -> CarrierTypeId {
+            CarrierTypeId("scr.1".into())
+        }
+
+        fn capabilities(&self) -> CarrierCapabilities {
+            CarrierCapabilities {
+                api_version: 1,
+                carrier_type: self.type_id(),
+                packet_mode: PacketMode::StreamFramed,
+                reliability: Reliability::ReliableUntilLinkFailure,
+                ordering: Ordering::Ordered,
+                connection_model: ConnectionModel::Connected,
+                supports_listen: false,
+                supports_dial: true,
+                supports_discovery: false,
+                minimum_packet_size: 1,
+                maximum_packet_size: 65_535,
+                scope_classes: vec![],
+            }
+        }
+
+        fn listen(
+            &self,
+            _bind: String,
+        ) -> Result<Box<dyn umc_carrier::Listener + Send + Sync>, CarrierError> {
+            Err(CarrierError::new(CarrierErrorKind::Unsupported, "listen"))
+        }
+
+        fn dial(&self, _remote: String) -> Result<umc_carrier::BoxLink, CarrierError> {
+            Ok(Box::new(ScriptedLink {
+                responses: self.responses.clone(),
+                sent: self.sent.clone(),
+            }))
+        }
+    }
+
+    struct ScriptedLink {
+        responses: Arc<StdMutex<VecDeque<Vec<u8>>>>,
+        sent: Arc<StdMutex<Vec<Vec<u8>>>>,
+    }
+
+    impl umc_carrier::Link for ScriptedLink {
+        fn properties(&self) -> LinkProperties {
+            LinkProperties {
+                reliability: Reliability::ReliableUntilLinkFailure,
+                ordering: Ordering::Ordered,
+                current_mtu: 65_535,
+                queue_bytes: 0,
+                queue_capacity: 2 * 1024 * 1024,
+                estimated_rtt_ms: None,
+                estimated_loss: None,
+                metered: false,
+            }
+        }
+
+        fn send(&self, packet: OutboundPacket) -> Result<SendResult, CarrierError> {
+            self.sent.lock().expect("sent").push(packet.bytes);
+            Ok(SendResult::Accepted {
+                queue_state: QueueState::SentToMedium,
+            })
+        }
+
+        fn recv(&self) -> Result<InboundPacket, CarrierError> {
+            match self.responses.lock().expect("responses").pop_front() {
+                Some(bytes) => Ok(InboundPacket {
+                    bytes,
+                    received_at: Instant(0),
+                }),
+                None => Err(CarrierError::new(
+                    CarrierErrorKind::LinkFailed,
+                    "recv: no scripted response",
+                )),
+            }
+        }
+
+        fn events(&self) -> Result<LinkEvent, CarrierError> {
+            Err(CarrierError::new(CarrierErrorKind::WouldBlock, "events"))
+        }
+
+        fn close(&self, _reason: &str) -> Result<(), CarrierError> {
+            Ok(())
+        }
+    }
+
+    /// An Initial-protected packet carrying a (garbage-auth) `SERVER_HELLO`
+    /// sealed with the server initial keys derived from the client's DCID —
+    /// the mirror of the daemon's accept-path `build_initial_packet`. The
+    /// client's DCID is deterministic under `TestEntropy` (all `0x5A`), so
+    /// the mock response is pre-buildable.
+    fn build_server_hello_initial(dcid: &[u8], scid: &[u8]) -> Vec<u8> {
+        let server_hello = umc_handshake::xx::ServerHello {
+            server_random: [1u8; 32],
+            server_ephemeral_public_key: [2u8; 32],
+            selected_protocol_version: 1,
+            selected_crypto_profile: umc_handshake::xx::CRYPTO_PROFILE.to_vec(),
+            selected_handshake_mode: umc_handshake::xx::MODE_XX.to_vec(),
+            encrypted_server_authentication: vec![3u8; 64],
+            // The canonical capabilities hash in the padding prefix: the
+            // client's `complete_client_side` verification passes here.
+            padding: {
+                let mut p = umc_handshake::xx::capabilities_hash(
+                    &umc_handshake::xx::canonical_capabilities(),
+                )
+                .to_vec();
+                p.extend_from_slice(&[0u8; 32]);
+                p
+            },
+        }
+        .encode()
+        .expect("server hello");
+        let keys = umc_handshake::initial::derive_initial_keys(dcid).server;
+        let header = umc_wire::header::LongHeader {
+            ptype: umc_wire::header::LongPacketType::Initial,
+            version: umc_types::version::PROTOCOL_VERSION,
+            dcid: dcid.to_vec(),
+            scid: scid.to_vec(),
+            token: Vec::new(),
+            payload_len: u64::try_from(server_hello.len() + umc_crypto::aead::TAG_LEN)
+                .expect("fits"),
+            packet_number: 0,
+            pn_bits: 8,
+        }
+        .encode()
+        .expect("header");
+        let ciphertext = keys.seal(0, &header, &server_hello).expect("seal");
+        let mut out = header;
+        out.extend_from_slice(&ciphertext);
+        out
+    }
+
     #[test]
     fn node_identity_generates_distinct_ids() {
         let a = NodeIdentity::generate(&TestEntropy);
@@ -632,6 +822,95 @@ mod tests {
                 umc_handshake::xx::ClientHello::decode(&payload).is_ok(),
                 "decrypted payload is a CLIENT_HELLO"
             );
+        });
+    }
+
+    /// Version negotiation retry (compatibility.md §5.2): a VN response
+    /// listing version 1 makes the client dial a fresh link and retry the
+    /// handshake — it only fails later, at the (garbage) server-auth
+    /// decrypt, never at version negotiation.
+    #[test]
+    fn connect_retries_once_on_version_negotiation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            // TestEntropy fixes the client DCID at [0x5A; 8], so the mock
+            // SERVER_HELLO packet is buildable ahead of time.
+            let dcid = [0x5Au8; 8];
+            let responses = Arc::new(StdMutex::new(VecDeque::from([
+                umc_handshake::xx::build_version_negotiation(&dcid, &[0x5Bu8; 8], &[1]),
+                build_server_hello_initial(&dcid, &[0x5Bu8; 8]),
+            ])));
+            let sent = Arc::new(StdMutex::new(Vec::new()));
+            let mut node = Node::new(
+                NodeConfig {
+                    identity: NodeIdentity::generate(&TestEntropy),
+                    dcid: vec![1u8; 8],
+                },
+                Arc::new(TestClock),
+                Arc::new(TestEntropy),
+            );
+            node.register_carrier(Box::new(ScriptedCarrier {
+                responses: responses.clone(),
+                sent: sent.clone(),
+            }));
+            let peer = NodeIdentity::generate(&TestEntropy);
+            let error = node
+                .connect("scr.1", "server".into(), &peer)
+                .await
+                .expect_err("the retry must fail at the server-auth decrypt");
+            assert!(
+                matches!(&error, NodeError::Handshake(_)),
+                "the VN was accepted and the handshake continued: {error:?}"
+            );
+            let sent = sent.lock().expect("sent").clone();
+            assert_eq!(sent.len(), 2, "the initial attempt and the retry");
+            assert!(
+                umc_handshake::initial::try_parse_initial(&sent[1]).is_some(),
+                "the retry re-sends an Initial hello on the fresh link"
+            );
+        });
+    }
+
+    /// A Version-Negotiation response listing only unsupported versions
+    /// aborts the connect: no retry is attempted (compatibility.md §5.2).
+    #[test]
+    fn connect_rejects_vn_not_listing_supported_version() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let dcid = [0x5Au8; 8];
+            let responses = Arc::new(StdMutex::new(VecDeque::from([
+                umc_handshake::xx::build_version_negotiation(&dcid, &[0x5Bu8; 8], &[2]),
+            ])));
+            let sent = Arc::new(StdMutex::new(Vec::new()));
+            let mut node = Node::new(
+                NodeConfig {
+                    identity: NodeIdentity::generate(&TestEntropy),
+                    dcid: vec![1u8; 8],
+                },
+                Arc::new(TestClock),
+                Arc::new(TestEntropy),
+            );
+            node.register_carrier(Box::new(ScriptedCarrier {
+                responses: responses.clone(),
+                sent: sent.clone(),
+            }));
+            let peer = NodeIdentity::generate(&TestEntropy);
+            let error = node
+                .connect("scr.1", "server".into(), &peer)
+                .await
+                .expect_err("a VN listing no supported version must abort");
+            assert!(
+                matches!(&error, NodeError::Handshake(message) if message.contains("version negotiation")),
+                "{error:?}"
+            );
+            let sent = sent.lock().expect("sent").clone();
+            assert_eq!(sent.len(), 1, "no retry against an unsupported VN");
         });
     }
 }

@@ -275,6 +275,13 @@ fn handle_inbound_link_locked(
         Some((header_dcid, _, _, _)) if header_dcid.len() == 8 => header_dcid.clone(),
         _ => session_dcid(&hello),
     };
+    // The client's SCID (its own connection id), for the Version-
+    // Negotiation echo: VN DCID ← client SCID, VN SCID ← client DCID (RFC
+    // 9000 §17.2.1). Empty on the transitional raw path.
+    let vn_scid = match &parsed_initial {
+        Some((_dcid, _pn, _payload, return_to)) => return_to.clone(),
+        None => Vec::new(),
+    };
 
     let now = state.lock().expect("state").node.clock.as_ref().now();
     tracker
@@ -289,7 +296,7 @@ fn handle_inbound_link_locked(
     // stay symmetric on both sides (the SERVER_HELLO itself binds only
     // DH_ee and the transcript). The CLIENT_AUTH payload carries the REAL
     // static + identity binding + signature, which complete() verifies.
-    let (server_hello_bytes, pending) = {
+    let responder_outcome = {
         let state = state.lock().expect("state");
         let client_static = StaticHandshakePublicKey(hello.client_ephemeral_public_key);
         handshake_responder::respond_hello(
@@ -297,7 +304,31 @@ fn handle_inbound_link_locked(
             carrier_type.as_bytes(),
             &hello_bytes,
             &client_static,
+            &dcid,
+            &vn_scid,
         )?
+    };
+    let (server_hello_bytes, pending) = match responder_outcome {
+        handshake_responder::ResponderResponse::ServerHello { bytes, pending } => (bytes, pending),
+        handshake_responder::ResponderResponse::VersionNegotiation { bytes } => {
+            // Version negotiation (compatibility.md §5.2): the client's
+            // offered protocol versions exclude the supported one. A VN
+            // packet is never protected (no keys exist before version
+            // agreement), so it travels raw even on the live path. Send
+            // it, then close the connection: the client retries with a
+            // fresh connection offering a supported version.
+            let send_result = tokio::task::block_in_place(|| {
+                link.send(OutboundPacket {
+                    bytes,
+                    control: true,
+                    deadline_ms: Some(3_000),
+                })
+            });
+            if let Err(e) = send_result {
+                return Err(format!("send version negotiation: {e:?}"));
+            }
+            return Err("version negotiation: client offered no supported version".into());
+        }
     };
     // SERVER_HELLO travels in the same form as the request: Initial-
     // protected when the client spoke Initial, raw on the transitional

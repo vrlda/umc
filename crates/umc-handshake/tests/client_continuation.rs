@@ -87,7 +87,15 @@ fn client_continuation_matches_driver_secrets() {
         selected_crypto_profile: b"UMP-CRYPTO-1".to_vec(),
         selected_handshake_mode: b"XX".to_vec(),
         encrypted_server_authentication: encrypted_auth,
-        padding: vec![0u8; 32],
+        // The driver carries the server's canonical capabilities hash in
+        // the first 32 bytes of the padding (compatibility.md §5.4).
+        padding: {
+            let mut padding =
+                umc_handshake::xx::capabilities_hash(&umc_handshake::xx::canonical_capabilities())
+                    .to_vec();
+            padding.extend_from_slice(&[0u8; 32]);
+            padding
+        },
     };
 
     let out = complete_client_side(
