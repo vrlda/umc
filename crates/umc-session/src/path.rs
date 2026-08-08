@@ -152,12 +152,6 @@ impl Path {
         self.state = PathState::Failed;
         self.validated = false;
     }
-
-    pub fn mark_degraded(&mut self) {
-        if self.state == PathState::Validated {
-            self.state = PathState::Degraded;
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 umc-types = { path = "../../crates/umc-types" }
 umc-carrier = { path = "../../crates/umc-carrier" }
-tokio = { version = "1", features = ["rt", "net", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time"] }
 
 [lints]
 workspace = true
