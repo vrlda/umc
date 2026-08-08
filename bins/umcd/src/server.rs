@@ -19,7 +19,7 @@ use umc_control::framing::{frame_envelope, EnvelopeDecoder};
 use umc_control::pages::PageToken;
 use umc_control::proto::umc::api::v1 as api;
 use umc_core::block::BlockReason;
-use umc_core::trust::TrustLevel;
+use umc_core::trust::TrustState;
 use umc_discovery::invitation::InvitationError;
 use umc_discovery::provider::{CandidateAuth, CandidateSource, PeerCandidate, SharingPolicy};
 use umc_routing::types::{RouteKey, RouteScope, RouteState};
@@ -1367,11 +1367,14 @@ fn remove_peer(state: &mut RuntimeState, request: &api::Request) -> (i32, Option
 /// v1 trust store has five levels; the spec's seven-state set replaces
 /// them in Phase G (gap-closure G1), so this mapping is documented coarse.
 fn trust_state_code(state: &RuntimeState, endpoint: &[u8]) -> i32 {
-    match state.trust_store().effective_trust_level(endpoint) {
-        Ok(TrustLevel::Distrusted) => api::TrustState::Blocked as i32,
-        Ok(TrustLevel::Unknown) | Err(_) => api::TrustState::Unknown as i32,
-        Ok(TrustLevel::Basic) => api::TrustState::Observed as i32,
-        Ok(TrustLevel::Familiar | TrustLevel::Privileged) => api::TrustState::Trusted as i32,
+    match state.trust_store().effective_trust_state(endpoint) {
+        Ok(umc_core::trust::TrustState::Unknown) | Err(_) => api::TrustState::Unknown as i32,
+        Ok(umc_core::trust::TrustState::Observed) => api::TrustState::Observed as i32,
+        Ok(umc_core::trust::TrustState::Introduced) => api::TrustState::Introduced as i32,
+        Ok(umc_core::trust::TrustState::Trusted) => api::TrustState::Trusted as i32,
+        Ok(umc_core::trust::TrustState::Restricted) => api::TrustState::Restricted as i32,
+        Ok(umc_core::trust::TrustState::Blocked) => api::TrustState::Blocked as i32,
+        Ok(umc_core::trust::TrustState::Revoked) => api::TrustState::Revoked as i32,
     }
 }
 
@@ -1387,19 +1390,18 @@ fn security_peer_summary(endpoint_id: &[u8; 32], trust_state: i32) -> api::PeerS
 }
 
 /// The v1 trust-level mapping for `SetTrustState` (identity-trust.md §13):
-/// the spec's seven states land on the store's five levels. `Restricted`,
-/// `Blocked`, and `Revoked` collapse to `Distrusted`; `Introduced` falls
-/// back to `Basic` (the v1 store has no introduction level); `Trusted`
-/// maps to `Familiar`. Phase G (gap-closure G1) replaces this with the
-/// full seven-state set.
-fn trust_level_from_proto(state: api::TrustState) -> TrustLevel {
+/// The control API's seven states are persisted without collapsing
+/// `Introduced`, `Restricted`, or `Revoked` into the legacy compatibility
+/// levels (identity-trust.md §14–15).
+fn trust_state_from_proto(state: api::TrustState) -> TrustState {
     match state {
-        api::TrustState::Observed | api::TrustState::Introduced => TrustLevel::Basic,
-        api::TrustState::Trusted => TrustLevel::Familiar,
-        api::TrustState::Restricted | api::TrustState::Blocked | api::TrustState::Revoked => {
-            TrustLevel::Distrusted
-        }
-        api::TrustState::Unknown | api::TrustState::Unspecified => TrustLevel::Unknown,
+        api::TrustState::Observed => TrustState::Observed,
+        api::TrustState::Introduced => TrustState::Introduced,
+        api::TrustState::Trusted => TrustState::Trusted,
+        api::TrustState::Restricted => TrustState::Restricted,
+        api::TrustState::Blocked => TrustState::Blocked,
+        api::TrustState::Revoked => TrustState::Revoked,
+        api::TrustState::Unknown | api::TrustState::Unspecified => TrustState::Unknown,
     }
 }
 
@@ -1422,12 +1424,11 @@ fn set_trust_state(state: &mut RuntimeState, request: &api::Request) -> (i32, Op
         return (api::StatusCode::InvalidArgument as i32, None);
     }
     let now_ms = wall_now().0;
-    let level = trust_level_from_proto(proto_state);
+    let trust_state = trust_state_from_proto(proto_state);
     let trust = state.trust_store();
-    let result = match level {
-        TrustLevel::Distrusted => trust.mark_distrusted(&endpoint, now_ms),
-        TrustLevel::Unknown => trust.remove_distrust(&endpoint),
-        other => trust.set_level(&endpoint, other, now_ms),
+    let result = match trust_state {
+        TrustState::Unknown => trust.remove_distrust(&endpoint),
+        other => trust.set_state(&endpoint, other, now_ms),
     };
     if let Err(e) = result {
         log::error!("[peers] trust update failed: {e:?}");
@@ -1437,7 +1438,7 @@ fn set_trust_state(state: &mut RuntimeState, request: &api::Request) -> (i32, Op
         state,
         "trust_state_set",
         format!(
-            "peer {:02x?} -> {proto_state:?} (v1 {level:?}); reason {}",
+            "peer {:02x?} -> {proto_state:?} ({trust_state:?}); reason {}",
             endpoint, set.reason
         ),
     );
@@ -3542,6 +3543,7 @@ pub fn load_node_state(store: &SqliteStore) -> Result<(String, Vec<String>), Str
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use umc_core::trust::TrustLevel;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
