@@ -851,7 +851,7 @@ mod tests {
                 panic!("an unsupported offer must get a VN packet, not a SERVER_HELLO")
             }
             ResponderResponse::VersionNegotiation { bytes } => {
-                let offered = parse_version_negotiation(&bytes).expect("a VN packet");
+                let (offered, _) = parse_version_negotiation(&bytes).expect("a VN packet");
                 assert_eq!(offered, vec![SELECTED_PROTOCOL_VERSION]);
             }
         }
@@ -881,7 +881,7 @@ mod tests {
             ResponderResponse::VersionNegotiation { bytes } => bytes,
         };
         assert_eq!(
-            parse_version_negotiation(&bytes).expect("vn"),
+            parse_version_negotiation(&bytes).expect("vn").0,
             vec![SELECTED_PROTOCOL_VERSION]
         );
     }
