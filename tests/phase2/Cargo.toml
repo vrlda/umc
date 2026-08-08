@@ -6,7 +6,6 @@ license.workspace = true
 publish = false
 
 [dependencies]
-umcd = { path = "../../bins/umcd" }
 umc-sdk = { path = "../../crates/umc-sdk" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time"] }
 
