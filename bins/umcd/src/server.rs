@@ -270,9 +270,13 @@ impl ConnectionState {
 /// FIFO eviction at 1,024 entries. A replay returns the stored bytes
 /// without re-dispatching.
 #[derive(Debug, Default)]
+/// Idempotency key: (service, method, client key) — scoped per
+/// control-api.md §18.
+type IdempotencyKey = (String, String, Vec<u8>);
+
 struct IdempotencyCache {
-    entries: HashMap<(String, String, Vec<u8>), (Vec<u8>, u64)>,
-    order: VecDeque<(String, String, Vec<u8>)>,
+    entries: HashMap<IdempotencyKey, (Vec<u8>, u64)>,
+    order: VecDeque<IdempotencyKey>,
 }
 
 impl IdempotencyCache {
@@ -300,7 +304,7 @@ impl IdempotencyCache {
     }
 
     /// The stored bytes for `key` when it is fresh at `now_ms`.
-    fn get(&self, key: &(String, String, Vec<u8>), now_ms: u64) -> Option<Vec<u8>> {
+    fn get(&self, key: &IdempotencyKey, now_ms: u64) -> Option<Vec<u8>> {
         let (response, inserted_at) = self.entries.get(key)?;
         (now_ms < inserted_at + IDEMPOTENCY_TTL_MS).then(|| response.clone())
     }
