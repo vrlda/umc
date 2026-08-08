@@ -65,7 +65,6 @@ impl PacketSpaceState {
         Ok(pn)
     }
 
-    #[must_use]
     /// Admit an already-reconstructed packet number (the parser rebuilt the
     /// full pn for the AEAD open): replay-window check without a second
     /// reconstruction step.
