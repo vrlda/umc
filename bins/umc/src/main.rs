@@ -2,6 +2,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use prost::Message;
@@ -82,6 +83,11 @@ enum Command {
         #[command(subcommand)]
         action: PeersAction,
     },
+    /// Invitation lifecycle.
+    Invite {
+        #[command(subcommand)]
+        action: InviteAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -110,6 +116,41 @@ enum RoutesAction {
 #[derive(Debug, Subcommand)]
 enum PeersAction {
     List,
+    /// Add an operator-supplied connection hint.
+    Add {
+        endpoint_id: String,
+        carrier: String,
+        address: String,
+        #[arg(long)]
+        expires_at_unix_ms: Option<i64>,
+        #[arg(long)]
+        do_not_reshare: bool,
+    },
+    /// Remove a peer and its persisted hints.
+    Remove {
+        endpoint_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum InviteAction {
+    /// Create an invitation; returned values are hex for piping to import.
+    Create {
+        #[arg(long = "endpoint-id")]
+        endpoint_ids: Vec<String>,
+        #[arg(long)]
+        expires_at_unix_ms: i64,
+        #[arg(long, default_value_t = 1)]
+        maximum_uses: u64,
+    },
+    /// Import an invitation document and secret encoded as hex.
+    Import { document: String, secret: String },
+    /// Revoke an invitation id encoded as hex.
+    Revoke {
+        invitation_id: String,
+        #[arg(long, default_value = "cli revoke")]
+        reason: String,
+    },
 }
 
 async fn cmd_status(socket: &str) -> Result<Vec<String>, String> {
@@ -342,6 +383,173 @@ async fn cmd_peers_list(socket: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+async fn cmd_peers_add(
+    socket: &str,
+    endpoint_id: String,
+    carrier: String,
+    address: String,
+    expires_at_unix_ms: Option<i64>,
+    do_not_reshare: bool,
+) -> Result<Vec<String>, String> {
+    let endpoint_id = decode_hex(&endpoint_id)?;
+    let expires_at_unix_ms = expires_at_unix_ms.unwrap_or_else(|| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| {
+                i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+            });
+        now.saturating_add(24 * 60 * 60 * 1_000)
+    });
+    let request = api::AddPeerHintRequest {
+        endpoint_id,
+        hint: Some(api::PeerHint {
+            carrier_type_id: carrier,
+            connection_hint: address.into_bytes(),
+            expires_at_unix_ms,
+            source: "cli".into(),
+            do_not_reshare,
+        }),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&request, &mut payload).map_err(|e| format!("peers add: encode: {e}"))?;
+    let mut daemon = DaemonClient::connect(socket, CLIENT_NAME)
+        .await
+        .map_err(|e| format!("peers add: {e:?}"))?;
+    let (code, response_payload) = daemon
+        .request_raw("PeerService", "AddPeerHint", payload)
+        .await
+        .map_err(|e| format!("peers add: {e:?}"))?;
+    if code != api::StatusCode::Ok as i32 {
+        return Err(format!("peers add: status {code}"));
+    }
+    let response = api::AddPeerHintResponse::decode(response_payload.as_slice())
+        .map_err(|e| format!("peers add: decode: {e}"))?;
+    Ok(vec![format!(
+        "peer added: {}",
+        response
+            .peer
+            .map_or_else(|| "unknown".into(), |peer| hex_id(&peer.endpoint_id))
+    )])
+}
+
+async fn cmd_peers_remove(socket: &str, endpoint_id: String) -> Result<Vec<String>, String> {
+    let request = api::RemovePeerRequest {
+        endpoint_id: decode_hex(&endpoint_id)?,
+        expected_revision: None,
+    };
+    let mut payload = Vec::new();
+    Message::encode(&request, &mut payload).map_err(|e| format!("peers remove: encode: {e}"))?;
+    let mut daemon = DaemonClient::connect(socket, CLIENT_NAME)
+        .await
+        .map_err(|e| format!("peers remove: {e:?}"))?;
+    let (code, _) = daemon
+        .request_raw("PeerService", "RemovePeer", payload)
+        .await
+        .map_err(|e| format!("peers remove: {e:?}"))?;
+    if code != api::StatusCode::Ok as i32 {
+        return Err(format!("peers remove: status {code}"));
+    }
+    Ok(vec!["peer removed".into()])
+}
+
+async fn cmd_invite_create(
+    socket: &str,
+    endpoint_ids: Vec<String>,
+    expires_at_unix_ms: i64,
+    maximum_uses: u64,
+) -> Result<Vec<String>, String> {
+    let endpoint_ids = endpoint_ids
+        .into_iter()
+        .map(|id| decode_hex(&id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let request = api::CreateInvitationRequest {
+        identity_handle: None,
+        scope: Some(api::InvitationScope {
+            endpoint_ids,
+            protocol_ids: Vec::new(),
+            allow_relay: false,
+            allow_discovery: true,
+            maximum_uses,
+            expires_at_unix_ms,
+        }),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&request, &mut payload).map_err(|e| format!("invite create: encode: {e}"))?;
+    let mut daemon = DaemonClient::connect(socket, CLIENT_NAME)
+        .await
+        .map_err(|e| format!("invite create: {e:?}"))?;
+    let (code, response_payload) = daemon
+        .request_raw("PeerService", "CreateInvitation", payload)
+        .await
+        .map_err(|e| format!("invite create: {e:?}"))?;
+    if code != api::StatusCode::Ok as i32 {
+        return Err(format!("invite create: status {code}"));
+    }
+    let response = api::CreateInvitationResponse::decode(response_payload.as_slice())
+        .map_err(|e| format!("invite create: decode: {e}"))?;
+    Ok(vec![
+        format!("invitation_id={}", hex_id(&response.invitation_id)),
+        format!("invitation_secret={}", hex_id(&response.invitation_secret)),
+        format!(
+            "invitation_document={}",
+            hex_id(&response.invitation_document)
+        ),
+    ])
+}
+
+async fn cmd_invite_import(
+    socket: &str,
+    document: String,
+    secret: String,
+) -> Result<Vec<String>, String> {
+    let request = api::ImportInvitationRequest {
+        invitation_document: decode_hex(&document)?,
+        invitation_secret: decode_hex(&secret)?,
+    };
+    let mut payload = Vec::new();
+    Message::encode(&request, &mut payload).map_err(|e| format!("invite import: encode: {e}"))?;
+    let mut daemon = DaemonClient::connect(socket, CLIENT_NAME)
+        .await
+        .map_err(|e| format!("invite import: {e:?}"))?;
+    let (code, response_payload) = daemon
+        .request_raw("PeerService", "ImportInvitation", payload)
+        .await
+        .map_err(|e| format!("invite import: {e:?}"))?;
+    if code != api::StatusCode::Ok as i32 {
+        return Err(format!("invite import: status {code}"));
+    }
+    let response = api::ImportInvitationResponse::decode(response_payload.as_slice())
+        .map_err(|e| format!("invite import: decode: {e}"))?;
+    Ok(vec![format!(
+        "invitation imported: {}",
+        hex_id(&response.invitation_id)
+    )])
+}
+
+async fn cmd_invite_revoke(
+    socket: &str,
+    invitation_id: String,
+    reason: String,
+) -> Result<Vec<String>, String> {
+    let request = api::RevokeInvitationRequest {
+        invitation_id: decode_hex(&invitation_id)?,
+        reason,
+    };
+    let mut payload = Vec::new();
+    Message::encode(&request, &mut payload).map_err(|e| format!("invite revoke: encode: {e}"))?;
+    let mut daemon = DaemonClient::connect(socket, CLIENT_NAME)
+        .await
+        .map_err(|e| format!("invite revoke: {e:?}"))?;
+    let (code, _) = daemon
+        .request_raw("PeerService", "RevokeInvitation", payload)
+        .await
+        .map_err(|e| format!("invite revoke: {e:?}"))?;
+    if code != api::StatusCode::Ok as i32 {
+        return Err(format!("invite revoke: status {code}"));
+    }
+    Ok(vec!["invitation revoked".into()])
+}
+
 /// `umc init`: local node initialization mirroring `umcd --init` file
 /// creation (core.md §19) — data dir, keystore dir, and the default config
 /// file written only when absent. The node identity is generated by the
@@ -408,6 +616,29 @@ fn hex_id(id: &[u8]) -> String {
     out
 }
 
+fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+    let value = value.strip_prefix("0x").unwrap_or(value);
+    if value.len() % 2 != 0 {
+        return Err("hex value must have an even number of characters".into());
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let high = hex_digit(pair[0]).ok_or_else(|| format!("invalid hex byte {pair:?}"))?;
+        let low = hex_digit(pair[1]).ok_or_else(|| format!("invalid hex byte {pair:?}"))?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
 async fn run(cli: Cli) -> Vec<String> {
     let result = match cli.command {
         Command::Status => cmd_status(&cli.socket).await,
@@ -432,6 +663,47 @@ async fn run(cli: Cli) -> Vec<String> {
         Command::Peers {
             action: PeersAction::List,
         } => cmd_peers_list(&cli.socket).await,
+        Command::Peers {
+            action:
+                PeersAction::Add {
+                    endpoint_id,
+                    carrier,
+                    address,
+                    expires_at_unix_ms,
+                    do_not_reshare,
+                },
+        } => {
+            cmd_peers_add(
+                &cli.socket,
+                endpoint_id,
+                carrier,
+                address,
+                expires_at_unix_ms,
+                do_not_reshare,
+            )
+            .await
+        }
+        Command::Peers {
+            action: PeersAction::Remove { endpoint_id },
+        } => cmd_peers_remove(&cli.socket, endpoint_id).await,
+        Command::Invite {
+            action:
+                InviteAction::Create {
+                    endpoint_ids,
+                    expires_at_unix_ms,
+                    maximum_uses,
+                },
+        } => cmd_invite_create(&cli.socket, endpoint_ids, expires_at_unix_ms, maximum_uses).await,
+        Command::Invite {
+            action: InviteAction::Import { document, secret },
+        } => cmd_invite_import(&cli.socket, document, secret).await,
+        Command::Invite {
+            action:
+                InviteAction::Revoke {
+                    invitation_id,
+                    reason,
+                },
+        } => cmd_invite_revoke(&cli.socket, invitation_id, reason).await,
     };
     match result {
         Ok(lines) => lines,
@@ -504,6 +776,18 @@ mod tests {
             parse(&["umc", "peers", "list"]).command,
             Command::Peers {
                 action: PeersAction::List
+            }
+        ));
+        assert!(matches!(
+            parse(&["umc", "invite", "create", "--expires-at-unix-ms", "123"]).command,
+            Command::Invite {
+                action: InviteAction::Create { .. }
+            }
+        ));
+        assert!(matches!(
+            parse(&["umc", "peers", "add", "00", "ump.tcp/1", "127.0.0.1:1"]).command,
+            Command::Peers {
+                action: PeersAction::Add { .. }
             }
         ));
     }

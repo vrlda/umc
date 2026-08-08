@@ -108,10 +108,28 @@ impl Node {
         remote: String,
         server_identity_public: &NodeIdentity,
     ) -> Result<u64, NodeError> {
+        self.connect_to_endpoint(carrier_type, remote, server_identity_public.endpoint_id())
+            .await
+    }
+
+    /// Connect using only the expected endpoint id from a static-peer
+    /// configuration. The handshake still verifies the peer identity
+    /// signature; no private key material is needed in the configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same carrier and handshake errors as [`Node::connect`],
+    /// plus a handshake error when the peer endpoint does not match.
+    pub async fn connect_to_endpoint(
+        &mut self,
+        carrier_type: &str,
+        remote: String,
+        expected_endpoint_id: [u8; 32],
+    ) -> Result<u64, NodeError> {
         let mut retried = false;
         loop {
             match self
-                .connect_attempt(carrier_type, remote.clone(), server_identity_public)
+                .connect_attempt(carrier_type, remote.clone(), expected_endpoint_id)
                 .await
             {
                 Err(NodeError::VersionNegotiation) if !retried => {
@@ -130,7 +148,7 @@ impl Node {
         &mut self,
         carrier_type: &str,
         remote: String,
-        server_identity_public: &NodeIdentity,
+        expected_endpoint_id: [u8; 32],
     ) -> Result<u64, NodeError> {
         let carrier = self
             .carrier(carrier_type)
@@ -227,6 +245,11 @@ impl Node {
             carrier_type.as_bytes(),
         )
         .map_err(NodeError::Handshake)?;
+        if handshake_out.server_endpoint_id != expected_endpoint_id {
+            return Err(NodeError::Handshake(
+                "server endpoint id does not match static peer".into(),
+            ));
+        }
 
         // CLIENT_AUTH (handshake.md §18): the client's real static handshake
         // key, its identity binding, and a transcript-bound signature over
@@ -366,7 +389,7 @@ impl Node {
             id,
             SessionEntry {
                 secrets: handshake_out.session_secrets,
-                peer_endpoint_id: server_identity_public.endpoint_id(),
+                peer_endpoint_id: expected_endpoint_id,
             },
         );
         Ok(id)

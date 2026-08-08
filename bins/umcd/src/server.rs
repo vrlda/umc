@@ -2201,6 +2201,11 @@ fn node_config_message(config: &NodeConfig) -> api::NodeConfig {
             value: config.disabled_carriers.join(","),
             sensitive_present: false,
         },
+        api::ConfigEntry {
+            key: "static_peers".into(),
+            value: serde_json::to_string(&config.static_peers).unwrap_or_else(|_| "[]".into()),
+            sensitive_present: false,
+        },
     ];
     api::NodeConfig {
         resource_profile: config.profile.clone(),
