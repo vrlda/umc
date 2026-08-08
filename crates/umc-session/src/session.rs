@@ -37,6 +37,10 @@ pub const MIN_DRAIN_MS: u64 = 1_000;
 /// Rate limit between emitted stateless resets (session.md §31): 1 per
 /// minute per connection.
 pub const STATELESS_RESET_INTERVAL_MS: u64 = 60_000;
+/// Fixed payload size used by the opt-in traffic-padding policy. The target
+/// is deliberately modest and applies only to packets carrying non-control
+/// data; cover traffic and timing hygiene remain separate policy work.
+pub const TRAFFIC_PADDING_TARGET: usize = 1_024;
 
 /// Bounded set of stream ids that reached EOF and were read: re-opening
 /// (or delivering to) a closed id is a protocol violation (session.md §29).
@@ -155,6 +159,10 @@ pub struct Session {
     /// rate-limited to one per [`STATELESS_RESET_INTERVAL_MS`] per
     /// connection (session.md §31).
     last_reset_ms: Option<u64>,
+    /// Whether application data should be padded to
+    /// [`TRAFFIC_PADDING_TARGET`] bytes before encryption (privacy.md §P3).
+    /// Disabled by default; ACK/PING control payloads are never padded.
+    traffic_padding: bool,
 }
 
 impl std::fmt::Debug for Session {
@@ -230,6 +238,7 @@ impl Session {
             draining_deadline: None,
             stateless_reset_secret: None,
             last_reset_ms: None,
+            traffic_padding: false,
         })
     }
 
@@ -445,6 +454,7 @@ impl Session {
         if self.state != SessionState::Active {
             return Ok(None);
         }
+        let payload = self.outbound_payload(payload);
         // Anti-amplification (congestion.md §18): before validation a path
         // may send at most 3x the bytes it has received. Control payloads
         // are exempt — ACKs and PINGs are a few bytes, and refusing them
@@ -453,7 +463,7 @@ impl Session {
         // unrestricted.
         if let Some(path) = self.paths.get(&super::packet::DEFAULT_PATH_ID) {
             if !path.validated
-                && !payload_is_exempt(payload)
+                && !payload_is_exempt(&payload)
                 && payload.len() as u64 > path.send_allowance()
             {
                 return Err(SessionError::AmplificationLimit);
@@ -470,7 +480,7 @@ impl Session {
         // bounded by `payload.len() + PROTECTED_OVERHEAD_ESTIMATE` — the
         // wire bytes (which charge in-flight) always include the header,
         // dcid, path id, packet number, and the AEAD tag beyond the payload.
-        if !payload_is_exempt(payload)
+        if !payload_is_exempt(&payload)
             && payload.len() + PROTECTED_OVERHEAD_ESTIMATE > self.congestion.send_allowance()
         {
             return Err(SessionError::CongestionLimited);
@@ -494,11 +504,11 @@ impl Session {
             0,
             pn,
             false,
-            payload,
+            &payload,
         )
         .map_err(SessionError::Packet)?;
         let sent = SentPacket::new(pn, PacketSpace::SessionData, now, pkt.len(), true, 0);
-        self.retransmit_payloads.insert(pn, payload.to_vec());
+        self.retransmit_payloads.insert(pn, payload);
         if let Some((lost_pn, lost_size)) = self.sent.record_sent(sent) {
             // Cap eviction (MAX_OUTSTANDING_PACKETS): the evicted packet is
             // beyond recovery, so drop its retained payload. Its bytes are
@@ -1243,6 +1253,32 @@ impl Session {
         self.direct_path_allowed
     }
 
+    /// Enables or disables fixed-size padding for application data packets.
+    /// Control packets (ACK/PING) and payloads already at or above the target
+    /// remain unchanged.
+    pub fn set_traffic_padding(&mut self, enabled: bool) {
+        self.traffic_padding = enabled;
+    }
+
+    /// Returns whether fixed-size traffic padding is enabled.
+    #[must_use]
+    pub fn traffic_padding_active(&self) -> bool {
+        self.traffic_padding
+    }
+
+    fn outbound_payload(&self, payload: &[u8]) -> Vec<u8> {
+        if !self.traffic_padding
+            || payload_is_exempt(payload)
+            || payload.len() >= TRAFFIC_PADDING_TARGET
+        {
+            return payload.to_vec();
+        }
+        let mut padded = Vec::with_capacity(TRAFFIC_PADDING_TARGET);
+        padded.extend_from_slice(payload);
+        padded.resize(TRAFFIC_PADDING_TARGET, 0);
+        padded
+    }
+
     fn entropy_fill(out: &mut [u8]) {
         // The session holds no entropy source directly in Phase 4; the daemon
         // supplies challenges through Node. For library tests, a deterministic
@@ -1370,6 +1406,29 @@ mod tests {
         session
             .migrate_to(1, true, Instant(0))
             .expect("validated relay path can become primary");
+    }
+
+    #[test]
+    fn traffic_padding_uniforms_small_data_packets_when_enabled() {
+        let mut padded = session();
+        padded.set_traffic_padding(true);
+        assert!(padded.traffic_padding_active());
+        let first = padded
+            .build_outbound(&TestClock, Instant(0), &[0x0A, 0x01])
+            .expect("first packet")
+            .expect("active session");
+        let second = padded
+            .build_outbound(&TestClock, Instant(1), &[0x0A, 0x01, 0xAA, 0xBB, 0xCC])
+            .expect("second packet")
+            .expect("active session");
+        assert_eq!(first.len(), second.len());
+
+        let mut plain = session();
+        let unpadded = plain
+            .build_outbound(&TestClock, Instant(0), &[0x0A, 0x01])
+            .expect("plain packet")
+            .expect("active session");
+        assert_ne!(unpadded.len(), first.len());
     }
 
     /// Test controller that never limits sends: for tests exercising other

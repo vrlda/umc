@@ -1549,3 +1549,9 @@ A–K gap-closure plan:
     transition descriptors. The relay primitive exposes only the next layer
     or terminal destination context; direct-path and rendezvous wiring remain
     deferred until the route policy is complete.
+13. **Traffic padding scope.** The first K7 implementation is an explicit
+    session/config opt-in that pads non-control payloads below 1,024 bytes to
+    that target before AEAD protection. ACK/PING control packets and payloads
+    already at or above the target are unchanged; the target is provisional
+    and does not claim timing privacy, cover traffic, or MTU-aware P3
+    conformance.

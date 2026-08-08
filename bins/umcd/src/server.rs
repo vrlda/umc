@@ -2197,6 +2197,11 @@ fn node_config_message(config: &NodeConfig) -> api::NodeConfig {
             sensitive_present: false,
         },
         api::ConfigEntry {
+            key: "traffic_padding".into(),
+            value: config.traffic_padding.to_string(),
+            sensitive_present: false,
+        },
+        api::ConfigEntry {
             key: "public_relay".into(),
             value: config.public_relay.to_string(),
             sensitive_present: false,
