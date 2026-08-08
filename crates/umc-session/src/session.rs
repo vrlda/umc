@@ -826,6 +826,15 @@ impl Session {
         &self.rtt
     }
 
+    /// Expected next packet number for a space (the reconstruction anchor
+    /// for the AEAD open — the largest received pn plus one).
+    #[must_use]
+    pub fn expected_pn(&self, space: PacketSpace) -> u64 {
+        self.spaces
+            .get(&space)
+            .map_or(0, |s| s.largest_received().saturating_add(1))
+    }
+
     /// Connection-level flow bytes consumed so far (observability/test
     /// accessor; drives `MAX_DATA` emission).
     #[must_use]
