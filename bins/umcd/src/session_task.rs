@@ -555,7 +555,7 @@ async fn process_inbound_packet(
         // older packets lost; their retained payloads are re-sent under
         // fresh packet numbers. Every lost packet leaves the sent queue;
         // non-ack-eliciting ones only have their retained payload pruned.
-        if let Some((space, control_frames)) = frames.as_ref() {
+        if let Some((space, path_id, control_frames)) = frames.as_ref() {
             if *space == ShortPacketSpace::SessionData {
                 if let Some(largest_acked) = control_frames
                     .iter()
@@ -570,12 +570,19 @@ async fn process_inbound_packet(
                     // Congestion feedback (congestion.md §14.4): every lost
                     // packet releases its bytes from in-flight.
                     // `detect_lost_packets` drops the lost packets from the
-                    // sent queue, so their sizes are captured beforehand.
+                    // sent queue, so their sizes and sent timestamps are
+                    // captured beforehand.
                     let sizes_by_pn: HashMap<u64, usize> = session
                         .sent_state()
                         .sent()
                         .iter()
                         .map(|p| (p.packet_number, p.size))
+                        .collect();
+                    let sent_at_by_pn: HashMap<u64, Instant> = session
+                        .sent_state()
+                        .sent()
+                        .iter()
+                        .map(|p| (p.packet_number, p.sent_at))
                         .collect();
                     let lost = detect_lost_packets(
                         session.sent_state_mut(),
@@ -584,6 +591,34 @@ async fn process_inbound_packet(
                         largest_acked,
                         &detector,
                     );
+                    if !lost.is_empty() {
+                        // Persistent congestion (congestion.md §14.4): when
+                        // the lost batch spans at least three PTOs the path
+                        // is degraded — one-shot, recorded on the session —
+                        // and the daemon is notified via a `path_degraded`
+                        // event. Migration is operator/daemon policy; the
+                        // event is the hook, not an automatic switch.
+                        let pto = detector.pto(&rtt);
+                        let oldest = lost.iter().filter_map(|pn| sent_at_by_pn.get(pn)).min();
+                        let newest = lost.iter().filter_map(|pn| sent_at_by_pn.get(pn)).max();
+                        if let (Some(oldest), Some(newest)) = (oldest, newest) {
+                            if detector.persistent_congestion(pto, *oldest, *newest)
+                                && session.mark_path_degraded(*path_id)
+                            {
+                                let span = newest.duration_since(*oldest).as_millis();
+                                let mut state = runtime.lock().expect("runtime state");
+                                push_event(
+                                    &mut state,
+                                    "path_degraded",
+                                    now,
+                                    format!(
+                                        "path {path_id}: loss span {span} ms >= 3 x PTO ({} ms)",
+                                        pto.as_millis()
+                                    ),
+                                );
+                            }
+                        }
+                    }
                     for pn in lost {
                         if let Some(size) = sizes_by_pn.get(&pn) {
                             session.congestion_mut().on_packet_lost(*size);
@@ -628,7 +663,7 @@ async fn process_inbound_packet(
         }
         if frames.is_some() || sweep_due || rotation_due {
             let mut state = runtime.lock().expect("runtime state");
-            if let Some((_space, control_frames)) = &frames {
+            if let Some((_space, _path_id, control_frames)) = &frames {
                 if let Some(payload) =
                     handle_control_frames(&mut state, session_id, &mut session, control_frames, now)
                 {
@@ -738,22 +773,23 @@ async fn process_inbound_packet(
     }
     frames
         .as_ref()
-        .is_some_and(|(_space, fs)| fs.iter().any(|f| matches!(f, Frame::Ack(_))))
+        .is_some_and(|(_space, _path_id, fs)| fs.iter().any(|f| matches!(f, Frame::Ack(_))))
 }
 
 /// Parse the control frames out of an inbound protected packet with the
 /// daemon's copy of the peer's traffic keys. The session layer applies
 /// stream/datagram/ACK frames itself; this read-only parse (with the same
-/// keys, so it never disturbs session state) exposes the packet's space and
-/// the relay, bundle, routing, and key-update frames for daemon dispatch.
+/// keys, so it never disturbs session state) exposes the packet's space, its
+/// path id, and the relay, bundle, routing, and key-update frames for daemon
+/// dispatch.
 fn parse_control_frames(
     remote_keys: &PacketKeys,
     bytes: &[u8],
-) -> Option<(ShortPacketSpace, Vec<Frame>)> {
-    let (space, _dcid, _path, _pn, payload) =
+) -> Option<(ShortPacketSpace, u64, Vec<Frame>)> {
+    let (space, _dcid, path_id, _pn, payload) =
         umc_session::packet::parse_protected_packet(remote_keys, bytes).ok()?;
     let parsed = parse_payload(&PacketContext::Protected(space), &payload).ok()?;
-    Some((space, parsed.frames))
+    Some((space, path_id, parsed.frames))
 }
 
 /// Dispatch the control frames of one inbound packet to the runtime
@@ -1960,6 +1996,181 @@ mod tests {
                 "gated retransmit keeps the payload for a later attempt"
             );
         }
+    }
+
+    /// Fill the sent state for a persistent-congestion scenario: `pn 0..5`
+    /// with `pn 0..2` spanning `span_ms` (pn 2 sent at t0 + span). pn 5 sits
+    /// at `t0` so the peer ACK of pn 5 samples no rtt (sample 0 is skipped)
+    /// and the session's PTO stays at its 1 s default; the ACK of pn 5
+    /// declares `pn 0..2` packet-threshold lost (three numbers higher,
+    /// session.md §14.1).
+    fn fill_loss_window(session: &mut Session, t0: Instant, span_ms: u64) {
+        for (pn, at) in [
+            (0u64, t0),
+            (1, t0 + ms(1_000)),
+            (2, t0 + ms(span_ms)),
+            (3, t0 + ms(span_ms)),
+            (4, t0 + ms(span_ms)),
+            (5, t0),
+        ] {
+            session.sent_state_mut().record_sent(SentPacket::new(
+                pn,
+                PacketSpace::SessionData,
+                at,
+                64,
+                true,
+                0,
+            ));
+        }
+    }
+
+    /// Protected packet from the peer `ACKing` only packet number 5 (a real
+    /// sent packet) with an empty first range: a hand-encoded ACK frame
+    /// wrapped by the peer session's outbound builder.
+    fn loss_ack_packet(clock: &Arc<dyn Clock>, t0: Instant) -> Vec<u8> {
+        let ack_payload = umc_wire::frame::AckFrame {
+            largest_acknowledged: 5,
+            ack_delay: 0,
+            first_ack_range: 1,
+            additional_ranges: Vec::new(),
+        }
+        .encode()
+        .expect("ack frame");
+        let mut peer = peer_session();
+        peer.build_outbound(clock.as_ref(), t0, &ack_payload)
+            .unwrap()
+            .expect("ack packet")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn persistent_congestion_marks_path_degraded() {
+        let (state, _tx) = test_state();
+        let runtime = Arc::new(std::sync::Mutex::new(state));
+        let t0 = Instant(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(t0.0));
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let link: Arc<BoxLink> = Arc::new(Box::new(RecordingLink {
+            sent: recorded.clone(),
+        }));
+        let remote_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[2u8; 32]).unwrap();
+
+        let mut client = test_session();
+        client
+            .add_path(0, "ump.tcp/1".into(), vec![], vec![], t0)
+            .expect("default path added");
+        // Losses spanning exactly 3 x PTO (1 s default): persistent
+        // congestion (congestion.md §14.4).
+        fill_loss_window(&mut client, t0, 3_000);
+        let ack_pkt = loss_ack_packet(&clock, t0);
+
+        let session = Arc::new(tokio::sync::Mutex::new(client));
+        let app_channels: Arc<std::sync::Mutex<HashMap<Vec<u8>, AppTx>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut sweep = SweepState::default();
+        process_inbound_packet(
+            &link,
+            &session,
+            &clock,
+            &app_channels,
+            &runtime,
+            &remote_keys,
+            1,
+            &ack_pkt,
+            &mut sweep,
+        )
+        .await;
+
+        {
+            let session = session.lock().await;
+            assert!(
+                session.is_path_degraded(0),
+                "persistent congestion marks the path degraded"
+            );
+            assert_eq!(session.path(0).unwrap().rtt_ms, 0, "rtt marked stale");
+        }
+        let recent = runtime.lock().unwrap().events.lock().unwrap().recent(10);
+        let degraded = recent
+            .iter()
+            .find(|e| e.kind == "path_degraded")
+            .expect("path_degraded event pushed");
+        assert!(
+            degraded.detail.contains("path 0") && degraded.detail.contains("3000"),
+            "event carries the path id and the loss span: {}",
+            degraded.detail
+        );
+        // The degradation is one-shot: a second persistent-congestion pass
+        // must not push another event.
+        let before = recent.len();
+        process_inbound_packet(
+            &link,
+            &session,
+            &clock,
+            &app_channels,
+            &runtime,
+            &remote_keys,
+            1,
+            &ack_pkt,
+            &mut sweep,
+        )
+        .await;
+        let again = runtime.lock().unwrap().events.lock().unwrap().recent(10);
+        assert_eq!(
+            again.len(),
+            before,
+            "no second path_degraded event once degraded"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn short_loss_span_does_not_degrade() {
+        let (state, _tx) = test_state();
+        let runtime = Arc::new(std::sync::Mutex::new(state));
+        let t0 = Instant(1_000_000);
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(t0.0));
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let link: Arc<BoxLink> = Arc::new(Box::new(RecordingLink {
+            sent: recorded.clone(),
+        }));
+        let remote_keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[2u8; 32]).unwrap();
+
+        let mut client = test_session();
+        client
+            .add_path(0, "ump.tcp/1".into(), vec![], vec![], t0)
+            .expect("default path added");
+        // Losses spanning only 2 s: below the 3 x PTO (1 s) persistent
+        // congestion threshold, so the path stays untouched.
+        fill_loss_window(&mut client, t0, 2_000);
+        let ack_pkt = loss_ack_packet(&clock, t0);
+
+        let session = Arc::new(tokio::sync::Mutex::new(client));
+        let app_channels: Arc<std::sync::Mutex<HashMap<Vec<u8>, AppTx>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut sweep = SweepState::default();
+        process_inbound_packet(
+            &link,
+            &session,
+            &clock,
+            &app_channels,
+            &runtime,
+            &remote_keys,
+            1,
+            &ack_pkt,
+            &mut sweep,
+        )
+        .await;
+
+        {
+            let session = session.lock().await;
+            assert!(
+                !session.is_path_degraded(0),
+                "losses under 3 x PTO must not degrade the path"
+            );
+        }
+        let recent = runtime.lock().unwrap().events.lock().unwrap().recent(10);
+        assert!(
+            !recent.iter().any(|e| e.kind == "path_degraded"),
+            "no path_degraded event for a short loss span"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1086,6 +1086,33 @@ impl Session {
         self.paths.get(&path_id)
     }
 
+    /// Mark a path degraded after persistent congestion (congestion.md
+    /// §14.4): the state flips to `Degraded` and the path's rtt is marked
+    /// stale (`rtt_ms = 0`). Idempotent: a second call is a no-op. Returns
+    /// whether the path transitioned, so the daemon can push its one-shot
+    /// `path_degraded` event only on the transition. Migration is operator
+    /// policy — this accessor only records the degradation; an unknown path
+    /// id is a no-op.
+    pub fn mark_path_degraded(&mut self, path_id: u64) -> bool {
+        let Some(path) = self.paths.get_mut(&path_id) else {
+            return false;
+        };
+        if path.state == crate::path::PathState::Degraded {
+            return false;
+        }
+        path.state = crate::path::PathState::Degraded;
+        path.rtt_ms = 0;
+        true
+    }
+
+    /// Whether the path is currently degraded (congestion.md §14.4).
+    #[must_use]
+    pub fn is_path_degraded(&self, path_id: u64) -> bool {
+        self.paths
+            .get(&path_id)
+            .is_some_and(|p| p.state == crate::path::PathState::Degraded)
+    }
+
     /// Test helper: mark a path validated without challenge/response. The
     /// daemon drives the real `PATH_CHALLENGE`/`PATH_RESPONSE` flow.
     pub fn force_validate(&mut self, path_id: u64) {
@@ -1335,6 +1362,25 @@ mod tests {
         // min_rtt still reflects every packet.
         assert_eq!(s.rtt().latest_rtt, 10);
         assert_eq!(s.rtt().min_rtt, 10);
+    }
+
+    #[test]
+    fn mark_path_degraded_idempotent() {
+        let mut s = session();
+        s.add_path(0, "ump.tcp/1".into(), vec![], vec![], Instant(0))
+            .unwrap();
+        assert!(!s.is_path_degraded(0));
+        // First call transitions the path (Validating -> Degraded) and marks
+        // its rtt stale; the second call is a no-op (one-shot degradation).
+        assert!(s.mark_path_degraded(0));
+        assert!(s.is_path_degraded(0));
+        assert_eq!(s.path(0).unwrap().state, crate::path::PathState::Degraded);
+        assert_eq!(s.path(0).unwrap().rtt_ms, 0);
+        assert!(!s.mark_path_degraded(0));
+        assert!(s.is_path_degraded(0));
+        // An unknown path id never transitions.
+        assert!(!s.mark_path_degraded(99));
+        assert!(!s.is_path_degraded(99));
     }
 
     #[test]
