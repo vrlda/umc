@@ -2,9 +2,16 @@ use umc_crypto::signatures::{
     IdentityKeyPair, IdentityPublicKey, StaticHandshakeKeyPair, StaticHandshakePublicKey,
 };
 use umc_types::runtime::EntropySource;
+use umc_wire::header::{HeaderByte, LongPacketType};
 
 pub const CRYPTO_PROFILE: &[u8] = b"UMP-CRYPTO-1";
 pub const MODE_XX: &[u8] = b"XX";
+
+/// The protocol version this implementation supports (compatibility.md
+/// §5.2). Version 1 is the only version the v1 wire defines; the
+/// responder selects it from the client's offered list and the client
+/// retries on a Version-Negotiation response that lists it.
+pub const SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 
 pub const CLIENT_RANDOM_LEN: usize = 32;
 pub const MAX_SUPPORTED_PARAMETERS: usize = 16;
@@ -34,8 +41,11 @@ impl ClientHello {
             client_ephemeral_public_key: ephemeral.public().0,
             supported_crypto_profiles: vec![CRYPTO_PROFILE.to_vec()],
             supported_handshake_modes: vec![MODE_XX.to_vec()],
-            supported_protocol_versions: vec![1],
-            capabilities_hash: [0u8; 32],
+            supported_protocol_versions: vec![SUPPORTED_PROTOCOL_VERSION],
+            // Capability negotiation (compatibility.md §5.4): the client
+            // binds its capability set with the canonical hash, replacing
+            // the placeholder zero hash (audit B.17).
+            capabilities_hash: capabilities_hash(&canonical_capabilities()),
             destination_hint: Vec::new(),
             retry_token: Vec::new(),
             invitation_authenticator: Vec::new(),
@@ -251,6 +261,143 @@ impl ServerHello {
             padding,
         })
     }
+
+    /// The server's capabilities hash (compatibility.md §5.4): the first
+    /// 32 bytes of the padding field — the documented convention the
+    /// responder writes and the client verifies. The padding prefix is
+    /// inside the encoded `SERVER_HELLO`, so the hash is transcript-bound
+    /// like every other hello field. Returns `None` when the padding is
+    /// shorter than 32 bytes (a malformed hello).
+    #[must_use]
+    pub fn server_capabilities_hash(&self) -> Option<[u8; 32]> {
+        self.padding.get(..32)?.try_into().ok()
+    }
+}
+
+/// Select the protocol version from the client's offered list
+/// (compatibility.md §5.2, handshake.md §16): the highest version we
+/// support — v1 offers exactly [`SUPPORTED_PROTOCOL_VERSION`]. Returns
+/// `None` when the list excludes every supported version; the responder
+/// then answers with a Version-Negotiation packet instead of a
+/// `SERVER_HELLO`.
+#[must_use]
+pub fn select_version(offered: &[u32]) -> Option<u32> {
+    if offered.contains(&SUPPORTED_PROTOCOL_VERSION) {
+        Some(SUPPORTED_PROTOCOL_VERSION)
+    } else {
+        None
+    }
+}
+
+/// The capability identifiers negotiated at protocol version 1
+/// (compatibility.md §5.4): streaming, datagrams, relay, bundles,
+/// routing, and mobility. The list order is part of the convention —
+/// every implementation hashes the same canonical bytes.
+pub const CANONICAL_CAPABILITY_IDS: &[&[u8]] = &[
+    b"stream",
+    b"datagram",
+    b"relay",
+    b"bundle",
+    b"route",
+    b"mobility",
+];
+
+/// The canonical capability set serialized for hashing (compatibility.md
+/// §5.4): `"UMP-CAPABILITIES-v1"` followed by the varint count and the
+/// length-prefixed capability identifiers in canonical order. The bytes
+/// are deterministic and identical on every v1 implementation.
+///
+/// # Panics
+///
+/// Panics if a varint or length-prefixed identifier cannot be encoded
+/// (the canonical list is small and bounded — it never does).
+#[must_use]
+pub fn canonical_capabilities() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"UMP-CAPABILITIES-v1");
+    umc_wire::varint::encode_into(&mut out, CANONICAL_CAPABILITY_IDS.len() as u64)
+        .expect("bounded count");
+    for id in CANONICAL_CAPABILITY_IDS {
+        umc_wire::bytes::encode(&mut out, id, 64).expect("bounded identifier");
+    }
+    out
+}
+
+/// The capabilities hash (compatibility.md §5.4): BLAKE2s-256 over the
+/// capability serialization. The client's hash rides in
+/// `ClientHello.capabilities_hash`; the server's rides in the first 32
+/// bytes of `ServerHello.padding`. Each side verifies the other's hash
+/// against the canonical set, so the session's effective capability set
+/// is the intersection of the two (v1: the canonical set).
+#[must_use]
+pub fn capabilities_hash(caps: &[u8]) -> [u8; 32] {
+    let mut hasher = Blake2s256::new();
+    hasher.update(caps);
+    hasher.finalize().into()
+}
+
+/// Build a minimal Version-Negotiation packet (wire-format §25): the long
+/// header form with the `VersionNegotiation` type, version 0 (the VN
+/// convention — no version is being negotiated), the connection-id echo
+/// (VN DCID ← client SCID, VN SCID ← client DCID, RFC 9000 §17.2.1), the
+/// varint count of supported versions, and each version as a big-endian
+/// u32. VN packets are never protected: no keys exist before version
+/// agreement, so the packet is plain header + list bytes.
+///
+/// SANCTIONED minimal construction: the wire crate defines the
+/// `VersionNegotiation` type and header byte but no VN packet builder.
+///
+/// # Panics
+///
+/// Panics if the version count does not fit a varint (it never does).
+#[must_use]
+pub fn build_version_negotiation(dcid: &[u8], scid: &[u8], supported: &[u32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(HeaderByte::LONG_VERSION_NEGOTIATION.encode());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.push(u8::try_from(dcid.len()).unwrap_or(u8::MAX));
+    out.extend_from_slice(dcid);
+    out.push(u8::try_from(scid.len()).unwrap_or(u8::MAX));
+    out.extend_from_slice(scid);
+    umc_wire::varint::encode_into(&mut out, supported.len() as u64).expect("bounded");
+    for v in supported {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+/// Parse a Version-Negotiation packet (wire-format §25): the long header
+/// form with the `VersionNegotiation` type and version 0, followed by the
+/// supported protocol versions as big-endian u32s. Returns the offered
+/// versions; `None` when the bytes are not a VN packet or the fields are
+/// malformed. VN packets carry no AEAD (no keys exist before version
+/// agreement), so this is a plain header + list parse.
+#[must_use]
+pub fn parse_version_negotiation(bytes: &[u8]) -> Option<Vec<u32>> {
+    let hb = HeaderByte::decode(*bytes.first()?).ok()?;
+    if !hb.long || hb.long_type()? != LongPacketType::VersionNegotiation {
+        return None;
+    }
+    if u32::from_be_bytes(bytes.get(1..5)?.try_into().ok()?) != 0 {
+        return None;
+    }
+    let dcid_len = usize::from(*bytes.get(5)?);
+    let scid_len = usize::from(*bytes.get(6 + dcid_len)?);
+    let mut pos = 7 + dcid_len + scid_len;
+    let (count, n) = umc_wire::varint::decode(bytes.get(pos..)?).ok()?;
+    pos += n;
+    let count = usize::try_from(count).ok()?;
+    if count > MAX_SUPPORTED_PARAMETERS {
+        return None;
+    }
+    let mut versions = Vec::with_capacity(count);
+    for _ in 0..count {
+        versions.push(u32::from_be_bytes(
+            bytes.get(pos..pos + 4)?.try_into().ok()?,
+        ));
+        pos += 4;
+    }
+    Some(versions)
 }
 
 use blake2::{Blake2s256, Digest};
@@ -562,6 +709,12 @@ pub fn run_xx_handshake(
 ) -> Result<(SessionSecrets, SessionSecrets), String> {
     let client_ephemeral = StaticHandshakeKeyPair::generate();
     let client_hello = ClientHello::new(entropy, &client_ephemeral);
+    // Capability negotiation (compatibility.md §5.4): the driver's server
+    // half verifies the client's capabilities hash against the canonical
+    // set, exactly as the responder does.
+    if client_hello.capabilities_hash != capabilities_hash(&canonical_capabilities()) {
+        return Err("client capabilities hash mismatch".into());
+    }
 
     let mut transcript = Transcript::new(MODE_XX, CRYPTO_PROFILE, carrier_binding);
     transcript
@@ -607,11 +760,18 @@ pub fn run_xx_handshake(
     let server_hello = ServerHello {
         server_random,
         server_ephemeral_public_key: server_ephemeral.public().0,
-        selected_protocol_version: 1,
+        selected_protocol_version: SUPPORTED_PROTOCOL_VERSION,
         selected_crypto_profile: CRYPTO_PROFILE.to_vec(),
         selected_handshake_mode: MODE_XX.to_vec(),
         encrypted_server_authentication: encrypted_auth,
-        padding: vec![0u8; 32],
+        // The server's capabilities hash rides in the first 32 bytes of
+        // the padding (compatibility.md §5.4): the client verifies it.
+        padding: {
+            let mut padding = Vec::with_capacity(64);
+            padding.extend_from_slice(&capabilities_hash(&canonical_capabilities()));
+            padding.extend_from_slice(&[0u8; 32]);
+            padding
+        },
     };
     let server_hello_bytes = server_hello.encode().map_err(|e| format!("{e:?}"))?;
     transcript
@@ -624,6 +784,13 @@ pub fn run_xx_handshake(
     ));
     if client_dh_ee != dh_ee {
         return Err("DH_ee mismatch".into());
+    }
+    // Capability negotiation (compatibility.md §5.4): the driver's client
+    // half verifies the server's hash from the padding prefix, exactly as
+    // `complete_client_side` does.
+    if server_hello.server_capabilities_hash() != Some(capabilities_hash(&canonical_capabilities()))
+    {
+        return Err("server capabilities hash mismatch".into());
     }
     let client_extract1 = umc_crypto::hkdf::extract(&[0u8; 32], &client_dh_ee);
     let server_block = decrypt_server_auth(
@@ -807,6 +974,15 @@ pub fn complete_client_side(
 ) -> Result<ClientHandshakeOutput, String> {
     let _ = client_identity;
     let _ = entropy;
+    // Capability negotiation (compatibility.md §5.4): the server's
+    // capabilities hash rides in the first 32 bytes of the SERVER_HELLO
+    // padding; verify it against the canonical set before any secret
+    // derivation. A mismatch is a protocol violation (or a peer speaking
+    // a different capability set) and the handshake is refused.
+    if server_hello.server_capabilities_hash() != Some(capabilities_hash(&canonical_capabilities()))
+    {
+        return Err("server capabilities hash mismatch".into());
+    }
     // Transcript through CLIENT_HELLO; SERVER_HELLO fields are the preceding
     // unencrypted fields for the auth-block AAD (handshake.md §16.1).
     let mut transcript = Transcript::new(MODE_XX, CRYPTO_PROFILE, carrier_binding);
@@ -1018,6 +1194,88 @@ mod tests {
             ch.client_ephemeral_public_key
         );
         assert_eq!(dec.supported_crypto_profiles, vec![CRYPTO_PROFILE.to_vec()]);
+        assert_eq!(
+            dec.capabilities_hash,
+            capabilities_hash(&canonical_capabilities()),
+            "the hello must carry the canonical capabilities hash, not zeros"
+        );
+    }
+
+    /// Version selection (compatibility.md §5.2): the offered list selects
+    /// the supported version when present, `None` otherwise.
+    #[test]
+    fn select_version_picks_supported_offer() {
+        assert_eq!(select_version(&[1]), Some(1));
+        assert_eq!(select_version(&[2, 1, 3]), Some(1));
+        assert_eq!(select_version(&[2, 3]), None);
+        assert_eq!(select_version(&[]), None);
+    }
+
+    /// The canonical capabilities serialize and hash deterministically
+    /// (compatibility.md §5.4): two calls produce identical bytes and
+    /// hashes, and a different input hashes differently. The canonical
+    /// set is the v1 negotiated capability list.
+    #[test]
+    fn capabilities_hash_is_canonical() {
+        let a = canonical_capabilities();
+        let b = canonical_capabilities();
+        assert_eq!(a, b, "the canonical serialization must be deterministic");
+        assert_eq!(capabilities_hash(&a), capabilities_hash(&b));
+        assert_ne!(capabilities_hash(&a), capabilities_hash(b"other"));
+        let expected: [&[u8]; 6] = [
+            b"stream",
+            b"datagram",
+            b"relay",
+            b"bundle",
+            b"route",
+            b"mobility",
+        ];
+        assert_eq!(CANONICAL_CAPABILITY_IDS, expected.as_slice());
+    }
+
+    /// The Version-Negotiation packet (wire-format §25): the minimal
+    /// builder's bytes parse back to the listed versions, a VN listing
+    /// only unsupported versions parses but selects nothing, and
+    /// non-VN bytes are not a VN.
+    #[test]
+    fn version_negotiation_round_trip() {
+        let vn = build_version_negotiation(&[1u8; 8], &[2u8; 8], &[1]);
+        assert_eq!(parse_version_negotiation(&vn), Some(vec![1]));
+        let vn = build_version_negotiation(&[], &[], &[2, 3]);
+        assert_eq!(parse_version_negotiation(&vn), Some(vec![2, 3]));
+        assert_eq!(select_version(&[2, 3]), None);
+        // An Initial long header is not a VN packet.
+        assert_eq!(parse_version_negotiation(&[0xC0, 0, 0, 0, 1, 0, 0]), None);
+    }
+
+    /// The client verifies the server's capabilities hash from the
+    /// `SERVER_HELLO` padding prefix (compatibility.md §5.4): a hello
+    /// carrying a non-canonical hash is refused before any secret
+    /// derivation.
+    #[test]
+    fn client_refuses_non_canonical_server_capabilities() {
+        let eph = StaticHandshakeKeyPair::generate();
+        let hello = ClientHello::new(&TestEntropy, &eph);
+        let server_hello = ServerHello {
+            server_random: [3u8; 32],
+            server_ephemeral_public_key: [4u8; 32],
+            selected_protocol_version: 1,
+            selected_crypto_profile: CRYPTO_PROFILE.to_vec(),
+            selected_handshake_mode: MODE_XX.to_vec(),
+            encrypted_server_authentication: vec![7u8; 100],
+            padding: vec![0u8; 32],
+        };
+        let error = complete_client_side(
+            &IdentityKeyPair::generate(),
+            &eph,
+            &eph,
+            &hello,
+            &server_hello,
+            &TestEntropy,
+            b"binding",
+        )
+        .expect_err("a non-canonical server hash must be refused");
+        assert!(error.contains("capabilities"), "{error}");
     }
 
     #[test]
