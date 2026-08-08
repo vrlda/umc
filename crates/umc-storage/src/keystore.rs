@@ -166,6 +166,47 @@ impl Keystore {
         Err(KeystoreError::UnsupportedClass)
     }
 
+    /// Deletes every record stored under `(class, name)`. The store is
+    /// append-only, so deletion rewrites the file without the matching
+    /// records; a subsequent `store` under the same name is then the only
+    /// record and `load` returns it (identity rotation relies on this
+    /// replace semantics).
+    ///
+    /// # Errors
+    /// Returns [`KeystoreError::NotUnlocked`] if the keystore is locked,
+    /// [`KeystoreError::Integrity`] if a record cannot be decrypted or
+    /// parsed, or [`KeystoreError::Io`] if the file cannot be read or
+    /// written.
+    ///
+    /// # Panics
+    /// Panics if a truncated length prefix is read from the file (the same
+    /// invariant [`Self::load`] relies on).
+    pub fn delete(&self, class: KeyClass, name: &[u8]) -> Result<(), KeystoreError> {
+        let master = self.master.as_ref().ok_or(KeystoreError::NotUnlocked)?;
+        let file = std::fs::read(&self.path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+        let mut out = file[..CHECK_END].to_vec();
+        let mut pos = CHECK_END;
+        while pos + 4 <= file.len() {
+            let len = u32::from_be_bytes(file[pos..pos + 4].try_into().expect("4 bytes")) as usize;
+            pos += 4;
+            let sealed = file.get(pos..pos + len).ok_or(KeystoreError::Integrity)?;
+            pos += len;
+            let payload = umc_crypto_open(master, sealed).ok_or(KeystoreError::Integrity)?;
+            let (cls, rest) = payload.split_at(class.as_bytes().len());
+            let matches = cls == class.as_bytes()
+                && rest.first() == Some(&0u8)
+                && rest.get(1..1 + name.len()) == Some(name)
+                && rest.get(1 + name.len()) == Some(&0u8);
+            if !matches {
+                out.extend_from_slice(
+                    &(u32::try_from(len).expect("sealed record fits u32")).to_be_bytes(),
+                );
+                out.extend_from_slice(sealed);
+            }
+        }
+        write_private(&self.path, &out)
+    }
+
     pub fn lock(&mut self) {
         self.master = None;
     }
@@ -348,6 +389,56 @@ mod tests {
         assert_eq!(
             ks.load(KeyClass::Recovery, b"r"),
             Err(KeystoreError::NotUnlocked)
+        );
+    }
+
+    #[test]
+    fn delete_removes_only_the_matching_record() {
+        let path = temp_path();
+        let _ = std::fs::remove_file(&path);
+        let ks = Keystore::open(path.clone(), b"pw").unwrap();
+        ks.store(KeyClass::IdentitySigning, b"node-identity", &[1u8; 64])
+            .unwrap();
+        ks.store(KeyClass::IdentitySigning, b"secondary-1", &[2u8; 64])
+            .unwrap();
+        ks.store(KeyClass::Ticket, b"t", &[3u8; 16]).unwrap();
+        ks.delete(KeyClass::IdentitySigning, b"secondary-1")
+            .unwrap();
+        assert_eq!(
+            ks.load(KeyClass::IdentitySigning, b"secondary-1"),
+            Err(KeystoreError::UnsupportedClass)
+        );
+        assert_eq!(
+            ks.load(KeyClass::IdentitySigning, b"node-identity")
+                .unwrap(),
+            vec![1u8; 64],
+            "the sibling record survives"
+        );
+        assert_eq!(
+            ks.load(KeyClass::Ticket, b"t").unwrap(),
+            vec![3u8; 16],
+            "a different class record survives"
+        );
+    }
+
+    #[test]
+    fn store_after_delete_replaces_the_record() {
+        let path = temp_path();
+        let _ = std::fs::remove_file(&path);
+        let ks = Keystore::open(path.clone(), b"pw").unwrap();
+        ks.store(KeyClass::IdentitySigning, b"node-identity", &[1u8; 64])
+            .unwrap();
+        // Without delete the first record shadows the second (load returns
+        // the first match); delete + store gives replace semantics, which
+        // identity rotation depends on.
+        ks.delete(KeyClass::IdentitySigning, b"node-identity")
+            .unwrap();
+        ks.store(KeyClass::IdentitySigning, b"node-identity", &[9u8; 64])
+            .unwrap();
+        assert_eq!(
+            ks.load(KeyClass::IdentitySigning, b"node-identity")
+                .unwrap(),
+            vec![9u8; 64]
         );
     }
 

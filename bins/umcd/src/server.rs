@@ -4,7 +4,7 @@ use crate::config::NodeConfig;
 use crate::doctor;
 use crate::relay_service::CircuitOpenRequest;
 use crate::runtime_adapters::OsEntropy;
-use crate::state::{metric_names, wall_now, RuntimeState};
+use crate::state::{metric_names, wall_now, IdentityRef, RuntimeState, NODE_IDENTITY_RECORD};
 use prost::Message;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use umc_bundle::manager::BundleStatus;
+use umc_carrier::Carrier;
 use umc_control::conn::SequenceTracker;
 use umc_control::framing::{frame_envelope, EnvelopeDecoder};
 use umc_control::pages::PageToken;
@@ -98,6 +99,59 @@ struct CandidateSummary {
     expires_at_ms: u64,
     #[prost(bool, tag = "4")]
     public: bool,
+}
+
+/// Wire request for `CarrierService.GetLinkProperties` (task F2): the
+/// capability report for one registered carrier type. No proto message
+/// exists yet, so the control surface carries the carrier type id until
+/// the API spec gains the method.
+#[derive(Clone, PartialEq, prost::Message)]
+struct GetLinkPropertiesRequest {
+    #[prost(string, tag = "1")]
+    carrier_type: String,
+}
+
+/// Wire response for `CarrierService.GetLinkProperties` (task F2).
+#[derive(Clone, PartialEq, prost::Message)]
+struct GetLinkPropertiesResponse {
+    #[prost(message, optional, tag = "1")]
+    info: Option<api::CarrierTypeInfo>,
+}
+
+/// One per-carrier session count for `CarrierService.GetLinkStats`
+/// (task F2): the v1 registry's only per-carrier statistic.
+#[derive(Clone, PartialEq, prost::Message)]
+struct LinkStats {
+    #[prost(string, tag = "1")]
+    carrier_type: String,
+    #[prost(uint32, tag = "2")]
+    active_links: u32,
+}
+
+/// Wire response for `CarrierService.GetLinkStats` (task F2).
+#[derive(Clone, PartialEq, prost::Message)]
+struct GetLinkStatsResponse {
+    #[prost(message, repeated, tag = "1")]
+    stats: Vec<LinkStats>,
+}
+
+/// Wire request for `CarrierService.Listen` (task F2): bind one registered
+/// carrier at an explicit address. No proto message exists yet.
+#[derive(Clone, PartialEq, prost::Message)]
+struct ListenRequest {
+    #[prost(string, tag = "1")]
+    carrier_type: String,
+    #[prost(string, tag = "2")]
+    bind_address: String,
+}
+
+/// Wire response for `CarrierService.Listen` (task F2): the requested bind
+/// address. The `Listener` trait exposes no kernel-assigned address, so an
+/// ephemeral port (`127.0.0.1:0`) is reported as requested, not as bound.
+#[derive(Clone, PartialEq, prost::Message)]
+struct ListenResponse {
+    #[prost(string, tag = "1")]
+    bound_address: String,
 }
 
 pub async fn run(state: Arc<Mutex<RuntimeState>>) {
@@ -457,6 +511,8 @@ fn dispatch_request(
         "RouteService" => metric_names::CONTROL_REQUESTS_ROUTE,
         "ConfigService" => metric_names::CONTROL_REQUESTS_CONFIG,
         "DiagnosticsService" => metric_names::CONTROL_REQUESTS_DIAGNOSTICS,
+        "IdentityService" => metric_names::CONTROL_REQUESTS_IDENTITY,
+        "CarrierService" => metric_names::CONTROL_REQUESTS_CARRIER,
         _ => metric_names::CONTROL_REQUESTS_OTHER,
     };
     state.metrics.incr(service_counter, 1);
@@ -479,6 +535,27 @@ fn dispatch_request(
         ("ConfigService", "SetConfig") | ("NodeAdmin", "UpdateConfig") => {
             set_config(state, request)
         }
+        // IdentityService (task F2): all nine proto RPCs have runtime
+        // backing — the keystore-backed identity registry in state.rs.
+        ("IdentityService", "ListIdentities") => list_identities(state, request),
+        ("IdentityService", "GetIdentity") => get_identity(state, request),
+        ("IdentityService", "CreateIdentity") => create_identity(state, request),
+        ("IdentityService", "RotateHandshakeKey") => rotate_handshake_key(state, request),
+        ("IdentityService", "RotateIdentityKey") => rotate_identity_key(state, request),
+        ("IdentityService", "ExportPublicIdentity") => export_public_identity(state, request),
+        ("IdentityService", "ExportSecretIdentity") => export_secret_identity(state, request),
+        ("IdentityService", "ImportIdentity") => import_identity(state, request),
+        ("IdentityService", "DeleteIdentity") => delete_identity(state, request),
+        // CarrierService (task F2): the registry-backed read surface plus
+        // Listen are real; the instance lifecycle (Create/Update/Start/
+        // Stop/DeleteCarrierInstance), Dial, and CloseLink are documented
+        // `Unimplemented` — the daemon wires one static carrier set at
+        // boot and has no outbound initiator or per-link close path yet.
+        ("CarrierService", "ListCarrierTypes") => list_carrier_types(state, request),
+        ("CarrierService", "ListLinks") => list_links(state, request),
+        ("CarrierService", "GetLinkProperties") => get_link_properties(state, request),
+        ("CarrierService", "GetLinkStats") => get_link_stats(state, request),
+        ("CarrierService", "Listen") => listen(state, request),
         _ => (api::StatusCode::Unimplemented as i32, None),
     };
     response_envelope(request, code, payload)
@@ -1159,6 +1236,571 @@ fn close_circuit(state: &mut RuntimeState, request: &api::Request) -> (i32, Opti
     }
 }
 
+// --- Task F2: IdentityService (all nine proto RPCs) ---
+
+/// One `IdentitySummary` from a registry entry (task F2): the record name
+/// is the identity handle; the binding sequence doubles as the revision.
+fn identity_summary(
+    record_name: &str,
+    endpoint_id: [u8; 32],
+    binding: &umc_handshake::identity::IdentityBinding,
+    kind: i32,
+    label: &str,
+) -> api::IdentitySummary {
+    api::IdentitySummary {
+        identity_handle: Some(api::OpaqueHandle {
+            value: record_name.as_bytes().to_vec(),
+        }),
+        endpoint_id: endpoint_id.to_vec(),
+        kind,
+        label: label.to_string(),
+        binding_sequence: binding.sequence,
+        binding_not_after_unix_ms: i64::try_from(binding.not_after).unwrap_or(i64::MAX),
+        secret_available: true,
+        revision: Some(api::ResourceRevision {
+            value: binding.sequence,
+        }),
+    }
+}
+
+/// The primary identity's summary: handle `node-identity`, kind
+/// `NODE_MANAGEMENT`.
+fn primary_summary(state: &RuntimeState) -> api::IdentitySummary {
+    identity_summary(
+        &String::from_utf8_lossy(NODE_IDENTITY_RECORD),
+        state.node_identity.endpoint_id(),
+        &state.primary_binding,
+        api::IdentityKind::NodeManagement as i32,
+        "node",
+    )
+}
+
+/// The summary for whichever identity `resolved` names.
+fn summary_for(state: &RuntimeState, resolved: IdentityRef<'_>) -> api::IdentitySummary {
+    match resolved {
+        IdentityRef::Primary => primary_summary(state),
+        IdentityRef::Secondary(entry) => identity_summary(
+            &entry.record_name,
+            entry.identity.endpoint_id(),
+            &entry.binding,
+            entry.kind,
+            &entry.label,
+        ),
+    }
+}
+
+/// `IdentityService.ListIdentities`: the primary plus every secondary,
+/// paginated (control-api.md §37).
+fn list_identities(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(list) = api::ListIdentitiesRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok((offset, page_size)) = page_window(list.page.as_ref(), "ListIdentities") else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let mut all = Vec::with_capacity(1 + state.secondaries.len());
+    all.push(primary_summary(state));
+    all.extend(state.secondaries.iter().map(|entry| {
+        identity_summary(
+            &entry.record_name,
+            entry.identity.endpoint_id(),
+            &entry.binding,
+            entry.kind,
+            &entry.label,
+        )
+    }));
+    let total = all.len();
+    let identities = all.into_iter().skip(offset).take(page_size).collect();
+    let response = api::ListIdentitiesResponse {
+        identities,
+        page: Some(page_info(total, offset, page_size, "ListIdentities")),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `IdentityService.GetIdentity`: one identity by handle or endpoint id,
+/// with the signed binding as the public material.
+fn get_identity(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(get) = api::GetIdentityRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let resolved = match get.identity {
+        Some(api::get_identity_request::Identity::Handle(handle)) => {
+            state.identity_by_handle(&handle.value)
+        }
+        Some(api::get_identity_request::Identity::EndpointId(endpoint)) => {
+            state.identity_by_endpoint(&endpoint)
+        }
+        None => return (api::StatusCode::InvalidArgument as i32, None),
+    };
+    let Some(resolved) = resolved else {
+        return (api::StatusCode::NotFound as i32, None);
+    };
+    let public_binding = match resolved {
+        IdentityRef::Primary => state.primary_binding.signed_bytes(),
+        IdentityRef::Secondary(entry) => entry.binding.signed_bytes(),
+    };
+    let response = api::GetIdentityResponse {
+        identity: Some(summary_for(state, resolved)),
+        public_binding,
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `IdentityService.CreateIdentity`: generate a SECONDARY identity,
+/// keystore-stored. The node identity is never touched.
+fn create_identity(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(create) = api::CreateIdentityRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if create.kind == api::IdentityKind::Unspecified as i32 {
+        // The kind drives the summary; an unspecified kind is a client
+        // bug (control-api.md §32).
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    let lifetime_ms = u64::try_from(create.binding_lifetime_ms).unwrap_or(0);
+    match state.create_secondary_identity(create.kind, &create.label, lifetime_ms) {
+        Ok(secondary) => {
+            let response = api::CreateIdentityResponse {
+                identity: Some(identity_summary(
+                    &secondary.record_name,
+                    secondary.identity.endpoint_id(),
+                    &secondary.binding,
+                    secondary.kind,
+                    &secondary.label,
+                )),
+                public_binding: secondary.binding.signed_bytes(),
+            };
+            let mut payload = Vec::new();
+            Message::encode(&response, &mut payload).expect("encode");
+            (api::StatusCode::Ok as i32, Some(payload))
+        }
+        Err(e) => {
+            log::warn!("[identity] create failed: {e}");
+            (api::StatusCode::Internal as i32, None)
+        }
+    }
+}
+
+/// `IdentityService.RotateHandshakeKey`: fresh static handshake key,
+/// binding re-signed at sequence + 1, persisted; the node switches to the
+/// new static key for future handshakes (handshake.md §33).
+fn rotate_handshake_key(
+    state: &mut RuntimeState,
+    request: &api::Request,
+) -> (i32, Option<Vec<u8>>) {
+    let Ok(rotate) = api::RotateHandshakeKeyRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(handle) = rotate.identity_handle else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(resolved) = state.identity_by_handle(&handle.value) else {
+        return (api::StatusCode::NotFound as i32, None);
+    };
+    if let Some(expected) = rotate.expected_revision {
+        let current = match resolved {
+            IdentityRef::Primary => state.primary_binding.sequence,
+            IdentityRef::Secondary(entry) => entry.binding.sequence,
+        };
+        if expected.value != current {
+            return (api::StatusCode::Conflict as i32, None);
+        }
+    }
+    let lifetime_ms = u64::try_from(rotate.new_binding_lifetime_ms).unwrap_or(0);
+    match state.rotate_handshake_key(&handle.value, lifetime_ms) {
+        Ok(binding) => {
+            let summary = match state.identity_by_handle(&handle.value) {
+                Some(resolved) => summary_for(state, resolved),
+                None => return (api::StatusCode::NotFound as i32, None),
+            };
+            let response = api::RotateHandshakeKeyResponse {
+                identity: Some(summary),
+                public_binding: binding.signed_bytes(),
+            };
+            let mut payload = Vec::new();
+            Message::encode(&response, &mut payload).expect("encode");
+            (api::StatusCode::Ok as i32, Some(payload))
+        }
+        Err(e) => {
+            log::warn!("[identity] rotate handshake key failed: {e}");
+            (api::StatusCode::Internal as i32, None)
+        }
+    }
+}
+
+/// `IdentityService.RotateIdentityKey`: a full identity change — fresh
+/// identity and static keys, new endpoint id, persisted. The primary's
+/// session-ticket key follows the new identity, so existing tickets stop
+/// being redeemable (documented; it is a NEW endpoint).
+fn rotate_identity_key(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(rotate) = api::RotateIdentityKeyRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(handle) = rotate.identity_handle else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if rotate.require_old_key_signature {
+        // The request carries no old-signature material to verify against;
+        // the flag is unsupported (documented).
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    let Some(resolved) = state.identity_by_handle(&handle.value) else {
+        return (api::StatusCode::NotFound as i32, None);
+    };
+    if let Some(expected) = rotate.expected_revision {
+        let current = match resolved {
+            IdentityRef::Primary => state.primary_binding.sequence,
+            IdentityRef::Secondary(entry) => entry.binding.sequence,
+        };
+        if expected.value != current {
+            return (api::StatusCode::Conflict as i32, None);
+        }
+    }
+    match state.rotate_identity_key(&handle.value) {
+        Ok(binding) => {
+            let summary = match state.identity_by_handle(&handle.value) {
+                Some(resolved) => summary_for(state, resolved),
+                None => return (api::StatusCode::NotFound as i32, None),
+            };
+            let response = api::RotateIdentityKeyResponse {
+                identity: Some(summary),
+                rotation_proof: binding.signature.to_vec(),
+            };
+            let mut payload = Vec::new();
+            Message::encode(&response, &mut payload).expect("encode");
+            (api::StatusCode::Ok as i32, Some(payload))
+        }
+        Err(e) => {
+            log::warn!("[identity] rotate identity key failed: {e}");
+            (api::StatusCode::Internal as i32, None)
+        }
+    }
+}
+
+/// `IdentityService.ExportPublicIdentity`: the signed binding (public
+/// material only — endpoint id, public keys, validity, sequence,
+/// signature).
+fn export_public_identity(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(export) = api::ExportPublicIdentityRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(handle) = export.identity_handle else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(resolved) = state.identity_by_handle(&handle.value) else {
+        return (api::StatusCode::NotFound as i32, None);
+    };
+    let public_binding = match resolved {
+        IdentityRef::Primary => state.primary_binding.signed_bytes(),
+        IdentityRef::Secondary(entry) => entry.binding.signed_bytes(),
+    };
+    let response = api::ExportPublicIdentityResponse {
+        export_bytes: public_binding,
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `IdentityService.ExportSecretIdentity`: the raw 64-byte
+/// `[identity_seed || static_seed]` material. Gated behind the
+/// `allow_secret_export` config flag (default off) — without it the
+/// request is `PermissionDenied`. The proto names the field
+/// `encrypted_export`; v1 exports the raw seeds in it (no wrapping
+/// envelope yet, documented), and the `protection`/`confirmation` request
+/// fields are accepted but ignored.
+fn export_secret_identity(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    if !state.config.allow_secret_export {
+        return (api::StatusCode::PermissionDenied as i32, None);
+    }
+    let Ok(export) = api::ExportSecretIdentityRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(handle) = export.identity_handle else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(resolved) = state.identity_by_handle(&handle.value) else {
+        return (api::StatusCode::NotFound as i32, None);
+    };
+    let identity = match resolved {
+        IdentityRef::Primary => &state.node_identity,
+        IdentityRef::Secondary(entry) => &entry.identity,
+    };
+    let mut seeds = Vec::with_capacity(64);
+    seeds.extend_from_slice(&identity.identity.to_seed());
+    seeds.extend_from_slice(&identity.static_handshake.to_seed());
+    let response = api::ExportSecretIdentityResponse {
+        encrypted_export: seeds,
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `IdentityService.ImportIdentity`: the `encrypted_export` field carries
+/// raw 64-byte seeds (mirroring the v1 export); the seeds are keystore-
+/// stored as a NEW secondary. The primary can never be replaced via
+/// import. `validate_only` reports the would-be identity without storing.
+fn import_identity(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(import) = api::ImportIdentityRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if import.encrypted_export.len() != 64 {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    match state.import_secondary_identity(
+        &import.encrypted_export,
+        "imported",
+        import.validate_only,
+    ) {
+        Ok(secondary) => {
+            let response = api::ImportIdentityResponse {
+                identity: Some(identity_summary(
+                    &secondary.record_name,
+                    secondary.identity.endpoint_id(),
+                    &secondary.binding,
+                    secondary.kind,
+                    &secondary.label,
+                )),
+            };
+            let mut payload = Vec::new();
+            Message::encode(&response, &mut payload).expect("encode");
+            (api::StatusCode::Ok as i32, Some(payload))
+        }
+        Err(e) => {
+            log::warn!("[identity] import failed: {e}");
+            (api::StatusCode::Internal as i32, None)
+        }
+    }
+}
+
+/// `IdentityService.DeleteIdentity`: deletes a SECONDARY identity from the
+/// registry and keystore. The primary is `FailedPrecondition` — a full
+/// replacement is `RotateIdentityKey`. `plan_only` reports the would-be
+/// deletion without executing; the deletion-plan token is accepted but
+/// ignored (no dependency planning in v1).
+fn delete_identity(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(delete) = api::DeleteIdentityRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(handle) = delete.identity_handle else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(resolved) = state.identity_by_handle(&handle.value) else {
+        return (api::StatusCode::NotFound as i32, None);
+    };
+    if let IdentityRef::Primary = resolved {
+        return (api::StatusCode::FailedPrecondition as i32, None);
+    }
+    if let Some(expected) = delete.expected_revision {
+        if let IdentityRef::Secondary(entry) = resolved {
+            if expected.value != entry.binding.sequence {
+                return (api::StatusCode::Conflict as i32, None);
+            }
+        }
+    }
+    if delete.plan_only {
+        let response = api::DeleteIdentityResponse {
+            deleted: false,
+            deletion_plan_token: Vec::new(),
+            dependencies: Vec::new(),
+        };
+        let mut payload = Vec::new();
+        Message::encode(&response, &mut payload).expect("encode");
+        return (api::StatusCode::Ok as i32, Some(payload));
+    }
+    match state.delete_secondary_identity(&handle.value) {
+        Ok(()) => {
+            let response = api::DeleteIdentityResponse {
+                deleted: true,
+                deletion_plan_token: Vec::new(),
+                dependencies: Vec::new(),
+            };
+            let mut payload = Vec::new();
+            Message::encode(&response, &mut payload).expect("encode");
+            (api::StatusCode::Ok as i32, Some(payload))
+        }
+        Err(e) => {
+            log::warn!("[identity] delete failed: {e}");
+            (api::StatusCode::Internal as i32, None)
+        }
+    }
+}
+
+// --- Task F2: CarrierService (registry-backed read surface + Listen) ---
+
+/// The capability report for one registered carrier (task F2).
+fn carrier_type_info(carrier: &(dyn Carrier + Send + Sync)) -> api::CarrierTypeInfo {
+    let caps = carrier.capabilities();
+    api::CarrierTypeInfo {
+        type_id: caps.carrier_type.0.clone(),
+        display_name: caps.carrier_type.0,
+        built_in: true,
+        supports_listen: caps.supports_listen,
+        supports_dial: caps.supports_dial,
+        supports_discovery: caps.supports_discovery,
+        minimum_packet_size: u32::try_from(caps.minimum_packet_size).unwrap_or(u32::MAX),
+        maximum_packet_size: u32::try_from(caps.maximum_packet_size).unwrap_or(u32::MAX),
+    }
+}
+
+/// Every registered carrier, in config order (task F2): the daemon wires
+/// one carrier per configured type id at boot (carriers.rs), so the
+/// registry is enumerated by resolving the configured ids against the
+/// runtime node. Configured-but-unregistered ids are skipped.
+fn registered_carriers(state: &RuntimeState) -> Vec<api::CarrierTypeInfo> {
+    state
+        .config
+        .carriers
+        .iter()
+        .filter_map(|type_id| state.node.carrier(type_id).map(carrier_type_info))
+        .collect()
+}
+
+/// `CarrierService.ListCarrierTypes`: the registered carriers and their
+/// capabilities, paginated (control-api.md §37).
+fn list_carrier_types(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(list) = api::ListCarrierTypesRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok((offset, page_size)) = page_window(list.page.as_ref(), "ListCarrierTypes") else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let all = registered_carriers(state);
+    let total = all.len();
+    let types = all.into_iter().skip(offset).take(page_size).collect();
+    let response = api::ListCarrierTypesResponse {
+        types,
+        page: Some(page_info(total, offset, page_size, "ListCarrierTypes")),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `CarrierService.ListLinks`: the active session registry as links,
+/// paginated (control-api.md §37). The v1 registry does not track MTU or
+/// byte counters, so those fields report 0 (documented).
+fn list_links(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(list) = api::ListLinksRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok((offset, page_size)) = page_window(list.page.as_ref(), "ListLinks") else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let all = state.sessions.snapshot();
+    let total = all.len();
+    let links = all
+        .into_iter()
+        .skip(offset)
+        .take(page_size)
+        .map(|(id, entry)| api::LinkSummary {
+            link_handle: Some(api::OpaqueHandle {
+                value: id.to_be_bytes().to_vec(),
+            }),
+            carrier_handle: Some(api::OpaqueHandle {
+                value: entry.carrier_type.as_bytes().to_vec(),
+            }),
+            carrier_type_id: entry.carrier_type.clone(),
+            state: "active".into(),
+            current_mtu: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            scope: "session".into(),
+        })
+        .collect();
+    let response = api::ListLinksResponse {
+        links,
+        page: Some(page_info(total, offset, page_size, "ListLinks")),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `CarrierService.GetLinkProperties`: the capability report for one
+/// carrier type. Unknown types are `NotFound`.
+fn get_link_properties(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(get) = GetLinkPropertiesRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(carrier) = state.node.carrier(&get.carrier_type) else {
+        return (api::StatusCode::NotFound as i32, None);
+    };
+    let response = GetLinkPropertiesResponse {
+        info: Some(carrier_type_info(carrier)),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `CarrierService.GetLinkStats`: the active-session count per registered
+/// carrier; carriers without sessions report 0.
+fn get_link_stats(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let _ = request;
+    let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for info in registered_carriers(state) {
+        counts.insert(info.type_id, 0);
+    }
+    for (_id, entry) in state.sessions.snapshot() {
+        *counts.entry(entry.carrier_type.clone()).or_insert(0) += 1;
+    }
+    let link_stats = counts
+        .into_iter()
+        .map(|(carrier_type, active_links)| LinkStats {
+            carrier_type,
+            active_links,
+        })
+        .collect();
+    let response = GetLinkStatsResponse { stats: link_stats };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `CarrierService.Listen`: bind one registered carrier at an explicit
+/// address and hold the listener. The reported `bound_address` is the
+/// requested address — the `Listener` trait exposes no kernel-assigned
+/// address, so an ephemeral port is not resolved (documented).
+fn listen(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(listen) = ListenRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(carrier) = state.node.carrier(&listen.carrier_type) else {
+        return (api::StatusCode::NotFound as i32, None);
+    };
+    let bind_address = listen.bind_address.clone();
+    // Carrier binds are synchronous and block the runtime thread
+    // (Handle::block_on); block_in_place moves off the async machinery
+    // (the same pattern as carriers.rs `bind_tcp`).
+    let result = tokio::task::block_in_place(|| carrier.listen(bind_address.clone()));
+    match result {
+        Ok(listener) => {
+            state.listeners.push(listener);
+            let response = ListenResponse {
+                bound_address: bind_address,
+            };
+            let mut payload = Vec::new();
+            Message::encode(&response, &mut payload).expect("encode");
+            (api::StatusCode::Ok as i32, Some(payload))
+        }
+        Err(e) => {
+            log::warn!(
+                "[carrier] {} listen on {} failed: {e:?}",
+                listen.carrier_type,
+                listen.bind_address
+            );
+            (api::StatusCode::FailedPrecondition as i32, None)
+        }
+    }
+}
+
 /// Persist node state at shutdown and reload at startup (storage.md §22).
 pub fn persist_node_state(store: &SqliteStore, config: &NodeConfig) -> Result<(), String> {
     use umc_storage::store::{Namespace, Store};
@@ -1489,67 +2131,70 @@ mod tests {
         assert_eq!(listing[0].bundle_id, created.bundle_id);
     }
 
-    #[tokio::test]
-    async fn bundles_survive_state_reopen() {
-        let dir = std::env::temp_dir().join(format!(
-            "umcd-bundle-reopen-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        let config = NodeConfig {
-            data_dir: dir,
-            ..NodeConfig::default()
-        };
-        let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
-        let mut state = RuntimeState::new(config.clone(), tx).expect("runtime state");
-        // Bundle times are wall-clock epoch ms (restart-safe): the request
-        // must be stamped against the same clock the restore compares with.
-        let now_ms = crate::state::wall_now().0;
-        let create = api::CreateBundleRequest {
-            application_handle: Some(api::OpaqueHandle {
-                value: b"sender-a".to_vec(),
-            }),
-            destination_hint: b"dest-token".to_vec(),
-            priority: 1,
-            expires_at_unix_ms: i64::try_from(now_ms + 60_000).unwrap(),
-            payload_chunk: b"ciphertext".to_vec(),
-            payload_complete: true,
-            upload_handle: None,
-        };
-        let mut payload = Vec::new();
-        Message::encode(&create, &mut payload).unwrap();
-        let bytes = dispatch_request(
-            &mut state,
-            &request("BundleService", "CreateBundle", payload),
-            None,
-        );
-        let response = decode_response(&bytes);
-        assert_eq!(
-            response.status.as_ref().unwrap().code,
-            api::StatusCode::Ok as i32
-        );
-        let created = api::CreateBundleResponse::decode(response.payload.as_slice())
-            .expect("payload")
-            .bundle
-            .expect("bundle");
-        drop(state);
+    #[test]
+    fn bundles_survive_state_reopen() {
+        with_password("test-password", || {
+            let dir = std::env::temp_dir().join(format!(
+                "umcd-bundle-reopen-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let config = NodeConfig {
+                data_dir: dir,
+                ..NodeConfig::default()
+            };
+            let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
+            let mut state = RuntimeState::new(config.clone(), tx).expect("runtime state");
+            // Bundle times are wall-clock epoch ms (restart-safe): the request
+            // must be stamped against the same clock the restore compares with.
+            let now_ms = crate::state::wall_now().0;
+            let create = api::CreateBundleRequest {
+                application_handle: Some(api::OpaqueHandle {
+                    value: b"sender-a".to_vec(),
+                }),
+                destination_hint: b"dest-token".to_vec(),
+                priority: 1,
+                expires_at_unix_ms: i64::try_from(now_ms + 60_000).unwrap(),
+                payload_chunk: b"ciphertext".to_vec(),
+                payload_complete: true,
+                upload_handle: None,
+            };
+            let mut payload = Vec::new();
+            Message::encode(&create, &mut payload).unwrap();
+            let bytes = dispatch_request(
+                &mut state,
+                &request("BundleService", "CreateBundle", payload),
+                None,
+            );
+            let response = decode_response(&bytes);
+            assert_eq!(
+                response.status.as_ref().unwrap().code,
+                api::StatusCode::Ok as i32
+            );
+            let created = api::CreateBundleResponse::decode(response.payload.as_slice())
+                .expect("payload")
+                .bundle
+                .expect("bundle");
+            drop(state);
 
-        // A fresh daemon over the same data dir restores the bundle from
-        // persisted metadata (storage.md §6.3): the listing round-trips.
-        let (tx2, _rx2) = tokio::sync::mpsc::channel::<()>(1);
-        let mut reopened = RuntimeState::new(config, tx2).expect("reopened runtime state");
-        let bytes = dispatch_request(
-            &mut reopened,
-            &request("BundleService", "ListBundles", vec![]),
-            None,
-        );
-        let listing = api::ListBundlesResponse::decode(decode_response(&bytes).payload.as_slice())
-            .expect("payload")
-            .bundles;
-        assert_eq!(listing.len(), 1);
-        assert_eq!(listing[0].bundle_id, created.bundle_id);
-        assert_eq!(listing[0].payload_size, 10);
+            // A fresh daemon over the same data dir restores the bundle from
+            // persisted metadata (storage.md §6.3): the listing round-trips.
+            let (tx2, _rx2) = tokio::sync::mpsc::channel::<()>(1);
+            let mut reopened = RuntimeState::new(config, tx2).expect("reopened runtime state");
+            let bytes = dispatch_request(
+                &mut reopened,
+                &request("BundleService", "ListBundles", vec![]),
+                None,
+            );
+            let listing =
+                api::ListBundlesResponse::decode(decode_response(&bytes).payload.as_slice())
+                    .expect("payload")
+                    .bundles;
+            assert_eq!(listing.len(), 1);
+            assert_eq!(listing[0].bundle_id, created.bundle_id);
+            assert_eq!(listing[0].payload_size, 10);
+        });
     }
 
     #[test]
@@ -2520,6 +3165,896 @@ mod tests {
         assert!(cache
             .get(&key(9_999), 5_000 + IDEMPOTENCY_TTL_MS - 1)
             .is_some());
+    }
+
+    // --- Task F2: IdentityService + CarrierService dispatch ---
+
+    /// Runs `f` with `UMC_KEYSTORE_PASSWORD` set; env mutation is
+    /// serialized with every other keystore test in the crate via the
+    /// shared test lock.
+    fn with_password(password: &str, f: impl FnOnce()) {
+        let _guard = crate::state::KEYSTORE_PASSWORD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("UMC_KEYSTORE_PASSWORD", password);
+        f();
+        std::env::remove_var("UMC_KEYSTORE_PASSWORD");
+    }
+
+    fn encode_request<M: prost::Message>(message: &M) -> Vec<u8> {
+        let mut payload = Vec::new();
+        message.encode(&mut payload).expect("encode");
+        payload
+    }
+
+    fn identity_handle(record_name: &str) -> api::OpaqueHandle {
+        api::OpaqueHandle {
+            value: record_name.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn list_identities_shows_primary_then_secondaries() {
+        with_password("test-password", || {
+            let (mut state, _tx) = test_state();
+            let bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "ListIdentities", vec![]),
+                None,
+            );
+            let response = decode_response(&bytes);
+            assert_eq!(
+                response.status.as_ref().unwrap().code,
+                api::StatusCode::Ok as i32
+            );
+            let list = api::ListIdentitiesResponse::decode(response.payload.as_slice())
+                .expect("payload")
+                .identities;
+            assert_eq!(list.len(), 1, "the primary is always listed");
+            assert_eq!(list[0].kind, api::IdentityKind::NodeManagement as i32);
+            assert_eq!(
+                list[0].endpoint_id,
+                state.node_identity.endpoint_id(),
+                "the primary's endpoint id round-trips"
+            );
+            let primary_handle = list[0]
+                .identity_handle
+                .as_ref()
+                .expect("handle")
+                .value
+                .clone();
+            assert_eq!(primary_handle, b"node-identity");
+
+            // Create a secondary through the dispatcher; the node identity
+            // is untouched.
+            let create = api::CreateIdentityRequest {
+                kind: api::IdentityKind::UserEndpoint as i32,
+                label: "alice".into(),
+                binding_lifetime_ms: 0,
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "CreateIdentity", encode_request(&create)),
+                None,
+            );
+            let created =
+                api::CreateIdentityResponse::decode(decode_response(&bytes).payload.as_slice())
+                    .expect("payload")
+                    .identity
+                    .expect("identity");
+            assert_eq!(created.kind, api::IdentityKind::UserEndpoint as i32);
+            assert_eq!(created.label, "alice");
+            assert_eq!(created.binding_sequence, 0, "fresh secondaries start at 0");
+            assert_ne!(
+                created.endpoint_id,
+                state.node_identity.endpoint_id(),
+                "the secondary is a different identity"
+            );
+
+            let bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "ListIdentities", vec![]),
+                None,
+            );
+            let list =
+                api::ListIdentitiesResponse::decode(decode_response(&bytes).payload.as_slice())
+                    .expect("payload")
+                    .identities;
+            assert_eq!(list.len(), 2);
+            assert_eq!(
+                list[1].identity_handle.as_ref().unwrap().value,
+                b"secondary-0"
+            );
+        });
+    }
+
+    #[test]
+    fn get_identity_resolves_by_endpoint_and_handle() {
+        with_password("test-password", || {
+            let (mut state, _tx) = test_state();
+            let create = api::CreateIdentityRequest {
+                kind: api::IdentityKind::UserEndpoint as i32,
+                label: "alice".into(),
+                binding_lifetime_ms: 0,
+            };
+            dispatch_request(
+                &mut state,
+                &request("IdentityService", "CreateIdentity", encode_request(&create)),
+                None,
+            );
+            let secondary_endpoint = state.secondaries[0].identity.endpoint_id();
+
+            // By endpoint id: the secondary resolves.
+            let get = api::GetIdentityRequest {
+                identity: Some(api::get_identity_request::Identity::EndpointId(
+                    secondary_endpoint.to_vec(),
+                )),
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "GetIdentity", encode_request(&get)),
+                None,
+            );
+            let response = decode_response(&bytes);
+            assert_eq!(
+                response.status.as_ref().unwrap().code,
+                api::StatusCode::Ok as i32
+            );
+            let got =
+                api::GetIdentityResponse::decode(response.payload.as_slice()).expect("payload");
+            assert_eq!(got.identity.expect("identity").label, "alice");
+            assert!(
+                !got.public_binding.is_empty(),
+                "the signed binding is the public material"
+            );
+
+            // By handle: the primary resolves with its own endpoint.
+            let get = api::GetIdentityRequest {
+                identity: Some(api::get_identity_request::Identity::Handle(
+                    identity_handle("node-identity"),
+                )),
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "GetIdentity", encode_request(&get)),
+                None,
+            );
+            let got = api::GetIdentityResponse::decode(decode_response(&bytes).payload.as_slice())
+                .expect("payload")
+                .identity
+                .expect("identity");
+            assert_eq!(got.endpoint_id, state.node_identity.endpoint_id().to_vec());
+
+            // An unknown endpoint is NotFound; an empty oneof is
+            // InvalidArgument.
+            let get = api::GetIdentityRequest {
+                identity: Some(api::get_identity_request::Identity::EndpointId(vec![
+                    0u8;
+                    32
+                ])),
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "GetIdentity", encode_request(&get)),
+                None,
+            );
+            assert_eq!(
+                decode_response(&bytes).status.unwrap().code,
+                api::StatusCode::NotFound as i32
+            );
+            let bytes = dispatch_request(
+                &mut state,
+                &request(
+                    "IdentityService",
+                    "GetIdentity",
+                    encode_request(&api::GetIdentityRequest::default()),
+                ),
+                None,
+            );
+            assert_eq!(
+                decode_response(&bytes).status.unwrap().code,
+                api::StatusCode::InvalidArgument as i32
+            );
+        });
+    }
+
+    #[test]
+    fn rotate_handshake_key_increments_sequence_and_round_trips() {
+        with_password("test-password", || {
+            let dir = std::env::temp_dir().join(format!(
+                "umcd-rotate-handshake-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let config = NodeConfig {
+                data_dir: dir,
+                ..NodeConfig::default()
+            };
+            let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
+            let mut state = RuntimeState::new(config.clone(), tx).expect("runtime state");
+            let old_static = state.node_identity.static_handshake.public();
+            let old_sequence = state.primary_binding.sequence;
+
+            let rotate = api::RotateHandshakeKeyRequest {
+                identity_handle: Some(identity_handle("node-identity")),
+                expected_revision: Some(api::ResourceRevision {
+                    value: old_sequence,
+                }),
+                new_binding_lifetime_ms: 0,
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request(
+                    "IdentityService",
+                    "RotateHandshakeKey",
+                    encode_request(&rotate),
+                ),
+                None,
+            );
+            let response = decode_response(&bytes);
+            assert_eq!(
+                response.status.as_ref().unwrap().code,
+                api::StatusCode::Ok as i32
+            );
+            let rotated = api::RotateHandshakeKeyResponse::decode(response.payload.as_slice())
+                .expect("payload");
+            let summary = rotated.identity.expect("identity");
+            assert_eq!(
+                summary.binding_sequence,
+                old_sequence + 1,
+                "the binding sequence increments"
+            );
+            assert_ne!(
+                state.node_identity.static_handshake.public(),
+                old_static,
+                "the node switches to the new static key"
+            );
+            assert_eq!(state.primary_binding.sequence, old_sequence + 1);
+            drop(state);
+
+            // Keystore round-trip after rotation: a fresh daemon restores
+            // the new static key and the incremented sequence.
+            let (tx2, _rx2) = tokio::sync::mpsc::channel::<()>(1);
+            let reopened = RuntimeState::new(config, tx2).expect("reopened runtime state");
+            assert_ne!(
+                reopened.node_identity.static_handshake.public(),
+                old_static,
+                "the rotated static key survives restart"
+            );
+            assert_eq!(reopened.primary_binding.sequence, old_sequence + 1);
+        });
+    }
+
+    #[test]
+    fn rotate_identity_key_changes_endpoint_and_persists() {
+        with_password("test-password", || {
+            let dir = std::env::temp_dir().join(format!(
+                "umcd-rotate-identity-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let config = NodeConfig {
+                data_dir: dir,
+                ..NodeConfig::default()
+            };
+            let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
+            let mut state = RuntimeState::new(config.clone(), tx).expect("runtime state");
+            let old_endpoint = state.node_identity.endpoint_id();
+
+            let rotate = api::RotateIdentityKeyRequest {
+                identity_handle: Some(identity_handle("node-identity")),
+                expected_revision: None,
+                require_old_key_signature: false,
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request(
+                    "IdentityService",
+                    "RotateIdentityKey",
+                    encode_request(&rotate),
+                ),
+                None,
+            );
+            let response = decode_response(&bytes);
+            assert_eq!(
+                response.status.as_ref().unwrap().code,
+                api::StatusCode::Ok as i32
+            );
+            let rotated = api::RotateIdentityKeyResponse::decode(response.payload.as_slice())
+                .expect("payload");
+            let summary = rotated.identity.expect("identity");
+            assert_ne!(
+                summary.endpoint_id,
+                old_endpoint.to_vec(),
+                "a full identity change means a new endpoint id"
+            );
+            assert_eq!(summary.binding_sequence, 1);
+            assert_eq!(
+                rotated.rotation_proof.len(),
+                64,
+                "the new binding's signature"
+            );
+            assert_eq!(
+                state.node.config.dcid,
+                summary.endpoint_id[..8],
+                "the node dcid follows the new endpoint"
+            );
+            assert_eq!(
+                state.ticket_key,
+                crate::state::ticket_key_for(&state.node_identity),
+                "the ticket key follows the new identity"
+            );
+            drop(state);
+
+            let (tx2, _rx2) = tokio::sync::mpsc::channel::<()>(1);
+            let reopened = RuntimeState::new(config, tx2).expect("reopened runtime state");
+            assert_eq!(
+                reopened.node_identity.endpoint_id().to_vec(),
+                summary.endpoint_id
+            );
+            assert_eq!(reopened.primary_binding.sequence, 1);
+        });
+    }
+
+    #[test]
+    fn rotation_rejects_stale_revisions_and_unknown_handles() {
+        with_password("test-password", || {
+            let (mut state, _tx) = test_state();
+            // Stale expected_revision → Conflict.
+            let rotate = api::RotateHandshakeKeyRequest {
+                identity_handle: Some(identity_handle("node-identity")),
+                expected_revision: Some(api::ResourceRevision { value: 99 }),
+                new_binding_lifetime_ms: 0,
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request(
+                    "IdentityService",
+                    "RotateHandshakeKey",
+                    encode_request(&rotate),
+                ),
+                None,
+            );
+            assert_eq!(
+                decode_response(&bytes).status.unwrap().code,
+                api::StatusCode::Conflict as i32
+            );
+            // Unknown handle → NotFound.
+            let rotate = api::RotateHandshakeKeyRequest {
+                identity_handle: Some(identity_handle("no-such-identity")),
+                expected_revision: None,
+                new_binding_lifetime_ms: 0,
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request(
+                    "IdentityService",
+                    "RotateHandshakeKey",
+                    encode_request(&rotate),
+                ),
+                None,
+            );
+            assert_eq!(
+                decode_response(&bytes).status.unwrap().code,
+                api::StatusCode::NotFound as i32
+            );
+            // require_old_key_signature is unsupported → InvalidArgument.
+            let rotate = api::RotateIdentityKeyRequest {
+                identity_handle: Some(identity_handle("node-identity")),
+                expected_revision: None,
+                require_old_key_signature: true,
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request(
+                    "IdentityService",
+                    "RotateIdentityKey",
+                    encode_request(&rotate),
+                ),
+                None,
+            );
+            assert_eq!(
+                decode_response(&bytes).status.unwrap().code,
+                api::StatusCode::InvalidArgument as i32
+            );
+        });
+    }
+
+    #[test]
+    fn secret_export_is_gated_and_import_round_trips() {
+        with_password("test-password", || {
+            let (mut state, _tx) = test_state();
+            // Default config: secret export is PermissionDenied.
+            let export = api::ExportSecretIdentityRequest {
+                identity_handle: Some(identity_handle("node-identity")),
+                ..Default::default()
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request(
+                    "IdentityService",
+                    "ExportSecretIdentity",
+                    encode_request(&export),
+                ),
+                None,
+            );
+            assert_eq!(
+                decode_response(&bytes).status.unwrap().code,
+                api::StatusCode::PermissionDenied as i32
+            );
+            assert_eq!(state.secondaries.len(), 0, "nothing was written");
+
+            // With the flag on, the raw seeds come back and import them as
+            // a secondary round-trips.
+            state.config.allow_secret_export = true;
+            let bytes = dispatch_request(
+                &mut state,
+                &request(
+                    "IdentityService",
+                    "ExportSecretIdentity",
+                    encode_request(&export),
+                ),
+                None,
+            );
+            let response = decode_response(&bytes);
+            assert_eq!(
+                response.status.as_ref().unwrap().code,
+                api::StatusCode::Ok as i32
+            );
+            let seeds = api::ExportSecretIdentityResponse::decode(response.payload.as_slice())
+                .expect("payload")
+                .encrypted_export;
+            assert_eq!(seeds.len(), 64, "raw identity_seed || static_seed");
+            assert_eq!(
+                state.node_identity.identity.to_seed(),
+                seeds[..32],
+                "the primary's identity seed is exported"
+            );
+
+            // Importing the same material produces a secondary with the
+            // SAME endpoint id — the primary is untouched.
+            let import = api::ImportIdentityRequest {
+                encrypted_export: seeds.clone(),
+                validate_only: false,
+                ..Default::default()
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "ImportIdentity", encode_request(&import)),
+                None,
+            );
+            let imported =
+                api::ImportIdentityResponse::decode(decode_response(&bytes).payload.as_slice())
+                    .expect("payload")
+                    .identity
+                    .expect("identity");
+            assert_eq!(
+                imported.endpoint_id,
+                state.node_identity.endpoint_id().to_vec(),
+                "import reconstructs the exported identity"
+            );
+            assert_ne!(
+                imported.identity_handle.as_ref().unwrap().value,
+                b"node-identity",
+                "import always creates a secondary"
+            );
+            assert_eq!(state.secondaries.len(), 1);
+
+            // validate_only does not store.
+            let import = api::ImportIdentityRequest {
+                encrypted_export: seeds,
+                validate_only: true,
+                ..Default::default()
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "ImportIdentity", encode_request(&import)),
+                None,
+            );
+            assert_eq!(
+                decode_response(&bytes).status.unwrap().code,
+                api::StatusCode::Ok as i32
+            );
+            assert_eq!(state.secondaries.len(), 1, "validate-only stores nothing");
+
+            // Malformed seeds are InvalidArgument.
+            let import = api::ImportIdentityRequest {
+                encrypted_export: vec![1u8; 32],
+                ..Default::default()
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "ImportIdentity", encode_request(&import)),
+                None,
+            );
+            assert_eq!(
+                decode_response(&bytes).status.unwrap().code,
+                api::StatusCode::InvalidArgument as i32
+            );
+        });
+    }
+
+    #[test]
+    fn delete_identity_removes_secondaries_only() {
+        with_password("test-password", || {
+            let (mut state, _tx) = test_state();
+            // The primary is not deletable.
+            let delete = api::DeleteIdentityRequest {
+                identity_handle: Some(identity_handle("node-identity")),
+                plan_only: false,
+                ..Default::default()
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "DeleteIdentity", encode_request(&delete)),
+                None,
+            );
+            assert_eq!(
+                decode_response(&bytes).status.unwrap().code,
+                api::StatusCode::FailedPrecondition as i32
+            );
+
+            // Create a secondary, then delete it; the list returns to 1.
+            let create = api::CreateIdentityRequest {
+                kind: api::IdentityKind::ServiceEndpoint as i32,
+                label: "ephemeral".into(),
+                binding_lifetime_ms: 0,
+            };
+            dispatch_request(
+                &mut state,
+                &request("IdentityService", "CreateIdentity", encode_request(&create)),
+                None,
+            );
+            let handle = state.secondaries[0].record_name.as_bytes().to_vec();
+
+            let delete = api::DeleteIdentityRequest {
+                identity_handle: Some(api::OpaqueHandle {
+                    value: handle.clone(),
+                }),
+                plan_only: false,
+                ..Default::default()
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "DeleteIdentity", encode_request(&delete)),
+                None,
+            );
+            let response = decode_response(&bytes);
+            assert_eq!(
+                response.status.as_ref().unwrap().code,
+                api::StatusCode::Ok as i32
+            );
+            assert!(
+                api::DeleteIdentityResponse::decode(response.payload.as_slice())
+                    .expect("payload")
+                    .deleted
+            );
+            assert!(state.secondaries.is_empty());
+        });
+    }
+
+    #[test]
+    fn delete_identity_plan_only_and_revision_checks() {
+        with_password("test-password", || {
+            let (mut state, _tx) = test_state();
+            let create = api::CreateIdentityRequest {
+                kind: api::IdentityKind::ServiceEndpoint as i32,
+                label: "again".into(),
+                binding_lifetime_ms: 0,
+            };
+            dispatch_request(
+                &mut state,
+                &request("IdentityService", "CreateIdentity", encode_request(&create)),
+                None,
+            );
+            let handle = state.secondaries[0].record_name.as_bytes().to_vec();
+            // plan_only reports without deleting.
+            let delete = api::DeleteIdentityRequest {
+                identity_handle: Some(api::OpaqueHandle {
+                    value: handle.clone(),
+                }),
+                plan_only: true,
+                expected_revision: Some(api::ResourceRevision { value: 0 }),
+                ..Default::default()
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "DeleteIdentity", encode_request(&delete)),
+                None,
+            );
+            let response = decode_response(&bytes);
+            assert_eq!(
+                response.status.as_ref().unwrap().code,
+                api::StatusCode::Ok as i32
+            );
+            assert!(
+                !api::DeleteIdentityResponse::decode(response.payload.as_slice())
+                    .expect("payload")
+                    .deleted,
+                "plan_only must not delete"
+            );
+            assert_eq!(state.secondaries.len(), 1);
+
+            // A stale expected_revision is Conflict.
+            let delete = api::DeleteIdentityRequest {
+                identity_handle: Some(api::OpaqueHandle { value: handle }),
+                plan_only: false,
+                expected_revision: Some(api::ResourceRevision { value: 99 }),
+                ..Default::default()
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "DeleteIdentity", encode_request(&delete)),
+                None,
+            );
+            assert_eq!(
+                decode_response(&bytes).status.unwrap().code,
+                api::StatusCode::Conflict as i32
+            );
+            assert_eq!(
+                state.secondaries.len(),
+                1,
+                "a rejected delete changes nothing"
+            );
+        });
+    }
+
+    #[test]
+    fn export_public_identity_returns_the_binding() {
+        with_password("test-password", || {
+            let (mut state, _tx) = test_state();
+            let export = api::ExportPublicIdentityRequest {
+                identity_handle: Some(identity_handle("node-identity")),
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request(
+                    "IdentityService",
+                    "ExportPublicIdentity",
+                    encode_request(&export),
+                ),
+                None,
+            );
+            let response = decode_response(&bytes);
+            assert_eq!(
+                response.status.as_ref().unwrap().code,
+                api::StatusCode::Ok as i32
+            );
+            let exported = api::ExportPublicIdentityResponse::decode(response.payload.as_slice())
+                .expect("payload")
+                .export_bytes;
+            assert_eq!(
+                exported,
+                state.primary_binding.signed_bytes(),
+                "the public export is the signed binding"
+            );
+            // Unknown handle → NotFound.
+            let export = api::ExportPublicIdentityRequest {
+                identity_handle: Some(identity_handle("nope")),
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request(
+                    "IdentityService",
+                    "ExportPublicIdentity",
+                    encode_request(&export),
+                ),
+                None,
+            );
+            assert_eq!(
+                decode_response(&bytes).status.unwrap().code,
+                api::StatusCode::NotFound as i32
+            );
+        });
+    }
+
+    #[test]
+    fn carrier_types_and_properties_round_trip() {
+        let (mut state, _tx) = test_state();
+        state
+            .node
+            .register_carrier(Box::new(umc_carrier_tcp::TcpCarrier));
+
+        // ListCarrierTypes reports the registered configured carrier.
+        let bytes = dispatch_request(
+            &mut state,
+            &request("CarrierService", "ListCarrierTypes", vec![]),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let types = api::ListCarrierTypesResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .types;
+        assert_eq!(types.len(), 1, "only the registered carrier is listed");
+        assert_eq!(types[0].type_id, "ump.tcp/1");
+        assert!(types[0].supports_listen);
+        assert!(types[0].supports_dial);
+        assert!(!types[0].supports_discovery);
+        assert!(types[0].maximum_packet_size > 0);
+
+        // GetLinkProperties matches, and an unknown type is NotFound.
+        let get = GetLinkPropertiesRequest {
+            carrier_type: "ump.tcp/1".into(),
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("CarrierService", "GetLinkProperties", encode_request(&get)),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let info = GetLinkPropertiesResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .info
+            .expect("info");
+        assert_eq!(info.type_id, "ump.tcp/1");
+        assert_eq!(info, types[0]);
+
+        let get = GetLinkPropertiesRequest {
+            carrier_type: "ump.quic/1".into(),
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("CarrierService", "GetLinkProperties", encode_request(&get)),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::NotFound as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn list_links_and_stats_report_sessions() {
+        let (mut state, _tx) = test_state();
+        state
+            .node
+            .register_carrier(Box::new(umc_carrier_tcp::TcpCarrier));
+        register_session(&state, state.sessions.next_id(), [1u8; 32]);
+        register_session(&state, state.sessions.next_id(), [2u8; 32]);
+
+        let bytes = dispatch_request(
+            &mut state,
+            &request("CarrierService", "ListLinks", vec![]),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let links = api::ListLinksResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .links;
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].carrier_type_id, "ump.tcp/1");
+        assert_eq!(links[0].state, "active");
+        assert_eq!(
+            links[0].carrier_handle.as_ref().unwrap().value,
+            b"ump.tcp/1",
+            "the carrier type id is the carrier handle"
+        );
+        assert_eq!(links[0].current_mtu, 0, "the v1 registry tracks no MTU");
+
+        let bytes = dispatch_request(
+            &mut state,
+            &request("CarrierService", "GetLinkStats", vec![]),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let link_stats = GetLinkStatsResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .stats;
+        assert_eq!(link_stats.len(), 1);
+        assert_eq!(link_stats[0].carrier_type, "ump.tcp/1");
+        assert_eq!(link_stats[0].active_links, 2, "sessions per carrier");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn listen_binds_a_registered_carrier() {
+        let (mut state, _tx) = test_state();
+        state
+            .node
+            .register_carrier(Box::new(umc_carrier_tcp::TcpCarrier));
+        let listen = ListenRequest {
+            carrier_type: "ump.tcp/1".into(),
+            bind_address: "127.0.0.1:0".into(),
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("CarrierService", "Listen", encode_request(&listen)),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let bound = ListenResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .bound_address;
+        assert_eq!(bound, "127.0.0.1:0", "the requested address is reported");
+        assert_eq!(state.listeners.len(), 1, "the listener is held open");
+
+        // An unknown carrier is NotFound.
+        let listen = ListenRequest {
+            carrier_type: "ump.quic/1".into(),
+            bind_address: "127.0.0.1:0".into(),
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request("CarrierService", "Listen", encode_request(&listen)),
+            None,
+        );
+        assert_eq!(
+            decode_response(&bytes).status.unwrap().code,
+            api::StatusCode::NotFound as i32
+        );
+    }
+
+    #[test]
+    fn carrier_methods_without_runtime_backing_are_unimplemented() {
+        let (mut state, _tx) = test_state();
+        // Dial: no outbound initiator yet. CloseLink: no per-link close
+        // path yet. Instance lifecycle: single static carrier wiring.
+        for (service, method) in [
+            ("CarrierService", "Dial"),
+            ("CarrierService", "CloseLink"),
+            ("CarrierService", "ListCarrierInstances"),
+            ("CarrierService", "GetCarrierInstance"),
+            ("CarrierService", "CreateCarrierInstance"),
+            ("CarrierService", "UpdateCarrierInstance"),
+            ("CarrierService", "StartCarrier"),
+            ("CarrierService", "StopCarrier"),
+            ("CarrierService", "DeleteCarrierInstance"),
+        ] {
+            let bytes = dispatch_request(&mut state, &request(service, method, vec![]), None);
+            assert_eq!(
+                decode_response(&bytes).status.unwrap().code,
+                api::StatusCode::Unimplemented as i32,
+                "{service}.{method} must be Unimplemented"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_and_carrier_requests_count_per_service() {
+        let (mut state, _tx) = test_state();
+        dispatch_request(
+            &mut state,
+            &request("IdentityService", "ListIdentities", vec![]),
+            None,
+        );
+        dispatch_request(
+            &mut state,
+            &request("CarrierService", "ListCarrierTypes", vec![]),
+            None,
+        );
+        assert_eq!(
+            state
+                .metrics
+                .get(crate::state::metric_names::CONTROL_REQUESTS_IDENTITY),
+            Some(1)
+        );
+        assert_eq!(
+            state
+                .metrics
+                .get(crate::state::metric_names::CONTROL_REQUESTS_CARRIER),
+            Some(1)
+        );
     }
 
     #[tokio::test]

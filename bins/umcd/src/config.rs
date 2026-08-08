@@ -4,6 +4,9 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+// The four bools are independent flat config flags (mesh mode, relay,
+// telemetry, secret export), not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub struct NodeConfig {
     pub data_dir: PathBuf,
     pub control_socket: PathBuf,
@@ -20,6 +23,11 @@ pub struct NodeConfig {
     /// Telemetry opt-in (core.md §61, privacy.md §38): off by default. The
     /// daemon dumps a bounded JSONL metrics file only when enabled.
     pub telemetry_enabled: bool,
+    /// Permits `IdentityService.ExportSecretIdentity` (raw seed export) on
+    /// the control socket. Off by default: without this flag the method
+    /// answers `PermissionDenied` (control-api.md §32.7 — secret material
+    /// leaves the keystore only when an operator opts in).
+    pub allow_secret_export: bool,
     /// Bearer credential for the control API (control-api.md §11.3).
     /// Development-only: honored when set, never persisted or exposed.
     pub development_token: Option<String>,
@@ -42,6 +50,7 @@ impl Default for NodeConfig {
             keystore: None,
             public_relay: false,
             telemetry_enabled: false,
+            allow_secret_export: false,
             development_token: None,
             config_path: None,
         }
@@ -107,6 +116,11 @@ impl NodeConfig {
                 self.telemetry_enabled = value
                     .parse::<bool>()
                     .map_err(|_| format!("telemetry_enabled must be a bool, got {value:?}"))?;
+            }
+            "allow_secret_export" => {
+                self.allow_secret_export = value
+                    .parse::<bool>()
+                    .map_err(|_| format!("allow_secret_export must be a bool, got {value:?}"))?;
             }
             "carriers" => {
                 let carriers: Vec<String> = value
@@ -174,6 +188,10 @@ mod tests {
         assert!(!config.public_relay);
         assert!(!config.telemetry_enabled);
         assert!(!config.mesh);
+        assert!(
+            !config.allow_secret_export,
+            "secret export is off by default"
+        );
         assert!(config.keystore.is_none());
     }
 
@@ -231,6 +249,9 @@ mod tests {
             !config.telemetry_enabled,
             "legacy `telemetry` key aliases the same field"
         );
+        config.set_entry("allow_secret_export", "true").unwrap();
+        assert!(config.allow_secret_export);
+        assert!(config.set_entry("allow_secret_export", "maybe").is_err());
         config
             .set_entry("carriers", "ump.tcp/1, ump.udp/1")
             .unwrap();
