@@ -467,6 +467,10 @@ fn handle_inbound_link_locked(
     // from the client's identity binding (the provisional hello derivation
     // is gone; the session registers under the verified identity).
     let peer_endpoint_id = peer.binding.endpoint_id;
+    state
+        .lock()
+        .expect("state")
+        .validate_peer_binding(&peer.binding, now.0)?;
 
     // SERVER_FINISHED (handshake.md §19): the daemon's reply after a
     // verified CLIENT_AUTH — the server signature + finished MAC, as a raw
