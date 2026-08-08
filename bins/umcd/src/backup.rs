@@ -306,11 +306,11 @@ fn rollback(renamed: &[(PathBuf, PathBuf)]) {
                 std::fs::remove_file(original)
             };
             if let Err(e) = removed {
-                eprintln!("[restore] rollback: clear {}: {e}", original.display());
+                log::error!("[restore] rollback: clear {}: {e}", original.display());
             }
         }
         if let Err(e) = std::fs::rename(staged, original) {
-            eprintln!("[restore] rollback: {}: {e}", staged.display());
+            log::error!("[restore] rollback: {}: {e}", staged.display());
         }
     }
 }

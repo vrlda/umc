@@ -60,7 +60,7 @@ pub(crate) fn keystore_password() -> Vec<u8> {
         // Dev default: the keystore then protects identity with file
         // permissions only (storage.md §10.1 requires a strong secret
         // before production use).
-        eprintln!("[keystore] warning: UMC_KEYSTORE_PASSWORD unset — using the dev default (no password protection)");
+        log::warn!("[keystore] warning: UMC_KEYSTORE_PASSWORD unset — using the dev default (no password protection)");
         return Vec::new();
     };
     pw.into_bytes()
@@ -311,8 +311,8 @@ impl RuntimeState {
         // clock family or every persisted bundle would look expired.
         let bundle_now = wall_now();
         match bundle.restore(store.as_ref(), bundle_now) {
-            Ok(count) => println!("[bundle] restored {count} bundle(s) from metadata"),
-            Err(e) => eprintln!("[bundle] metadata restore failed: {e}"),
+            Ok(count) => log::info!("[bundle] restored {count} bundle(s) from metadata"),
+            Err(e) => log::error!("[bundle] metadata restore failed: {e}"),
         }
         // The event log persists under the api namespace (core.md §15
         // audit logging): prior history is restored into the ring so the

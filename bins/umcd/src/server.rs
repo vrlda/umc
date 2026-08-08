@@ -91,10 +91,10 @@ pub async fn run(state: Arc<Mutex<RuntimeState>>) {
     };
     std::fs::create_dir_all(&data_dir).expect("data dir");
     let store = state.lock().expect("runtime state").store.clone();
-    println!("data directory: {}", data_dir.display());
+    log::info!("data directory: {}", data_dir.display());
 
     if let Ok((profile, carriers)) = load_node_state(&store) {
-        println!(
+        log::info!(
             "node state: profile {profile}, carriers [{}]",
             carriers.join(", ")
         );
@@ -108,8 +108,8 @@ pub async fn run(state: Arc<Mutex<RuntimeState>>) {
     }
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).expect("bind socket");
-    println!("control socket: {}", socket_path.display());
-    println!("node initialized");
+    log::info!("control socket: {}", socket_path.display());
+    log::info!("node initialized");
 
     // Concurrent control connections are capped: each live connection holds
     // one permit for its lifetime (control-api.md §16).
@@ -126,14 +126,14 @@ pub async fn run(state: Arc<Mutex<RuntimeState>>) {
                 if let Ok((stream, _)) = accepted {
                     let state = state.clone();
                     if !admit_connection(&connections, stream, state) {
-                        println!("control socket: connection refused (cap {MAX_CONTROL_CONNECTIONS})");
+                        log::warn!("control socket: connection refused (cap {MAX_CONTROL_CONNECTIONS})");
                     }
                 }
             }
         }
     }
     let _ = std::fs::remove_file(&socket_path);
-    println!("control socket: closed");
+    log::info!("control socket: closed");
 }
 
 /// Admit one control connection under the concurrent-connection cap. The
@@ -435,12 +435,12 @@ fn set_config(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<
             return (api::StatusCode::InvalidArgument as i32, None);
         };
         if let Err(e) = updated.set_entry(&change.key, &value) {
-            println!("[config] set {}/{} rejected: {e}", change.key, value);
+            log::warn!("[config] set {}/{} rejected: {e}", change.key, value);
             return (api::StatusCode::InvalidArgument as i32, None);
         }
     }
     if let Err(e) = updated.persist() {
-        println!("[config] persist failed: {e}");
+        log::error!("[config] persist failed: {e}");
         return (api::StatusCode::Internal as i32, None);
     }
     state.config = updated;
@@ -510,7 +510,7 @@ fn create_bundle(state: &mut RuntimeState, request: &api::Request) -> (i32, Opti
             (api::StatusCode::Ok as i32, Some(payload))
         }
         Err(e) => {
-            println!("[bundle] create rejected: {e:?}");
+            log::warn!("[bundle] create rejected: {e:?}");
             (api::StatusCode::InvalidArgument as i32, None)
         }
     }

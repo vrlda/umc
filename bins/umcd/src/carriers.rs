@@ -22,7 +22,7 @@ pub fn wire_carriers(state: &mut RuntimeState) {
             "ump.tcp/1" => bind_tcp(state, config.tcp_listen.clone()),
             "ump.udp/1" => bind_udp(state, config.udp_listen.clone()),
             "ump.lan-discovery/1" => register_lan(state),
-            other => println!("[carrier] {other} not built in"),
+            other => log::warn!("[carrier] {other} not built in"),
         }
     }
 }
@@ -36,9 +36,12 @@ fn bind_tcp(state: &mut RuntimeState, bind: Option<String>) {
     match result {
         Ok(listener) => {
             state.listeners.push(listener);
-            println!("[carrier] ump.tcp/1 listening on {addr}");
+            log::info!(
+                "[carrier] ump.tcp/1 listening on {}",
+                crate::logging::redact_addr(&addr)
+            );
         }
-        Err(e) => println!("[carrier] ump.tcp/1 failed to listen on {addr}: {e:?}"),
+        Err(e) => log::error!("[carrier] ump.tcp/1 failed to listen on {addr}: {e:?}"),
     }
 }
 
@@ -49,9 +52,12 @@ fn bind_udp(state: &mut RuntimeState, bind: Option<String>) {
     match result {
         Ok(listener) => {
             state.listeners.push(listener);
-            println!("[carrier] ump.udp/1 listening on {addr}");
+            log::info!(
+                "[carrier] ump.udp/1 listening on {}",
+                crate::logging::redact_addr(&addr)
+            );
         }
-        Err(e) => println!("[carrier] ump.udp/1 failed to listen on {addr}: {e:?}"),
+        Err(e) => log::error!("[carrier] ump.udp/1 failed to listen on {addr}: {e:?}"),
     }
 }
 
@@ -63,7 +69,7 @@ fn register_lan(state: &mut RuntimeState) {
         },
     };
     state.node.register_carrier(Box::new(carrier));
-    println!("[carrier] ump.lan-discovery/1 registered (discovery loop in Task 15+)");
+    log::info!("[carrier] ump.lan-discovery/1 registered (discovery loop in Task 15+)");
 }
 
 #[cfg(test)]

@@ -151,7 +151,7 @@ fn load_candidates(store: &dyn Store) -> Vec<PeerCandidate> {
     let entries = match store.scan(Namespace::Peer) {
         Ok(entries) => entries,
         Err(e) => {
-            eprintln!("[discovery] failed to scan persisted candidates: {e:?}");
+            log::error!("[discovery] failed to scan persisted candidates: {e:?}");
             return out;
         }
     };
@@ -159,12 +159,12 @@ fn load_candidates(store: &dyn Store) -> Vec<PeerCandidate> {
         match serde_json::from_slice::<CandidateJson>(&entry.value) {
             Ok(json) => match json.into_candidate() {
                 Some(candidate) => out.push(candidate),
-                None => eprintln!(
+                None => log::warn!(
                     "[discovery] skipping candidate with unknown enum discriminant (key {})",
                     u64::from_be_bytes(entry.key.try_into().unwrap_or([0; 8]))
                 ),
             },
-            Err(e) => eprintln!("[discovery] skipping corrupt candidate record: {e}"),
+            Err(e) => log::warn!("[discovery] skipping corrupt candidate record: {e}"),
         }
     }
     out
@@ -211,7 +211,7 @@ impl DiscoveryService {
                 continue;
             }
             if let Err(e) = self.candidates.upsert(candidate, now) {
-                eprintln!("[discovery] candidate table full during restore: {e:?}");
+                log::warn!("[discovery] candidate table full during restore: {e:?}");
                 break;
             }
         }
@@ -234,7 +234,7 @@ impl DiscoveryService {
         if let Some(store) = &self.store {
             if let Some(stored) = self.candidates.get(id) {
                 if let Err(e) = save_candidate(store.as_ref(), stored) {
-                    eprintln!("[discovery] failed to persist candidate {id}: {e:?}");
+                    log::error!("[discovery] failed to persist candidate {id}: {e:?}");
                 }
             }
         }
