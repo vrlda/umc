@@ -301,7 +301,7 @@ fn pacing_rate_matches_cwnd_over_rtt() {
     // 12000 × 8000 / 100 = 960,000 bits/s. The burst is capped at
     // min(cwnd / 2, 10 × SMSS) = min(6000, 12000) = 6000 bytes and the
     // freshly enabled bucket starts full at that cap.
-    c.set_smoothed_rtt(100);
+    c.set_smoothed_rtt(100, Instant(0));
     assert_eq!(c.pacing_rate_bps(), 960_000);
     assert_eq!(c.pacing_burst_bytes(), 6_000);
     assert_eq!(c.pacing_tokens(), 6_000);
@@ -310,7 +310,7 @@ fn pacing_rate_matches_cwnd_over_rtt() {
 #[test]
 fn burst_cap_limits_tokens() {
     let mut c = RenoCongestionController::new();
-    c.set_smoothed_rtt(100);
+    c.set_smoothed_rtt(100, Instant(0));
     // Drain the bucket completely.
     c.consume_pacing(6_000, Instant(0));
     assert_eq!(c.pacing_tokens(), 0);
@@ -329,7 +329,7 @@ fn burst_cap_limits_tokens() {
 #[test]
 fn next_send_time_delays_when_tokens_insufficient() {
     let mut c = RenoCongestionController::new();
-    c.set_smoothed_rtt(100);
+    c.set_smoothed_rtt(100, Instant(0));
     c.consume_pacing(6_000, Instant(0));
     assert_eq!(c.pacing_tokens(), 0);
     // With an empty bucket a 1200-byte packet waits 1200 × 8000 / 960000 =
@@ -351,7 +351,7 @@ fn no_pacing_without_rtt() {
     assert_eq!(c.next_send_time(Instant(5), 1_200), None);
     // An explicit zero RTT (the session estimator before its first sample)
     // behaves identically.
-    c.set_smoothed_rtt(0);
+    c.set_smoothed_rtt(0, Instant(0));
     assert_eq!(c.pacing_rate_bps(), 0);
     assert_eq!(c.next_send_time(Instant(5), 1_200), None);
 }
@@ -359,7 +359,7 @@ fn no_pacing_without_rtt() {
 #[test]
 fn pacing_rate_tracks_window_changes() {
     let mut c = RenoCongestionController::new();
-    c.set_smoothed_rtt(100);
+    c.set_smoothed_rtt(100, Instant(0));
     assert_eq!(c.pacing_rate_bps(), 960_000);
     // A loss halves the window: the pacing rate and burst follow the new
     // window (congestion.md §12): 6000 × 8000 / 100 = 480,000 bits/s and
@@ -375,7 +375,7 @@ fn pacing_rate_tracks_window_changes() {
 #[test]
 fn reset_clears_pacing() {
     let mut c = RenoCongestionController::new();
-    c.set_smoothed_rtt(100);
+    c.set_smoothed_rtt(100, Instant(0));
     assert_eq!(c.pacing_rate_bps(), 960_000);
     // Restart clears congestion state (congestion.md §24.21): the pacing
     // rate resets to 0 (unlimited) until a fresh RTT sample arrives.

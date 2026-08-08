@@ -42,8 +42,11 @@ pub trait CongestionController: Send {
     /// Feed the sender's smoothed RTT in milliseconds (congestion.md §12):
     /// activates pacing. A 0 RTT (the estimator before its first sample)
     /// keeps the rate at 0 = unlimited, so pacing changes nothing until the
-    /// RTT is measured.
-    fn set_smoothed_rtt(&mut self, _ms: u64) {}
+    /// RTT is measured. `now` anchors the rate change: the pending refill
+    /// is credited at the OLD rate up to `now` before the bucket is
+    /// re-rated, so a faster clock cannot refund time that accrued at the
+    /// slower rate.
+    fn set_smoothed_rtt(&mut self, _ms: u64, _now: Instant) {}
     /// When the next `bytes` may be put on the wire (congestion.md §12):
     /// `None` sends immediately (tokens cover the packet, or pacing is
     /// unlimited); `Some(t)` waits until `t`. The caller consults this
@@ -92,11 +95,19 @@ const LOSS_THRESHOLD: u32 = 3;
 /// computes the effective tokens at the query instant from the last send
 /// anchor. That way a paced send that sleeps between the query and the
 /// wire never double-counts its own delay.
+///
+/// Tokens are counted in milli-byte units (×1000): the fractional refill
+/// that whole-byte truncation would drop every query is carried, and the
+/// bucket may go negative (debt) so a send that wakes on a truncated delay
+/// is charged its full cost — the debt is then earned back at the pacing
+/// rate, keeping the long-run wire rate exact (a whole-byte/whole-ms
+/// bucket runs ~23% hot on fractional rates).
 #[derive(Debug)]
 pub struct PacingState {
     rate_bps: u64,
     burst_bytes: u64,
-    tokens: u64,
+    /// Tokens in milli-byte units; negative = debt against future refills.
+    tokens_milli: i64,
     last_send: Option<Instant>,
 }
 
@@ -106,7 +117,7 @@ impl PacingState {
         Self {
             rate_bps: 0,
             burst_bytes: 0,
-            tokens: 0,
+            tokens_milli: 0,
             last_send: None,
         }
     }
@@ -128,50 +139,79 @@ impl PacingState {
         } else {
             (cwnd / 2).min(smss.saturating_mul(10))
         };
+        let burst_milli = i64::try_from(self.burst_bytes)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1000);
         if self.rate_bps == 0 {
-            self.tokens = 0;
+            self.tokens_milli = 0;
         } else if was_unlimited {
-            self.tokens = self.burst_bytes;
+            self.tokens_milli = burst_milli;
         } else {
-            self.tokens = self.tokens.min(self.burst_bytes);
+            self.tokens_milli = self.tokens_milli.min(burst_milli);
         }
+    }
+
+    /// Credit the pending refill at the OLD rate and re-anchor the accrual
+    /// clock at `now` (congestion.md §12, rate-change accuracy): elapsed
+    /// before a re-rate must not be refilled at the new rate — the call
+    /// materializes `tokens_at(now)` while the old rate still governs, then
+    /// moves the anchor so only post-change time accrues at the new rate.
+    /// Callers must invoke this BEFORE `set_rate`.
+    fn materialize(&mut self, now: Instant) {
+        if self.last_send.is_some() {
+            self.tokens_milli = self.tokens_at_milli(now);
+        }
+        self.last_send = Some(now);
     }
 
     /// Effective tokens at `now`: the stored tokens plus the refill earned
     /// since the last send, capped at the burst allowance. Read-only — the
-    /// caller queries without mutating the bucket.
-    fn tokens_at(&self, now: Instant) -> u64 {
+    /// caller queries without mutating the bucket. A negative stored value
+    /// (debt) survives: the deficit is covered by the refill first.
+    fn tokens_at_milli(&self, now: Instant) -> i64 {
         let Some(last) = self.last_send else {
-            return self.tokens;
+            return self.tokens_milli;
         };
         let elapsed = now.duration_since(last).as_millis();
-        let refilled = self.rate_bps.saturating_mul(elapsed) / 8_000;
-        self.tokens.saturating_add(refilled).min(self.burst_bytes)
+        let refilled = i64::try_from(self.rate_bps.saturating_mul(elapsed) / 8).unwrap_or(i64::MAX);
+        let burst_milli = i64::try_from(self.burst_bytes)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1000);
+        self.tokens_milli.saturating_add(refilled).min(burst_milli)
     }
 
     /// When the next `needed` bytes may be sent (congestion.md §12):
     /// `None` when the bucket already covers the packet or the rate is 0
     /// (unlimited); `Some(now + deficit / rate)` otherwise — the deficit is
-    /// refilled at the pacing rate.
+    /// refilled at the pacing rate. The whole-millisecond truncation of the
+    /// returned instant is recovered by the debt carry in `consume`.
     #[must_use]
     pub fn next_send_time(&self, now: Instant, needed: usize) -> Option<Instant> {
         if self.rate_bps == 0 {
             return None;
         }
-        let tokens = self.tokens_at(now);
-        let needed = needed as u64;
-        if tokens >= needed {
+        let needed_milli = i64::try_from(needed)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1000);
+        let tokens = self.tokens_at_milli(now);
+        if tokens >= needed_milli {
             return None;
         }
-        let delay_ms = (needed - tokens).saturating_mul(8_000) / self.rate_bps;
+        let rate = i64::try_from(self.rate_bps).unwrap_or(i64::MAX);
+        let delay_ms =
+            u64::try_from((needed_milli - tokens).saturating_mul(8) / rate).unwrap_or(u64::MAX);
         Some(now + Duration::from_millis(delay_ms))
     }
 
     /// A wire send of `bytes` at `now`: refills to `now`, consumes the
-    /// bytes, and anchors the bucket at the real send time.
+    /// bytes, and anchors the bucket at the real send time. A partial
+    /// refill over a truncated delay leaves a debt (negative tokens) that
+    /// the next refill covers — the sender never runs ahead of the rate.
     pub fn consume(&mut self, bytes: usize, now: Instant) {
-        let tokens = self.tokens_at(now);
-        self.tokens = tokens.saturating_sub(bytes as u64);
+        let consumed = i64::try_from(bytes)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1000);
+        self.tokens_milli = self.tokens_at_milli(now).saturating_sub(consumed);
         self.last_send = Some(now);
     }
 
@@ -187,10 +227,10 @@ impl PacingState {
         self.burst_bytes
     }
 
-    /// Tokens currently in the bucket.
+    /// Tokens currently in the bucket (whole bytes, floored at 0).
     #[must_use]
-    pub const fn tokens(&self) -> u64 {
-        self.tokens
+    pub fn tokens(&self) -> u64 {
+        u64::try_from(self.tokens_milli.max(0) / 1000).unwrap_or(u64::MAX)
     }
 }
 
@@ -341,8 +381,18 @@ impl CongestionController for RenoCongestionController {
         self.pacing = PacingState::new();
     }
 
-    fn set_smoothed_rtt(&mut self, ms: u64) {
+    fn set_smoothed_rtt(&mut self, ms: u64, now: Instant) {
+        if self.smoothed_rtt_ms == ms {
+            return;
+        }
         self.smoothed_rtt_ms = ms;
+        // Rate change (congestion.md §12): credit the pending refill at the
+        // OLD rate up to `now` before re-rating, so time that accrued while
+        // the old rate governed is not refunded at the new rate. The anchor
+        // then moves to `now`: only post-change time accrues at the new
+        // rate. An unchanged RTT (the daemon feeds the smoothed value every
+        // pass) leaves the accrual clock untouched.
+        self.pacing.materialize(now);
         self.update_pacing();
     }
 
