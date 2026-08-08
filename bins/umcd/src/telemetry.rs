@@ -32,7 +32,7 @@ pub fn spawn_telemetry_dump_no_clock(metrics: Arc<Registry>, path: PathBuf) {
     spawn_telemetry_dump_at(
         metrics,
         path,
-        crate::runtime_adapters::TokioAdaptor,
+        std::sync::Arc::new(crate::runtime_adapters::TokioAdaptor),
         Duration::from_secs(60),
     );
 }

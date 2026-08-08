@@ -614,7 +614,14 @@ fn set_config(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<
             state.metrics.clone(),
             state.config.resolved_data_dir().join("telemetry.jsonl"),
         );
-        log::info!("[telemetry] enabled (reactive SetConfig) → {}", state.config.resolved_data_dir().join("telemetry.jsonl").display());
+        log::info!(
+            "[telemetry] enabled (reactive SetConfig) → {}",
+            state
+                .config
+                .resolved_data_dir()
+                .join("telemetry.jsonl")
+                .display()
+        );
     }
     let config = node_config_message(&state.config);
     let mut payload = Vec::new();
