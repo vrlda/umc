@@ -6,49 +6,40 @@ pub const TIMER_GRANULARITY_MS: u64 = 1;
 pub const DEFAULT_PTO_MS: u64 = 1_000;
 pub const PACKET_THRESHOLD: u64 = 3;
 /// Probe timeout backoff cap: 6 doublings (congestion.md §10.3).
-pub const MAX_PTO_BACKOFF: u32 = 64;
-const MAX_PTO_BACKOFF_EXPONENT: u32 = 6;
+pub const MAX_PTO_BACKOFF_EXPONENT: u32 = 6;
 
 /// Probe timeout backoff state (congestion.md §10.3): each consecutive PTO
 /// expiry doubles the probe deadline, capped at 64x the base PTO; any ACK
 /// resets the count. Pure math, testable without the daemon loop.
 #[derive(Debug, Clone, Default)]
 pub struct PtoState {
-    /// Consecutive PTO expiries since the last ACK (capped at 6).
+    /// Consecutive PTO expiries since the last ACK (capped at 6); the
+    /// effective multiplier is `2^consecutive`, so Default is naturally 1x.
     consecutive: u32,
-    /// Effective deadline multiplier: `2^consecutive`, capped at
-    /// `MAX_PTO_BACKOFF`. Mirrors `consecutive`; the derived default is 0,
-    /// which the accessor reads as 1x.
-    multiplier: u32,
 }
 
 impl PtoState {
     /// Deadline `now + pto * 2^consecutive`, capped at `now + pto * 64`.
     #[must_use]
     pub fn next_deadline(&self, pto: Duration, now: Instant) -> Instant {
-        now + Duration::from_millis(
-            pto.as_millis()
-                .saturating_mul(u64::from(self.multiplier().min(MAX_PTO_BACKOFF))),
-        )
+        now + Duration::from_millis(pto.as_millis().saturating_mul(u64::from(self.multiplier())))
     }
 
     /// A PTO expiry: consecutive expiries double the deadline until the
     /// 64x cap.
     pub fn on_expiry(&mut self) {
         self.consecutive = (self.consecutive + 1).min(MAX_PTO_BACKOFF_EXPONENT);
-        self.multiplier = 1 << self.consecutive;
     }
 
     /// An ACK-bearing inbound resets the backoff to 1x.
     pub fn on_ack(&mut self) {
         self.consecutive = 0;
-        self.multiplier = 1;
     }
 
     /// The effective deadline multiplier (1x while no expiry has occurred).
     #[must_use]
     pub fn multiplier(&self) -> u32 {
-        self.multiplier.max(1)
+        1u32 << self.consecutive
     }
 }
 
