@@ -20,6 +20,15 @@ pub struct NodeConfig {
     /// Keystore directory; defaults to `<data_dir>/keystore`.
     pub keystore: Option<PathBuf>,
     pub public_relay: bool,
+    /// Emergency protocol kill-switches. Values are comma-separated through
+    /// `SetConfig` and are intentionally independent of the normal carrier
+    /// and relay enablement flags (security-operations.md §15.2).
+    pub disabled_protocol_versions: Vec<String>,
+    pub disabled_crypto_profiles: Vec<String>,
+    pub disabled_carriers: Vec<String>,
+    /// Immediately refuses new public-relay circuit admission. Existing
+    /// circuits are drained by their normal lifetime/close path.
+    pub disable_public_relay: bool,
     /// Telemetry opt-in (core.md §61, privacy.md §38): off by default. The
     /// daemon dumps a bounded JSONL metrics file only when enabled.
     pub telemetry_enabled: bool,
@@ -49,6 +58,10 @@ impl Default for NodeConfig {
             mesh: false,
             keystore: None,
             public_relay: false,
+            disabled_protocol_versions: Vec::new(),
+            disabled_crypto_profiles: Vec::new(),
+            disabled_carriers: Vec::new(),
+            disable_public_relay: false,
             telemetry_enabled: false,
             allow_secret_export: false,
             development_token: None,
@@ -107,6 +120,11 @@ impl NodeConfig {
                     .parse::<bool>()
                     .map_err(|_| format!("public_relay must be a bool, got {value:?}"))?;
             }
+            "disable_public_relay" => {
+                self.disable_public_relay = value
+                    .parse::<bool>()
+                    .map_err(|_| format!("disable_public_relay must be a bool, got {value:?}"))?;
+            }
             "mesh" => {
                 self.mesh = value
                     .parse::<bool>()
@@ -133,9 +151,54 @@ impl NodeConfig {
                 }
                 self.carriers = carriers;
             }
+            "disabled_protocol_versions" => {
+                self.disabled_protocol_versions = parse_csv(value);
+            }
+            "disabled_crypto_profiles" => {
+                self.disabled_crypto_profiles = parse_csv(value);
+            }
+            "disabled_carriers" => {
+                self.disabled_carriers = parse_csv(value);
+            }
             other => return Err(format!("unsupported config key {other:?}")),
         }
         Ok(())
+    }
+
+    /// Whether a protocol version is disabled by the emergency kill-switch.
+    /// Decimal and common hexadecimal spellings are accepted so operators can
+    /// copy values from wire traces or compatibility tables.
+    #[must_use]
+    pub fn protocol_version_disabled(&self, version: u32) -> bool {
+        let decimal = version.to_string();
+        let hex = format!("0x{version:x}");
+        let hex_padded = format!("0x{version:08x}");
+        self.disabled_protocol_versions.iter().any(|entry| {
+            let entry = entry.trim();
+            entry == decimal
+                || entry.eq_ignore_ascii_case(&hex)
+                || entry.eq_ignore_ascii_case(&hex_padded)
+                || entry.eq_ignore_ascii_case(&format!("ump/{version}"))
+        })
+    }
+
+    /// Whether the exact crypto profile identifier has been disabled.
+    #[must_use]
+    pub fn crypto_profile_disabled(&self, profile: &[u8]) -> bool {
+        self.disabled_crypto_profiles.iter().any(|entry| {
+            entry.trim().as_bytes() == profile
+                || entry
+                    .trim()
+                    .eq_ignore_ascii_case(&String::from_utf8_lossy(profile))
+        })
+    }
+
+    /// Whether a carrier type is disabled by the emergency kill-switch.
+    #[must_use]
+    pub fn carrier_disabled(&self, carrier: &str) -> bool {
+        self.disabled_carriers
+            .iter()
+            .any(|entry| entry.trim() == carrier)
     }
 
     /// Persist the current config to [`Self::resolved_config_path`].
@@ -178,6 +241,15 @@ fn expand_tilde(path: &std::path::Path) -> PathBuf {
     path.to_path_buf()
 }
 
+fn parse_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +265,10 @@ mod tests {
             "secret export is off by default"
         );
         assert!(config.keystore.is_none());
+        assert!(config.disabled_protocol_versions.is_empty());
+        assert!(config.disabled_crypto_profiles.is_empty());
+        assert!(config.disabled_carriers.is_empty());
+        assert!(!config.disable_public_relay);
     }
 
     #[test]
@@ -211,12 +287,16 @@ mod tests {
         let path = dir.join("node.json");
         std::fs::write(
             &path,
-            r#"{"public_relay": true, "telemetry_enabled": true, "profile": "standard"}"#,
+            r#"{"public_relay": true, "telemetry_enabled": true, "profile": "standard", "disabled_protocol_versions": ["1"], "disabled_crypto_profiles": ["UMP-CRYPTO-1"], "disabled_carriers": ["ump.tcp/1"], "disable_public_relay": true}"#,
         )
         .unwrap();
         let config = NodeConfig::load(Some(&path)).unwrap();
         assert!(!config.public_relay);
         assert!(!config.telemetry_enabled);
+        assert!(config.protocol_version_disabled(1));
+        assert!(config.crypto_profile_disabled(b"UMP-CRYPTO-1"));
+        assert!(config.carrier_disabled("ump.tcp/1"));
+        assert!(config.disable_public_relay);
     }
 
     #[test]
@@ -264,6 +344,32 @@ mod tests {
         assert!(config.set_entry("no_such_key", "x").is_err());
         // A failed entry leaves the previous value intact.
         assert_eq!(config.profile, "relay");
+    }
+
+    #[test]
+    fn emergency_disablement_entries_round_trip() {
+        let mut config = NodeConfig::default();
+        config
+            .set_entry("disabled_protocol_versions", "1, 0x00000002")
+            .unwrap();
+        config
+            .set_entry("disabled_crypto_profiles", "UMP-CRYPTO-1,legacy")
+            .unwrap();
+        config
+            .set_entry("disabled_carriers", "ump.tcp/1, ump.udp/1")
+            .unwrap();
+        config.set_entry("disable_public_relay", "true").unwrap();
+
+        assert!(config.protocol_version_disabled(1));
+        assert!(config.protocol_version_disabled(2));
+        assert!(!config.protocol_version_disabled(3));
+        assert!(config.crypto_profile_disabled(b"UMP-CRYPTO-1"));
+        assert!(config.carrier_disabled("ump.udp/1"));
+        assert!(config.disable_public_relay);
+
+        config.set_entry("disabled_carriers", "").unwrap();
+        assert!(config.disabled_carriers.is_empty());
+        assert!(config.set_entry("disable_public_relay", "maybe").is_err());
     }
 
     #[test]

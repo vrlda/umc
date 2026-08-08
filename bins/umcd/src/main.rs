@@ -148,6 +148,15 @@ async fn run(config: NodeConfig) {
     let carrier_types = state.lock().expect("state").config.carriers.clone();
     for carrier_type in carrier_types {
         if matches!(carrier_type.as_str(), "ump.tcp/1" | "ump.udp/1") {
+            if state
+                .lock()
+                .expect("state")
+                .config
+                .carrier_disabled(&carrier_type)
+            {
+                log::warn!("[carrier] {carrier_type} disabled; accept loop not started");
+                continue;
+            }
             if let Some(listener) = listeners.pop_front() {
                 let accept_state = state.clone();
                 tokio::spawn(async move {
@@ -193,12 +202,18 @@ pub(crate) async fn accept_loop(
         handshake_timeout::HandshakeTracker::new(),
     ));
     loop {
-        if state
-            .lock()
-            .expect("state")
-            .shutdown_requested
-            .load(Ordering::Relaxed)
-        {
+        let (shutdown, disabled) = {
+            let state = state.lock().expect("state");
+            (
+                state.shutdown_requested.load(Ordering::Relaxed),
+                state.config.carrier_disabled(&carrier_type),
+            )
+        };
+        if shutdown {
+            break;
+        }
+        if disabled {
+            log::warn!("[carrier] {carrier_type} disabled; accept loop stopped");
             break;
         }
         let Ok(link) = tokio::task::block_in_place(|| listener.accept()) else {
@@ -311,6 +326,44 @@ fn handle_inbound_link_locked(
         .expect("handshake tracker")
         .check(&dcid, now)
         .map_err(|e| format!("handshake rejected: {e}"))?;
+
+    // Emergency security controls apply before both the resumed IK path and
+    // the full XX responder. A disabled protocol produces a raw VN packet
+    // listing no enabled versions; disabled carriers/profiles close without
+    // revealing handshake state.
+    let (carrier_disabled, crypto_disabled, protocol_disabled) = {
+        let state = state.lock().expect("state");
+        (
+            state.config.carrier_disabled(carrier_type),
+            state
+                .config
+                .crypto_profile_disabled(umc_handshake::xx::CRYPTO_PROFILE),
+            state
+                .config
+                .protocol_version_disabled(umc_handshake::xx::SUPPORTED_PROTOCOL_VERSION),
+        )
+    };
+    if carrier_disabled {
+        return Err(format!("disabled carrier: {carrier_type}"));
+    }
+    if crypto_disabled {
+        return Err(format!(
+            "disabled crypto profile: {}",
+            String::from_utf8_lossy(umc_handshake::xx::CRYPTO_PROFILE)
+        ));
+    }
+    if protocol_disabled {
+        let bytes = umc_handshake::xx::build_version_negotiation(&vn_scid, &dcid, &[]);
+        tokio::task::block_in_place(|| {
+            link.send(OutboundPacket {
+                bytes,
+                control: true,
+                deadline_ms: Some(3_000),
+            })
+        })
+        .map_err(|e| format!("send disabled-version negotiation: {e:?}"))?;
+        return Err("unsupported protocol version: disabled by policy".into());
+    }
 
     // Session resumption (handshake.md §35, IK mode): a hello offering the
     // IK handshake mode carries a session ticket in `retry_token` (the

@@ -8,11 +8,13 @@ This file is the public entry point for security reporting and handling. The ful
 
 Do NOT open a public issue for security vulnerabilities.
 
-Report privately to the security team:
+Report privately to the security team. The production reporting channel has
+not yet been assigned; its owner must replace `TBD-contact` before a public
+release:
 
-- **Contact:** security@example.invalid (replace with the published address before launch)
+- **Contact:** `TBD-contact`
 - **Signing:** reports containing sensitive detail SHOULD be signed with the published security key
-- **Response target:** acknowledgment within 3 business days; severity assessment within 7 days
+- **Response target:** acknowledgment within 3 business days; severity assessment within 7 days; a fix, mitigation, or agreed disclosure plan within the 90-day SLA
 
 Include:
 
@@ -36,7 +38,12 @@ The security team triages reports using the severity classes in the threat model
 | `MEDIUM` | Scoped metadata disclosure, route manipulation, bounded denial of service |
 | `LOW` | Minor fingerprinting or local degradation |
 
-Coordinated disclosure is the default (90-day embargo from confirmation). Actively exploited critical issues are disclosed earlier.
+Coordinated disclosure is the default: the 90-day disclosure SLA starts when
+the report is confirmed. The security owner gives the reporter a status update
+at least every 14 days, records the affected versions and remediation owner,
+and requests an extension before the deadline when a fix needs more time.
+Actively exploited critical issues are disclosed earlier, with the least
+possible exploit detail.
 
 ## Supported versions
 

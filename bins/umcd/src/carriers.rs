@@ -18,6 +18,10 @@ pub const DEFAULT_UDP_LISTEN: &str = "127.0.0.1:9002";
 pub fn wire_carriers(state: &mut RuntimeState) {
     let config = state.config.clone();
     for carrier_type in &config.carriers {
+        if config.carrier_disabled(carrier_type) {
+            log::warn!("[carrier] {carrier_type} disabled by emergency policy");
+            continue;
+        }
         match carrier_type.as_str() {
             "ump.tcp/1" => bind_tcp(state, config.tcp_listen.clone()),
             "ump.udp/1" => bind_udp(state, config.udp_listen.clone()),
@@ -93,6 +97,26 @@ mod tests {
         wire_carriers(&mut state);
         assert_eq!(state.listeners.len(), 2);
         assert!(state.node.carrier("ump.tcp/1").is_some());
+        assert!(state.node.carrier("ump.udp/1").is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disabled_carrier_is_not_registered_or_bound() {
+        let dir =
+            std::env::temp_dir().join(format!("umcd-carriers-disabled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = NodeConfig {
+            data_dir: dir,
+            tcp_listen: Some("127.0.0.1:0".to_string()),
+            udp_listen: Some("127.0.0.1:0".to_string()),
+            disabled_carriers: vec!["ump.tcp/1".to_string()],
+            ..NodeConfig::default()
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = crate::state::RuntimeState::new(config, tx).unwrap();
+        wire_carriers(&mut state);
+        assert_eq!(state.listeners.len(), 1);
+        assert!(state.node.carrier("ump.tcp/1").is_none());
         assert!(state.node.carrier("ump.udp/1").is_some());
     }
 }
