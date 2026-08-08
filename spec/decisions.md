@@ -1500,3 +1500,43 @@ These decisions establish a clear project boundary:
 * Community experimentation remains possible through carriers, SDKs, routing algorithms, and UMEPs.
 * Neither storage, the control API, Tokio, SQLite, nor the reference daemon becomes part of UMP interoperability.
 * The first release remains narrow enough to build and audit.
+
+---
+
+## 21. Gap-closure implementation decisions (2026-08-08)
+
+The following decisions resolve the implementation questions recorded by the
+A–K gap-closure plan:
+
+1. **Fixed-layout dispatch.** Wire frames that do not carry a length prefix
+   keep their fixed layout; length-delimited relay status and unknown optional
+   frames are skipped using their declared length.
+2. **Protected session transition.** Initial packets protect the early
+   handshake, while the current daemon uses a provisional header-protection
+   continuation until the authenticated session keys are established. The
+   transcript still binds the real identity binding and finished messages.
+3. **Bus protection.** Session-bus payloads are frame payloads, not carrier
+   packets; the destination session encrypts them with its own traffic keys
+   before sending them on the link.
+4. **Relay authorization compatibility.** Signed HMAC-BLAKE2s authorization
+   is validated when present. Empty authorization remains accepted only for
+   legacy phase-12 fixtures and is a tracked hardening item.
+5. **Envelope sealing.** A 32-byte destination hint is treated as the
+   destination public key and receives a sealed bundle envelope. Opaque or
+   legacy hints retain the old payload behavior for compatibility.
+6. **TLS experimental status.** `ump.tls-stream/1` uses TLS 1.3, a channel
+   exporter helper, bounded queues, and the TCP varint framing profile. The
+   reference daemon currently creates an ephemeral self-signed certificate;
+   independent deployments must provide a trust configuration before using
+   it between separate daemons.
+7. **SDK bindings.** Python is a pure-stdlib local client with a small
+   dependency-free protobuf subset. The C ABI is experimental and uses opaque
+   generation-tagged handles plus explicit buffer/status ownership.
+8. **PSK-XX.** PSK mixing is HKDF extract over the PSK and ephemeral DH, then
+   the existing UMC labeled expansion. It is a helper API, not a silent
+   downgrade from XX.
+9. **Privacy ladder.** P0 is the default and P2/P3 mechanisms remain opt-in
+   future work; no release may claim anonymity from encryption alone.
+10. **Deferred capabilities.** 0-RTT, internet-scale discovery, dynamic
+    process plugins, multi-hop relay construction, anonymous credentials,
+    PSI/PIR, and mix modes remain explicit non-goals for v0.1.
