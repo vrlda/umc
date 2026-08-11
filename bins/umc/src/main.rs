@@ -725,8 +725,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::process::{Child, Command as StdCommand, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(unix)]
     use std::time::Duration;
 
     fn parse(args: &[&str]) -> Cli {
@@ -836,6 +838,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn fresh_dir(name: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -850,6 +853,7 @@ mod tests {
 
     /// Locate (and if necessary build) the umcd binary, mirroring the
     /// phase12 harness: a stale daemon silently tests the wrong code.
+    #[cfg(unix)]
     fn umcd_binary() -> PathBuf {
         let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let bin = here
@@ -879,11 +883,13 @@ mod tests {
     }
 
     /// A running daemon; kills the child on drop.
+    #[cfg(unix)]
     struct Daemon {
         child: Child,
         _dir: PathBuf,
     }
 
+    #[cfg(unix)]
     impl Drop for Daemon {
         fn drop(&mut self) {
             let _ = self.child.kill();
@@ -893,6 +899,7 @@ mod tests {
 
     /// Spawn a daemon with no carriers bound (the control socket is all the
     /// smoke test needs).
+    #[cfg(unix)]
     fn spawn_daemon(dir: &Path) -> Daemon {
         let config = format!(
             r#"{{"data_dir": "{}", "control_socket": "{}", "carriers": [], "profile": "standard", "mesh": false, "public_relay": false, "telemetry_enabled": false, "development_token": null}}"#,
@@ -914,6 +921,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn wait_for_socket(socket: &Path) {
         for _ in 0..200 {
             if socket.exists() {
@@ -927,6 +935,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn run_cli(socket: &str, command: Command) -> Vec<String> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
@@ -941,6 +950,7 @@ mod tests {
     /// The new subcommands round-trip against a live daemon: doctor runs
     /// the daemon-side checks, and the list commands hit their service
     /// handlers over the control socket.
+    #[cfg(unix)]
     #[test]
     fn new_subcommands_round_trip_against_a_live_daemon() {
         let dir = fresh_dir("smoke");
