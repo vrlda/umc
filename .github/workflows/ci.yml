@@ -23,7 +23,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
       - uses: arduino/setup-protoc@v3
+        if: runner.os != 'macOS'
         with:
           version: "28.3"
       - name: Install Linux keychain build dependencies
