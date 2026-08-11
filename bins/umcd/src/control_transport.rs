@@ -5,7 +5,7 @@
 //! longer needs to know their internal state: it calls the server's narrow
 //! dispatch/response boundary.
 
-use crate::cancellation::CancellationHandle;
+use crate::cancellation::{CancellationHandle, CancellationRegistry};
 use crate::control_authorization::{authorize_live_request_with_peer, control_principal_id};
 use crate::control_events::acknowledge_event;
 use crate::runtime_adapters::OsEntropy;
@@ -60,6 +60,10 @@ pub(crate) struct ConnectionState {
     pub(crate) draining: bool,
     pub(crate) subscriptions: HashMap<u64, api::EventFilter>,
     pub(crate) next_server_sequence: u64,
+    /// Compatibility-path cancellation table. Live socket readers use their
+    /// own concurrent registry; this table gives direct envelope callers the
+    /// same registration and cleanup semantics at the synchronous boundary.
+    pub(crate) compatibility_cancellation: CancellationRegistry,
 }
 
 impl ConnectionState {
@@ -80,6 +84,7 @@ impl ConnectionState {
             draining: false,
             subscriptions: HashMap::new(),
             next_server_sequence: 1,
+            compatibility_cancellation: CancellationRegistry::new(),
         }
     }
 
@@ -351,6 +356,16 @@ fn rebind_response_request_id(stored: &[u8], request_id: u64) -> Vec<u8> {
     }
 }
 
+fn release_compatibility_cancellation(
+    conn: &ConnectionState,
+    request_id: u64,
+    registered: bool,
+) {
+    if registered {
+        conn.compatibility_cancellation.remove(request_id);
+    }
+}
+
 /// Handle one decoded envelope on a connection. Returns the response bytes to
 /// write back, or `None` when the envelope is dropped or produces no response.
 #[allow(clippy::too_many_lines)]
@@ -425,6 +440,36 @@ fn handle_envelope_inner(
             if let Some(code) = request_validation_status(&request) {
                 return Some(response_envelope(&request, code, None));
             }
+            let compatibility_handle = if cancellation.is_none() {
+                match conn
+                    .compatibility_cancellation
+                    .register(request.request_id)
+                {
+                    Some(handle) => Some(handle),
+                    None => {
+                        return Some(response_envelope(
+                            &request,
+                            api::StatusCode::InvalidArgument as i32,
+                            None,
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            let request_cancellation = compatibility_handle.as_ref().or(cancellation);
+            if request_cancellation.is_some_and(CancellationHandle::is_cancelled) {
+                release_compatibility_cancellation(
+                    conn,
+                    request.request_id,
+                    compatibility_handle.is_some(),
+                );
+                return Some(response_envelope(
+                    &request,
+                    api::StatusCode::Cancelled as i32,
+                    None,
+                ));
+            }
             // Replays still pass the current authorization/resource checks;
             // revocation or handle expiry must not be bypassed by a cached
             // success from earlier on this connection.
@@ -434,9 +479,19 @@ fn handle_envelope_inner(
                 conn.presented_token.as_deref(),
                 conn.os_peer_authenticated,
             ) {
+                release_compatibility_cancellation(
+                    conn,
+                    request.request_id,
+                    compatibility_handle.is_some(),
+                );
                 return Some(response_envelope(&request, code, None));
             }
-            if cancellation.is_some_and(CancellationHandle::is_cancelled) {
+            if request_cancellation.is_some_and(CancellationHandle::is_cancelled) {
+                release_compatibility_cancellation(
+                    conn,
+                    request.request_id,
+                    compatibility_handle.is_some(),
+                );
                 return Some(response_envelope(
                     &request,
                     api::StatusCode::Cancelled as i32,
@@ -464,12 +519,22 @@ fn handle_envelope_inner(
                             "[control] idempotent replay for request {}",
                             request.request_id
                         );
+                        release_compatibility_cancellation(
+                            conn,
+                            request.request_id,
+                            compatibility_handle.is_some(),
+                        );
                         return Some(rebind_response_request_id(&stored, request.request_id));
                     }
                     IdempotencyLookup::Conflict => {
                         log::debug!(
                             "[control] idempotency conflict for request {}",
                             request.request_id
+                        );
+                        release_compatibility_cancellation(
+                            conn,
+                            request.request_id,
+                            compatibility_handle.is_some(),
                         );
                         return Some(response_envelope(
                             &request,
@@ -485,7 +550,7 @@ fn handle_envelope_inner(
                     state,
                     &request,
                     presented_token.as_deref(),
-                    cancellation,
+                    request_cancellation,
                 );
                 let store = state.store.clone();
                 let ticket_key = state.ticket_key;
@@ -499,28 +564,41 @@ fn handle_envelope_inner(
                 ) {
                     log::warn!("[control] idempotency persistence failed: {error}");
                 }
+                release_compatibility_cancellation(
+                    conn,
+                    request.request_id,
+                    compatibility_handle.is_some(),
+                );
                 return Some(response);
             }
             let presented_token = conn.presented_token.clone();
-            Some(dispatch_connection_request_with_cancellation(
+            let response = dispatch_connection_request_with_cancellation(
                 conn,
                 state,
                 &request,
                 presented_token.as_deref(),
-                cancellation,
-            ))
+                request_cancellation,
+            );
+            release_compatibility_cancellation(
+                conn,
+                request.request_id,
+                compatibility_handle.is_some(),
+            );
+            Some(response)
         }
         Some(api::envelope::Body::Cancel(cancel)) => {
             if !conn.hello_received {
                 conn.draining = true;
                 return None;
             }
-            // Direct/unit callers do not provide the live registry. The socket
-            // reader handles cancellation through its in-flight table before
-            // workers reach this compatibility path.
+            // The live reader owns the concurrent registry; direct callers use
+            // the connection-local compatibility registry. Unknown IDs are
+            // deliberately no-ops in both paths.
+            let cancelled = conn.compatibility_cancellation.cancel(cancel.request_id);
             log::debug!(
-                "[control] cancellation ignored for request {}",
-                cancel.request_id
+                "[control] compatibility cancellation {} for request {}",
+                if cancelled { "accepted" } else { "unknown" },
+                cancel.request_id,
             );
             None
         }

@@ -8149,6 +8149,32 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_cancel_marks_an_active_request_and_is_idempotent() {
+        let (mut state, _tx) = test_state();
+        let mut conn = ConnectionState::new();
+        establish_connection(&mut conn, &mut state);
+        let handle = conn
+            .compatibility_cancellation
+            .register(7)
+            .expect("active compatibility request");
+        assert!(handle_envelope(
+            &mut conn,
+            &mut state,
+            envelope(
+                2,
+                api::envelope::Body::Cancel(api::Cancel {
+                    request_id: 7,
+                    reason: "caller cancelled".into(),
+                }),
+            ),
+        )
+        .is_none());
+        assert!(handle.is_cancelled());
+        assert!(!conn.compatibility_cancellation.cancel(7));
+        conn.compatibility_cancellation.remove(7);
+    }
+
+    #[test]
     fn pre_cancelled_request_returns_cancelled_without_dispatch() {
         let (mut state, _tx) = test_state();
         let mut conn = ConnectionState::new();
@@ -8174,6 +8200,27 @@ mod tests {
                 .get(crate::state::metric_names::CONTROL_REQUESTS_NODEADMIN),
             None,
             "cancelled work must not dispatch"
+        );
+    }
+
+    #[test]
+    fn compatibility_dispatch_registers_and_releases_cancellation_state() {
+        let (mut state, _tx) = test_state();
+        let mut conn = ConnectionState::new();
+        establish_connection(&mut conn, &mut state);
+        let response = handle_envelope(
+            &mut conn,
+            &mut state,
+            request_envelope(2, request("NodeAdmin", "GetStatus", vec![])),
+        )
+        .expect("direct compatibility response");
+        assert_eq!(
+            decode_response(&response).status.unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        assert!(
+            !conn.compatibility_cancellation.cancel(2),
+            "completed direct requests must be removed from the cancellation table"
         );
     }
 
