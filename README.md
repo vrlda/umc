@@ -85,10 +85,10 @@ embedded backend. The C and Python interfaces speak the local Control API.
 
 ## Platform status
 
-The Unix daemon uses a protected Unix-domain control socket. Windows builds
-compile the libraries and CLI, while named-pipe daemon control is not yet
-available. TCP, TLS, UDP, LAN, embedded transport, storage, routing, and
-security behavior are covered by the implementation and automated checks.
+The Unix daemon uses a protected Unix-domain control socket. Windows uses a
+local-only named pipe with the same framed control API and handshake. TCP, TLS,
+UDP, LAN, embedded transport, storage, routing, and security behavior are
+covered by the implementation and automated checks.
 
 UMC's privacy and topology mechanisms are bounded: it does not claim a global
 topology database, unrestricted multipath, anonymous credentials, or

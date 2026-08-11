@@ -2,9 +2,9 @@ pub mod app;
 pub mod backpressure;
 pub mod client;
 pub mod config;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod daemon;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 #[path = "daemon_stub.rs"]
 pub mod daemon;
 pub mod embedded;

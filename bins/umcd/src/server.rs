@@ -1,4 +1,4 @@
-//! Control socket server: Unix stream socket, framing, connection handling,
+//! Control transport server: local stream/pipe transport, framing, connection handling,
 //! and the service-backed envelope dispatcher (control-api.md §16-24).
 use crate::cancellation::CancellationHandle;
 use crate::cancellation::CancellationRegistry;
@@ -33,7 +33,10 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
 use tokio::sync::mpsc;
 use umc_bundle::envelope::seal_bundle;
 use umc_bundle::manager::BundleStatus;
@@ -203,6 +206,7 @@ struct ListenResponse {
     bound_address: String,
 }
 
+#[cfg(unix)]
 pub async fn run(state: Arc<Mutex<RuntimeState>>) {
     let data_dir = {
         let state = state.lock().expect("runtime state");
@@ -266,9 +270,86 @@ pub async fn run(state: Arc<Mutex<RuntimeState>>) {
     log::info!("control socket: closed");
 }
 
+/// Windows named-pipe control server. Named pipes are local-only by default:
+/// Tokio's `ServerOptions` rejects remote clients and each connection uses
+/// the same Control API framing and hello handshake as the Unix path.
+#[cfg(windows)]
+pub async fn run(state: Arc<Mutex<RuntimeState>>) {
+    let data_dir = {
+        let state = state.lock().expect("runtime state");
+        state.config.resolved_data_dir()
+    };
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+    let store = state.lock().expect("runtime state").store.clone();
+    log::info!("data directory: {}", data_dir.display());
+
+    if let Ok((profile, carriers)) = load_node_state(&store) {
+        log::info!(
+            "node state: profile {profile}, carriers [{}]",
+            carriers.join(", ")
+        );
+    }
+    let config = state.lock().expect("runtime state").config.clone();
+    persist_node_state(&store, &config).expect("persist node state");
+
+    let pipe_name = state
+        .lock()
+        .expect("runtime state")
+        .control_socket
+        .to_string_lossy()
+        .into_owned();
+    if !pipe_name.starts_with(r"\\.\pipe\") {
+        log::error!(
+            "control_socket must be a Windows named pipe (\\\\.\\pipe\\name), got {pipe_name}"
+        );
+        return;
+    }
+    log::info!("control pipe: {pipe_name}");
+    log::info!("node initialized");
+
+    let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONTROL_CONNECTIONS));
+    loop {
+        if state
+            .lock()
+            .expect("runtime state")
+            .shutdown_requested
+            .load(Ordering::Relaxed)
+        {
+            break;
+        }
+
+        let mut options = ServerOptions::new();
+        options.pipe_mode(PipeMode::Byte);
+        let pipe = match options.create(&pipe_name) {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                log::error!("control pipe: create failed for {pipe_name}: {error}");
+                break;
+            }
+        };
+        tokio::select! {
+            connected = pipe.connect() => {
+                if let Err(error) = connected {
+                    log::warn!("control pipe: connect failed: {error}");
+                    continue;
+                }
+                let Ok(permit) = connections.clone().try_acquire_owned() else {
+                    log::warn!("control pipe: connection refused (cap {MAX_CONTROL_CONNECTIONS})");
+                    let _ = pipe.disconnect();
+                    continue;
+                };
+                tokio::spawn(handle_connection(pipe, state.clone(), permit));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+    }
+    log::info!("control pipe: closed");
+}
+
 /// Admit one control connection under the concurrent-connection cap. The
 /// permit is held for the connection's lifetime; returns `false` when the
 /// cap is reached and the connection is refused.
+#[cfg(unix)]
 fn admit_connection(
     connections: &Arc<tokio::sync::Semaphore>,
     stream: UnixStream,
@@ -284,28 +365,19 @@ fn admit_connection(
     let Ok(permit) = connections.clone().try_acquire_owned() else {
         return false;
     };
-    tokio::spawn(handle_connection(stream, state, permit, daemon_uid));
+    tokio::spawn(handle_connection(stream, state, permit));
     true
 }
 
 #[allow(clippy::too_many_lines)]
-async fn handle_connection(
-    mut stream: UnixStream,
+async fn handle_connection<S>(
+    mut stream: S,
     state: Arc<Mutex<RuntimeState>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
-    daemon_uid: u32,
-) {
-    // OS peer-credential authorization (control-api.md §11.1): the peer uid
-    // on the Unix control socket must equal the daemon's uid; any other
-    // local user's connection is refused before any envelope is read. The
-    // control socket is always a Unix stream socket (config.rs
-    // `control_socket`), so no TCP or non-Unix path exists to skip; a
-    // hypothetical loopback-TCP transport would have to bypass this check
-    // (control-api.md §48.7 — loopback TCP lacks peer credentials).
-    if !os_peer_authorized(&stream, daemon_uid) {
-        log::warn!("control socket: peer uid mismatch, refusing connection");
-        return;
-    }
+)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let mut decoder = EnvelopeDecoder::new(DEFAULT_ENVELOPE_MAX);
     let mut buf = [0u8; 8 * 1024];
     let conn = Arc::new(Mutex::new(ConnectionState::authenticated_peer()));
@@ -491,6 +563,7 @@ async fn handle_connection(
 
 /// Unix-socket peer-credential check (control-api.md §11.1): the peer must
 /// report the daemon's uid via `SO_PEERCRED` (tokio `peer_cred`).
+#[cfg(unix)]
 fn os_peer_authorized(stream: &UnixStream, daemon_uid: u32) -> bool {
     match stream.peer_cred() {
         Ok(peer) => peer.uid() == daemon_uid,
@@ -4561,7 +4634,7 @@ pub fn load_node_state(store: &SqliteStore) -> Result<(String, Vec<String>), Str
     Ok((profile, carriers))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::control_transport::{IdempotencyCache, IDEMPOTENCY_CACHE_CAP, IDEMPOTENCY_TTL_MS};

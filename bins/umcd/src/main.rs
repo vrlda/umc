@@ -1,12 +1,9 @@
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 include!("unix_main.rs");
 
-/// The daemon's Unix-domain control socket and filesystem permission model
-/// are intentionally authoritative for v0.1. Windows named-pipe transport is
-/// deferred, but the package remains compileable on Tier-1 CI.
-#[cfg(not(unix))]
+/// Unsupported targets remain compileable, but do not claim a daemon runtime
+/// until a local control transport is available.
+#[cfg(not(any(unix, windows)))]
 fn main() {
-    eprintln!(
-        "umcd runtime is unavailable on this platform; Windows named-pipe support is deferred"
-    );
+    eprintln!("umcd runtime is unavailable on this platform; no control transport is available");
 }

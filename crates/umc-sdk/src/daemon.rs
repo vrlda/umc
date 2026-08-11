@@ -7,6 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use umc_control::framing::{frame_envelope, EnvelopeDecoder};
 use umc_control::proto::umc::api::v1 as api;
@@ -18,10 +21,15 @@ const MAX_PENDING_RESPONSES: usize = 1_024;
 const MAX_PENDING_EVENTS: usize = 100;
 const MAX_PENDING_ENVELOPES: usize = 1_024;
 
+#[cfg(unix)]
+type DaemonStream = UnixStream;
+#[cfg(windows)]
+type DaemonStream = NamedPipeClient;
+
 /// Connected daemon control socket with hello negotiation done.
 #[derive(Debug)]
 pub struct DaemonClient {
-    stream: UnixStream,
+    stream: DaemonStream,
     sequence: u64,
     request_id: u64,
     generation: u64,
@@ -41,9 +49,12 @@ impl DaemonClient {
     /// [`ClientError::VersionMismatch`] or [`ClientError::Denied`] when the
     /// handshake is not accepted.
     pub async fn connect(socket: &str, client_name: &str) -> Result<Self, ClientError> {
+        #[cfg(unix)]
         let stream = UnixStream::connect(socket)
             .await
             .map_err(|e| ClientError::Io(e.to_string()))?;
+        #[cfg(windows)]
+        let stream = connect_named_pipe(socket).await?;
         let mut client = Self {
             stream,
             sequence: 1,
@@ -292,6 +303,22 @@ impl DaemonClient {
             if let Some(envelope) = self.pending_envelopes.pop_front() {
                 return Ok(envelope);
             }
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn connect_named_pipe(socket: &str) -> Result<NamedPipeClient, ClientError> {
+    // ERROR_PIPE_BUSY. Tokio's named-pipe client exposes raw OS errors without
+    // requiring callers to depend on `windows-sys` directly.
+    const ERROR_PIPE_BUSY: i32 = 231;
+    loop {
+        match ClientOptions::new().open(socket) {
+            Ok(client) => return Ok(client),
+            Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => return Err(ClientError::Io(error.to_string())),
         }
     }
 }
@@ -632,5 +659,29 @@ mod tests {
         assert_eq!(event.sequence(), 1);
         assert_eq!(event.subscription().as_bytes(), b"subscription");
         server.await.expect("server task");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    #[tokio::test]
+    async fn named_pipe_connect_retries_until_server_is_ready() {
+        let pipe_name = format!(r"\\.\pipe\umc-sdk-test-{}", std::process::id());
+        let server = ServerOptions::new()
+            .create(&pipe_name)
+            .expect("create named-pipe server");
+        let server_task = tokio::spawn(async move {
+            server.connect().await.expect("accept named-pipe client");
+        });
+
+        let client = tokio::time::timeout(Duration::from_secs(5), connect_named_pipe(&pipe_name))
+            .await
+            .expect("named-pipe connect timed out")
+            .expect("named-pipe connect failed");
+        drop(client);
+        server_task.await.expect("server task");
     }
 }

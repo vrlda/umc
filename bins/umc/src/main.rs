@@ -11,6 +11,11 @@ use umc_sdk::config::ConfigClient;
 use umc_sdk::daemon::DaemonClient;
 use umc_sdk::status::StatusClient;
 
+#[cfg(unix)]
+const DEFAULT_SOCKET: &str = "~/.local/run/umc.sock";
+#[cfg(windows)]
+const DEFAULT_SOCKET: &str = r"\\.\pipe\umc";
+#[cfg(not(any(unix, windows)))]
 const DEFAULT_SOCKET: &str = "~/.local/run/umc.sock";
 const CLIENT_NAME: &str = "umc-cli";
 
@@ -21,6 +26,35 @@ const DEFAULT_DATA_DIR: &str = "~/.local/share/umc";
 /// The default config `umc init` writes (mirroring `umcd --init`, core.md
 /// §19): the documented keys with conservative defaults. Written only when
 /// no config file exists; the daemon's `NodeConfig::load` accepts it as-is.
+#[cfg(unix)]
+const DEFAULT_CONFIG_JSON: &str = r#"{
+  "data_dir": "~/.local/share/umc",
+  "control_socket": "~/.local/run/umc.sock",
+  "profile": "standard",
+  "carriers": ["ump.tcp/1", "ump.udp/1"],
+  "mesh": false,
+  "keystore": null,
+  "public_relay": false,
+  "telemetry_enabled": false,
+  "development_token": null
+}
+"#;
+
+#[cfg(windows)]
+const DEFAULT_CONFIG_JSON: &str = r#"{
+  "data_dir": "~/.local/share/umc",
+  "control_socket": "\\\\.\\pipe\\umc",
+  "profile": "standard",
+  "carriers": ["ump.tcp/1", "ump.udp/1"],
+  "mesh": false,
+  "keystore": null,
+  "public_relay": false,
+  "telemetry_enabled": false,
+  "development_token": null
+}
+"#;
+
+#[cfg(not(any(unix, windows)))]
 const DEFAULT_CONFIG_JSON: &str = r#"{
   "data_dir": "~/.local/share/umc",
   "control_socket": "~/.local/run/umc.sock",
@@ -588,7 +622,10 @@ fn default_data_dir() -> PathBuf {
 fn expand_home(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if let Some(rest) = text.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
+        if let Some(home) = std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok())
+        {
             return PathBuf::from(home).join(rest);
         }
     }
@@ -800,6 +837,11 @@ mod tests {
     #[test]
     fn default_socket_matches_daemon_config() {
         let cli = parse(&["umc", "status"]);
+        #[cfg(unix)]
+        assert_eq!(cli.socket, "~/.local/run/umc.sock");
+        #[cfg(windows)]
+        assert_eq!(cli.socket, r"\\.\pipe\umc");
+        #[cfg(not(any(unix, windows)))]
         assert_eq!(cli.socket, "~/.local/run/umc.sock");
     }
 

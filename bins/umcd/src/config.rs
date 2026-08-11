@@ -5,6 +5,13 @@ use std::str::FromStr;
 use umc_core::privacy::PrivacyProfile;
 use umc_storage::quota::Profile;
 
+#[cfg(unix)]
+const DEFAULT_CONTROL_SOCKET: &str = "~/.local/run/umc.sock";
+#[cfg(windows)]
+const DEFAULT_CONTROL_SOCKET: &str = r"\\.\pipe\umc";
+#[cfg(not(any(unix, windows)))]
+const DEFAULT_CONTROL_SOCKET: &str = "~/.local/run/umc.sock";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 // The four bools are independent flat config flags (mesh mode, relay,
@@ -103,7 +110,7 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("~/.local/share/umc"),
-            control_socket: PathBuf::from("~/.local/run/umc.sock"),
+            control_socket: PathBuf::from(DEFAULT_CONTROL_SOCKET),
             profile: "standard".to_string(),
             privacy_profile: PrivacyProfile::P0.as_str().to_string(),
             privacy_policy_override: None,
@@ -508,11 +515,17 @@ impl NodeConfig {
 fn expand_tilde(path: &std::path::Path) -> PathBuf {
     let s = path.to_string_lossy();
     if let Some(rest) = s.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
+        if let Some(home) = home_directory() {
             return PathBuf::from(home).join(rest);
         }
     }
     path.to_path_buf()
+}
+
+fn home_directory() -> Option<String> {
+    std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
 }
 
 fn parse_csv(value: &str) -> Vec<String> {
