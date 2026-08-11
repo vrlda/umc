@@ -6,6 +6,8 @@
 //! synchronously: the carriers run blocking `Handle::block_on` calls that
 //! panic from an async context on the same runtime, so the handshake runs
 //! on a `spawn_blocking` thread exactly like the daemon's accept loops.
+#![cfg(unix)]
+
 use prost::Message;
 use std::fs;
 use std::path::{Path, PathBuf};

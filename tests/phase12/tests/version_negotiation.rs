@@ -3,6 +3,8 @@
 //! packet from the live daemon listing version 1 (the wire's only
 //! supported version), and the retry — a fresh connection offering
 //! version 1 — completes the full XX handshake with session secrets.
+#![cfg(unix)]
+
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};

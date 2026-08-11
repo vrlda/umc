@@ -8,6 +8,8 @@
 //! panic from an async context on the same runtime, so the handshake and
 //! the session loop run on a `spawn_blocking` thread exactly like the
 //! daemon's accept loops (phase8 harness).
+#![cfg(unix)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

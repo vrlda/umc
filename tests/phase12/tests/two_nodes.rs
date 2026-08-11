@@ -6,6 +6,8 @@
 //! The daemon binary is spawned exactly like the phase 9 harness; the
 //! client-side session traffic runs on `spawn_blocking` threads because the
 //! carriers use blocking `Handle::block_on` calls.
+#![cfg(unix)]
+
 use prost::Message;
 use std::fs;
 use std::future::Future;

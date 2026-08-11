@@ -23,6 +23,8 @@
 //! method, and the real TCP carrier's `Handle::block_on` cannot nest inside
 //! a runtime, so the live test drives it with a carrier that performs plain
 //! blocking IO (mirroring the phase9 synchronous harness).
+#![cfg(unix)]
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;

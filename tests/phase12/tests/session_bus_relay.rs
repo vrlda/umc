@@ -19,6 +19,8 @@
 //! writer. The test therefore runs sends with no recv in flight, and B
 //! pings periodically so the daemon's recv pump hands the stream mutex to
 //! B's writer long enough to flush the forwarded frame.
+#![cfg(unix)]
+
 use prost::Message;
 use std::future::Future;
 use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};

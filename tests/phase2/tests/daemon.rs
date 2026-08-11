@@ -1,4 +1,6 @@
 //! Phase 2 integration: daemon lifecycle, hello, request/response, restart.
+#![cfg(unix)]
+
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
