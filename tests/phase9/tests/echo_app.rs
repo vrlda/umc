@@ -337,7 +337,19 @@ fn tcp_handshake(node: &Node, remote: &str) -> Result<(BoxLink, Session), String
     .map_err(|e| format!("initial packet: {e}"))?;
     send_packet(link.as_ref(), &initial)?;
     std::thread::sleep(Duration::from_millis(100));
-    let server_hello_bytes = link.recv().map_err(|e| format!("recv: {e:?}"))?.bytes;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let server_hello_bytes = loop {
+        match link.recv() {
+            Ok(packet) => break packet.bytes,
+            Err(error)
+                if error.kind == umc_carrier::error::CarrierErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("recv: {error:?}")),
+        }
+    };
     let server_hello_payload =
         umc_handshake::initial::parse_initial_with_keys(&server_hello_bytes, &initial_keys.server)
             .ok_or("server Initial rejected")?
