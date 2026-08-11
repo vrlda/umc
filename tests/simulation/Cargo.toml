@@ -1,0 +1,14 @@
+[package]
+name = "umc-simulation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+umc-session = { path = "../../crates/umc-session" }
+umc-types = { path = "../../crates/umc-types" }
+umc-wire = { path = "../../crates/umc-wire" }
+
+[lints]
+workspace = true

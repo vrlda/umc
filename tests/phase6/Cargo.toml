@@ -1,0 +1,15 @@
+[package]
+name = "phase6-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+umc-bundle = { path = "../../crates/umc-bundle" }
+umc-crypto = { path = "../../crates/umc-crypto" }
+umc-storage = { path = "../../crates/umc-storage" }
+umc-types = { path = "../../crates/umc-types" }
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "umc-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+umc-types = { path = "../umc-types" }
+umc-wire = { path = "../umc-wire" }
+umc-crypto = { path = "../umc-crypto" }
+
+[lints]
+workspace = true

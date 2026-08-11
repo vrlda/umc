@@ -1,0 +1,107 @@
+[package]
+name = "umc-wire-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+prost = "0.13"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde_json = "1"
+umc-carrier = { path = "../crates/umc-carrier" }
+umc-control = { path = "../crates/umc-control" }
+umc-crypto = { path = "../crates/umc-crypto" }
+umc-handshake = { path = "../crates/umc-handshake" }
+umc-plugin = { path = "../crates/umc-plugin" }
+umc-storage = { path = "../crates/umc-storage" }
+umc-wire = { path = "../crates/umc-wire" }
+
+[[bin]]
+name = "wire_parser"
+path = "fuzz_targets/wire_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "relay_frames"
+path = "fuzz_targets/relay_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_encoding"
+path = "fuzz_targets/handshake_encoding.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bundle_frame"
+path = "fuzz_targets/bundle_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_envelope"
+path = "fuzz_targets/control_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "carrier_framing"
+path = "fuzz_targets/carrier_framing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_packet"
+path = "fuzz_targets/session_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "identity_binding"
+path = "fuzz_targets/identity_binding.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "route_frames"
+path = "fuzz_targets/route_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "plugin_manifest"
+path = "fuzz_targets/plugin_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "db_recovery"
+path = "fuzz_targets/db_recovery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "storage_recovery"
+path = "fuzz_targets/storage_recovery.rs"
+test = false
+doc = false
+bench = false

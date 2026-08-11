@@ -1,0 +1,17 @@
+[package]
+name = "umc-sdk-c"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "umc_sdk_c"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+umc-sdk = { path = "../umc-sdk" }
+tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
+
+[lints]
+workspace = true

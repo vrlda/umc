@@ -1,0 +1,16 @@
+[package]
+name = "phase3-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+umc-types = { path = "../../crates/umc-types" }
+umc-routing = { path = "../../crates/umc-routing" }
+umc-relay = { path = "../../crates/umc-relay" }
+umc-discovery = { path = "../../crates/umc-discovery" }
+umc-wire = { path = "../../crates/umc-wire" }
+
+[lints]
+workspace = true

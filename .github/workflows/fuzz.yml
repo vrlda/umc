@@ -1,0 +1,59 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - "crates/umc-carrier/**"
+      - "crates/umc-control/**"
+      - "crates/umc-handshake/**"
+      - "crates/umc-plugin/**"
+      - "crates/umc-session/**"
+      - "crates/umc-storage/**"
+      - "crates/umc-wire/**"
+      - "carriers/**"
+      - "scripts/fuzz-report.sh"
+      - "scripts/verify-fuzz-report.sh"
+      - ".github/workflows/fuzz.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: Fuzz corpus smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Run each target against its seed corpus and write report
+        run: bash scripts/fuzz-report.sh "$RUNNER_TEMP/umc-fuzz-report" 1000
+      - name: Verify fuzz report
+        run: bash scripts/verify-fuzz-report.sh "$RUNNER_TEMP/umc-fuzz-report/fuzz-report.json"
+      - name: Upload corpus/resource report
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-resource-report
+          path: ${{ runner.temp }}/umc-fuzz-report
+
+  nightly:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    name: Nightly fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wire_parser, relay_frames, handshake_encoding, bundle_frame, control_envelope, carrier_framing, session_packet, identity_binding, route_frames, plugin_manifest, db_recovery, storage_recovery]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz for ten minutes
+        working-directory: fuzz
+        run: cargo fuzz run "${{ matrix.target }}" "corpus/${{ matrix.target }}" --sanitizer none -- -max_total_time=600

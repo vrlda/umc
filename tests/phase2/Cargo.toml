@@ -1,0 +1,13 @@
+[package]
+name = "phase2-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+umc-sdk = { path = "../../crates/umc-sdk" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time"] }
+
+[lints]
+workspace = true

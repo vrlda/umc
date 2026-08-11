@@ -1,0 +1,19 @@
+[package]
+name = "umc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "umc"
+path = "src/main.rs"
+
+[dependencies]
+umc-control = { path = "../../crates/umc-control" }
+umc-sdk = { path = "../../crates/umc-sdk" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "net", "io-util"] }
+prost = "0.13"
+
+[lints]
+workspace = true

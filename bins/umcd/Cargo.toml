@@ -1,0 +1,44 @@
+[package]
+name = "umcd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "umcd"
+path = "src/main.rs"
+
+[dependencies]
+umc-types = { path = "../../crates/umc-types" }
+umc-core = { path = "../../crates/umc-core" }
+umc-carrier = { path = "../../crates/umc-carrier" }
+umc-storage = { path = "../../crates/umc-storage" }
+umc-control = { path = "../../crates/umc-control" }
+umc-handshake = { path = "../../crates/umc-handshake" }
+umc-wire = { path = "../../crates/umc-wire" }
+umc-session = { path = "../../crates/umc-session" }
+umc-crypto = { path = "../../crates/umc-crypto" }
+umc-carrier-tcp = { path = "../../carriers/umc-carrier-tcp" }
+umc-carrier-tls = { path = "../../carriers/umc-carrier-tls" }
+umc-carrier-udp = { path = "../../carriers/umc-carrier-udp" }
+umc-carrier-lan = { path = "../../carriers/umc-carrier-lan" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+prost = "0.13"
+umc-bundle = { path = "../../crates/umc-bundle" }
+umc-discovery = { path = "../../crates/umc-discovery" }
+umc-relay = { path = "../../crates/umc-relay" }
+umc-routing = { path = "../../crates/umc-routing" }
+umc-metrics = { path = "../../crates/umc-metrics" }
+blake2 = "0.10"
+log = "0.4"
+env_logger = "0.11"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }

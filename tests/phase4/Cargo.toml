@@ -1,0 +1,16 @@
+[package]
+name = "phase4-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+umc-types = { path = "../../crates/umc-types" }
+umc-session = { path = "../../crates/umc-session" }
+umc-handshake = { path = "../../crates/umc-handshake" }
+umc-crypto = { path = "../../crates/umc-crypto" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

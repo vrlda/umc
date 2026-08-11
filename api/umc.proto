@@ -1,0 +1,1133 @@
+syntax = "proto3";
+
+package umc.api.v1;
+
+option java_multiple_files = true;
+option java_package = "org.universalmesh.umc.api.v1";
+option java_outer_classname = "UmcApi";
+option csharp_namespace = "UniversalMesh.Umc.Api.V1";
+
+// The custom local transport frames each Envelope with a 32-bit big-endian
+// length. Service declarations define method names and typed payloads; they do
+// not require gRPC or HTTP/2.
+
+message ApiVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+message Envelope {
+  ApiVersion api_version = 1;
+  uint64 sequence = 2;
+
+  oneof body {
+    ClientHello client_hello = 10;
+    ServerHello server_hello = 11;
+    Request request = 12;
+    Response response = 13;
+    Cancel cancel = 14;
+    Event event = 15;
+    EventAck event_ack = 16;
+    GoAway go_away = 17;
+  }
+}
+
+enum ClientKind {
+  CLIENT_KIND_UNSPECIFIED = 0;
+  CLIENT_KIND_ADMIN = 1;
+  CLIENT_KIND_APPLICATION = 2;
+  CLIENT_KIND_DIAGNOSTIC = 3;
+  CLIENT_KIND_TEST = 4;
+}
+
+message ClientHello {
+  repeated ApiVersion supported_versions = 1;
+  string client_name = 2;
+  bytes client_instance_id = 3;
+  ClientKind client_kind = 4;
+  ClientAuthentication authentication = 5;
+  uint32 requested_envelope_size = 6;
+  repeated string requested_features = 7;
+}
+
+message ClientAuthentication {
+  oneof method {
+    OsPeerAuthentication os_peer = 1;
+    BearerAuthentication bearer = 2;
+    DevelopmentAuthentication development = 3;
+    CombinedAuthentication combined = 4;
+  }
+}
+
+message OsPeerAuthentication {}
+
+message BearerAuthentication {
+  bytes token = 1;
+}
+
+message DevelopmentAuthentication {
+  bytes token = 1;
+}
+
+message CombinedAuthentication {
+  bytes bearer_token = 1;
+  bool require_os_peer = 2;
+}
+
+enum NodeLifecycleState {
+  NODE_LIFECYCLE_STATE_UNSPECIFIED = 0;
+  NODE_LIFECYCLE_STATE_STARTING = 1;
+  NODE_LIFECYCLE_STATE_RUNNING = 2;
+  NODE_LIFECYCLE_STATE_DEGRADED = 3;
+  NODE_LIFECYCLE_STATE_DRAINING = 4;
+  NODE_LIFECYCLE_STATE_STOPPING = 5;
+}
+
+message ServerHello {
+  ApiVersion selected_version = 1;
+  bytes server_instance_id = 2;
+  NodeLifecycleState node_state = 3;
+  bytes connection_id = 4;
+  bytes principal_id = 5;
+  repeated CapabilityGrant granted_capabilities = 6;
+  uint32 negotiated_envelope_size = 7;
+  repeated string enabled_features = 8;
+  ConnectionLimits limits = 9;
+}
+
+message ConnectionLimits {
+  uint32 maximum_envelope_size = 1;
+  uint32 maximum_concurrent_requests = 2;
+  uint32 maximum_queued_requests = 3;
+  uint32 maximum_event_streams = 4;
+  uint32 maximum_event_backlog = 5;
+  uint64 maximum_event_backlog_bytes = 6;
+}
+
+message Request {
+  uint64 request_id = 1;
+  string service = 2;
+  string method = 3;
+  int64 deadline_unix_ms = 4;
+  bytes idempotency_key = 5;
+  bytes payload = 6;
+}
+
+message Response {
+  uint64 request_id = 1;
+  Status status = 2;
+  bytes payload = 3;
+  int64 completed_at_unix_ms = 4;
+}
+
+message Cancel {
+  uint64 request_id = 1;
+  string reason = 2;
+}
+
+message GoAway {
+  GoAwayReason reason = 1;
+  uint64 last_accepted_request_id = 2;
+  int64 drain_deadline_unix_ms = 3;
+  string message = 4;
+}
+
+enum GoAwayReason {
+  GO_AWAY_REASON_UNSPECIFIED = 0;
+  GO_AWAY_REASON_NORMAL = 1;
+  GO_AWAY_REASON_SERVER_SHUTDOWN = 2;
+  GO_AWAY_REASON_RELOAD = 3;
+  GO_AWAY_REASON_VERSION_RETIRED = 4;
+  GO_AWAY_REASON_AUTHORIZATION_REVOKED = 5;
+  GO_AWAY_REASON_RESOURCE_PRESSURE = 6;
+  GO_AWAY_REASON_PROTOCOL_ERROR = 7;
+}
+
+enum StatusCode {
+  STATUS_CODE_OK = 0;
+  STATUS_CODE_CANCELLED = 1;
+  STATUS_CODE_UNKNOWN = 2;
+  STATUS_CODE_INVALID_ARGUMENT = 3;
+  STATUS_CODE_DEADLINE_EXCEEDED = 4;
+  STATUS_CODE_NOT_FOUND = 5;
+  STATUS_CODE_ALREADY_EXISTS = 6;
+  STATUS_CODE_PERMISSION_DENIED = 7;
+  STATUS_CODE_UNAUTHENTICATED = 8;
+  STATUS_CODE_RESOURCE_EXHAUSTED = 9;
+  STATUS_CODE_FAILED_PRECONDITION = 10;
+  STATUS_CODE_ABORTED = 11;
+  STATUS_CODE_OUT_OF_RANGE = 12;
+  STATUS_CODE_UNIMPLEMENTED = 13;
+  STATUS_CODE_INTERNAL = 14;
+  STATUS_CODE_UNAVAILABLE = 15;
+  STATUS_CODE_DATA_LOSS = 16;
+  STATUS_CODE_CONFLICT = 17;
+  STATUS_CODE_IDEMPOTENCY_CONFLICT = 18;
+}
+
+message Status {
+  StatusCode code = 1;
+  string message = 2;
+  repeated StatusDetail details = 3;
+  uint64 retry_after_ms = 4;
+}
+
+message StatusDetail {
+  string type = 1;
+  bytes value = 2;
+}
+
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  CAPABILITY_NODE_READ = 1;
+  CAPABILITY_NODE_ADMIN = 2;
+  CAPABILITY_NODE_SHUTDOWN = 3;
+  CAPABILITY_IDENTITY_READ = 10;
+  CAPABILITY_IDENTITY_CREATE = 11;
+  CAPABILITY_IDENTITY_ROTATE = 12;
+  CAPABILITY_IDENTITY_EXPORT_PUBLIC = 13;
+  CAPABILITY_IDENTITY_EXPORT_SECRET = 14;
+  CAPABILITY_IDENTITY_DELETE = 15;
+  CAPABILITY_CARRIER_READ = 20;
+  CAPABILITY_CARRIER_ADMIN = 21;
+  CAPABILITY_PEER_READ = 30;
+  CAPABILITY_PEER_ADMIN = 31;
+  CAPABILITY_TRUST_ADMIN = 32;
+  CAPABILITY_ROUTE_READ = 40;
+  CAPABILITY_ROUTE_PROBE = 41;
+  CAPABILITY_SESSION_READ = 50;
+  CAPABILITY_SESSION_CLOSE = 51;
+  CAPABILITY_SESSION_MIGRATE = 52;
+  CAPABILITY_BUNDLE_READ = 60;
+  CAPABILITY_BUNDLE_CREATE = 61;
+  CAPABILITY_BUNDLE_DELETE = 62;
+  CAPABILITY_RELAY_READ = 70;
+  CAPABILITY_RELAY_ADMIN = 71;
+  CAPABILITY_APPLICATION_REGISTER = 80;
+  CAPABILITY_APPLICATION_CONNECT = 81;
+  CAPABILITY_APPLICATION_LISTEN = 82;
+  CAPABILITY_APPLICATION_STREAM = 83;
+  CAPABILITY_APPLICATION_DATAGRAM = 84;
+  CAPABILITY_DISCOVERY_READ = 90;
+  CAPABILITY_DISCOVERY_RUN = 91;
+  CAPABILITY_DIAGNOSTICS_READ = 100;
+  CAPABILITY_DIAGNOSTICS_SENSITIVE = 101;
+  CAPABILITY_EVENT_SUBSCRIBE = 110;
+  CAPABILITY_TOKEN_ADMIN = 120;
+}
+
+message CapabilityGrant {
+  bytes grant_id = 1;
+  Capability capability = 2;
+  ResourceConstraints constraints = 3;
+  int64 expires_at_unix_ms = 4;
+  bool delegable = 5;
+}
+
+message ResourceConstraints {
+  bool all_resources = 1;
+  repeated bytes endpoint_ids = 2;
+  repeated string protocol_ids = 3;
+  repeated bytes destination_endpoint_ids = 4;
+  repeated string carrier_type_ids = 5;
+  repeated bytes peer_endpoint_ids = 6;
+  repeated TrustState trust_states = 7;
+  uint32 maximum_sessions = 8;
+  uint32 maximum_streams = 9;
+  uint64 maximum_pending_bytes = 10;
+  uint32 maximum_datagram_size = 11;
+  repeated RouteScope route_scopes = 12;
+  repeated RelayMode relay_modes = 13;
+  uint64 maximum_bundle_bytes = 14;
+}
+
+message Empty {}
+
+message PageRequest {
+  uint32 page_size = 1;
+  bytes page_token = 2;
+  bytes snapshot_token = 3;
+}
+
+message PageInfo {
+  bytes next_page_token = 1;
+  bytes snapshot_token = 2;
+  uint64 total_size_hint = 3;
+}
+
+message OpaqueHandle {
+  bytes value = 1;
+}
+
+message ResourceRevision {
+  uint64 value = 1;
+}
+
+message NodeStatus {
+  NodeLifecycleState state = 1;
+  string software_version = 2;
+  repeated ApiVersion api_versions = 3;
+  repeated uint32 ump_versions = 4;
+  int64 started_at_unix_ms = 5;
+  uint64 uptime_ms = 6;
+  ResourcePressure pressure = 7;
+  uint32 active_sessions = 8;
+  uint32 active_links = 9;
+  uint32 active_relay_circuits = 10;
+  uint32 pending_handshakes = 11;
+  string privacy_profile = 12;
+}
+
+enum ResourcePressure {
+  RESOURCE_PRESSURE_UNSPECIFIED = 0;
+  RESOURCE_PRESSURE_NORMAL = 1;
+  RESOURCE_PRESSURE_ELEVATED = 2;
+  RESOURCE_PRESSURE_HIGH = 3;
+  RESOURCE_PRESSURE_CRITICAL = 4;
+  RESOURCE_PRESSURE_EMERGENCY = 5;
+}
+
+message GetStatusRequest {}
+message GetStatusResponse { NodeStatus status = 1; }
+
+message NodeConfig {
+  ResourceRevision revision = 1;
+  string resource_profile = 2;
+  bool telemetry_enabled = 3;
+  bool public_relay_enabled = 4;
+  repeated ConfigEntry entries = 5;
+}
+
+message ConfigEntry {
+  string key = 1;
+  string value = 2;
+  bool sensitive_present = 3;
+}
+
+message GetConfigRequest { repeated string keys = 1; }
+message GetConfigResponse { NodeConfig config = 1; }
+
+message ConfigMutation {
+  string key = 1;
+  oneof operation {
+    string set_value = 2;
+    bytes set_secret = 3;
+    bool clear = 4;
+  }
+}
+
+message UpdateConfigRequest {
+  ResourceRevision expected_revision = 1;
+  repeated ConfigMutation mutations = 2;
+  bool validate_only = 3;
+}
+
+message UpdateConfigResponse {
+  NodeConfig config = 1;
+  repeated ConfigEffect effects = 2;
+}
+
+message ConfigEffect {
+  string subsystem = 1;
+  bool restart_required = 2;
+  bool drain_required = 3;
+  string message = 4;
+}
+
+message ReloadConfigRequest { bool validate_only = 1; }
+message ReloadConfigResponse { NodeConfig config = 1; repeated ConfigEffect effects = 2; }
+
+enum ShutdownMode {
+  SHUTDOWN_MODE_UNSPECIFIED = 0;
+  SHUTDOWN_MODE_GRACEFUL = 1;
+  SHUTDOWN_MODE_FAST = 2;
+  SHUTDOWN_MODE_EMERGENCY = 3;
+}
+
+message ShutdownRequest {
+  ShutdownMode mode = 1;
+  uint64 drain_timeout_ms = 2;
+}
+message ShutdownResponse { int64 expected_exit_unix_ms = 1; }
+
+message ResourceUsage {
+  string resource = 1;
+  uint64 current = 2;
+  uint64 soft_limit = 3;
+  uint64 hard_limit = 4;
+  string unit = 5;
+}
+
+message GetResourceUsageRequest { repeated string resources = 1; }
+message GetResourceUsageResponse {
+  ResourcePressure pressure = 1;
+  repeated ResourceUsage usages = 2;
+}
+
+message EventRecord {
+  string kind = 1;
+  int64 at_ms = 2;
+  string detail = 3;
+}
+
+message GetEventsResponse {
+  repeated EventRecord events = 1;
+}
+
+enum IdentityKind {
+  IDENTITY_KIND_UNSPECIFIED = 0;
+  IDENTITY_KIND_NODE_MANAGEMENT = 1;
+  IDENTITY_KIND_USER_ENDPOINT = 2;
+  IDENTITY_KIND_SERVICE_ENDPOINT = 3;
+  IDENTITY_KIND_GATEWAY_ENDPOINT = 4;
+  IDENTITY_KIND_TEMPORARY_ENDPOINT = 5;
+}
+
+message IdentitySummary {
+  OpaqueHandle identity_handle = 1;
+  bytes endpoint_id = 2;
+  IdentityKind kind = 3;
+  string label = 4;
+  uint64 binding_sequence = 5;
+  int64 binding_not_after_unix_ms = 6;
+  bool secret_available = 7;
+  ResourceRevision revision = 8;
+}
+
+message ListIdentitiesRequest { PageRequest page = 1; }
+message ListIdentitiesResponse { repeated IdentitySummary identities = 1; PageInfo page = 2; }
+message GetIdentityRequest { oneof identity { OpaqueHandle handle = 1; bytes endpoint_id = 2; } }
+message GetIdentityResponse { IdentitySummary identity = 1; bytes public_binding = 2; }
+
+message CreateIdentityRequest {
+  IdentityKind kind = 1;
+  string label = 2;
+  int64 binding_lifetime_ms = 3;
+}
+message CreateIdentityResponse { IdentitySummary identity = 1; bytes public_binding = 2; }
+
+message RotateHandshakeKeyRequest {
+  OpaqueHandle identity_handle = 1;
+  ResourceRevision expected_revision = 2;
+  int64 new_binding_lifetime_ms = 3;
+}
+message RotateHandshakeKeyResponse { IdentitySummary identity = 1; bytes public_binding = 2; }
+
+message RotateIdentityKeyRequest {
+  OpaqueHandle identity_handle = 1;
+  ResourceRevision expected_revision = 2;
+  bool require_old_key_signature = 3;
+}
+message RotateIdentityKeyResponse { IdentitySummary identity = 1; bytes rotation_proof = 2; }
+
+message ExportPublicIdentityRequest { OpaqueHandle identity_handle = 1; }
+message ExportPublicIdentityResponse { bytes export_bytes = 1; }
+
+message ExportProtection {
+  oneof protection {
+    bytes recipient_public_key = 1;
+    bytes passphrase = 2;
+    string os_key_reference = 3;
+  }
+}
+
+message ExportSecretIdentityRequest {
+  OpaqueHandle identity_handle = 1;
+  ExportProtection protection = 2;
+  string confirmation = 3;
+}
+message ExportSecretIdentityResponse { bytes encrypted_export = 1; }
+
+message ImportIdentityRequest {
+  bytes encrypted_export = 1;
+  bytes passphrase = 2;
+  string os_key_reference = 3;
+  bool validate_only = 4;
+}
+message ImportIdentityResponse { IdentitySummary identity = 1; }
+
+message DeleteIdentityRequest {
+  OpaqueHandle identity_handle = 1;
+  ResourceRevision expected_revision = 2;
+  bytes deletion_plan_token = 3;
+  bool plan_only = 4;
+}
+message DeleteIdentityResponse {
+  bool deleted = 1;
+  bytes deletion_plan_token = 2;
+  repeated string dependencies = 3;
+}
+
+enum CarrierInstanceState {
+  CARRIER_INSTANCE_STATE_UNSPECIFIED = 0;
+  CARRIER_INSTANCE_STATE_CREATED = 1;
+  CARRIER_INSTANCE_STATE_STARTING = 2;
+  CARRIER_INSTANCE_STATE_RUNNING = 3;
+  CARRIER_INSTANCE_STATE_DEGRADED = 4;
+  CARRIER_INSTANCE_STATE_STOPPING = 5;
+  CARRIER_INSTANCE_STATE_STOPPED = 6;
+  CARRIER_INSTANCE_STATE_FAILED = 7;
+  CARRIER_INSTANCE_STATE_DISABLED = 8;
+}
+
+message CarrierTypeInfo {
+  string type_id = 1;
+  string display_name = 2;
+  bool built_in = 3;
+  bool supports_listen = 4;
+  bool supports_dial = 5;
+  bool supports_discovery = 6;
+  uint32 minimum_packet_size = 7;
+  uint32 maximum_packet_size = 8;
+}
+
+message CarrierInstance {
+  OpaqueHandle carrier_handle = 1;
+  string type_id = 2;
+  string label = 3;
+  CarrierInstanceState state = 4;
+  repeated ConfigEntry options = 5;
+  ResourceRevision revision = 6;
+  bool external_plugin = 7;
+  string isolation_state = 8;
+}
+
+message ListCarrierTypesRequest { PageRequest page = 1; }
+message ListCarrierTypesResponse { repeated CarrierTypeInfo types = 1; PageInfo page = 2; }
+message ListCarrierInstancesRequest { PageRequest page = 1; }
+message ListCarrierInstancesResponse { repeated CarrierInstance instances = 1; PageInfo page = 2; }
+message GetCarrierInstanceRequest { OpaqueHandle carrier_handle = 1; }
+message GetCarrierInstanceResponse { CarrierInstance instance = 1; }
+
+message CreateCarrierInstanceRequest {
+  string type_id = 1;
+  string label = 2;
+  repeated ConfigMutation options = 3;
+  bool enabled = 4;
+}
+message CreateCarrierInstanceResponse { CarrierInstance instance = 1; }
+
+message UpdateCarrierInstanceRequest {
+  OpaqueHandle carrier_handle = 1;
+  ResourceRevision expected_revision = 2;
+  repeated ConfigMutation options = 3;
+}
+message UpdateCarrierInstanceResponse { CarrierInstance instance = 1; repeated ConfigEffect effects = 2; }
+
+message StartCarrierRequest { OpaqueHandle carrier_handle = 1; }
+message StartCarrierResponse { CarrierInstance instance = 1; }
+message StopCarrierRequest { OpaqueHandle carrier_handle = 1; bool drain_links = 2; uint64 drain_timeout_ms = 3; }
+message StopCarrierResponse { CarrierInstance instance = 1; }
+message DeleteCarrierInstanceRequest { OpaqueHandle carrier_handle = 1; ResourceRevision expected_revision = 2; }
+message DeleteCarrierInstanceResponse {}
+
+message LinkSummary {
+  OpaqueHandle link_handle = 1;
+  OpaqueHandle carrier_handle = 2;
+  string carrier_type_id = 3;
+  string state = 4;
+  uint32 current_mtu = 5;
+  uint64 bytes_sent = 6;
+  uint64 bytes_received = 7;
+  string scope = 8;
+}
+
+message ListLinksRequest { OpaqueHandle carrier_handle = 1; PageRequest page = 2; }
+message ListLinksResponse { repeated LinkSummary links = 1; PageInfo page = 2; }
+message CloseLinkRequest { OpaqueHandle link_handle = 1; string reason = 2; }
+message CloseLinkResponse {}
+
+message DialRequest {
+  OpaqueHandle carrier_handle = 1;
+  string remote = 2;
+}
+message DialResponse {
+  LinkSummary link = 1;
+}
+
+enum TrustState {
+  TRUST_STATE_UNSPECIFIED = 0;
+  TRUST_STATE_UNKNOWN = 1;
+  TRUST_STATE_OBSERVED = 2;
+  TRUST_STATE_INTRODUCED = 3;
+  TRUST_STATE_TRUSTED = 4;
+  TRUST_STATE_RESTRICTED = 5;
+  TRUST_STATE_BLOCKED = 6;
+  TRUST_STATE_REVOKED = 7;
+}
+
+message PeerSummary {
+  bytes endpoint_id = 1;
+  string label = 2;
+  TrustState trust_state = 3;
+  int64 last_seen_unix_ms = 4;
+  int64 last_success_unix_ms = 5;
+  uint32 carrier_hint_count = 6;
+  ResourceRevision revision = 7;
+}
+
+message ListPeersRequest { repeated TrustState trust_states = 1; PageRequest page = 2; }
+message ListPeersResponse { repeated PeerSummary peers = 1; PageInfo page = 2; }
+message GetPeerRequest { bytes endpoint_id = 1; }
+message GetPeerResponse { PeerSummary peer = 1; repeated PeerHint hints = 2; }
+
+message PeerHint {
+  string carrier_type_id = 1;
+  bytes connection_hint = 2;
+  int64 expires_at_unix_ms = 3;
+  string source = 4;
+  bool do_not_reshare = 5;
+}
+
+message AddPeerHintRequest { bytes endpoint_id = 1; PeerHint hint = 2; }
+message AddPeerHintResponse { PeerSummary peer = 1; }
+message RemovePeerRequest { bytes endpoint_id = 1; ResourceRevision expected_revision = 2; }
+message RemovePeerResponse {}
+message SetTrustStateRequest { bytes endpoint_id = 1; TrustState trust_state = 2; ResourceRevision expected_revision = 3; string reason = 4; }
+message SetTrustStateResponse { PeerSummary peer = 1; }
+message BlockPeerRequest { bytes endpoint_id = 1; string reason = 2; int64 expires_at_unix_ms = 3; }
+message BlockPeerResponse { PeerSummary peer = 1; }
+message UnblockPeerRequest { bytes endpoint_id = 1; ResourceRevision expected_revision = 2; }
+message UnblockPeerResponse { PeerSummary peer = 1; }
+
+message InvitationScope {
+  repeated bytes endpoint_ids = 1;
+  repeated string protocol_ids = 2;
+  bool allow_relay = 3;
+  bool allow_discovery = 4;
+  uint64 maximum_uses = 5;
+  int64 expires_at_unix_ms = 6;
+}
+
+message CreateInvitationRequest { OpaqueHandle identity_handle = 1; InvitationScope scope = 2; }
+message CreateInvitationResponse { bytes invitation_id = 1; bytes invitation_secret = 2; bytes invitation_document = 3; }
+message ImportInvitationRequest { bytes invitation_document = 1; bytes invitation_secret = 2; }
+message ImportInvitationResponse { bytes invitation_id = 1; InvitationScope scope = 2; }
+message RevokeInvitationRequest { bytes invitation_id = 1; string reason = 2; }
+message RevokeInvitationResponse {}
+
+enum RouteScope {
+  ROUTE_SCOPE_UNSPECIFIED = 0;
+  ROUTE_SCOPE_LINK_LOCAL = 1;
+  ROUTE_SCOPE_LOCAL_MESH = 2;
+  ROUTE_SCOPE_INTRODUCED = 3;
+  ROUTE_SCOPE_GENERAL = 4;
+}
+
+message RouteSummary {
+  OpaqueHandle route_handle = 1;
+  bytes destination_hint_hash = 2;
+  RouteScope scope = 3;
+  string state = 4;
+  uint32 hop_count = 5;
+  uint32 relay_count = 6;
+  string carrier_class = 7;
+  int64 expires_at_unix_ms = 8;
+  int64 last_success_unix_ms = 9;
+  string proof_state = 10;
+}
+
+message ListRoutesRequest { bytes destination_hint_hash = 1; RouteScope scope = 2; PageRequest page = 3; }
+message ListRoutesResponse { repeated RouteSummary routes = 1; PageInfo page = 2; }
+message GetRouteRequest { OpaqueHandle route_handle = 1; }
+message GetRouteResponse { RouteSummary route = 1; repeated string redacted_legs = 2; }
+
+message RoutePolicy {
+  RouteScope scope = 1;
+  uint32 maximum_hops = 2;
+  uint32 maximum_relays = 3;
+  bool allow_relay = 4;
+  bool allow_store_forward = 5;
+  repeated string allowed_carrier_types = 6;
+  TrustState minimum_trust = 7;
+}
+
+message ProbeRouteRequest { bytes destination_hint = 1; RoutePolicy policy = 2; bool wait_for_usable = 3; }
+message ProbeRouteResponse { OpaqueHandle operation_handle = 1; repeated RouteSummary candidates = 2; }
+message InvalidateRouteRequest { OpaqueHandle route_handle = 1; string reason = 2; }
+message InvalidateRouteResponse {}
+
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_STATE_HANDSHAKING = 1;
+  SESSION_STATE_ACTIVE = 2;
+  SESSION_STATE_DRAINING = 3;
+  SESSION_STATE_CLOSED = 4;
+  SESSION_STATE_FAILED = 5;
+}
+
+message SessionSummary {
+  OpaqueHandle session_handle = 1;
+  bytes local_endpoint_id = 2;
+  bytes remote_endpoint_id = 3;
+  SessionState state = 4;
+  string protocol_id = 5;
+  uint32 active_streams = 6;
+  uint32 active_paths = 7;
+  int64 created_at_unix_ms = 8;
+  int64 last_activity_unix_ms = 9;
+  bool relayed = 10;
+  bool application_owned = 11;
+}
+
+message ListSessionsRequest { bytes endpoint_id = 1; SessionState state = 2; PageRequest page = 3; }
+message ListSessionsResponse { repeated SessionSummary sessions = 1; PageInfo page = 2; }
+message GetSessionRequest { OpaqueHandle session_handle = 1; }
+message SessionPrivacyInfo {
+  string requested_profile = 1;
+  string effective_profile = 2;
+  bool direct_path_allowed = 3;
+  bool traffic_padding_active = 4;
+  uint32 hop_count = 5;
+}
+message GetSessionResponse {
+  SessionSummary session = 1;
+  repeated PathSummary paths = 2;
+  SessionPrivacyInfo privacy = 3;
+}
+
+message PathSummary {
+  uint64 path_id = 1;
+  string state = 2;
+  string carrier_type_id = 3;
+  uint64 estimated_rtt_ms = 4;
+  uint32 current_mtu = 5;
+  bool primary = 6;
+}
+
+message CloseSessionRequest { OpaqueHandle session_handle = 1; uint64 application_error_code = 2; string reason = 3; }
+message CloseSessionResponse {}
+message MigrateSessionRequest {
+  OpaqueHandle session_handle = 1;
+  OpaqueHandle carrier_handle = 2;
+  string remote = 3;
+  bool keep_old_path = 4;
+  uint64 deadline_ms = 5;
+}
+message MigrateSessionResponse {
+  OpaqueHandle session_handle = 1;
+  uint64 path_id = 2;
+  OpaqueHandle link_handle = 3;
+}
+
+message StreamSummary {
+  OpaqueHandle stream_handle = 1;
+  OpaqueHandle session_handle = 2;
+  uint64 stream_id = 3;
+  string state = 4;
+  bool bidirectional = 5;
+  uint64 bytes_sent = 6;
+  uint64 bytes_received = 7;
+}
+
+message ListStreamsRequest { OpaqueHandle session_handle = 1; PageRequest page = 2; }
+message ListStreamsResponse { repeated StreamSummary streams = 1; PageInfo page = 2; }
+
+enum BundleState {
+  BUNDLE_STATE_UNSPECIFIED = 0;
+  BUNDLE_STATE_STORED = 1;
+  BUNDLE_STATE_FORWARDING = 2;
+  BUNDLE_STATE_FORWARDED = 3;
+  BUNDLE_STATE_DELIVERED = 4;
+  BUNDLE_STATE_EXPIRED = 5;
+  BUNDLE_STATE_EVICTED = 6;
+  BUNDLE_STATE_REJECTED = 7;
+}
+
+message BundleSummary {
+  bytes bundle_id = 1;
+  bytes owner_endpoint_id = 2;
+  bytes destination_hint_hash = 3;
+  BundleState state = 4;
+  uint64 payload_size = 5;
+  uint32 priority = 6;
+  int64 created_at_unix_ms = 7;
+  int64 expires_at_unix_ms = 8;
+}
+
+message ListBundlesRequest { bytes owner_endpoint_id = 1; BundleState state = 2; PageRequest page = 3; }
+message ListBundlesResponse { repeated BundleSummary bundles = 1; PageInfo page = 2; }
+message GetBundleRequest { bytes bundle_id = 1; bool include_payload = 2; uint64 payload_offset = 3; uint32 payload_length = 4; }
+message GetBundleResponse { BundleSummary bundle = 1; bytes payload_chunk = 2; bool payload_eof = 3; }
+message CreateBundleRequest { OpaqueHandle application_handle = 1; bytes destination_hint = 2; uint32 priority = 3; int64 expires_at_unix_ms = 4; bytes payload_chunk = 5; bool payload_complete = 6; OpaqueHandle upload_handle = 7; }
+message CreateBundleResponse { BundleSummary bundle = 1; OpaqueHandle upload_handle = 2; }
+message DeleteBundleRequest { bytes bundle_id = 1; string reason = 2; }
+message DeleteBundleResponse {}
+
+enum RelayMode {
+  RELAY_MODE_UNSPECIFIED = 0;
+  RELAY_MODE_DISABLED = 1;
+  RELAY_MODE_FRIENDS_ONLY = 2;
+  RELAY_MODE_COMMUNITY = 3;
+  RELAY_MODE_PUBLIC = 4;
+}
+
+message RelayPolicy {
+  ResourceRevision revision = 1;
+  RelayMode mode = 2;
+  uint32 maximum_circuits = 3;
+  uint32 maximum_circuits_per_peer = 4;
+  uint64 maximum_bytes_per_circuit = 5;
+  uint64 maximum_lifetime_ms = 6;
+  uint64 maximum_idle_ms = 7;
+  uint64 maximum_bytes_per_second = 8;
+  repeated TrustState allowed_trust_states = 9;
+  repeated string allowed_carrier_types = 10;
+  repeated RouteScope allowed_destination_scopes = 11;
+}
+
+message RelayStatus {
+  RelayPolicy policy = 1;
+  uint32 opening_circuits = 2;
+  uint32 active_circuits = 3;
+  uint64 queued_bytes = 4;
+  uint64 bytes_forwarded = 5;
+  ResourcePressure pressure = 6;
+}
+
+message RelayCircuitSummary {
+  OpaqueHandle circuit_handle = 1;
+  string state = 2;
+  bytes redacted_upstream_peer = 3;
+  bytes redacted_downstream_peer = 4;
+  uint64 granted_byte_quota = 5;
+  uint64 accepted_bytes = 6;
+  int64 expires_at_unix_ms = 7;
+  int64 last_activity_unix_ms = 8;
+  bool private_circuit = 9;
+}
+
+message GetRelayStatusRequest {}
+message GetRelayStatusResponse { RelayStatus status = 1; }
+message UpdateRelayPolicyRequest { ResourceRevision expected_revision = 1; RelayPolicy policy = 2; }
+message UpdateRelayPolicyResponse { RelayPolicy policy = 1; }
+message ListRelayCircuitsRequest { string state = 1; PageRequest page = 2; }
+message ListRelayCircuitsResponse { repeated RelayCircuitSummary circuits = 1; PageInfo page = 2; }
+message CloseRelayCircuitRequest { OpaqueHandle circuit_handle = 1; string reason = 2; }
+message CloseRelayCircuitResponse {}
+
+message RegisterApplicationRequest {
+  string application_name = 1;
+  bytes application_instance_id = 2;
+  repeated bytes requested_endpoint_ids = 3;
+  repeated string requested_protocol_ids = 4;
+  repeated Capability requested_capabilities = 5;
+  bool resumable = 6;
+}
+
+message RegisterApplicationResponse {
+  OpaqueHandle application_handle = 1;
+  repeated CapabilityGrant effective_grants = 2;
+  bytes resume_token = 3;
+}
+
+message UnregisterApplicationRequest { OpaqueHandle application_handle = 1; bool close_owned_sessions = 2; }
+message UnregisterApplicationResponse {}
+
+message ListenPolicy {
+  TrustState minimum_trust = 1;
+  bool allow_relay = 2;
+  bool allow_early_data = 3;
+  uint32 maximum_pending_sessions = 4;
+}
+
+message OpenListenerRequest {
+  OpaqueHandle application_handle = 1;
+  bytes endpoint_id = 2;
+  string protocol_id = 3;
+  ListenPolicy policy = 4;
+}
+
+message OpenListenerResponse { OpaqueHandle listener_handle = 1; }
+message CloseListenerRequest { OpaqueHandle listener_handle = 1; bool close_owned_sessions = 2; }
+message CloseListenerResponse {}
+
+message ConnectionPolicy {
+  RoutePolicy route = 1;
+  uint32 maximum_streams = 2;
+  uint64 idle_timeout_ms = 3;
+  bool allow_datagrams = 4;
+  bool allow_multipath = 5;
+  bool allow_early_data = 6;
+}
+
+message ConnectRequest {
+  OpaqueHandle application_handle = 1;
+  bytes local_endpoint_id = 2;
+  bytes destination_hint = 3;
+  string protocol_id = 4;
+  ConnectionPolicy policy = 5;
+  bool return_operation = 6;
+}
+
+message ConnectResponse {
+  OpaqueHandle session_handle = 1;
+  OpaqueHandle operation_handle = 2;
+  SessionSummary session = 3;
+}
+
+message AcceptIncomingSessionRequest { OpaqueHandle application_handle = 1; OpaqueHandle pending_session_handle = 2; }
+message AcceptIncomingSessionResponse { OpaqueHandle session_handle = 1; SessionSummary session = 2; }
+message RejectIncomingSessionRequest { OpaqueHandle application_handle = 1; OpaqueHandle pending_session_handle = 2; uint64 application_error_code = 3; string reason = 4; }
+message RejectIncomingSessionResponse {}
+
+message OpenStreamRequest { OpaqueHandle application_handle = 1; OpaqueHandle session_handle = 2; bool unidirectional = 3; bytes initial_metadata = 4; }
+message OpenStreamResponse { OpaqueHandle stream_handle = 1; StreamSummary stream = 2; }
+message AcceptStreamRequest { OpaqueHandle application_handle = 1; OpaqueHandle pending_stream_handle = 2; }
+message AcceptStreamResponse { OpaqueHandle stream_handle = 1; StreamSummary stream = 2; }
+message RejectStreamRequest { OpaqueHandle pending_stream_handle = 1; uint64 application_error_code = 2; }
+message RejectStreamResponse {}
+
+message ReadStreamRequest { OpaqueHandle stream_handle = 1; uint32 maximum_bytes = 2; bool wait_for_data = 3; }
+message ReadStreamResponse { bytes data = 1; bool eof = 2; bool reset = 3; uint64 application_error_code = 4; }
+message WriteStreamRequest { OpaqueHandle stream_handle = 1; bytes data = 2; bool fin = 3; }
+message WriteStreamResponse { uint32 accepted_bytes = 1; bool fin_accepted = 2; }
+message CloseStreamSendRequest { OpaqueHandle stream_handle = 1; }
+message CloseStreamSendResponse {}
+message ResetStreamRequest { OpaqueHandle stream_handle = 1; uint64 application_error_code = 2; }
+message ResetStreamResponse {}
+message StopStreamRequest { OpaqueHandle stream_handle = 1; uint64 application_error_code = 2; }
+message StopStreamResponse {}
+
+message SendDatagramRequest { OpaqueHandle session_handle = 1; uint64 context_id = 2; bytes data = 3; uint64 lifetime_ms = 4; bool request_ack = 5; }
+message SendDatagramResponse { uint64 local_datagram_id = 1; }
+message ReceiveDatagramRequest { OpaqueHandle application_handle = 1; OpaqueHandle session_handle = 2; uint32 maximum_bytes = 3; bool wait_for_data = 4; }
+message ReceiveDatagramResponse { OpaqueHandle session_handle = 1; uint64 context_id = 2; bytes data = 3; bool expired = 4; }
+
+message RunDoctorRequest { repeated string checks = 1; bool sensitive = 2; bool return_operation = 3; }
+message RunDoctorResponse { OpaqueHandle operation_handle = 1; repeated DiagnosticResult results = 2; }
+
+enum DiagnosticSeverity {
+  DIAGNOSTIC_SEVERITY_UNSPECIFIED = 0;
+  DIAGNOSTIC_SEVERITY_INFO = 1;
+  DIAGNOSTIC_SEVERITY_WARNING = 2;
+  DIAGNOSTIC_SEVERITY_ERROR = 3;
+  DIAGNOSTIC_SEVERITY_CRITICAL = 4;
+}
+
+message DiagnosticResult {
+  string check_id = 1;
+  DiagnosticSeverity severity = 2;
+  string summary = 3;
+  string detail = 4;
+  repeated string remediation = 5;
+}
+
+message GetMetricsSnapshotRequest { repeated string metric_prefixes = 1; }
+message MetricPoint { string name = 1; double value = 2; repeated Label labels = 3; int64 observed_at_unix_ms = 4; }
+message Label { string key = 1; string value = 2; }
+message GetMetricsSnapshotResponse { repeated MetricPoint points = 1; }
+
+message GetRecentErrorsRequest { DiagnosticSeverity minimum_severity = 1; uint32 maximum_results = 2; }
+message RecentError { int64 occurred_at_unix_ms = 1; string subsystem = 2; DiagnosticSeverity severity = 3; Status status = 4; }
+message GetRecentErrorsResponse { repeated RecentError errors = 1; }
+
+message GetSubsystemHealthRequest { repeated string subsystems = 1; }
+message SubsystemHealth { string subsystem = 1; string state = 2; string summary = 3; int64 changed_at_unix_ms = 4; }
+message GetSubsystemHealthResponse { repeated SubsystemHealth health = 1; }
+
+enum EventClass {
+  EVENT_CLASS_UNSPECIFIED = 0;
+  EVENT_CLASS_CRITICAL = 1;
+  EVENT_CLASS_STATE = 2;
+  EVENT_CLASS_EDGE = 3;
+  EVENT_CLASS_SAMPLE = 4;
+}
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_NODE_STATE = 1;
+  EVENT_TYPE_RESOURCE_PRESSURE = 2;
+  EVENT_TYPE_IDENTITY_CHANGED = 10;
+  EVENT_TYPE_TRUST_CHANGED = 11;
+  EVENT_TYPE_CARRIER_STATE = 20;
+  EVENT_TYPE_LINK_STATE = 21;
+  EVENT_TYPE_PEER_CHANGED = 30;
+  EVENT_TYPE_ROUTE_CHANGED = 40;
+  EVENT_TYPE_SESSION_STATE = 50;
+  EVENT_TYPE_PATH_CHANGED = 51;
+  EVENT_TYPE_INCOMING_SESSION = 52;
+  EVENT_TYPE_STREAM_STATE = 60;
+  EVENT_TYPE_INCOMING_STREAM = 61;
+  EVENT_TYPE_DATAGRAM_AVAILABLE = 62;
+  EVENT_TYPE_BUNDLE_STATE = 70;
+  EVENT_TYPE_RELAY_STATE = 80;
+  EVENT_TYPE_OPERATION_PROGRESS = 90;
+  EVENT_TYPE_AUDIT = 100;
+  EVENT_TYPE_EVENT_GAP = 110;
+}
+
+message EventFilter {
+  repeated EventType event_types = 1;
+  repeated OpaqueHandle resource_handles = 2;
+  repeated bytes endpoint_ids = 3;
+  DiagnosticSeverity minimum_severity = 4;
+  bool include_initial_snapshot = 5;
+}
+
+message SubscribeRequest { EventFilter filter = 1; bytes resume_cursor = 2; }
+message SubscribeResponse { OpaqueHandle subscription_handle = 1; bytes resume_cursor = 2; uint64 first_event_sequence = 3; }
+message UnsubscribeRequest { OpaqueHandle subscription_handle = 1; }
+message UnsubscribeResponse {}
+
+message Event {
+  OpaqueHandle subscription_handle = 1;
+  uint64 event_sequence = 2;
+  EventType event_type = 3;
+  EventClass event_class = 4;
+  int64 occurred_at_unix_ms = 5;
+  OpaqueHandle resource_handle = 6;
+  bytes resource_id = 7;
+  string payload_type = 8;
+  bytes payload = 9;
+  bytes resume_cursor = 10;
+}
+
+message EventAck {
+  OpaqueHandle subscription_handle = 1;
+  uint64 highest_contiguous_sequence = 2;
+}
+
+message EventGap {
+  uint64 first_missing_sequence = 1;
+  uint64 last_missing_sequence = 2;
+  bool snapshot_required = 3;
+}
+
+message OperationProgress {
+  OpaqueHandle operation_handle = 1;
+  string state = 2;
+  uint32 completed_units = 3;
+  uint32 total_units = 4;
+  Status terminal_status = 5;
+}
+
+message ListGrantsRequest { PageRequest page = 1; bytes principal_id = 2; }
+message ListGrantsResponse { repeated CapabilityGrant grants = 1; PageInfo page = 2; }
+
+message CreateTokenRequest {
+  string label = 1;
+  repeated CapabilityGrant grants = 2;
+  int64 expires_at_unix_ms = 3;
+}
+message CreateTokenResponse { bytes token_id = 1; bytes token = 2; repeated CapabilityGrant effective_grants = 3; }
+message RevokeTokenRequest { bytes token_id = 1; string reason = 2; bool terminate_connections = 3; }
+message RevokeTokenResponse {}
+message InspectCurrentGrantRequest {}
+message InspectCurrentGrantResponse { bytes principal_id = 1; repeated CapabilityGrant grants = 2; }
+
+service NodeAdmin {
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+  rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse);
+  rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+  rpc GetResourceUsage(GetResourceUsageRequest) returns (GetResourceUsageResponse);
+}
+
+service IdentityService {
+  rpc ListIdentities(ListIdentitiesRequest) returns (ListIdentitiesResponse);
+  rpc GetIdentity(GetIdentityRequest) returns (GetIdentityResponse);
+  rpc CreateIdentity(CreateIdentityRequest) returns (CreateIdentityResponse);
+  rpc RotateHandshakeKey(RotateHandshakeKeyRequest) returns (RotateHandshakeKeyResponse);
+  rpc RotateIdentityKey(RotateIdentityKeyRequest) returns (RotateIdentityKeyResponse);
+  rpc ExportPublicIdentity(ExportPublicIdentityRequest) returns (ExportPublicIdentityResponse);
+  rpc ExportSecretIdentity(ExportSecretIdentityRequest) returns (ExportSecretIdentityResponse);
+  rpc ImportIdentity(ImportIdentityRequest) returns (ImportIdentityResponse);
+  rpc DeleteIdentity(DeleteIdentityRequest) returns (DeleteIdentityResponse);
+}
+
+service CarrierService {
+  rpc ListCarrierTypes(ListCarrierTypesRequest) returns (ListCarrierTypesResponse);
+  rpc ListCarrierInstances(ListCarrierInstancesRequest) returns (ListCarrierInstancesResponse);
+  rpc GetCarrierInstance(GetCarrierInstanceRequest) returns (GetCarrierInstanceResponse);
+  rpc CreateCarrierInstance(CreateCarrierInstanceRequest) returns (CreateCarrierInstanceResponse);
+  rpc UpdateCarrierInstance(UpdateCarrierInstanceRequest) returns (UpdateCarrierInstanceResponse);
+  rpc StartCarrier(StartCarrierRequest) returns (StartCarrierResponse);
+  rpc StopCarrier(StopCarrierRequest) returns (StopCarrierResponse);
+  rpc DeleteCarrierInstance(DeleteCarrierInstanceRequest) returns (DeleteCarrierInstanceResponse);
+  rpc Dial(DialRequest) returns (DialResponse);
+  rpc ListLinks(ListLinksRequest) returns (ListLinksResponse);
+  rpc CloseLink(CloseLinkRequest) returns (CloseLinkResponse);
+}
+
+service PeerService {
+  rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
+  rpc GetPeer(GetPeerRequest) returns (GetPeerResponse);
+  rpc AddPeerHint(AddPeerHintRequest) returns (AddPeerHintResponse);
+  rpc RemovePeer(RemovePeerRequest) returns (RemovePeerResponse);
+  rpc SetTrustState(SetTrustStateRequest) returns (SetTrustStateResponse);
+  rpc BlockPeer(BlockPeerRequest) returns (BlockPeerResponse);
+  rpc UnblockPeer(UnblockPeerRequest) returns (UnblockPeerResponse);
+  rpc CreateInvitation(CreateInvitationRequest) returns (CreateInvitationResponse);
+  rpc ImportInvitation(ImportInvitationRequest) returns (ImportInvitationResponse);
+  rpc RevokeInvitation(RevokeInvitationRequest) returns (RevokeInvitationResponse);
+}
+
+service RouteService {
+  rpc ListRoutes(ListRoutesRequest) returns (ListRoutesResponse);
+  rpc GetRoute(GetRouteRequest) returns (GetRouteResponse);
+  rpc ProbeRoute(ProbeRouteRequest) returns (ProbeRouteResponse);
+  rpc InvalidateRoute(InvalidateRouteRequest) returns (InvalidateRouteResponse);
+}
+
+service SessionService {
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
+  rpc MigrateSession(MigrateSessionRequest) returns (MigrateSessionResponse);
+  rpc ListStreams(ListStreamsRequest) returns (ListStreamsResponse);
+}
+
+service BundleService {
+  rpc ListBundles(ListBundlesRequest) returns (ListBundlesResponse);
+  rpc GetBundle(GetBundleRequest) returns (GetBundleResponse);
+  rpc CreateBundle(CreateBundleRequest) returns (CreateBundleResponse);
+  rpc DeleteBundle(DeleteBundleRequest) returns (DeleteBundleResponse);
+}
+
+service RelayService {
+  rpc GetRelayStatus(GetRelayStatusRequest) returns (GetRelayStatusResponse);
+  rpc UpdateRelayPolicy(UpdateRelayPolicyRequest) returns (UpdateRelayPolicyResponse);
+  rpc ListRelayCircuits(ListRelayCircuitsRequest) returns (ListRelayCircuitsResponse);
+  rpc CloseRelayCircuit(CloseRelayCircuitRequest) returns (CloseRelayCircuitResponse);
+}
+
+service ApplicationService {
+  rpc RegisterApplication(RegisterApplicationRequest) returns (RegisterApplicationResponse);
+  rpc UnregisterApplication(UnregisterApplicationRequest) returns (UnregisterApplicationResponse);
+  rpc OpenListener(OpenListenerRequest) returns (OpenListenerResponse);
+  rpc CloseListener(CloseListenerRequest) returns (CloseListenerResponse);
+  rpc Connect(ConnectRequest) returns (ConnectResponse);
+  rpc AcceptIncomingSession(AcceptIncomingSessionRequest) returns (AcceptIncomingSessionResponse);
+  rpc RejectIncomingSession(RejectIncomingSessionRequest) returns (RejectIncomingSessionResponse);
+  rpc OpenStream(OpenStreamRequest) returns (OpenStreamResponse);
+  rpc AcceptStream(AcceptStreamRequest) returns (AcceptStreamResponse);
+  rpc RejectStream(RejectStreamRequest) returns (RejectStreamResponse);
+  rpc ReadStream(ReadStreamRequest) returns (ReadStreamResponse);
+  rpc WriteStream(WriteStreamRequest) returns (WriteStreamResponse);
+  rpc CloseStreamSend(CloseStreamSendRequest) returns (CloseStreamSendResponse);
+  rpc ResetStream(ResetStreamRequest) returns (ResetStreamResponse);
+  rpc StopStream(StopStreamRequest) returns (StopStreamResponse);
+  rpc SendDatagram(SendDatagramRequest) returns (SendDatagramResponse);
+  rpc ReceiveDatagram(ReceiveDatagramRequest) returns (ReceiveDatagramResponse);
+}
+
+service DiagnosticsService {
+  rpc RunDoctor(RunDoctorRequest) returns (RunDoctorResponse);
+  rpc GetMetricsSnapshot(GetMetricsSnapshotRequest) returns (GetMetricsSnapshotResponse);
+  rpc GetRecentErrors(GetRecentErrorsRequest) returns (GetRecentErrorsResponse);
+  rpc GetSubsystemHealth(GetSubsystemHealthRequest) returns (GetSubsystemHealthResponse);
+}
+
+service EventService {
+  rpc Subscribe(SubscribeRequest) returns (SubscribeResponse);
+  rpc Unsubscribe(UnsubscribeRequest) returns (UnsubscribeResponse);
+}
+
+service TokenService {
+  rpc ListGrants(ListGrantsRequest) returns (ListGrantsResponse);
+  rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
+  rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
+  rpc InspectCurrentGrant(InspectCurrentGrantRequest) returns (InspectCurrentGrantResponse);
+}

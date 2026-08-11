@@ -1,0 +1,16 @@
+[package]
+name = "umc-carrier-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+umc-carrier = { path = "../../crates/umc-carrier" }
+umc-types = { path = "../../crates/umc-types" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rcgen = "0.14"
+
+[lints]
+workspace = true
