@@ -256,7 +256,8 @@ pub unsafe extern "C" fn umc_client_close(handle: *mut umc_handle_t) -> umc_stat
 #[no_mangle]
 pub unsafe extern "C" fn umc_bytes_free(bytes: umc_bytes) {
     if !bytes.data.is_null() {
-        drop(Vec::from_raw_parts(bytes.data, bytes.len, bytes.len));
+        let raw = std::ptr::slice_from_raw_parts_mut(bytes.data, bytes.len);
+        drop(Box::<[u8]>::from_raw(raw));
     }
 }
 
