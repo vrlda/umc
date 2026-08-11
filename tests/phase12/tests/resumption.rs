@@ -840,15 +840,19 @@ fn run_echo_client(
         .map_err(|e| format!("build: {e:?}"))?
         .ok_or("no outbound packet")?;
     send_packet(link.as_ref(), &packet)?;
-    std::thread::sleep(Duration::from_millis(50));
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let inbound = link.recv().map_err(|e| format!("recv: {e:?}"))?;
-        let _ = session.on_inbound(Instant(0), &inbound.bytes);
-        if let Ok((data, _eof)) = session.read_stream(stream_id) {
-            if !data.is_empty() {
-                return Ok(data);
+        match link.recv() {
+            Ok(inbound) => {
+                let _ = session.on_inbound(Instant(0), &inbound.bytes);
+                if let Ok((data, _eof)) = session.read_stream(stream_id) {
+                    if !data.is_empty() {
+                        return Ok(data);
+                    }
+                }
             }
+            Err(error) if error.kind == CarrierErrorKind::WouldBlock => {}
+            Err(error) => return Err(format!("recv: {error:?}")),
         }
         let mut ping = Vec::new();
         umc_wire::varint::encode_into(&mut ping, FrameType::PING.0)
