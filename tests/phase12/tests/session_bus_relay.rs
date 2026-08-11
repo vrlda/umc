@@ -466,7 +466,9 @@ async fn recv_until(
 /// binary cannot be produced.
 fn umcd_binary() -> std::path::PathBuf {
     let here = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let bin = here.join("../../target/debug/umcd");
+    let bin = here
+        .join("../../target/debug")
+        .join(format!("umcd{}", std::env::consts::EXE_SUFFIX));
     // Rebuild whenever the daemon sources are newer than the binary: a stale
     // daemon silently tests the wrong code.
     let src_newer = std::fs::read_dir(here.join("../../bins/umcd/src")).map_or(true, |entries| {

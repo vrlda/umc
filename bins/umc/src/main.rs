@@ -852,7 +852,9 @@ mod tests {
     /// phase12 harness: a stale daemon silently tests the wrong code.
     fn umcd_binary() -> PathBuf {
         let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let bin = here.join("../../target/debug/umcd");
+        let bin = here
+            .join("../../target/debug")
+            .join(format!("umcd{}", std::env::consts::EXE_SUFFIX));
         let src_newer =
             std::fs::read_dir(here.join("../../bins/umcd/src")).map_or(true, |entries| {
                 entries.filter_map(Result::ok).any(|e| {

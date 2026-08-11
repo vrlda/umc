@@ -23,7 +23,9 @@ fn daemon_bin() -> PathBuf {
         let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
         PathBuf::from(manifest).join("../../target")
     };
-    target.join("debug").join("umcd")
+    target
+        .join("debug")
+        .join(format!("umcd{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn spawn_daemon(suffix: &str) -> Child {

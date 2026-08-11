@@ -51,7 +51,9 @@ impl EntropySource for TestEntropy {
 /// binary cannot be produced.
 fn umcd_binary() -> PathBuf {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let bin = here.join("../../target/debug/umcd");
+    let bin = here
+        .join("../../target/debug")
+        .join(format!("umcd{}", std::env::consts::EXE_SUFFIX));
     // Rebuild whenever the daemon sources are newer than the binary: a stale
     // daemon silently tests the wrong code (the phase12 suites have been
     // burned by this more than once).
