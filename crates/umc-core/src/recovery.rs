@@ -712,15 +712,17 @@ fn read_len_bytes<'a>(bytes: &'a [u8], offset: &mut usize) -> Result<&'a [u8], R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use umc_crypto::signatures::StaticHandshakeKeyPair;
     use umc_handshake::identity::IdentityBinding;
     use umc_storage::sqlite::SqliteStore;
 
     fn store() -> SqliteStore {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "umc-recovery-{}-{}.db",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_file(&path);
         SqliteStore::open(&path).expect("sqlite")
