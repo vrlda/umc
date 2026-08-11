@@ -10526,6 +10526,7 @@ mod tests {
         };
         assert_eq!(event.event_sequence, 1);
         assert_eq!(event.event_type, api::EventType::SessionState as i32);
+        let resume_cursor = event.resume_cursor.clone();
 
         let unsubscribe = api::UnsubscribeRequest {
             subscription_handle: Some(handle),
@@ -10550,8 +10551,40 @@ mod tests {
             decode_response(&response).status.unwrap().code,
             api::StatusCode::Ok as i32
         );
+
+        let resumed = api::SubscribeRequest {
+            filter: Some(api::EventFilter::default()),
+            resume_cursor,
+        };
+        let response = handle_envelope(
+            &mut conn,
+            &mut state,
+            api::Envelope {
+                sequence: 5,
+                body: Some(api::envelope::Body::Request(api::Request {
+                    request_id: 3,
+                    service: "EventService".into(),
+                    method: "Subscribe".into(),
+                    payload: encode_request(&resumed),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        )
+        .expect("resume response");
+        assert_eq!(
+            decode_response(&response).status.unwrap().code,
+            api::StatusCode::Ok as i32
+        );
         push_event(&state, "session_active", "session 2".into());
-        assert!(drain_event_envelopes(&mut state, &mut conn).is_empty());
+        let events = drain_event_envelopes(&mut state, &mut conn);
+        assert_eq!(events.len(), 1);
+        let event = match events[0].body.as_ref().expect("event body") {
+            api::envelope::Body::Event(event) => event,
+            other => panic!("expected event envelope, got {other:?}"),
+        };
+        assert_eq!(event.event_sequence, 1, "resumed subscription has its own sequence");
+        assert_eq!(event.payload, b"session 2".to_vec());
     }
 
     #[test]

@@ -5,9 +5,13 @@
 //! and the general dispatcher can keep envelope framing in one place.
 
 use crate::control_transport::ConnectionState;
+use crate::control_authorization::control_principal_id;
 use crate::event_log::to_control_event;
 use crate::state::RuntimeState;
 use prost::Message;
+use umc_control::events::{
+    event_filter_digest, EventHistoryError, EventResumeCursor, EVENT_CURSOR_TTL_MS,
+};
 use umc_control::proto::umc::api::v1 as api;
 
 /// Dispatch one `EventService` request and return its protocol status/payload.
@@ -38,20 +42,46 @@ fn subscribe(
     let Ok(subscribe) = api::SubscribeRequest::decode(request.payload.as_slice()) else {
         return (api::StatusCode::InvalidArgument as i32, None);
     };
-    if !subscribe.resume_cursor.is_empty() {
-        return (api::StatusCode::OutOfRange as i32, None);
-    }
     if conn.subscriptions.len() >= umc_control::events::MAX_EVENT_STREAMS_PER_CLIENT {
         return (api::StatusCode::ResourceExhausted as i32, None);
     }
     let filter = subscribe.filter.unwrap_or_default();
-    let initial = if filter.include_initial_snapshot {
+    let principal_id = control_principal_id(state, conn.presented_token.as_deref()).unwrap_or(0);
+    let filter_digest = event_filter_digest(&filter);
+    let now_ms = crate::state::wall_now().0;
+    let resume_sequence = if subscribe.resume_cursor.is_empty() {
+        None
+    } else {
+        let Some(cursor) = EventResumeCursor::decode(
+            &subscribe.resume_cursor,
+            &state.event_cursor_key,
+        ) else {
+            return out_of_range_response();
+        };
+        if !cursor.validate(
+            principal_id,
+            state.server_instance_id,
+            filter_digest,
+            now_ms,
+        ) {
+            return out_of_range_response();
+        }
+        Some(cursor.sequence())
+    };
+    let initial = if resume_sequence.is_none() && filter.include_initial_snapshot {
         Some(state.events.lock().expect("event log").recent(100))
     } else {
         None
     };
     let subscription_id = {
         let mut bus = state.event_bus.lock().expect("event bus");
+        let replay = match resume_sequence {
+            Some(sequence) => match bus.history_after(sequence) {
+                Ok(history) => Some(history),
+                Err(EventHistoryError::OutOfRange) => return out_of_range_response(),
+            },
+            None => None,
+        };
         let id = bus.subscribe();
         if let Some(initial) = initial {
             if let Some(subscription) = bus.subscription(id) {
@@ -60,20 +90,66 @@ fn subscribe(
                 }
             }
         }
+        if let Some(replay) = replay {
+            if let Some(subscription) = bus.subscription(id) {
+                for (journal_sequence, event) in replay {
+                    let _ = subscription.push_with_journal_sequence(event, journal_sequence);
+                }
+            }
+        }
         id
     };
     conn.subscriptions.insert(subscription_id, filter);
     let handle = subscription_id.to_be_bytes().to_vec();
+    let resume_cursor = make_cursor(
+        principal_id,
+        state.server_instance_id,
+        filter_digest,
+        state
+            .event_bus
+            .lock()
+            .expect("event bus")
+            .latest_event_sequence(),
+        now_ms,
+        &state.event_cursor_key,
+    );
     let response = api::SubscribeResponse {
         subscription_handle: Some(api::OpaqueHandle {
             value: handle.clone(),
         }),
-        resume_cursor: handle,
+        resume_cursor,
         first_event_sequence: 1,
     };
     let mut payload = Vec::new();
     Message::encode(&response, &mut payload).expect("encode");
     (api::StatusCode::Ok as i32, Some(payload))
+}
+
+fn out_of_range_response() -> (i32, Option<Vec<u8>>) {
+    let payload = api::EventGap {
+        snapshot_required: true,
+        ..Default::default()
+    }
+    .encode_to_vec();
+    (api::StatusCode::OutOfRange as i32, Some(payload))
+}
+
+fn make_cursor(
+    principal_id: u64,
+    generation: [u8; 16],
+    filter_digest: [u8; 16],
+    sequence: u64,
+    now_ms: u64,
+    key: &[u8; 32],
+) -> Vec<u8> {
+    EventResumeCursor::encode(
+        principal_id,
+        generation,
+        filter_digest,
+        sequence,
+        now_ms.saturating_add(EVENT_CURSOR_TTL_MS),
+        key,
+    )
 }
 
 fn unsubscribe(
@@ -111,6 +187,7 @@ pub(crate) fn drain_event_envelopes(
         .map(|(id, filter)| (*id, filter.clone()))
         .collect();
     let mut bus = state.event_bus.lock().expect("event bus");
+    let latest_journal_sequence = bus.latest_event_sequence();
     let mut envelopes = Vec::new();
     for (id, filter) in subscriptions {
         let Some(subscription) = bus.subscription(id) else {
@@ -137,12 +214,21 @@ pub(crate) fn drain_event_envelopes(
                         .unwrap_or(i64::MAX),
                     payload_type: "event_gap".into(),
                     payload: gap.encode_to_vec(),
-                    resume_cursor: id.to_be_bytes().to_vec(),
+                    resume_cursor: make_cursor(
+                        control_principal_id(state, conn.presented_token.as_deref()).unwrap_or(0),
+                        state.server_instance_id,
+                        event_filter_digest(&filter),
+                        latest_journal_sequence,
+                        crate::state::wall_now().0,
+                        &state.event_cursor_key,
+                    ),
                     ..Default::default()
                 })),
             });
         }
-        while let Some((sequence, event)) = subscription.pop_with_sequence() {
+        while let Some((sequence, journal_sequence, event)) =
+            subscription.pop_with_sequence_and_journal()
+        {
             if !event_matches_filter(&event, &filter) {
                 continue;
             }
@@ -161,7 +247,18 @@ pub(crate) fn drain_event_envelopes(
                     resource_id: event.resource.unwrap_or_default(),
                     payload_type: event.event_type,
                     payload: event.payload,
-                    resume_cursor: id.to_be_bytes().to_vec(),
+                    resume_cursor: make_cursor(
+                        control_principal_id(state, conn.presented_token.as_deref()).unwrap_or(0),
+                        state.server_instance_id,
+                        event_filter_digest(&filter),
+                        if journal_sequence == 0 {
+                            latest_journal_sequence
+                        } else {
+                            journal_sequence
+                        },
+                        crate::state::wall_now().0,
+                        &state.event_cursor_key,
+                    ),
                 })),
             });
         }

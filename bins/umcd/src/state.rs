@@ -614,6 +614,9 @@ pub struct RuntimeState {
     /// Random identifier for this daemon process instance. It changes on
     /// every startup and scopes control-plane handles and resume cursors.
     pub server_instance_id: [u8; 16],
+    /// Secret used to authenticate event resume cursors. It is intentionally
+    /// process-local, so a daemon restart invalidates outstanding cursors.
+    pub event_cursor_key: [u8; 32],
     /// Resolved control socket path.
     pub control_socket: PathBuf,
     /// Node database (namespaces: config, trust, records).
@@ -926,6 +929,8 @@ impl RuntimeState {
 
         let mut server_instance_id = [0u8; 16];
         OsEntropy.fill(&mut server_instance_id);
+        let mut event_cursor_key = [0u8; 32];
+        OsEntropy.fill(&mut event_cursor_key);
         let (token_registry, token_grants) = restore_control_tokens(store.as_ref());
         let idempotency = crate::control_transport::IdempotencyCache::restore(
             store.as_ref(),
@@ -939,6 +944,7 @@ impl RuntimeState {
             restore_warning,
             revocation_warning,
             server_instance_id,
+            event_cursor_key,
             config,
             store,
             trust_default_level: TrustLevel::Unknown,

@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use prost::Message;
 use rand_core::RngCore;
 use umc_carrier::types::LinkEvent;
+use umc_control::events::{event_filter_digest, EventResumeCursor, EVENT_CURSOR_TTL_MS};
 use umc_control::proto::umc::api::v1 as api;
 use umc_core::node::{Node, NodeConfig, NodeIdentity};
 use umc_core::trust::{TrustState, TrustStore};
@@ -286,7 +287,10 @@ pub(crate) struct EmbeddedBackend {
     raw_links: HashMap<Vec<u8>, EmbeddedRawLink>,
     streams: HashMap<Vec<u8>, EmbeddedStream>,
     subscriptions: HashMap<Vec<u8>, EmbeddedSubscription>,
-    event_history: VecDeque<api::Event>,
+    event_cursor_key: [u8; 32],
+    event_history_next_sequence: u64,
+    event_history: VecDeque<(u64, api::Event)>,
+    event_history_bytes: usize,
 }
 
 impl EmbeddedBackend {
@@ -342,6 +346,8 @@ impl EmbeddedBackend {
         }
         let endpoint_id = identity.endpoint_id().to_vec();
         let generation = generation_for(&endpoint_id);
+        let mut event_cursor_key = [0u8; 32];
+        rand_core::OsRng.fill_bytes(&mut event_cursor_key);
         let node = Node::new(
             NodeConfig {
                 identity,
@@ -368,7 +374,10 @@ impl EmbeddedBackend {
             raw_links: HashMap::new(),
             streams: HashMap::new(),
             subscriptions: HashMap::new(),
+            event_cursor_key,
+            event_history_next_sequence: 0,
             event_history: VecDeque::new(),
+            event_history_bytes: 0,
         };
         let carrier_type = backend.carrier.0.type_id().0;
         backend.carrier_instances.insert(
@@ -2042,16 +2051,35 @@ impl EmbeddedBackend {
         let Ok(request) = api::SubscribeRequest::decode(payload) else {
             return (api::StatusCode::InvalidArgument as i32, Vec::new());
         };
-        if !request.resume_cursor.is_empty() {
-            return (api::StatusCode::OutOfRange as i32, Vec::new());
-        }
-        let handle = self.next_handle(8);
         let filter = request.filter.unwrap_or_default();
-        let include_initial_snapshot = filter.include_initial_snapshot;
+        let filter_digest = event_filter_digest(&filter);
+        let now = now_ms();
+        let resume_sequence = if request.resume_cursor.is_empty() {
+            None
+        } else {
+            let Some(cursor) =
+                EventResumeCursor::decode(&request.resume_cursor, &self.event_cursor_key)
+            else {
+                return Self::event_cursor_out_of_range();
+            };
+            if !cursor.validate(0, self.cursor_generation(), filter_digest, now) {
+                return Self::event_cursor_out_of_range();
+            }
+            Some(cursor.sequence())
+        };
+        let history = match resume_sequence {
+            Some(sequence) => match self.history_after(sequence) {
+                Ok(history) => history,
+                Err(()) => return Self::event_cursor_out_of_range(),
+            },
+            None if filter.include_initial_snapshot => self.event_history.iter().cloned().collect(),
+            None => Vec::new(),
+        };
+        let handle = self.next_handle(8);
         self.subscriptions.insert(
             handle.clone(),
             EmbeddedSubscription {
-                filter,
+                filter: filter.clone(),
                 next_sequence: 1,
                 queue: VecDeque::new(),
                 queue_bytes: 0,
@@ -2061,19 +2089,64 @@ impl EmbeddedBackend {
                 out_of_sync_to: None,
             },
         );
-        if include_initial_snapshot {
-            let history: Vec<_> = self.event_history.iter().cloned().collect();
-            for event in history {
-                self.enqueue_event(&handle, event);
-            }
+        for (journal_sequence, event) in history {
+            self.enqueue_event_with_journal(&handle, event, journal_sequence);
         }
         encoded_ok(&api::SubscribeResponse {
             subscription_handle: Some(api::OpaqueHandle {
                 value: handle.clone(),
             }),
-            resume_cursor: handle,
+            resume_cursor: self.make_event_cursor(filter_digest, self.event_history_next_sequence),
             first_event_sequence: 1,
         })
+    }
+
+    fn event_cursor_out_of_range() -> (i32, Vec<u8>) {
+        (
+            api::StatusCode::OutOfRange as i32,
+            api::EventGap {
+                snapshot_required: true,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    fn cursor_generation(&self) -> [u8; 16] {
+        let mut generation = [0u8; 16];
+        generation[8..].copy_from_slice(&self.generation.to_be_bytes());
+        generation
+    }
+
+    fn make_event_cursor(&self, filter_digest: [u8; 16], sequence: u64) -> Vec<u8> {
+        EventResumeCursor::encode(
+            0,
+            self.cursor_generation(),
+            filter_digest,
+            sequence,
+            now_ms().saturating_add(EVENT_CURSOR_TTL_MS),
+            &self.event_cursor_key,
+        )
+    }
+
+    fn history_after(&self, after_sequence: u64) -> Result<Vec<(u64, api::Event)>, ()> {
+        if after_sequence > self.event_history_next_sequence {
+            return Err(());
+        }
+        if self.event_history.is_empty() && after_sequence < self.event_history_next_sequence {
+            return Err(());
+        }
+        if let Some((oldest, _)) = self.event_history.front() {
+            if after_sequence.saturating_add(1) < *oldest {
+                return Err(());
+            }
+        }
+        Ok(self
+            .event_history
+            .iter()
+            .filter(|(sequence, _)| *sequence > after_sequence)
+            .cloned()
+            .collect())
     }
 
     fn unsubscribe_events(&mut self, payload: &[u8]) -> (i32, Vec<u8>) {
@@ -2090,6 +2163,13 @@ impl EmbeddedBackend {
     }
 
     pub(crate) fn next_event(&mut self, subscription: &[u8]) -> Result<Event, ClientError> {
+        let filter_digest = self
+            .subscriptions
+            .get(subscription)
+            .map(|state| event_filter_digest(&state.filter))
+            .ok_or(ClientError::NotFound)?;
+        let current_cursor =
+            self.make_event_cursor(filter_digest, self.event_history_next_sequence);
         let Some(subscription_state) = self.subscriptions.get_mut(subscription) else {
             return Err(ClientError::NotFound);
         };
@@ -2113,7 +2193,7 @@ impl EmbeddedBackend {
                     snapshot_required: true,
                 }
                 .encode_to_vec(),
-                resume_cursor: subscription.to_vec(),
+                resume_cursor: current_cursor,
                 ..Default::default()
             };
             return Event::from_proto(event, self.generation);
@@ -2175,17 +2255,47 @@ impl EmbeddedBackend {
             payload,
             ..Default::default()
         };
-        self.event_history.push_back(event.clone());
-        while self.event_history.len() > 100 {
-            self.event_history.pop_front();
+        self.event_history_next_sequence = self.event_history_next_sequence.saturating_add(1);
+        let journal_sequence = self.event_history_next_sequence;
+        self.event_history_bytes = self.event_history_bytes.saturating_add(event.payload.len());
+        self.event_history
+            .push_back((journal_sequence, event.clone()));
+        while self.event_history.len() > 100
+            || self.event_history_bytes > EMBEDDED_EVENT_MAX_BACKLOG_BYTES
+        {
+            if let Some((_, old_event)) = self.event_history.pop_front() {
+                self.event_history_bytes = self
+                    .event_history_bytes
+                    .saturating_sub(old_event.payload.len());
+            } else {
+                break;
+            }
         }
         let handles: Vec<Vec<u8>> = self.subscriptions.keys().cloned().collect();
         for handle in handles {
-            self.enqueue_event(&handle, event.clone());
+            self.enqueue_event_with_journal(&handle, event.clone(), journal_sequence);
         }
     }
 
-    fn enqueue_event(&mut self, subscription: &[u8], mut event: api::Event) {
+    fn enqueue_event_with_journal(
+        &mut self,
+        subscription: &[u8],
+        mut event: api::Event,
+        journal_sequence: u64,
+    ) {
+        let Some(filter_digest) = self
+            .subscriptions
+            .get(subscription)
+            .map(|state| event_filter_digest(&state.filter))
+        else {
+            return;
+        };
+        let cursor_sequence = if journal_sequence == 0 {
+            self.event_history_next_sequence
+        } else {
+            journal_sequence
+        };
+        let resume_cursor = self.make_event_cursor(filter_digest, cursor_sequence);
         let Some(subscription_state) = self.subscriptions.get_mut(subscription) else {
             return;
         };
@@ -2216,7 +2326,7 @@ impl EmbeddedBackend {
             value: subscription.to_vec(),
         });
         event.event_sequence = sequence;
-        event.resume_cursor = subscription.to_vec();
+        event.resume_cursor = resume_cursor;
         subscription_state.queue_bytes += event.payload.len();
         subscription_state.queue.push_back(event);
     }
@@ -2488,6 +2598,73 @@ mod tests {
                 .expect("post-ack event")
                 .payload(),
             &[3]
+        );
+    }
+
+    #[test]
+    fn embedded_event_resume_cursor_replays_only_events_after_cursor() {
+        let config = super::EmbeddedConfig::default();
+        let mut backend = super::EmbeddedBackend::new(&config).expect("embedded backend");
+        let subscribe = api::SubscribeRequest::default().encode_to_vec();
+        let (_, payload) = backend.request_raw("EventService", "Subscribe", &subscribe, None);
+        let first = api::SubscribeResponse::decode(payload.as_slice()).expect("subscribe");
+        let first_handle = first
+            .subscription_handle
+            .as_ref()
+            .expect("first handle")
+            .value
+            .clone();
+
+        backend.publish_event(
+            api::EventType::NodeState,
+            api::EventClass::State,
+            None,
+            Vec::new(),
+            "first",
+            vec![1],
+        );
+        let delivered = backend.next_event(&first_handle).expect("first event");
+        let cursor = delivered.resume_cursor().to_vec();
+        let unsubscribe = api::UnsubscribeRequest {
+            subscription_handle: Some(api::OpaqueHandle {
+                value: first_handle,
+            }),
+        }
+        .encode_to_vec();
+        let (status, _) = backend.request_raw("EventService", "Unsubscribe", &unsubscribe, None);
+        assert_eq!(status, api::StatusCode::Ok as i32);
+
+        let resumed = api::SubscribeRequest {
+            filter: None,
+            resume_cursor: cursor,
+        }
+        .encode_to_vec();
+        let (status, payload) = backend.request_raw("EventService", "Subscribe", &resumed, None);
+        assert_eq!(status, api::StatusCode::Ok as i32);
+        let resumed_handle = api::SubscribeResponse::decode(payload.as_slice())
+            .expect("resumed subscribe")
+            .subscription_handle
+            .expect("resumed handle")
+            .value;
+        assert!(matches!(
+            backend.next_event(&resumed_handle),
+            Err(ClientError::WouldBlock)
+        ));
+
+        backend.publish_event(
+            api::EventType::NodeState,
+            api::EventClass::State,
+            None,
+            Vec::new(),
+            "second",
+            vec![2],
+        );
+        let next = backend.next_event(&resumed_handle).expect("second event");
+        assert_eq!(next.payload_type(), "second");
+        assert_eq!(
+            next.sequence(),
+            1,
+            "a resumed subscription has its own sequence"
         );
     }
 

@@ -350,9 +350,33 @@ impl crate::client::Client {
         filter: EventFilter,
         deadline_unix_ms: Option<i64>,
     ) -> Result<SubscriptionHandle, ClientError> {
+        self.subscribe_events_from_cursor_with_deadline(filter, &[], deadline_unix_ms)
+            .await
+    }
+
+    /// Resumes an event subscription after the opaque cursor returned by a
+    /// previous event. The cursor is bound to this principal, filter, and
+    /// server journal generation; an expired or evicted cursor returns
+    /// `OUT_OF_RANGE` so the caller can request a fresh snapshot.
+    pub async fn subscribe_events_from_cursor(
+        &mut self,
+        filter: EventFilter,
+        resume_cursor: &[u8],
+    ) -> Result<SubscriptionHandle, ClientError> {
+        self.subscribe_events_from_cursor_with_deadline(filter, resume_cursor, None)
+            .await
+    }
+
+    /// Resumes an event subscription with an absolute Control API deadline.
+    pub async fn subscribe_events_from_cursor_with_deadline(
+        &mut self,
+        filter: EventFilter,
+        resume_cursor: &[u8],
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<SubscriptionHandle, ClientError> {
         let request = api::SubscribeRequest {
             filter: Some(filter.to_proto()),
-            resume_cursor: Vec::new(),
+            resume_cursor: resume_cursor.to_vec(),
         };
         let response = self
             .request_with_deadline(
