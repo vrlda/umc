@@ -50,6 +50,11 @@ impl ObjectStore {
             .map_err(|e| StoreError::Corrupt(e.to_string()))?;
         drop(file);
         std::fs::rename(&tmp, &path).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        // Unix permits opening a directory and syncing it to persist the
+        // rename. Windows rejects directory handles with `Access is denied`,
+        // while the file sync above plus the atomic rename is the supported
+        // durability boundary there.
+        #[cfg(unix)]
         if let Some(parent) = path.parent() {
             std::fs::File::open(parent)
                 .and_then(|dir| dir.sync_all())
