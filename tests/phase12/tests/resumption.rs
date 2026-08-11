@@ -137,6 +137,7 @@ fn spawn_daemon(name: &str, tcp_port: u16, udp_port: u16) -> (Daemon, PathBuf) {
     let log = fs::File::create(dir.join("umcd.log")).expect("log file");
     let child = Command::new(umcd_binary())
         .args(["--config", config_path.to_str().expect("config path")])
+        .env("RUST_LOG", "debug")
         .stdout(Stdio::from(log.try_clone().expect("clone log")))
         .stderr(Stdio::from(log))
         .spawn()
@@ -886,12 +887,15 @@ async fn node_connect_resumed_end_to_end() {
         let remote = remote.clone();
         tokio::task::spawn_blocking(move || tcp_handshake(&node, &remote))
     };
-    let (xx_link, xx_session, resumption_secret) =
-        tokio::time::timeout(Duration::from_secs(20), handshake)
-            .await
-            .expect("handshake timed out")
-            .expect("handshake thread panicked")
-            .expect("node handshake failed");
+    let handshake_result = tokio::time::timeout(Duration::from_secs(20), handshake)
+        .await
+        .expect("handshake timed out")
+        .expect("handshake thread panicked");
+    let (xx_link, xx_session, resumption_secret) = handshake_result.unwrap_or_else(|error| {
+        let log = fs::read_to_string(daemon.dir.join("umcd.log"))
+            .unwrap_or_else(|read_error| format!("<unable to read daemon log: {read_error}>"));
+        panic!("node handshake failed: {error:?}; daemon log:\n{log}");
+    });
     assert_ne!(resumption_secret, [0u8; 32]);
     // Close the XX link NOW (the bindings would otherwise live until the
     // test body ends): the daemon's session for the dead link must fully
