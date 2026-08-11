@@ -1,0 +1,8 @@
+/target
+# Keep the workspace dependency graph pinned for reproducible release and CI
+# evidence. Library-only crates may ignore their lockfile, but this repository
+# ships binaries and release artifacts.
+!Cargo.lock
+.DS_Store
+fuzz/target
+interop/python/__pycache__/

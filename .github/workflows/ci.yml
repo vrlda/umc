@@ -1,0 +1,178 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "41 3 * * 0"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Independent protocol vectors
+        run: |
+          python -m pip install --disable-pip-version-check -r interop/python/requirements.txt
+          python -m unittest discover -s interop/python -p 'test_*.py'
+      - name: Test
+        run: cargo test --workspace
+
+  sbom:
+    name: SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate Cargo SBOM metadata
+        run: cargo metadata --format-version 1 --locked > sbom.json
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+
+  dependency-audit:
+    name: Dependency audit and SBOM
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Generate locked dependency evidence
+        run: bash scripts/dependency-audit.sh dependency-audit
+      - name: Verify dependency evidence
+        run: bash scripts/verify-dependency-audit.sh dependency-audit/dependency-report.json
+      - name: Upload dependency evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-audit
+          path: dependency-audit/
+
+  interop:
+    name: Independent carrier interoperability
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install independent peer dependencies
+        run: python -m pip install --disable-pip-version-check -r interop/python/requirements.txt
+      - name: Build daemon
+        run: cargo build --package umcd --locked
+      - name: Live TCP interoperability
+        run: python interop/python/live_runner.py --carrier tcp --binary target/debug/umcd --result live-tcp.json
+      - name: Live UDP interoperability
+        run: python interop/python/live_runner.py --carrier udp --binary target/debug/umcd --result live-udp.json
+      - name: Live TLS-stream interoperability
+        run: python interop/python/live_runner.py --carrier tls --binary target/debug/umcd --result live-tls.json
+      - name: Upload live interoperability evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: independent-carrier-interoperability
+          path: live-*.json
+
+  aarch64-evidence:
+    name: Optional Tier-2 Linux aarch64 evidence
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Capture native platform evidence
+        run: bash scripts/platform-evidence.sh aarch64-platform-evidence.json
+      - name: Assert native aarch64 host
+        run: test "$(uname -m)" = aarch64
+      - name: Verify platform evidence
+        run: bash scripts/verify-platform-evidence.sh aarch64-platform-evidence.json
+      - name: Upload platform evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-aarch64-platform-evidence
+          path: aarch64-platform-evidence.json
+
+  coverage:
+    name: Protocol coverage
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Measure protocol-pure coverage
+        run: >-
+          cargo llvm-cov
+          --package umc-wire
+          --package umc-crypto
+          --package umc-handshake
+          --package umc-session
+          --lib
+          --lcov
+          --output-path lcov.info
+          --fail-under-lines 70
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: protocol-coverage
+          path: lcov.info
+
+  release-baseline:
+    name: Release benchmark and soak baseline
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run benchmarks and ten-minute soak
+        run: bash scripts/release-baseline.sh release-baseline
+      - name: Verify clean release baseline
+        run: bash scripts/verify-release-baseline.sh release-baseline/baseline.json
+      - name: Upload release baseline evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-baseline
+          path: release-baseline/
+
+  security-operations:
+    name: Security operations drills
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run offline security operations drills
+        run: bash scripts/security-operations-drill.sh security-operations-drill
+      - name: Upload security operations evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-operations-drill
+          path: security-operations-drill/

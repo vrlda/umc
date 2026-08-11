@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/umc-types",
+    "crates/umc-control",
+    "crates/umc-wire",
+    "crates/umc-crypto",
+    "crates/umc-handshake",
+    "crates/umc-metrics",
+    "crates/umc-session",
+    "crates/umc-routing",
+    "crates/umc-relay",
+    "crates/umc-discovery",
+    "crates/umc-carrier",
+    "crates/umc-core",
+    "crates/umc-storage",
+    "crates/umc-sdk",
+    "crates/umc-sdk-c",
+    "crates/umc-plugin",
+    "crates/umc-bundle",
+    "bins/umc",
+    "bins/umcd",
+    "carriers/umc-carrier-tcp",
+    "carriers/umc-carrier-tls",
+    "carriers/umc-carrier-udp",
+    "carriers/umc-carrier-lan",
+    "examples/echo",
+    "tests/phase1",
+    "tests/phase2",
+    "tests/phase3",
+    "tests/phase4",
+    "tests/phase5",
+    "tests/phase6",
+    "tests/phase7",
+    "tests/phase8",
+    "tests/phase9",
+    "tests/phase12",
+    "tests/phase13",
+    "tests/phase14",
+    "tests/simulation",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.80"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[profile.release]
+lto = "thin"
