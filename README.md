@@ -81,9 +81,4 @@ model before treating the runtime as production-secure.
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0
-- MIT License
-
-at your option.
+Licensed under the Apache License, Version 2.0.
