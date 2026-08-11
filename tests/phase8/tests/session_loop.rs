@@ -10,6 +10,7 @@ use prost::Message;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 use umc_carrier::types::OutboundPacket;
@@ -526,20 +527,30 @@ fn client_node(carrier_type: &str) -> Node {
     node
 }
 
+static TEST_PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
+
+/// Pick a per-process test port and verify it is currently bindable. The
+/// old bind-to-zero-then-drop pattern let parallel workspace binaries choose
+/// the same port before their daemon children had a chance to bind it.
+fn next_test_port() -> u16 {
+    loop {
+        let sequence = u32::from(TEST_PORT_COUNTER.fetch_add(1, AtomicOrdering::Relaxed));
+        let process_slot = std::process::id() % 10_000;
+        let port = 20_000 + ((process_slot * 2 + sequence) % 20_000) as u16;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+            && std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+        {
+            return port;
+        }
+    }
+}
+
 fn free_tcp_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral tcp")
-        .local_addr()
-        .expect("tcp local addr")
-        .port()
+    next_test_port()
 }
 
 fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .expect("bind ephemeral udp")
-        .local_addr()
-        .expect("udp local addr")
-        .port()
+    next_test_port()
 }
 
 #[tokio::test(flavor = "multi_thread")]
