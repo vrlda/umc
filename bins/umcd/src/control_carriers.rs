@@ -602,6 +602,7 @@ fn upsert_option(options: &mut Vec<api::ConfigEntry>, entry: api::ConfigEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn materialize_options_redacts_secrets_and_applies_clear() {
@@ -655,10 +656,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn configured_bind_address_creates_and_releases_runtime_listener() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let data_dir = std::env::temp_dir().join(format!(
             "umcd-carrier-runtime-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let config = crate::config::NodeConfig {
             data_dir,
