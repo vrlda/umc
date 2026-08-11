@@ -55,18 +55,16 @@ fn umcd_binary() -> PathBuf {
     // Rebuild whenever the daemon sources are newer than the binary: a stale
     // daemon silently tests the wrong code (the phase12 suites have been
     // burned by this more than once).
-    let src_newer = std::fs::read_dir(here.join("../../bins/umcd/src"))
-        .map(|entries| {
-            entries.filter_map(Result::ok).any(|e| {
-                e.path()
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .zip(bin.metadata().and_then(|m| m.modified()).ok())
-                    .is_some_and(|(src, bin)| src > bin)
-            })
+    let src_newer = std::fs::read_dir(here.join("../../bins/umcd/src")).map_or(true, |entries| {
+        entries.filter_map(Result::ok).any(|e| {
+            e.path()
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .zip(bin.metadata().and_then(|m| m.modified()).ok())
+                .is_some_and(|(src, bin)| src > bin)
         })
-        .unwrap_or(true);
+    });
     if !bin.exists() || src_newer {
         let status = Command::new(env!("CARGO"))
             .args(["build", "-p", "umcd"])
