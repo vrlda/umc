@@ -50,18 +50,34 @@ build on it but remain separate projects.
 
 ## Quick start
 
-Build the workspace:
+Install the CLI and daemon on Unix/macOS:
 
-```bash
-cargo build --workspace
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/vrlda/umc/main/install.sh | sh
 ```
 
-Initialize a node and inspect its commands:
+The installer clones the selected GitHub revision and runs Cargo, so it needs
+Git and a Rust toolchain. By default it installs the latest `main` revision to
+`~/.cargo/bin`. Pin another branch or tag by replacing `main` in `UMC_REF`:
 
-```bash
-cargo run -p umc -- init
-cargo run -p umc -- --help
-cargo run -p umcd -- --help
+```sh
+UMC_REF=main sh -c 'curl --proto "=https" --tlsv1.2 -LsSf https://raw.githubusercontent.com/vrlda/umc/main/install.sh | sh'
+```
+
+Initialize and start a local node:
+
+```sh
+umc init
+umcd &
+umc status
+```
+
+To build from a checkout instead:
+
+```sh
+git clone https://github.com/vrlda/umc.git
+cd umc
+cargo build --workspace
 ```
 
 The Rust SDK can run against a daemon or entirely in-process through its
