@@ -8,11 +8,11 @@ fuzz/target
 interop/python/__pycache__/
 
 # Development material retained locally but not shipped in the product tree.
-docs/
-spec/
-prototype/
-fuzz/
-interop/
-scripts/
-tests/
-umeps/
+/docs/
+/spec/
+/prototype/
+/fuzz/
+/interop/
+/scripts/
+/tests/
+/umeps/
