@@ -23,7 +23,7 @@ impl DaemonClient {
     /// Returns an explicit unsupported error until named-pipe transport is implemented.
     pub async fn connect(socket: &str, client_name: &str) -> Result<Self, ClientError> {
         let _ = (socket, client_name);
-        Err(ClientError::Unsupported(UNSUPPORTED.into()))
+        std::future::ready(Err(ClientError::Unsupported(UNSUPPORTED.into()))).await
     }
 
     /// Returns an explicit unsupported error until named-pipe transport is implemented.
@@ -34,7 +34,7 @@ impl DaemonClient {
         payload: Vec<u8>,
     ) -> Result<(i32, Vec<u8>), ClientError> {
         let _ = (service, method, payload);
-        Err(ClientError::Unsupported(UNSUPPORTED.into()))
+        std::future::ready(Err(ClientError::Unsupported(UNSUPPORTED.into()))).await
     }
 
     /// Returns an explicit unsupported error until named-pipe transport is implemented.
@@ -46,12 +46,12 @@ impl DaemonClient {
         deadline_unix_ms: Option<i64>,
     ) -> Result<(i32, Vec<u8>), ClientError> {
         let _ = (service, method, payload, deadline_unix_ms);
-        Err(ClientError::Unsupported(UNSUPPORTED.into()))
+        std::future::ready(Err(ClientError::Unsupported(UNSUPPORTED.into()))).await
     }
 
     pub(crate) async fn recv_event(&mut self, subscription: &[u8]) -> Result<Event, ClientError> {
         let _ = subscription;
-        Err(ClientError::Unsupported(UNSUPPORTED.into()))
+        std::future::ready(Err(ClientError::Unsupported(UNSUPPORTED.into()))).await
     }
 
     pub(crate) async fn acknowledge_event(
@@ -60,10 +60,11 @@ impl DaemonClient {
         highest_contiguous_sequence: u64,
     ) -> Result<(), ClientError> {
         let _ = (subscription, highest_contiguous_sequence);
-        Err(ClientError::Unsupported(UNSUPPORTED.into()))
+        std::future::ready(Err(ClientError::Unsupported(UNSUPPORTED.into()))).await
     }
 
     pub(crate) fn generation(&self) -> u64 {
+        let _ = self;
         0
     }
 }
