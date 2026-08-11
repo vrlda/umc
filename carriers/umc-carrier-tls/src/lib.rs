@@ -311,6 +311,12 @@ impl Listener for TlsListener {
                 }
             }
         };
+        stream.set_nonblocking(true).map_err(|error| CarrierError {
+            kind: CarrierErrorKind::Internal,
+            operation: "accept",
+            retryable: false,
+            message: error.to_string(),
+        })?;
         let stream = TcpStream::from_std(stream).map_err(|error| CarrierError {
             kind: CarrierErrorKind::Internal,
             operation: "accept",
