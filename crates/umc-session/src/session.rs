@@ -984,15 +984,15 @@ impl Session {
                 umc_wire::frame::Frame::PathResponse(response) => {
                     self.on_path_response(path_id, response.data)?;
                 }
-                umc_wire::frame::Frame::Migrate(migrate) => {
-                    if migrate.migration_sequence > self.last_migration_sequence {
-                        if migrate.old_path_id != self.primary_path_id {
-                            return Err(SessionError::PathMigration);
-                        }
-                        self.last_migration_sequence = migrate.migration_sequence;
-                        if migrate.make_primary {
-                            self.migrate_to(migrate.new_path_id, migrate.keep_old_path, now)?;
-                        }
+                umc_wire::frame::Frame::Migrate(migrate)
+                    if migrate.migration_sequence > self.last_migration_sequence =>
+                {
+                    if migrate.old_path_id != self.primary_path_id {
+                        return Err(SessionError::PathMigration);
+                    }
+                    self.last_migration_sequence = migrate.migration_sequence;
+                    if migrate.make_primary {
+                        self.migrate_to(migrate.new_path_id, migrate.keep_old_path, now)?;
                     }
                 }
                 _ => {}
@@ -1515,7 +1515,7 @@ impl Session {
             .values()
             .filter(|p| p.state == crate::path::PathState::Validating)
             .count();
-        if active + validating >= 1 + crate::path::MAX_CANDIDATE_PATHS {
+        if active + validating > crate::path::MAX_CANDIDATE_PATHS {
             return Err(SessionError::PathBudget);
         }
         let mut path = crate::path::Path::new(path_id, carrier_type, local, remote, now);

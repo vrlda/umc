@@ -129,11 +129,11 @@ impl PacingState {
     /// shrinking burst clamps the existing tokens to the new cap.
     pub fn set_rate(&mut self, cwnd: u64, smoothed_rtt_ms: u64, smss: u64) {
         let was_unlimited = self.rate_bps == 0;
-        self.rate_bps = if smoothed_rtt_ms == 0 {
-            0
-        } else {
-            cwnd.saturating_mul(8).saturating_mul(1_000) / smoothed_rtt_ms
-        };
+        self.rate_bps = cwnd
+            .saturating_mul(8)
+            .saturating_mul(1_000)
+            .checked_div(smoothed_rtt_ms)
+            .unwrap_or_default();
         self.burst_bytes = if smoothed_rtt_ms == 0 {
             0
         } else {
