@@ -853,8 +853,8 @@ mod tests {
     fn umcd_binary() -> PathBuf {
         let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let bin = here.join("../../target/debug/umcd");
-        let src_newer = std::fs::read_dir(here.join("../../bins/umcd/src"))
-            .map(|entries| {
+        let src_newer =
+            std::fs::read_dir(here.join("../../bins/umcd/src")).map_or(true, |entries| {
                 entries.filter_map(Result::ok).any(|e| {
                     e.path()
                         .metadata()
@@ -863,8 +863,7 @@ mod tests {
                         .zip(bin.metadata().and_then(|m| m.modified()).ok())
                         .is_some_and(|(src, bin)| src > bin)
                 })
-            })
-            .unwrap_or(true);
+            });
         if !bin.exists() || src_newer {
             let status = StdCommand::new(env!("CARGO"))
                 .args(["build", "-p", "umcd"])
