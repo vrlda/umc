@@ -13,8 +13,13 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 
 [dev-dependencies]
+criterion = "0.5"
 proptest = "1"
 hex = "0.4"
+
+[[bench]]
+name = "crypto"
+harness = false
 
 [lints]
 workspace = true

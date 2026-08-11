@@ -3,9 +3,10 @@
 //! Learned routes persist to the node database (storage.md §15); after a
 //! restart the cache restores every persisted route as `CANDIDATE` (§15.2)
 //! until a fresh `ROUTE_RESPONSE` revalidates it as usable.
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use umc_routing::cache::{RouteCache, DEFAULT_CACHE_MAX, DEFAULT_MAX_ROUTE_LIFETIME_MS};
 use umc_routing::duplicate::{RequestCache, DEFAULT_CACHE_ENTRIES};
+use umc_routing::paths::{PathBuilder, PathError, PathHop, PathPolicy, RoutePath};
 use umc_routing::request::{admit_request, Admission, AdmissionError, RequestPolicy};
 use umc_routing::reverse::ReverseState;
 use umc_routing::sybil::{SybilGroup, SybilGuard};
@@ -17,6 +18,22 @@ use umc_types::runtime::{Duration, Instant};
 
 /// Retention for reverse-path state (routing.md §17).
 pub const REVERSE_RETENTION_MS: u64 = 30_000;
+const MAX_REQUEST_CONTEXTS: usize = 1_024;
+
+/// Local context needed to bind a response to the destination and policy of
+/// the request that produced it. The wire response carries only the next hop;
+/// keeping this bounded context prevents cache entries from being keyed by
+/// that hop instead of the requested destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteRequestContext {
+    pub destination_hash: [u8; 32],
+    pub scope: RouteScope,
+    pub require_private_response: bool,
+    pub max_hops: u64,
+    pub max_relays: usize,
+    pub allow_relay: bool,
+    expires_at: Instant,
+}
 
 /// Process-local routing state, optionally bound to the node database for
 /// route persistence.
@@ -26,6 +43,7 @@ pub struct RoutingService {
     pub duplicate: RequestCache,
     pub sybil: SybilGuard,
     pub request_policy: RequestPolicy,
+    request_contexts: HashMap<[u8; 16], RouteRequestContext>,
     store: Option<Arc<SqliteStore>>,
 }
 
@@ -37,6 +55,7 @@ impl std::fmt::Debug for RoutingService {
             .field("duplicate", &self.duplicate)
             .field("sybil", &self.sybil)
             .field("request_policy", &self.request_policy)
+            .field("request_contexts", &self.request_contexts.len())
             .field("store_attached", &self.store.is_some())
             .finish()
     }
@@ -55,8 +74,112 @@ impl RoutingService {
             duplicate: RequestCache::new(DEFAULT_CACHE_ENTRIES, Duration::from_millis(30_000)),
             sybil: SybilGuard::default(),
             request_policy: RequestPolicy::default(),
+            request_contexts: HashMap::new(),
             store: None,
         }
+    }
+
+    /// Remember the bounded destination/scope context for a live route
+    /// request. Route responses do not repeat the destination hint, so the
+    /// context is required to key learned routes correctly.
+    #[allow(dead_code)] // retained as the default-policy convenience API
+    pub fn remember_route_request(
+        &mut self,
+        request_id: [u8; 16],
+        destination_hash: [u8; 32],
+        scope: RouteScope,
+        now: Instant,
+    ) {
+        self.remember_route_request_with_constraints(
+            request_id,
+            destination_hash,
+            scope,
+            false,
+            umc_routing::types::DEFAULT_HOP_LIMIT,
+            umc_routing::paths::DEFAULT_MAX_RELAYS,
+            true,
+            now,
+        );
+    }
+
+    /// Remember a route request together with its privacy requirement. The
+    /// flag is bounded reverse-state policy, not application-visible topology.
+    #[allow(dead_code)]
+    pub fn remember_route_request_with_policy(
+        &mut self,
+        request_id: [u8; 16],
+        destination_hash: [u8; 32],
+        scope: RouteScope,
+        require_private_response: bool,
+        now: Instant,
+    ) {
+        self.remember_route_request_with_constraints(
+            request_id,
+            destination_hash,
+            scope,
+            require_private_response,
+            umc_routing::types::DEFAULT_HOP_LIMIT,
+            umc_routing::paths::DEFAULT_MAX_RELAYS,
+            true,
+            now,
+        );
+    }
+
+    /// Remember route construction constraints alongside the destination
+    /// binding. Route responses carry only path metadata, so the requester
+    /// needs the original hop/relay policy to validate that metadata before
+    /// caching or handing the candidate to session setup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn remember_route_request_with_constraints(
+        &mut self,
+        request_id: [u8; 16],
+        destination_hash: [u8; 32],
+        scope: RouteScope,
+        require_private_response: bool,
+        max_hops: u64,
+        max_relays: usize,
+        allow_relay: bool,
+        now: Instant,
+    ) {
+        self.prune_request_contexts(now);
+        if self.request_contexts.len() >= MAX_REQUEST_CONTEXTS {
+            if let Some(oldest) = self
+                .request_contexts
+                .iter()
+                .min_by_key(|(_, context)| context.expires_at)
+                .map(|(request_id, _)| *request_id)
+            {
+                self.request_contexts.remove(&oldest);
+            }
+        }
+        self.request_contexts.insert(
+            request_id,
+            RouteRequestContext {
+                destination_hash,
+                scope,
+                require_private_response,
+                max_hops: max_hops.clamp(1, umc_routing::types::MAX_HOP_LIMIT),
+                max_relays: max_relays.min(umc_routing::paths::MAX_PATH_HOPS),
+                allow_relay,
+                expires_at: now + Duration::from_millis(REVERSE_RETENTION_MS),
+            },
+        );
+    }
+
+    /// Return request context while it remains within the reverse-state
+    /// retention window.
+    pub fn route_context(
+        &mut self,
+        request_id: &[u8; 16],
+        now: Instant,
+    ) -> Option<RouteRequestContext> {
+        self.prune_request_contexts(now);
+        self.request_contexts.get(request_id).cloned()
+    }
+
+    fn prune_request_contexts(&mut self, now: Instant) {
+        self.request_contexts
+            .retain(|_, context| context.expires_at > now);
     }
 
     /// Attaches the node database so learned routes persist (storage.md §15).
@@ -106,7 +229,7 @@ impl RoutingService {
                 },
                 state: RouteState::Candidate,
                 next_hop: String::from_utf8_lossy(&snapshot.next_hop).into_owned(),
-                metadata: vec![],
+                metadata: snapshot.metadata,
                 source_peer: vec![],
                 created_at,
                 expires_at: created_at + Duration::from_millis(snapshot.lifetime_ms),
@@ -134,6 +257,7 @@ impl RoutingService {
                 .as_millis(),
             learned_at_ms: record.created_at.0,
             scope: scope_to_u8(record.scope),
+            metadata: record.metadata.clone(),
         };
         if let Err(e) = records::save_route(store.as_ref(), &snapshot) {
             log::error!("[routing] failed to persist route: {e:?}");
@@ -183,6 +307,7 @@ impl RoutingService {
     /// upstream peer (routing.md §17-18). Returns the record when a
     /// response may travel.
     #[must_use]
+    #[allow(dead_code)]
     pub fn record_route_response(
         &mut self,
         key: RouteKey,
@@ -192,18 +317,57 @@ impl RoutingService {
         now: Instant,
     ) -> RouteRecord {
         let upstream = self.reverse.route_response(&request_id, now);
+        self.record_route_response_from_upstream(key, next_hop, lifetime_ms, now, upstream)
+    }
+
+    /// Record a response after the caller has already validated and consumed
+    /// reverse state (including response sequence checks).
+    #[must_use]
+    pub fn record_route_response_from_upstream(
+        &mut self,
+        key: RouteKey,
+        next_hop: String,
+        lifetime_ms: u64,
+        now: Instant,
+        upstream: Option<Vec<u8>>,
+    ) -> RouteRecord {
+        self.record_route_response_with_metadata(
+            key,
+            next_hop,
+            lifetime_ms,
+            now,
+            upstream,
+            Vec::new(),
+        )
+    }
+
+    /// Records a route response while retaining its bounded policy metadata.
+    /// Callers should pass metadata only after the response's authentication
+    /// and branch validity have been checked; hard route constraints fail
+    /// closed when this evidence is absent.
+    #[must_use]
+    pub fn record_route_response_with_metadata(
+        &mut self,
+        key: RouteKey,
+        next_hop: String,
+        lifetime_ms: u64,
+        now: Instant,
+        upstream: Option<Vec<u8>>,
+        metadata: Vec<u8>,
+    ) -> RouteRecord {
+        let scope = key.scope;
         let record = RouteRecord {
             key,
             state: RouteState::Usable,
             next_hop,
-            metadata: vec![],
+            metadata,
             source_peer: upstream.unwrap_or_default(),
             created_at: now,
             expires_at: now + Duration::from_millis(lifetime_ms),
             last_success: Some(now),
             last_failure: None,
             failure_count: 0,
-            scope: RouteScope::General,
+            scope,
         };
         self.cache.insert(record.clone(), now);
         self.persist_route(&record);
@@ -216,7 +380,61 @@ impl RoutingService {
     #[allow(dead_code)]
     #[must_use]
     pub fn find_route(&self, key: &RouteKey, now: Instant) -> Option<RouteRecord> {
-        self.cache.candidates(key, now).into_iter().next()
+        self.cache.ranked_candidates(key, now).into_iter().next()
+    }
+
+    /// Return bounded, failure-aware route alternatives for live forwarding.
+    /// Candidates remain partitioned by the full route key; no metadata from
+    /// another destination or policy class is merged.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn route_candidates(&self, key: &RouteKey, now: Instant) -> Vec<RouteRecord> {
+        self.cache.ranked_candidates(key, now)
+    }
+
+    /// Return a bounded topology-aware failover set. Independent authenticated
+    /// failure domains are preferred before a second candidate from a shared
+    /// domain, while the route key and all hard policy evidence remain
+    /// unchanged.
+    #[must_use]
+    pub fn diverse_route_candidates(
+        &self,
+        key: &RouteKey,
+        now: Instant,
+        maximum: usize,
+    ) -> Vec<RouteRecord> {
+        self.cache.diverse_candidates(key, now, maximum)
+    }
+
+    /// Record a failed forwarding attempt while retaining the route evidence
+    /// for diagnostics and later replacement by a fresh response.
+    pub fn mark_route_failure(&mut self, key: &RouteKey, next_hop: &str, now: Instant) -> bool {
+        self.cache.mark_failure(key, next_hop, now)
+    }
+
+    /// Constructs a bounded multi-hop path under the same hop policy used for
+    /// route-request admission.  Each adjacent hop is checked for loops,
+    /// exclusions, scope broadening, relay/hop caps, and explicit failure
+    /// domain diversity before it can reach session/relay setup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PathError`] when any path policy check fails.
+    #[allow(dead_code)] // consumed by the session/relay path-construction handoff
+    pub fn construct_path(
+        &self,
+        request_scope: RouteScope,
+        exclusions: &[Vec<u8>],
+        hops: &[PathHop],
+        mut policy: PathPolicy,
+    ) -> Result<RoutePath, PathError> {
+        let request_max_hops = usize::try_from(self.request_policy.max_hops).unwrap_or(usize::MAX);
+        policy.max_hops = policy.max_hops.min(request_max_hops);
+        let mut builder = PathBuilder::new(request_scope, exclusions, policy)?;
+        for hop in hops {
+            builder.push(hop.clone())?;
+        }
+        builder.finish()
     }
 }
 
@@ -296,6 +514,99 @@ mod tests {
     }
 
     #[test]
+    fn route_response_metadata_is_retained_for_hard_policy_checks() {
+        let mut routing = RoutingService::new();
+        let record = routing.record_route_response_with_metadata(
+            key(4),
+            "hop-a".into(),
+            1_000,
+            Instant(0),
+            None,
+            b"carrier=ump.tcp/1\0trust=3\0hops=1".to_vec(),
+        );
+        assert_eq!(record.metadata, b"carrier=ump.tcp/1\0trust=3\0hops=1");
+    }
+
+    #[test]
+    fn diverse_route_candidates_prefer_independent_domains() {
+        let mut routing = RoutingService::new();
+        let _ = routing.record_route_response_with_metadata(
+            key(5),
+            "hop-a".into(),
+            1_000,
+            Instant(0),
+            None,
+            b"domain=a".to_vec(),
+        );
+        let _ = routing.record_route_response_with_metadata(
+            key(5),
+            "hop-b".into(),
+            1_000,
+            Instant(0),
+            None,
+            b"domain=a".to_vec(),
+        );
+        let _ = routing.record_route_response_with_metadata(
+            key(5),
+            "hop-c".into(),
+            1_000,
+            Instant(0),
+            None,
+            b"domain=b".to_vec(),
+        );
+        let selected = routing.diverse_route_candidates(&key(5), Instant(1), 2);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|r| r.next_hop.as_str())
+                .collect::<Vec<_>>(),
+            vec!["hop-a", "hop-c"]
+        );
+    }
+
+    #[test]
+    fn route_record_preserves_key_scope() {
+        let mut routing = RoutingService::new();
+        let scoped_key = RouteKey {
+            scope: RouteScope::LocalMesh,
+            ..key(8)
+        };
+        let record = routing.record_route_response_with_metadata(
+            scoped_key,
+            "hop-local".into(),
+            1_000,
+            Instant(0),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(record.scope, RouteScope::LocalMesh);
+        assert_eq!(record.key.scope, RouteScope::LocalMesh);
+    }
+
+    #[test]
+    fn route_request_context_binds_destination_and_scope() {
+        let mut routing = RoutingService::new();
+        let request_id = [9u8; 16];
+        routing.remember_route_request(
+            request_id,
+            crate::session_task::hash_destination(b"destination-token"),
+            RouteScope::Introduced,
+            Instant(10),
+        );
+        let context = routing
+            .route_context(&request_id, Instant(11))
+            .expect("live route context");
+        assert_eq!(
+            context.destination_hash,
+            crate::session_task::hash_destination(b"destination-token")
+        );
+        assert_eq!(context.scope, RouteScope::Introduced);
+        assert!(routing
+            .route_context(&request_id, Instant(30_011))
+            .is_none());
+    }
+
+    #[test]
     fn zero_hop_limit_rejected() {
         let mut routing = RoutingService::new();
         assert_eq!(
@@ -352,6 +663,39 @@ mod tests {
         let record =
             routing.record_route_response(key(3), rid, "hop-x".into(), 600_000, Instant(1));
         assert_eq!(record.source_peer, b"upstream");
+    }
+
+    #[test]
+    fn path_construction_applies_runtime_hop_policy() {
+        let routing = RoutingService::new();
+        let hops = vec![
+            PathHop {
+                peer: b"relay-a".to_vec(),
+                scope: RouteScope::Introduced,
+                failure_domain: b"domain-a".to_vec(),
+                relay: true,
+            },
+            PathHop {
+                peer: b"relay-b".to_vec(),
+                scope: RouteScope::LocalMesh,
+                failure_domain: b"domain-b".to_vec(),
+                relay: true,
+            },
+        ];
+        let path = routing
+            .construct_path(
+                RouteScope::General,
+                &[],
+                &hops,
+                PathPolicy {
+                    minimum_distinct_failure_domains: 2,
+                    ..PathPolicy::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(path.hops.len(), 2);
+        assert_eq!(path.effective_scope, RouteScope::LocalMesh);
+        assert_eq!(path.distinct_failure_domains, 2);
     }
 
     fn temp_store() -> Arc<umc_storage::sqlite::SqliteStore> {

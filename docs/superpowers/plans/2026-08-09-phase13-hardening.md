@@ -188,7 +188,7 @@ pub fn persist_record(store: &SqliteStore, record: &BundleRecord) -> Result<(), 
 
 /// Load all persisted records. Status is re-derived: custody survives,
 /// forwarded becomes Received (the handoff is not resumable after restart,
-/// bundles.md §44/relay.md §44).
+/// bundles.md §9 / storage.md §12).
 pub fn load_records(store: &SqliteStore) -> Result<Vec<BundleRecord>, PersistError> {
     let mut out = Vec::new();
     for entry in store.scan(BUNDLE_NS)? {
@@ -908,4 +908,4 @@ git commit -m "docs: phase 13 complete"
 
 **Spec coverage:** `storage.md` §15-16 (peer/route records) → Task 1; §12 + `bundles.md` §9 (bundle metadata) → Task 2; `core.md` §42 + `resource-limits.md` §42 (metrics) → Tasks 3-4; `core.md` §49 + `testing.md` §11 (fuzzing) → Task 5; `resource-limits.md` §52 (restart quota recalc) → Task 6.
 
-**Known deferrals:** metrics exporter endpoint (public metrics server — disabled by default per core.md §42; the registry and snapshot exist), fuzz corpus minimization tooling, per-platform sandbox enforcement for plugins, OS keychain keystore integration, formal protocol analysis.
+**Known deferrals:** metrics exporter endpoint (public metrics server — disabled by default per core.md §42; the registry and snapshot exist), fuzz corpus minimization tooling, per-platform sandbox enforcement for plugins, formal protocol analysis, and OS/platform rollback anchors.

@@ -33,6 +33,36 @@ impl GrantSet {
         self.grants.push(grant);
     }
 
+    /// Convert the wire representation used by `TokenService` into the
+    /// runtime grant evaluator. Invalid or unspecified capabilities and
+    /// negative expiry values are ignored rather than becoming authority.
+    /// This keeps malformed delegated grants fail-closed at the authorization
+    /// boundary (control-api.md §12-14).
+    #[must_use]
+    pub fn from_api(grants: &[api::CapabilityGrant]) -> Self {
+        let mut set = Self::empty();
+        for (index, grant) in grants.iter().enumerate() {
+            let Ok(capability) = api::Capability::try_from(grant.capability) else {
+                continue;
+            };
+            if capability == api::Capability::Unspecified || grant.expires_at_unix_ms < 0 {
+                continue;
+            }
+            let expires_at_ms = if grant.expires_at_unix_ms == 0 {
+                None
+            } else {
+                u64::try_from(grant.expires_at_unix_ms).ok()
+            };
+            set.add(Grant {
+                grant_id: u64::try_from(index).unwrap_or(u64::MAX),
+                capabilities: vec![capability],
+                resource_constraints: grant.constraints.clone(),
+                expires_at_ms,
+            });
+        }
+        set
+    }
+
     #[must_use]
     pub fn allows(&self, capability: api::Capability, now_ms: u64) -> bool {
         self.grants.iter().any(|g| {
@@ -133,5 +163,33 @@ mod tests {
         });
         assert!(set.allows(api::Capability::NodeRead, 9));
         assert!(!set.allows(api::Capability::NodeRead, 10));
+    }
+
+    #[test]
+    fn api_grants_fail_closed_for_invalid_and_expired_entries() {
+        let grants = [
+            api::CapabilityGrant {
+                capability: api::Capability::NodeRead as i32,
+                expires_at_unix_ms: 50,
+                ..Default::default()
+            },
+            api::CapabilityGrant {
+                capability: api::Capability::Unspecified as i32,
+                ..Default::default()
+            },
+            api::CapabilityGrant {
+                capability: 9_999,
+                ..Default::default()
+            },
+            api::CapabilityGrant {
+                capability: api::Capability::NodeAdmin as i32,
+                expires_at_unix_ms: -1,
+                ..Default::default()
+            },
+        ];
+        let set = GrantSet::from_api(&grants);
+        assert!(set.allows(api::Capability::NodeRead, 49));
+        assert!(!set.allows(api::Capability::NodeRead, 50));
+        assert!(!set.allows(api::Capability::NodeAdmin, 0));
     }
 }

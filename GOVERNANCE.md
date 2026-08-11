@@ -1,6 +1,6 @@
 # Universal Mesh Project Governance
 
-**Status:** Draft
+**Status:** Draft — solo-maintainer v0.1 profile
 **Project:** Universal Mesh Core, UMC
 **Protocol:** Universal Mesh Protocol, UMP
 
@@ -10,9 +10,13 @@
 
 This document defines how the Universal Mesh Project is governed: who holds authority, how decisions are made, and how the project survives the departure or failure of any individual.
 
-The model is a **maintainer council with delegated module ownership**.
+For the current v0.1 repository, the model is one project owner operating with
+GitHub and CI. The owner holds release, security, and module authority. The
+council, quorum, and succession sections below are future-governance notes and
+do not create current requirements; there are no other maintainers today.
 
-No single maintainer should permanently control the protocol.
+Release manifests use one operator-controlled Ed25519 key (`1-of-1`). CI only
+verifies the public key and never receives the private key.
 
 ---
 
@@ -23,7 +27,7 @@ The project follows these principles:
 1. Public governance.
 2. Decisions by rough consensus, with defined fallbacks.
 3. Separation of protocol, release, security, and module authority.
-4. No single point of control.
+4. Keep the current operating model small and auditable.
 5. Succession and removal procedures defined in advance.
 6. Specification and protocol changes are public and reviewable.
 7. No mandatory project-operated infrastructure.
@@ -290,21 +294,12 @@ Recusal means:
 
 # 10. Release authority
 
-## 10.1 Threshold signing
+## 10.1 Solo signing
 
-Release manifests are signed by multiple long-lived maintainer keys.
-
-Initial policy:
-
-```text
-2-of-3 release approval
-```
-
-As the council grows:
-
-```text
-3-of-5
-```
+For the current v0.1 repository, release manifests are signed by one
+operator-controlled Ed25519 key (`1-of-1`). The key is kept offline and CI
+only verifies the published public key. Multi-maintainer thresholds are future
+governance, not a current release requirement.
 
 ## 10.2 Manifests
 
@@ -324,20 +319,21 @@ Storage schema version
 
 ## 10.3 Constraints
 
-* CI MUST NOT possess enough long-lived keys to satisfy the threshold alone.
-* Keys SHOULD use hardware tokens.
+* CI MUST NOT possess the private signing key.
+* The operator SHOULD use hardware-backed or encrypted offline storage.
 * Revocation documents are prepared in advance.
-* Emergency key rotation requires council approval.
+* Emergency key rotation is recorded by the project owner.
 
 ## 10.4 Emergency release authority
 
-In an emergency, the council MAY:
+In an emergency, the project owner MAY:
 
 * Authorize a fast-track security release
-* Approve an emergency key rotation
+* Perform an emergency key rotation
 * Deputize a trusted release process
 
-Emergency authority MUST NOT weaken the threshold below the standing minimum without a governance supermajority.
+Emergency authority MUST preserve the one-signature policy and publish the
+replacement public key before the next release.
 
 ---
 
@@ -546,6 +542,9 @@ Amendment history is preserved.
 
 # 22. Core rule
 
-The Universal Mesh Project is governed by a maintainer council of 3–7 members who decide by rough consensus with recorded majority and supermajority fallbacks.
-
-Module owners manage their areas within protocol and compatibility limits. The security team handles embargoes with defined authority. Releases require threshold signatures that no single member, CI, or organization can satisfy alone. Inactivity, removal, succession, repository transfer, and fork continuity are defined in advance so the protocol survives any individual or organization.
+For the current v0.1 repository, the project owner governs the codebase,
+handles security reports, and signs releases with one operator-controlled
+Ed25519 key (`1-of-1`). GitHub and CI provide review, history, and verification;
+they never hold the private key. The council, quorum, succession, and
+multi-maintainer procedures in this draft are future-governance notes and are
+inactive until the project has additional maintainers.

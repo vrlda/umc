@@ -1,4 +1,5 @@
 pub mod error;
+pub mod framing;
 pub mod registry;
 pub mod types;
 

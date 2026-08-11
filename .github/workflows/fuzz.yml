@@ -7,6 +7,16 @@ on:
   pull_request:
     paths:
       - "fuzz/**"
+      - "crates/umc-carrier/**"
+      - "crates/umc-control/**"
+      - "crates/umc-handshake/**"
+      - "crates/umc-plugin/**"
+      - "crates/umc-session/**"
+      - "crates/umc-storage/**"
+      - "crates/umc-wire/**"
+      - "carriers/**"
+      - "scripts/fuzz-report.sh"
+      - "scripts/verify-fuzz-report.sh"
       - ".github/workflows/fuzz.yml"
 
 env:
@@ -21,14 +31,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
-      - name: Run each target against its seed corpus
-        working-directory: fuzz
-        shell: bash
-        run: |
-          set -euo pipefail
-          for target in wire_parser relay_frames handshake_encoding bundle_frame control_envelope carrier_framing session_packet identity_binding route_frames plugin_manifest db_recovery; do
-            cargo fuzz run "$target" "corpus/$target" --sanitizer none -- -runs=1000
-          done
+      - name: Run each target against its seed corpus and write report
+        run: bash scripts/fuzz-report.sh "$RUNNER_TEMP/umc-fuzz-report" 1000
+      - name: Verify fuzz report
+        run: bash scripts/verify-fuzz-report.sh "$RUNNER_TEMP/umc-fuzz-report/fuzz-report.json"
+      - name: Upload corpus/resource report
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-resource-report
+          path: ${{ runner.temp }}/umc-fuzz-report
 
   nightly:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -37,7 +48,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [wire_parser, relay_frames, handshake_encoding, bundle_frame, control_envelope, carrier_framing, session_packet, identity_binding, route_frames, plugin_manifest, db_recovery]
+        target: [wire_parser, relay_frames, handshake_encoding, bundle_frame, control_envelope, carrier_framing, session_packet, identity_binding, route_frames, plugin_manifest, db_recovery, storage_recovery]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

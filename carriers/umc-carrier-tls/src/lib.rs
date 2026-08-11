@@ -6,10 +6,10 @@
 //! binding and is intentionally marked experimental in the registry.
 
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener as TokioListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio_rustls::rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
@@ -33,6 +33,7 @@ pub const SEND_QUEUE_BYTES: usize = 2 * 1024 * 1024;
 pub struct TlsCarrier {
     client: Arc<ClientConfig>,
     server: Arc<ServerConfig>,
+    server_name: String,
 }
 
 impl std::fmt::Debug for TlsCarrier {
@@ -66,13 +67,53 @@ impl TlsCarrier {
                     message: e.to_string(),
                 }
             })?;
-        let cert = CertificateDer::from(certified.cert.der().to_vec());
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            certified.signing_key.serialize_der(),
-        ));
+        let cert = certified.cert.der().to_vec();
+        let key = certified.signing_key.serialize_der();
+        Self::from_der(cert.clone(), key, vec![cert], "localhost")
+    }
+
+    /// Builds a carrier from operator-provisioned DER material.
+    ///
+    /// The server certificate and private key are expected to be a DER
+    /// certificate and PKCS#8 private key. `trusted_roots` supplies the CA or
+    /// pinned certificate set used by outbound dials; it is intentionally
+    /// explicit so independently configured daemons do not accidentally
+    /// trust each other's ephemeral development certificates.
+    ///
+    /// # Errors
+    ///
+    /// Returns a carrier error when the key/certificate cannot be installed or
+    /// no trust roots are supplied.
+    pub fn from_der(
+        server_certificate_der: Vec<u8>,
+        private_key_der: Vec<u8>,
+        trusted_roots: Vec<Vec<u8>>,
+        server_name: impl Into<String>,
+    ) -> Result<Self, CarrierError> {
+        if trusted_roots.is_empty() {
+            return Err(CarrierError {
+                kind: CarrierErrorKind::AuthenticationFailed,
+                operation: "tls-config",
+                retryable: false,
+                message: "at least one TLS trust root is required".into(),
+            });
+        }
+        let cert = CertificateDer::from(server_certificate_der);
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der));
         let mut roots = RootCertStore::empty();
-        roots.add(cert.clone()).map_err(|e| CarrierError {
-            kind: CarrierErrorKind::Internal,
+        for root in trusted_roots {
+            roots
+                .add(CertificateDer::from(root))
+                .map_err(|e| CarrierError {
+                    kind: CarrierErrorKind::AuthenticationFailed,
+                    operation: "tls-config",
+                    retryable: false,
+                    message: e.to_string(),
+                })?;
+        }
+        let server_name = server_name.into();
+        ServerName::try_from(server_name.clone()).map_err(|e| CarrierError {
+            kind: CarrierErrorKind::AddressInvalid,
             operation: "tls-config",
             retryable: false,
             message: e.to_string(),
@@ -94,6 +135,7 @@ impl TlsCarrier {
         Ok(Self {
             client: Arc::new(client),
             server: Arc::new(server),
+            server_name,
         })
     }
 
@@ -138,19 +180,24 @@ impl TlsCarrier {
     /// Returns a carrier error when the address cannot be bound or no Tokio
     /// runtime is active.
     pub fn bind(&self, bind: &str) -> Result<TlsListener, CarrierError> {
-        let rt = tokio::runtime::Handle::try_current()
+        let _runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| CarrierError::new(CarrierErrorKind::NotRunning, "listen"))?;
-        let listener = rt
-            .block_on(TokioListener::bind(bind))
-            .map_err(|e| CarrierError {
-                kind: CarrierErrorKind::AddressInUse,
-                operation: "listen",
-                retryable: false,
-                message: e.to_string(),
-            })?;
+        let listener = std::net::TcpListener::bind(bind).map_err(|e| CarrierError {
+            kind: CarrierErrorKind::AddressInUse,
+            operation: "listen",
+            retryable: false,
+            message: e.to_string(),
+        })?;
+        listener.set_nonblocking(true).map_err(|e| CarrierError {
+            kind: CarrierErrorKind::Internal,
+            operation: "listen",
+            retryable: false,
+            message: e.to_string(),
+        })?;
         Ok(TlsListener {
             inner: Arc::new(listener),
             acceptor: TlsAcceptor::from(self.server.clone()),
+            closed: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -195,7 +242,7 @@ impl Carrier for TlsCarrier {
                     message: e.to_string(),
                 })?;
             let server_name =
-                ServerName::try_from("localhost".to_string()).map_err(|e| CarrierError {
+                ServerName::try_from(self.server_name.clone()).map_err(|e| CarrierError {
                     kind: CarrierErrorKind::AddressInvalid,
                     operation: "dial",
                     retryable: false,
@@ -216,8 +263,9 @@ impl Carrier for TlsCarrier {
 }
 
 pub struct TlsListener {
-    inner: Arc<TokioListener>,
+    inner: Arc<std::net::TcpListener>,
     acceptor: TlsAcceptor,
+    closed: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for TlsListener {
@@ -239,13 +287,35 @@ impl TlsListener {
 
 impl Listener for TlsListener {
     fn accept(&self) -> Result<BoxLink, CarrierError> {
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return Err(CarrierError::new(CarrierErrorKind::NotRunning, "accept"));
+        }
         let rt = tokio::runtime::Handle::try_current()
             .map_err(|_| CarrierError::new(CarrierErrorKind::NotRunning, "accept"))?;
-        let (stream, _) = rt.block_on(self.inner.accept()).map_err(|e| CarrierError {
+        let (stream, _) = loop {
+            if self.closed.load(AtomicOrdering::Acquire) {
+                return Err(CarrierError::new(CarrierErrorKind::NotRunning, "accept"));
+            }
+            match self.inner.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => {
+                    return Err(CarrierError {
+                        kind: CarrierErrorKind::Internal,
+                        operation: "accept",
+                        retryable: true,
+                        message: error.to_string(),
+                    });
+                }
+            }
+        };
+        let stream = TcpStream::from_std(stream).map_err(|error| CarrierError {
             kind: CarrierErrorKind::Internal,
             operation: "accept",
-            retryable: true,
-            message: e.to_string(),
+            retryable: false,
+            message: error.to_string(),
         })?;
         let stream = rt
             .block_on(self.acceptor.accept(stream))
@@ -259,6 +329,7 @@ impl Listener for TlsListener {
     }
 
     fn close(&self) -> Result<(), CarrierError> {
+        self.closed.store(true, AtomicOrdering::Release);
         Ok(())
     }
 }
@@ -331,7 +402,9 @@ impl TlsLink {
         let writer_pending = pending_bytes.clone();
         tokio::spawn(async move {
             while let Some(packet) = rx.recv().await {
-                let Ok(mut framed) = frame_packet(&packet.bytes) else {
+                let Ok(mut framed) =
+                    umc_carrier::framing::frame_packet(&packet.bytes, MAX_PACKET_LEN)
+                else {
                     writer_pending.fetch_sub(packet.bytes.len(), AtomicOrdering::Relaxed);
                     break;
                 };
@@ -390,7 +463,7 @@ impl Link for TlsLink {
                 let mut guard = stream.lock().await;
                 let mut prefix = std::mem::take(&mut guard.1);
                 loop {
-                    match read_length(&prefix) {
+                    match umc_carrier::framing::read_length(&prefix, MAX_PACKET_LEN) {
                         Ok(Some((length, used))) => {
                             let mut payload = vec![0u8; length];
                             guard.0.read_exact(&mut payload).await.map_err(|_| {
@@ -400,7 +473,7 @@ impl Link for TlsLink {
                             return Ok(payload);
                         }
                         Ok(None) => {}
-                        Err(()) => {
+                        Err(_) => {
                             return Err(CarrierError::new(CarrierErrorKind::ProtocolError, "recv"));
                         }
                     }
@@ -439,54 +512,19 @@ impl Link for TlsLink {
         let stream = self.stream.clone();
         let rt = tokio::runtime::Handle::try_current()
             .map_err(|_| CarrierError::new(CarrierErrorKind::NotRunning, "close"))?;
-        rt.block_on(async move {
-            let mut guard = stream.lock().await;
-            let _ = guard.0.shutdown().await;
+        // `Link::close` is called from the daemon's Tokio runtime thread.
+        // Enter a blocking section before synchronously waiting on the async
+        // shutdown; calling `Handle::block_on` directly from a runtime thread
+        // panics and tears down the whole daemon (which made a TLS peer's
+        // normal version-refusal path look like a carrier failure).
+        tokio::task::block_in_place(|| {
+            rt.block_on(async move {
+                let mut guard = stream.lock().await;
+                let _ = guard.0.shutdown().await;
+            });
         });
         Ok(())
     }
-}
-
-fn frame_packet(payload: &[u8]) -> Result<Vec<u8>, ()> {
-    if payload.len() > MAX_PACKET_LEN {
-        return Err(());
-    }
-    let mut framed = Vec::with_capacity(payload.len() + 4);
-    let length = u64::try_from(payload.len()).map_err(|_| ())?;
-    if length <= 63 {
-        framed.push(u8::try_from(length).map_err(|_| ())?);
-    } else if length <= 16_383 {
-        let length = u16::try_from(length).map_err(|_| ())? | 0x4000;
-        framed.extend_from_slice(&length.to_be_bytes());
-    } else {
-        let length = u32::try_from(length).map_err(|_| ())? | 0x8000_0000;
-        framed.extend_from_slice(&length.to_be_bytes());
-    }
-    framed.extend_from_slice(payload);
-    Ok(framed)
-}
-
-fn read_length(prefix: &[u8]) -> Result<Option<(usize, usize)>, ()> {
-    let Some(&first) = prefix.first() else {
-        return Ok(None);
-    };
-    let width = match first >> 6 {
-        0 => 1usize,
-        1 => 2usize,
-        2 => 4usize,
-        _ => 8usize,
-    };
-    if prefix.len() < width {
-        return Ok(None);
-    }
-    let mut raw = [0u8; 8];
-    raw[..width].copy_from_slice(&prefix[..width]);
-    raw[0] &= 0x3f;
-    let length = u64::from_be_bytes(raw) >> ((8 - width) * 8);
-    if length > MAX_PACKET_LEN as u64 {
-        return Err(());
-    }
-    Ok(Some((usize::try_from(length).map_err(|_| ())?, width)))
 }
 
 #[cfg(test)]
@@ -503,19 +541,39 @@ mod tests {
 
     #[test]
     fn framing_rejects_oversize() {
-        assert!(frame_packet(&vec![0u8; MAX_PACKET_LEN + 1]).is_err());
-        assert_eq!(read_length(&[0]), Ok(Some((0, 1))));
-        assert!(read_length(&[0xff; 8]).is_err());
+        assert!(
+            umc_carrier::framing::frame_packet(&vec![0u8; MAX_PACKET_LEN + 1], MAX_PACKET_LEN)
+                .is_err()
+        );
+        assert_eq!(
+            umc_carrier::framing::read_length(&[0], MAX_PACKET_LEN),
+            Ok(Some((0, 1)))
+        );
+        assert!(umc_carrier::framing::read_length(&[0xff; 8], MAX_PACKET_LEN).is_err());
     }
 
     #[test]
     fn framing_uses_varint_boundaries() {
         for length in [0usize, 63, 64, 16_383, 16_384, MAX_PACKET_LEN] {
-            let framed = frame_packet(&vec![0u8; length]).unwrap();
-            let (decoded, used) = read_length(&framed).unwrap().unwrap();
+            let framed =
+                umc_carrier::framing::frame_packet(&vec![0u8; length], MAX_PACKET_LEN).unwrap();
+            let (decoded, used) = umc_carrier::framing::read_length(&framed, MAX_PACKET_LEN)
+                .unwrap()
+                .unwrap();
             assert_eq!(decoded, length);
             assert_eq!(&framed[used..], vec![0u8; length].as_slice());
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn listener_close_stops_accepting() {
+        let carrier = TlsCarrier::new().unwrap();
+        let listener = carrier.bind("127.0.0.1:0").unwrap();
+        listener.close().expect("close");
+        let Err(error) = listener.accept() else {
+            panic!("closed listener accepted a link")
+        };
+        assert_eq!(error.kind, CarrierErrorKind::NotRunning);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -544,5 +602,45 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(received.bytes, b"tls-payload");
+        // Closing from a Tokio task must not synchronously nest `block_on`
+        // into the runtime (the daemon uses this path on handshake refusal).
+        client.close("test close").expect("close link");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provisioned_certificate_and_root_are_used_for_dial() {
+        let certified = rcgen::generate_simple_self_signed(vec!["mesh.example".into()]).unwrap();
+        let certificate = certified.cert.der().to_vec();
+        let key = certified.signing_key.serialize_der();
+        let server = TlsCarrier::from_der(
+            certificate.clone(),
+            key.clone(),
+            vec![certificate.clone()],
+            "mesh.example",
+        )
+        .unwrap();
+        let client =
+            TlsCarrier::from_der(certificate.clone(), key, vec![certificate], "mesh.example")
+                .unwrap();
+        let listener = tokio::task::block_in_place(|| server.bind("127.0.0.1:0")).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_task = tokio::task::spawn_blocking(move || listener.accept());
+        let client_link = tokio::task::spawn_blocking(move || client.dial(address.to_string()))
+            .await
+            .unwrap()
+            .unwrap();
+        let server_link = server_task.await.unwrap().unwrap();
+        client_link
+            .send(OutboundPacket {
+                bytes: b"provisioned".to_vec(),
+                control: false,
+                deadline_ms: None,
+            })
+            .unwrap();
+        let received = tokio::task::spawn_blocking(move || server_link.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.bytes, b"provisioned");
     }
 }

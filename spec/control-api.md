@@ -276,6 +276,21 @@ The daemon reads peer credentials from the Unix socket or named pipe.
 
 OS identity provides an authentication input. Authorization policy maps it to capabilities.
 
+For the v0.1 Unix/macOS daemon, the socket is created with mode `0600` and the
+daemon accepts only a peer with the daemon's uid before reading `ClientHello`.
+That validated peer is the local-operator authentication mode when no bearer
+credential is presented; it is not anonymous access. The proof is carried into
+the connection authorization state and MUST be required again at hello and
+request dispatch. A bearer credential MUST NOT bypass a failed OS-peer check.
+The local-operator policy is intentionally separate from token grants:
+`TokenService` requires a bearer capability or enabled development token, and
+application clients use bearer grants for principal- and resource-scoped
+access. The current `ServerHello` uses the reserved eight-byte zero
+`principal_id` and an empty grant list for this implicit OS-peer operator;
+clients MUST treat that reserved representation as the transport-bound local
+operator rather than as an unauthenticated client. Zero is never allocated to
+a bearer principal.
+
 ## 11.2 BEARER_CAPABILITY
 
 The client sends an opaque random capability token in `ClientHello`.
@@ -670,9 +685,16 @@ UpdateCarrierInstance
 StartCarrier
 StopCarrier
 DeleteCarrierInstance
+Dial
 ListLinks
 CloseLink
 ```
+
+`Dial` acquires an outbound link from a running carrier instance. It returns
+an opaque link handle and the negotiated carrier properties; the daemon owns
+the link until `CloseLink`, carrier stop, or daemon shutdown. A raw carrier
+link is not an application session and carries no application authorization
+until a higher-level session operation adopts it.
 
 Read methods require `CARRIER_READ`; mutation requires `CARRIER_ADMIN`.
 
@@ -734,6 +756,7 @@ ProbeRoute returns an operation handle or bounded result. It must obey routing r
 ListSessions
 GetSession
 CloseSession
+MigrateSession
 ListStreams
 ```
 

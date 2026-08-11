@@ -67,6 +67,14 @@ impl SessionBus {
         self.by_peer.get(peer_endpoint_id).copied()
     }
 
+    /// Return the endpoint id associated with a live session id. Relay expiry
+    /// sweeps use this reverse lookup to address close notifications without
+    /// exposing the bus's internal channel maps.
+    #[must_use]
+    pub fn peer_for_session(&self, session_id: u64) -> Option<Vec<u8>> {
+        self.by_id.get(&session_id).cloned()
+    }
+
     /// Push bytes INTO a session's processing; the session task treats the
     /// buffer like a carrier packet (relay forwarding destination, future
     /// bundle delivery).

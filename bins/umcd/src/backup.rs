@@ -3,9 +3,11 @@
 //! the keystore, and the bundle object store. The config file (`node.json`)
 //! is user-owned and deliberately NOT part of a backup (storage.md §20.1).
 use crate::config::NodeConfig;
+use crate::state::KEYSTORE_FILE;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use umc_storage::keystore::Keystore;
+use umc_storage::keystore::{KeyClass, Keystore};
 use umc_storage::sqlite::{SqliteStore, SCHEMA_VERSION};
 use umc_storage::store::StoreError;
 
@@ -21,6 +23,12 @@ struct Manifest {
     created_at_ms: u64,
     data_dir_name: String,
     files: Vec<String>,
+    #[serde(default)]
+    file_hashes: BTreeMap<String, String>,
+    #[serde(default)]
+    storage_generation: u64,
+    #[serde(default)]
+    node_identity: Option<String>,
 }
 
 /// Creates a fresh backup of the node's data dir at `out_dir`: a
@@ -87,11 +95,17 @@ pub fn backup(config: &NodeConfig, out_dir: &Path) -> Result<(), String> {
         "keystore/keystore.ks",
         Some(&mut files),
     )?;
+    let object_file_start = files.len();
     copy_dir(
         &data_dir.join("objects"),
         &out_dir.join("objects"),
         Some(&mut files),
     )?;
+    files.truncate(object_file_start);
+    collect_manifest_files(&out_dir.join("objects"), out_dir, &mut files)?;
+
+    let file_hashes = hash_manifest_files(out_dir, &files)?;
+    let node_identity = node_identity_fingerprint(&ks_path)?;
 
     let manifest = Manifest {
         format_version: FORMAT_VERSION,
@@ -101,6 +115,9 @@ pub fn backup(config: &NodeConfig, out_dir: &Path) -> Result<(), String> {
             |name| name.to_string_lossy().into_owned(),
         ),
         files,
+        file_hashes,
+        storage_generation: crate::state::read_restore_anchor(&data_dir),
+        node_identity: Some(node_identity),
     };
     let json = serde_json::to_string_pretty(&manifest)
         .map_err(|e| format!("backup: serialize manifest: {e}"))?;
@@ -119,9 +136,19 @@ pub fn restore(config: &NodeConfig, in_dir: &Path) -> Result<(), String> {
         ));
     }
 
+    let data_dir = config.resolved_data_dir();
+    validate_manifest(in_dir, &manifest)?;
+    let current_generation = crate::state::read_restore_anchor(&data_dir);
+    if manifest.storage_generation < current_generation {
+        return Err(format!(
+            "restore refused: backup generation {} is older than current generation {current_generation}",
+            manifest.storage_generation
+        ));
+    }
+
     // Validate the backup contents BEFORE anything in the data dir is
     // touched (§21.1 step 5: validate before swap): the database must
-    // open with a matching schema, and the keystore must be a valid v2
+    // open with a matching schema, and the keystore must be a recognized v2/v3
     // file. Password verification is deliberately skipped here — the
     // daemon verifies the keystore at boot with the real password.
     let db_src = in_dir.join("node.db");
@@ -139,12 +166,11 @@ pub fn restore(config: &NodeConfig, in_dir: &Path) -> Result<(), String> {
         return Err("restore refused: backup has no keystore/keystore.ks".into());
     }
     if !Keystore::is_valid_format(&ks_src) {
-        return Err("restore refused: backup keystore is not a valid v2 keystore".into());
+        return Err("restore refused: backup keystore is not a recognized v2/v3 keystore".into());
     }
 
     // Downgrade protection (storage.md §21.4): never overwrite a target
     // database newer than the backup with the backup.
-    let data_dir = config.resolved_data_dir();
     let target_db = data_dir.join("node.db");
     if target_db.exists() {
         let target_schema = open_schema(&target_db, "target node.db")?;
@@ -152,6 +178,14 @@ pub fn restore(config: &NodeConfig, in_dir: &Path) -> Result<(), String> {
             return Err(format!(
                 "restore refused: target node.db schema v{target_schema} is newer than the backup's v{backup_schema}"
             ));
+        }
+    }
+    if let Some(expected_identity) = manifest.node_identity.as_deref() {
+        let target_keystore = config.resolved_keystore_dir().join(KEYSTORE_FILE);
+        if target_keystore.exists()
+            && node_identity_fingerprint(&target_keystore)? != expected_identity
+        {
+            return Err("restore refused: backup belongs to a different node identity".into());
         }
     }
 
@@ -170,6 +204,145 @@ fn read_manifest(in_dir: &Path) -> Result<Manifest, String> {
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("restore refused: {}: {e}", path.display()))?;
     serde_json::from_str(&text).map_err(|e| format!("restore refused: invalid manifest.json: {e}"))
+}
+
+fn validate_manifest(in_dir: &Path, manifest: &Manifest) -> Result<(), String> {
+    for relative in &manifest.files {
+        let path = safe_manifest_path(in_dir, relative)?;
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("restore refused: manifest file {relative}: {e}"))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "restore refused: manifest entry {relative} is not a regular file"
+            ));
+        }
+    }
+    if manifest.file_hashes.is_empty() {
+        return Ok(());
+    }
+    for (relative, expected) in &manifest.file_hashes {
+        if !manifest.files.iter().any(|entry| entry == relative) {
+            return Err(format!(
+                "restore refused: hash entry {relative} is absent from manifest files"
+            ));
+        }
+        if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!(
+                "restore refused: invalid hash for manifest file {relative}"
+            ));
+        }
+        let path = safe_manifest_path(in_dir, relative)?;
+        let actual = hex_bytes(&umc_storage::objects::blake2s(
+            &std::fs::read(&path)
+                .map_err(|e| format!("restore refused: read manifest file {relative}: {e}"))?,
+        ));
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(format!(
+                "restore refused: integrity hash mismatch for {relative}"
+            ));
+        }
+    }
+    for relative in &manifest.files {
+        if !manifest.file_hashes.contains_key(relative) {
+            return Err(format!(
+                "restore refused: manifest file {relative} has no integrity hash"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn safe_manifest_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute()
+        || relative_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!("restore refused: unsafe manifest path {relative}"));
+    }
+    Ok(root.join(relative_path))
+}
+
+fn hash_manifest_files(root: &Path, files: &[String]) -> Result<BTreeMap<String, String>, String> {
+    files
+        .iter()
+        .map(|relative| {
+            let path = safe_manifest_path(root, relative)?;
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|e| format!("backup: manifest file {relative}: {e}"))?;
+            if !metadata.file_type().is_file() {
+                return Err(format!("backup: manifest file {relative} is not regular"));
+            }
+            let bytes = std::fs::read(&path)
+                .map_err(|e| format!("backup: read manifest file {relative}: {e}"))?;
+            Ok((
+                relative.clone(),
+                hex_bytes(&umc_storage::objects::blake2s(&bytes)),
+            ))
+        })
+        .collect()
+}
+
+fn collect_manifest_files(
+    root: &Path,
+    backup_root: &Path,
+    files: &mut Vec<String>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(root)
+        .map_err(|e| format!("backup: enumerate {}: {e}", root.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("backup: enumerate {}: {e}", root.display()))?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("backup: inspect {}: {e}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("backup: refusing symlink {}", path.display()));
+        }
+        if metadata.is_dir() {
+            collect_manifest_files(&path, backup_root, files)?;
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(backup_root)
+                .map_err(|e| format!("backup: relative path {}: {e}", path.display()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            files.push(relative);
+        }
+    }
+    Ok(())
+}
+
+fn hex_bytes(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        write!(output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
+}
+
+fn node_identity_fingerprint(path: &Path) -> Result<String, String> {
+    let keystore = Keystore::open(path.to_path_buf(), &crate::state::keystore_password())
+        .map_err(|e| format!("keystore identity fingerprint: {e:?}"))?;
+    let seed = keystore
+        .load(
+            KeyClass::IdentitySigning,
+            crate::state::NODE_IDENTITY_RECORD,
+        )
+        .map_err(|e| format!("keystore identity fingerprint: {e:?}"))?;
+    let identity_seed: [u8; 32] = seed
+        .get(..32)
+        .ok_or_else(|| "keystore identity fingerprint: malformed identity record".to_string())?
+        .try_into()
+        .map_err(|_| "keystore identity fingerprint: malformed identity record".to_string())?;
+    let identity = umc_crypto::signatures::IdentityKeyPair::from_seed(identity_seed);
+    let endpoint_id = umc_handshake::identity::endpoint_id(&identity.public());
+    Ok(hex_bytes(&endpoint_id))
 }
 
 /// Opens a database and returns its schema version. A database with an
@@ -241,7 +414,12 @@ fn swap_in(config: &NodeConfig, in_dir: &Path) -> Result<(), String> {
         let _ = std::fs::remove_file(data_dir.join(sidecar));
     }
 
-    let result = install_backup(config, in_dir).and_then(|()| verify_restored(config));
+    let result = install_backup(config, in_dir)
+        .and_then(|()| verify_restored(config))
+        .and_then(|()| {
+            crate::state::advance_restore_anchor(&data_dir)
+                .map(|generation| log::info!("[restore] installed generation {generation}"))
+        });
     if let Err(e) = result {
         rollback(&renamed);
         return Err(format!("restore failed: {e}; existing state restored"));
@@ -292,6 +470,11 @@ fn verify_restored(config: &NodeConfig) -> Result<(), String> {
     if !config.resolved_keystore_dir().join("keystore.ks").exists() {
         return Err("restored keystore file is missing".into());
     }
+    let keystore_path = config.resolved_keystore_dir().join(KEYSTORE_FILE);
+    if !Keystore::is_valid_format(&keystore_path) {
+        return Err("restored keystore format is invalid".into());
+    }
+    node_identity_fingerprint(&keystore_path)?;
     Ok(())
 }
 
@@ -326,6 +509,11 @@ fn copy_file(
     label: &str,
     files: Option<&mut Vec<String>>,
 ) -> Result<(), String> {
+    let metadata =
+        std::fs::symlink_metadata(src).map_err(|e| format!("{label}: inspect source: {e}"))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("{label}: source is not a regular file"));
+    }
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{label}: create dir: {e}"))?;
     }
@@ -350,12 +538,17 @@ fn copy_dir(src: &Path, dst: &Path, mut files: Option<&mut Vec<String>>) -> Resu
     for entry in entries {
         let entry = entry.map_err(|e| format!("copy dir: {e}"))?;
         let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("copy dir: inspect {}: {e}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("copy dir: refusing symlink {}", path.display()));
+        }
         let rel = path
             .strip_prefix(src)
             .expect("directory entry is under its source")
             .to_string_lossy()
             .replace('\\', "/");
-        if path.is_dir() {
+        if metadata.is_dir() {
             copy_dir(&path, &dst.join(&rel), files.as_deref_mut())?;
         } else {
             let out_path = dst.join(&rel);
@@ -433,6 +626,7 @@ mod tests {
             lifetime_ms: 600_000,
             learned_at_ms: 42,
             scope: 3,
+            metadata: Vec::new(),
         };
         save_route(&store, &route).expect("save route");
         let mut events = DaemonEvents::new(100);
@@ -524,7 +718,7 @@ mod tests {
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].kind, "session_active");
         assert_eq!(recent[0].at_ms, 10);
-        // ...the keystore exists as a valid v2 file with the identical
+        // ...the keystore exists as a valid v3 file with the identical
         // bytes (same identity + same password material; the daemon
         // verifies the password at boot, not restore)...
         let ks_path = data_dir.join("keystore").join(KEYSTORE_FILE);
@@ -641,6 +835,61 @@ mod tests {
             Some(b"original".to_vec())
         );
         assert!(!data_dir.join("node.db.pre-restore").exists());
+    }
+
+    #[test]
+    fn restore_rejects_manifest_path_and_hash_tampering() {
+        let source = seeded_config();
+        seed_data_dir(&source);
+        let backup_dir = temp_dir("manifest-integrity");
+        backup(&source, &backup_dir).unwrap();
+
+        let mut manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(backup_dir.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        manifest["files"] = serde_json::json!(["../escape"]);
+        std::fs::write(
+            backup_dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let target = seeded_config();
+        assert!(restore(&target, &backup_dir)
+            .unwrap_err()
+            .contains("unsafe manifest path"));
+
+        backup(&source, &backup_dir).unwrap();
+        let db_path = backup_dir.join("node.db");
+        let mut bytes = std::fs::read(&db_path).unwrap();
+        bytes.push(0);
+        std::fs::write(db_path, bytes).unwrap();
+        assert!(restore(&target, &backup_dir)
+            .unwrap_err()
+            .contains("integrity hash mismatch"));
+    }
+
+    #[test]
+    fn restore_rejects_older_storage_generation() {
+        let config = seeded_config();
+        seed_data_dir(&config);
+        let backup_dir = temp_dir("generation");
+        backup(&config, &backup_dir).unwrap();
+        crate::state::advance_restore_anchor(&config.resolved_data_dir()).unwrap();
+        let error = restore(&config, &backup_dir).unwrap_err();
+        assert!(error.contains("older than current generation"));
+    }
+
+    #[test]
+    fn restore_rejects_different_node_identity() {
+        let source = seeded_config();
+        seed_data_dir(&source);
+        let backup_dir = temp_dir("identity-binding");
+        backup(&source, &backup_dir).unwrap();
+        let target = seeded_config();
+        seed_data_dir(&target);
+        let error = restore(&target, &backup_dir).unwrap_err();
+        assert!(error.contains("different node identity"));
     }
 
     #[test]

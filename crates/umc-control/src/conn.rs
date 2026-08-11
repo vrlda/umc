@@ -3,6 +3,9 @@ use crate::proto::umc::api::v1 as api;
 
 pub const API_VERSION_MAJOR: u32 = 1;
 pub const API_VERSION_MINOR: u32 = 0;
+/// Gaps at or below this size are tolerated for diagnostics; larger gaps
+/// indicate a desynchronized control stream.
+pub const SEQUENCE_GAP_THRESHOLD: u64 = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnState {
@@ -22,7 +25,8 @@ pub enum ConnError {
 }
 
 /// Per-connection sequence tracking (control-api.md §7): starts at 1,
-/// increases by one per envelope; zero/reuse/decrease is a violation.
+/// increases by one per envelope; zero/reuse/decrease and gaps above
+/// [`SEQUENCE_GAP_THRESHOLD`] are violations.
 #[derive(Debug, Clone)]
 pub struct SequenceTracker {
     next_expected: u64,
@@ -38,17 +42,21 @@ impl SequenceTracker {
     ///
     /// # Errors
     ///
-    /// Returns [`ConnError::SequenceViolation`] for zero, reuse, or decrease.
+    /// Returns [`ConnError::SequenceViolation`] for zero, reuse, decrease,
+    /// or a gap above [`SEQUENCE_GAP_THRESHOLD`].
     pub fn observe(&mut self, sequence: u64) -> Result<(), ConnError> {
         if sequence == 0 || sequence < self.next_expected {
             return Err(ConnError::SequenceViolation);
         }
+        if sequence > self.next_expected.saturating_add(SEQUENCE_GAP_THRESHOLD) {
+            return Err(ConnError::SequenceViolation);
+        }
         if sequence > self.next_expected {
-            // Gaps above a diagnostic threshold are tolerated; record only monotonicity.
-            self.next_expected = sequence + 1;
+            // Small gaps are tolerated for diagnostics.
+            self.next_expected = sequence.saturating_add(1);
             return Ok(());
         }
-        self.next_expected = sequence + 1;
+        self.next_expected = sequence.saturating_add(1);
         Ok(())
     }
 }
@@ -98,7 +106,9 @@ impl Connection {
         }
         self.state = ConnState::Negotiating;
         let supported = &hello.supported_versions;
-        let compatible = supported.iter().find(|v| v.major == API_VERSION_MAJOR);
+        let compatible = supported
+            .iter()
+            .find(|v| v.major == API_VERSION_MAJOR && v.minor == API_VERSION_MINOR);
         let selected = compatible.ok_or(ConnError::VersionMismatch)?;
         self.state = ConnState::Authenticated;
         self.principal_id = Some(0); // assigned by auth layer (Task 9)
@@ -132,8 +142,12 @@ mod tests {
     use super::*;
 
     fn hello(major: u32) -> api::ClientHello {
+        hello_version(major, 0)
+    }
+
+    fn hello_version(major: u32, minor: u32) -> api::ClientHello {
         api::ClientHello {
-            supported_versions: vec![api::ApiVersion { major, minor: 0 }],
+            supported_versions: vec![api::ApiVersion { major, minor }],
             ..Default::default()
         }
     }
@@ -156,6 +170,15 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_minor_fails_exact_version_negotiation() {
+        let mut conn = Connection::new();
+        assert_eq!(
+            conn.on_client_hello(&hello_version(1, 1)),
+            Err(ConnError::VersionMismatch)
+        );
+    }
+
+    #[test]
     fn hello_after_authenticated_fails() {
         let mut conn = Connection::new();
         conn.on_client_hello(&hello(1)).unwrap();
@@ -172,5 +195,11 @@ mod tests {
         assert_eq!(t.observe(2), Ok(()));
         assert_eq!(t.observe(2), Err(ConnError::SequenceViolation));
         assert_eq!(t.observe(0), Err(ConnError::SequenceViolation));
+        let mut gapped = SequenceTracker::new();
+        assert_eq!(gapped.observe(1 + SEQUENCE_GAP_THRESHOLD), Ok(()));
+        assert_eq!(
+            gapped.observe(2 + SEQUENCE_GAP_THRESHOLD + SEQUENCE_GAP_THRESHOLD + 1),
+            Err(ConnError::SequenceViolation)
+        );
     }
 }

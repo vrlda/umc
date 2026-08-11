@@ -658,6 +658,16 @@ The attacker can waste dial and route budgets and infer some policy from accepta
 
 # 20. Compromised carrier plugin
 
+## v0.1 implementation profile
+
+The external-plugin threat model is a reserved extension in v0.1: the core
+does not advertise or launch external carrier processes. Built-in carriers and
+trusted compiled-in hooks remain in scope, with capability checks and the
+generation-scoped `PluginSupervisor` enforcing bounded admission, failure
+cleanup, deadlines, restart backoff, and disablement. The process/IPC/sandbox
+requirements in this section become mandatory before an external plugin is
+enabled.
+
 ## 20.1 Assets at risk
 
 * Packet metadata and ciphertext
@@ -1031,6 +1041,17 @@ A compromised cryptographic, parsing, async-runtime, database, or build dependen
 
 # 31. Build and CI compromise
 
+## Solo-maintainer v0.1 qualification
+
+The current UMC release owner is one project owner. For v0.1, references in
+this threat model to maintainer thresholds, key holders, councils, or quorum
+mean future governance rather than a current deployment requirement. Release
+manifests use one operator-controlled Ed25519 signature with
+`signing.threshold=1`; CI verifies it but never stores the private key. This
+reduces coordination complexity but leaves compromise of the single operator
+key as a critical residual risk, so offline protection and revocation remain
+required.
+
 ## 31.1 Assets at risk
 
 * Release binaries
@@ -1051,10 +1072,10 @@ The project MUST or SHOULD:
 * Use least-privilege CI credentials
 * Isolate untrusted pull-request jobs from release secrets
 * Publish reproducible-build instructions
-* Sign release manifests with maintainer threshold keys
+* Sign release manifests with the operator Ed25519 key
 * Add Sigstore-compatible provenance
-* Keep enough long-lived signing keys outside CI
-* Verify source commit and artifact hashes before threshold approval
+* Keep the operator private key outside CI
+* Verify source commit and artifact hashes before operator approval
 * Publish revocation procedures
 
 ## 31.4 Explicit non-defenses
@@ -1063,7 +1084,9 @@ Sigstore or one CI signature alone cannot protect against compromise of its iden
 
 ## 31.5 Residual risk
 
-Compromise may ship malicious binaries under valid automation identity. Threshold review and independent reproduction reduce risk. Residual severity is `CRITICAL`.
+Compromise may ship malicious binaries under a valid operator identity. Offline
+key protection, exact-hash verification, and independent reproduction reduce
+risk. Residual severity is `CRITICAL` because v0.1 has one signing key.
 
 ---
 
@@ -1075,23 +1098,23 @@ Artifact authenticity and update trust are at risk.
 
 ## 32.2 Capabilities
 
-The attacker controls one or more long-lived maintainer keys or their hardware-token authorization.
+The attacker controls the operator signing key or its hardware-token
+authorization.
 
 ## 32.3 Required defenses
 
 The project MUST:
 
-* Use threshold release approval
-* Protect keys with hardware where possible
-* Separate key holders and conflict domains
+* Use one operator release signature for v0.1
+* Protect the key with hardware or encrypted offline storage where possible
 * Prepare revocation statements
 * Publish signed release manifests
 * Support emergency key rotation
-* Keep CI below signing threshold
+* Keep the private key out of CI
 
 ## 32.4 Explicit non-defenses
 
-Compromise of enough threshold keys can authorize a malicious release.
+Compromise of the operator key can authorize a malicious release.
 
 ## 32.5 Residual risk
 
@@ -1113,7 +1136,7 @@ The attacker controls a mirror, network path, package feed, or local update cach
 
 Update clients and operators MUST:
 
-* Verify threshold signatures and hashes
+* Verify the operator signature and hashes
 * Enforce supported-version policy
 * Reject unsigned metadata
 * Detect version rollback unless operator authorizes it
@@ -1187,11 +1210,13 @@ UMP MUST:
 * Reject invalid state transitions
 * Separate Initial, Handshake, session, ticket, Retry, and exporter keys
 * Erase obsolete secrets where supported
-* Publish vectors and undergo independent review
+* Publish vectors and complete the documented implementation review
 
 ## 35.4 Explicit non-defenses
 
-Use of standard primitives does not prove the composed handshake secure. The current draft has not received the required independent cryptographic and formal review.
+Use of standard primitives does not prove the composed handshake secure. The
+current draft has the solo implementation review and differential vectors, but
+does not claim a human cryptographic audit or formal proof.
 
 ## 35.5 Residual risk
 
@@ -1565,15 +1590,23 @@ The project MUST maintain:
 * Security regression tests
 * Release provenance and signature verification tests
 
-Before production security claims, the project MUST obtain:
+For the solo-maintainer v0.1 experimental profile, the project owner MUST
+perform and record the following implementation reviews using source tracing,
+independent vectors, adversarial tests, and dependency evidence:
 
-1. Independent handshake and cryptographic review.
-2. Network parser and unsafe-code audit.
+1. Handshake and cryptographic implementation review.
+2. Network parser and unsafe-code implementation audit.
 3. Adversarial review of routing, relaying, and discovery.
 4. Local API authorization review.
 5. Storage and migration review.
-6. Carrier plugin boundary review.
+6. Carrier/plugin boundary review.
 7. Reproducible-build and release-signing review.
+
+No human third-party sign-off is required for this profile because no second
+maintainer or reviewer exists. This evidence MUST NOT be described as a human
+audit or production-security certification. If additional maintainers join or
+production-security claims become a goal, the corresponding external reviews
+MUST be obtained before changing that claim.
 
 ---
 
@@ -1598,7 +1631,7 @@ The test suite SHOULD include:
 15. Database truncation, row mutation, and rollback.
 16. Malicious import archive and invitation.
 17. Dependency or build artifact substitution.
-18. Release-signing threshold and revocation exercise.
+18. Release-signature and revocation exercise.
 19. Clock rollback and forward jump.
 20. Randomness-source failure injection.
 21. Combined censor, Sybil, and malicious-relay attack.
@@ -1705,7 +1738,7 @@ The project must resolve these items before production claims:
 Implementation may begin while this threat model remains Draft. A stable v0.1 release MUST NOT claim production security until the project completes these gates:
 
 * Final wire and handshake vectors
-* Independent cryptographic review
+* Documented cryptographic review and differential vectors
 * Fuzzing of every network and local parser
 * Enforced resource-limit profiles
 * Local API permission tests

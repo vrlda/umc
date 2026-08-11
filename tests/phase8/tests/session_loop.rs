@@ -209,7 +209,7 @@ fn send_packet(link: &(dyn umc_carrier::Link + Send + Sync), bytes: &[u8]) -> Re
 /// static key plus identity binding and transcript-bound signature, sealed
 /// with the provisional-chain client-auth key (the daemon's DH chain
 /// stands the ephemeral in for the static, so the auth key matches on both
-/// sides) and framed as a raw handshake message.
+/// sides) and carried in an encrypted Handshake packet.
 fn send_client_auth(
     node: &Node,
     link: &(dyn umc_carrier::Link + Send + Sync),
@@ -248,7 +248,21 @@ fn send_client_auth(
         &auth_body,
     )
     .map_err(|e| format!("auth frame: {e:?}"))?;
-    send_packet(link, &frame)?;
+    let handshake_secret = umc_handshake::traffic::derive_handshake_traffic_secret(
+        &out.handshake_secret3,
+        &out.transcript_hash,
+        true,
+    );
+    let handshake_keys = umc_handshake::traffic::traffic_keys(&handshake_secret);
+    let packet = umc_handshake::handshake_packet::build_handshake_packet(
+        &[1u8; 8],
+        &[2u8; 8],
+        0,
+        &frame,
+        &handshake_keys,
+    )
+    .map_err(|e| format!("client auth packet: {e:?}"))?;
+    send_packet(link, &packet)?;
     Ok(auth_body)
 }
 
@@ -279,7 +293,20 @@ fn finish_finished_exchange(
             Err(e) => return Err(format!("recv server finished: {e:?}")),
         }
     };
-    let (finished_message, _) = umc_handshake::encoding::decode_message(&finished_packet)
+    let server_handshake_secret = umc_handshake::traffic::derive_handshake_traffic_secret(
+        &out.handshake_secret3,
+        &out.transcript_hash,
+        false,
+    );
+    let server_handshake_keys = umc_handshake::traffic::traffic_keys(&server_handshake_secret);
+    let (_dcid, _scid, _pn, finished_body) =
+        umc_handshake::handshake_packet::parse_handshake_packet(
+            &finished_packet,
+            &server_handshake_keys,
+            0,
+        )
+        .map_err(|e| format!("server finished packet: {e:?}"))?;
+    let (finished_message, _) = umc_handshake::encoding::decode_message(&finished_body)
         .map_err(|e| format!("server finished framing: {e:?}"))?;
     if finished_message.message_type != SERVER_FINISHED {
         return Err(format!(
@@ -310,7 +337,21 @@ fn finish_finished_exchange(
     let mut finished_frame = Vec::new();
     umc_handshake::encoding::encode_message(&mut finished_frame, CLIENT_FINISHED, &confirmation)
         .map_err(|e| format!("client finished frame: {e:?}"))?;
-    send_packet(link, &finished_frame)
+    let client_handshake_secret = umc_handshake::traffic::derive_handshake_traffic_secret(
+        &out.handshake_secret3,
+        &out.transcript_hash,
+        true,
+    );
+    let client_handshake_keys = umc_handshake::traffic::traffic_keys(&client_handshake_secret);
+    let finished_packet = umc_handshake::handshake_packet::build_handshake_packet(
+        &[1u8; 8],
+        &[2u8; 8],
+        1,
+        &finished_frame,
+        &client_handshake_keys,
+    )
+    .map_err(|e| format!("client finished packet: {e:?}"))?;
+    send_packet(link, &finished_packet)
 }
 
 /// Synchronous analogue of `Node::connect` over TCP: dial, send
@@ -329,11 +370,42 @@ fn tcp_handshake(node: &Node, remote: &str) -> Result<u64, String> {
     let client_ephemeral = StaticHandshakeKeyPair::generate();
     let hello = ClientHello::new(node.entropy.as_ref(), &client_ephemeral);
     let hello_bytes = hello.encode().map_err(|e| format!("hello: {e:?}"))?;
-    send_packet(link.as_ref(), &hello_bytes)?;
-    std::thread::sleep(Duration::from_millis(100));
-    let server_hello_bytes = link.recv().map_err(|e| format!("recv: {e:?}"))?.bytes;
+    let initial_keys = umc_handshake::initial::derive_initial_keys(&node.config.dcid);
+    let initial = umc_handshake::initial::build_initial_packet(
+        &node.config.dcid,
+        &[3u8; 8],
+        0,
+        &hello_bytes,
+        &initial_keys.client,
+    )
+    .map_err(|e| format!("initial packet: {e}"))?;
+    send_packet(link.as_ref(), &initial)?;
+    // TCP delivery is asynchronous: under workspace-wide parallel load the
+    // daemon may not have flushed SERVER_HELLO by the time the first read is
+    // attempted. Poll the non-blocking carrier within a bounded deadline,
+    // matching the UDP and finished-message paths below.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let server_hello_bytes = loop {
+        match link.recv() {
+            Ok(packet) => break packet.bytes,
+            Err(error)
+                if error.kind == umc_carrier::error::CarrierErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("recv server hello: {error:?}")),
+        }
+    };
+    let server_hello_payload =
+        umc_handshake::initial::parse_initial_with_keys(&server_hello_bytes, &initial_keys.server)
+            .ok_or("server Initial rejected")?
+            .2;
     let server_hello =
-        ServerHello::decode(&server_hello_bytes).map_err(|e| format!("server hello: {e:?}"))?;
+        ServerHello::decode(&server_hello_payload).map_err(|e| format!("server hello: {e:?}"))?;
+    let server_hello_bytes = server_hello
+        .encode()
+        .map_err(|e| format!("server hello encode: {e:?}"))?;
     let out = complete_client_side(
         &node.config.identity.identity,
         // The daemon stands the client's ephemeral in for the static in the
@@ -366,22 +438,48 @@ fn tcp_handshake(node: &Node, remote: &str) -> Result<u64, String> {
 }
 
 /// Synchronous analogue of `Node::connect` over UDP. The daemon's UDP
-/// accept consumes the first datagram to establish the association, so a
-/// copy of the hello follows it for the daemon's first `link.recv()`.
+/// accept peeks at the first datagram to establish the association, leaving
+/// that same hello available to the session handler.
 ///
-/// The link is built with `UdpLink::from_parts` instead of `dial`: dial
-/// connects the socket, which makes `send_to` fail with EISCONN on macOS.
+/// The link is built with `UdpLink::from_parts` so the test can share the
+/// Tokio-owned socket with its async harness.
 fn udp_handshake(node: &Node, link: &BoxLink) -> Result<u64, String> {
     let client_ephemeral = StaticHandshakeKeyPair::generate();
     let hello = ClientHello::new(node.entropy.as_ref(), &client_ephemeral);
     let hello_bytes = hello.encode().map_err(|e| format!("hello: {e:?}"))?;
-    for _ in 0..2 {
-        send_packet(link.as_ref(), &hello_bytes)?;
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let server_hello_bytes = link.recv().map_err(|e| format!("recv: {e:?}"))?.bytes;
+    let initial_keys = umc_handshake::initial::derive_initial_keys(&node.config.dcid);
+    let initial = umc_handshake::initial::build_initial_packet(
+        &node.config.dcid,
+        &[3u8; 8],
+        0,
+        &hello_bytes,
+        &initial_keys.client,
+    )
+    .map_err(|e| format!("initial packet: {e}"))?;
+    send_packet(link.as_ref(), &initial)?;
+    std::thread::sleep(Duration::from_millis(10));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let server_hello_bytes = loop {
+        match link.recv() {
+            Ok(packet) => break packet.bytes,
+            Err(error)
+                if error.kind == umc_carrier::error::CarrierErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("recv: {error:?}")),
+        }
+    };
+    let server_hello_payload =
+        umc_handshake::initial::parse_initial_with_keys(&server_hello_bytes, &initial_keys.server)
+            .ok_or("server Initial rejected")?
+            .2;
     let server_hello =
-        ServerHello::decode(&server_hello_bytes).map_err(|e| format!("server hello: {e:?}"))?;
+        ServerHello::decode(&server_hello_payload).map_err(|e| format!("server hello: {e:?}"))?;
+    let server_hello_bytes = server_hello
+        .encode()
+        .map_err(|e| format!("server hello encode: {e:?}"))?;
     let out = complete_client_side(
         &node.config.identity.identity,
         // Provisional static (the ephemeral), mirroring the daemon's DH
@@ -581,7 +679,7 @@ async fn daemon_serves_control_and_sessions_together() {
         .expect("handshake failed");
     assert_eq!(result, 1);
 
-    let mut active = 0u32;
+    let mut saw_active = false;
     for _ in 0..50 {
         let status = api::GetStatusResponse::decode(
             client
@@ -594,15 +692,38 @@ async fn daemon_serves_control_and_sessions_together() {
         .expect("status payload")
         .status
         .expect("status");
-        active = status.active_sessions;
+        let active = status.active_sessions;
         if active == 1 {
+            saw_active = true;
+            break;
+        }
+        // A handshake-only client closes its carrier as soon as the
+        // exchange completes. The session watcher now removes the registry
+        // entry once both wire tasks terminate, so the active window may be
+        // shorter than one control round-trip. The session_active event is
+        // the durable evidence that registration occurred.
+        let events = api::GetEventsResponse::decode(
+            client
+                .request("NodeAdmin", "GetEvents", vec![])
+                .await
+                .expect("GetEvents")
+                .payload
+                .as_slice(),
+        )
+        .expect("events payload")
+        .events;
+        if events.iter().any(|event| event.kind == "session_active") {
+            saw_active = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert_eq!(active, 1, "session must show up in GetStatus");
+    assert!(
+        saw_active,
+        "session must either remain active in GetStatus or emit session_active"
+    );
 
-    let mut saw_active = false;
+    let mut saw_active_event = false;
     for _ in 0..50 {
         let events = api::GetEventsResponse::decode(
             client
@@ -615,12 +736,15 @@ async fn daemon_serves_control_and_sessions_together() {
         .expect("events payload")
         .events;
         if events.iter().any(|e| e.kind == "session_active") {
-            saw_active = true;
+            saw_active_event = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert!(saw_active, "event log must contain a session_active entry");
+    assert!(
+        saw_active_event,
+        "event log must contain a session_active entry"
+    );
 
     daemon.shutdown_with_sigint();
 }

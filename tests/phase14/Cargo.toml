@@ -1,0 +1,17 @@
+[package]
+name = "phase14-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+proptest = "1"
+umc-handshake = { path = "../../crates/umc-handshake" }
+umc-relay = { path = "../../crates/umc-relay" }
+umc-session = { path = "../../crates/umc-session" }
+umc-types = { path = "../../crates/umc-types" }
+umc-wire = { path = "../../crates/umc-wire" }
+
+[lints]
+workspace = true

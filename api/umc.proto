@@ -197,6 +197,7 @@ enum Capability {
   CAPABILITY_ROUTE_PROBE = 41;
   CAPABILITY_SESSION_READ = 50;
   CAPABILITY_SESSION_CLOSE = 51;
+  CAPABILITY_SESSION_MIGRATE = 52;
   CAPABILITY_BUNDLE_READ = 60;
   CAPABILITY_BUNDLE_CREATE = 61;
   CAPABILITY_BUNDLE_DELETE = 62;
@@ -536,6 +537,14 @@ message ListLinksResponse { repeated LinkSummary links = 1; PageInfo page = 2; }
 message CloseLinkRequest { OpaqueHandle link_handle = 1; string reason = 2; }
 message CloseLinkResponse {}
 
+message DialRequest {
+  OpaqueHandle carrier_handle = 1;
+  string remote = 2;
+}
+message DialResponse {
+  LinkSummary link = 1;
+}
+
 enum TrustState {
   TRUST_STATE_UNSPECIFIED = 0;
   TRUST_STATE_UNKNOWN = 1;
@@ -688,6 +697,18 @@ message PathSummary {
 
 message CloseSessionRequest { OpaqueHandle session_handle = 1; uint64 application_error_code = 2; string reason = 3; }
 message CloseSessionResponse {}
+message MigrateSessionRequest {
+  OpaqueHandle session_handle = 1;
+  OpaqueHandle carrier_handle = 2;
+  string remote = 3;
+  bool keep_old_path = 4;
+  uint64 deadline_ms = 5;
+}
+message MigrateSessionResponse {
+  OpaqueHandle session_handle = 1;
+  uint64 path_id = 2;
+  OpaqueHandle link_handle = 3;
+}
 
 message StreamSummary {
   OpaqueHandle stream_handle = 1;
@@ -1025,6 +1046,7 @@ service CarrierService {
   rpc StartCarrier(StartCarrierRequest) returns (StartCarrierResponse);
   rpc StopCarrier(StopCarrierRequest) returns (StopCarrierResponse);
   rpc DeleteCarrierInstance(DeleteCarrierInstanceRequest) returns (DeleteCarrierInstanceResponse);
+  rpc Dial(DialRequest) returns (DialResponse);
   rpc ListLinks(ListLinksRequest) returns (ListLinksResponse);
   rpc CloseLink(CloseLinkRequest) returns (CloseLinkResponse);
 }
@@ -1053,6 +1075,7 @@ service SessionService {
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
   rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
+  rpc MigrateSession(MigrateSessionRequest) returns (MigrateSessionResponse);
   rpc ListStreams(ListStreamsRequest) returns (ListStreamsResponse);
 }
 

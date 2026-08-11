@@ -169,7 +169,7 @@ fn client_node() -> Node {
 /// static key plus identity binding and transcript-bound signature, sealed
 /// with the provisional-chain client-auth key (the daemon's DH chain
 /// stands the ephemeral in for the static, so the auth key matches on both
-/// sides) and framed as a raw handshake message.
+/// sides) and carried in an encrypted Handshake packet.
 fn send_client_auth(
     node: &Node,
     link: &(dyn umc_carrier::Link + Send + Sync),
@@ -208,7 +208,21 @@ fn send_client_auth(
         &auth_body,
     )
     .map_err(|e| format!("auth frame: {e:?}"))?;
-    send_packet(link, &frame)?;
+    let handshake_secret = umc_handshake::traffic::derive_handshake_traffic_secret(
+        &out.handshake_secret3,
+        &out.transcript_hash,
+        true,
+    );
+    let handshake_keys = umc_handshake::traffic::traffic_keys(&handshake_secret);
+    let packet = umc_handshake::handshake_packet::build_handshake_packet(
+        &[1u8; 8],
+        &[2u8; 8],
+        0,
+        &frame,
+        &handshake_keys,
+    )
+    .map_err(|e| format!("client auth packet: {e:?}"))?;
+    send_packet(link, &packet)?;
     Ok(auth_body)
 }
 
@@ -238,7 +252,20 @@ fn finish_finished_exchange(
             Err(e) => return Err(format!("recv server finished: {e:?}")),
         }
     };
-    let (finished_message, _) = umc_handshake::encoding::decode_message(&finished_packet)
+    let server_handshake_secret = umc_handshake::traffic::derive_handshake_traffic_secret(
+        &out.handshake_secret3,
+        &out.transcript_hash,
+        false,
+    );
+    let server_handshake_keys = umc_handshake::traffic::traffic_keys(&server_handshake_secret);
+    let (_dcid, _scid, _pn, finished_body) =
+        umc_handshake::handshake_packet::parse_handshake_packet(
+            &finished_packet,
+            &server_handshake_keys,
+            0,
+        )
+        .map_err(|e| format!("server finished packet: {e:?}"))?;
+    let (finished_message, _) = umc_handshake::encoding::decode_message(&finished_body)
         .map_err(|e| format!("server finished framing: {e:?}"))?;
     if finished_message.message_type != SERVER_FINISHED {
         return Err(format!(
@@ -269,7 +296,21 @@ fn finish_finished_exchange(
     let mut finished_frame = Vec::new();
     umc_handshake::encoding::encode_message(&mut finished_frame, CLIENT_FINISHED, &confirmation)
         .map_err(|e| format!("client finished frame: {e:?}"))?;
-    send_packet(link, &finished_frame)
+    let client_handshake_secret = umc_handshake::traffic::derive_handshake_traffic_secret(
+        &out.handshake_secret3,
+        &out.transcript_hash,
+        true,
+    );
+    let client_handshake_keys = umc_handshake::traffic::traffic_keys(&client_handshake_secret);
+    let finished_packet = umc_handshake::handshake_packet::build_handshake_packet(
+        &[1u8; 8],
+        &[2u8; 8],
+        1,
+        &finished_frame,
+        &client_handshake_keys,
+    )
+    .map_err(|e| format!("client finished packet: {e:?}"))?;
+    send_packet(link, &finished_packet)
 }
 
 /// Synchronous analogue of `Node::connect` over TCP, returning the live
@@ -285,11 +326,27 @@ fn tcp_handshake(node: &Node, remote: &str) -> Result<(BoxLink, Session), String
     let client_ephemeral = StaticHandshakeKeyPair::generate();
     let hello = ClientHello::new(node.entropy.as_ref(), &client_ephemeral);
     let hello_bytes = hello.encode().map_err(|e| format!("hello: {e:?}"))?;
-    send_packet(link.as_ref(), &hello_bytes)?;
+    let initial_keys = umc_handshake::initial::derive_initial_keys(&node.config.dcid);
+    let initial = umc_handshake::initial::build_initial_packet(
+        &node.config.dcid,
+        &[3u8; 8],
+        0,
+        &hello_bytes,
+        &initial_keys.client,
+    )
+    .map_err(|e| format!("initial packet: {e}"))?;
+    send_packet(link.as_ref(), &initial)?;
     std::thread::sleep(Duration::from_millis(100));
     let server_hello_bytes = link.recv().map_err(|e| format!("recv: {e:?}"))?.bytes;
+    let server_hello_payload =
+        umc_handshake::initial::parse_initial_with_keys(&server_hello_bytes, &initial_keys.server)
+            .ok_or("server Initial rejected")?
+            .2;
     let server_hello =
-        ServerHello::decode(&server_hello_bytes).map_err(|e| format!("server hello: {e:?}"))?;
+        ServerHello::decode(&server_hello_payload).map_err(|e| format!("server hello: {e:?}"))?;
+    let server_hello_bytes = server_hello
+        .encode()
+        .map_err(|e| format!("server hello encode: {e:?}"))?;
     let out = complete_client_side(
         &node.config.identity.identity,
         // The daemon stands the client's ephemeral in for the static until
@@ -361,7 +418,10 @@ fn stream_frame_payload(stream_id: u64, protocol_id: &[u8], data: &[u8]) -> Vec<
 /// which releases the daemon's recv lock and lets its queued echo flush.
 fn run_echo_client(node: &Node, remote: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
     let (link, mut session) = tcp_handshake(node, remote)?;
-    let stream_payload = stream_frame_payload(0, WELL_KNOWN_APP, payload);
+    let stream_id = session
+        .open_stream()
+        .map_err(|e| format!("open stream: {e:?}"))?;
+    let stream_payload = stream_frame_payload(stream_id, WELL_KNOWN_APP, payload);
     let packet = session
         .build_outbound(&TestClock, Instant(0), &stream_payload)
         .map_err(|e| format!("build: {e:?}"))?
@@ -374,7 +434,7 @@ fn run_echo_client(node: &Node, remote: &str, payload: &[u8]) -> Result<Vec<u8>,
     loop {
         let inbound = link.recv().map_err(|e| format!("recv: {e:?}"))?;
         let _ = session.on_inbound(Instant(0), &inbound.bytes);
-        if let Ok((data, _eof)) = session.read_stream(0) {
+        if let Ok((data, _eof)) = session.read_stream(stream_id) {
             if !data.is_empty() {
                 return Ok(data);
             }

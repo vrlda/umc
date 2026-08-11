@@ -1,8 +1,8 @@
 //! TCP carrier profile (carriers/tcp.md): varint-length-framed UMP packets.
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener as TokioListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use umc_carrier::error::{CarrierError, CarrierErrorKind};
 use umc_carrier::types::{
@@ -43,55 +43,90 @@ impl Carrier for TcpCarrier {
     }
 
     fn listen(&self, bind: String) -> Result<Box<dyn Listener + Send + Sync>, CarrierError> {
-        let rt = tokio::runtime::Handle::try_current()
+        let _runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| CarrierError::new(CarrierErrorKind::NotRunning, "listen"))?;
-        let listener = rt
-            .block_on(TokioListener::bind(&bind))
+        let std_listener = std::net::TcpListener::bind(&bind).map_err(|e| CarrierError {
+            kind: CarrierErrorKind::AddressInUse,
+            operation: "listen",
+            retryable: false,
+            message: e.to_string(),
+        })?;
+        std_listener
+            .set_nonblocking(true)
             .map_err(|e| CarrierError {
-                kind: CarrierErrorKind::AddressInUse,
+                kind: CarrierErrorKind::Internal,
                 operation: "listen",
                 retryable: false,
                 message: e.to_string(),
             })?;
         Ok(Box::new(TcpListenerAdapter {
-            inner: Arc::new(listener),
+            std_inner: Arc::new(std_listener),
+            closed: Arc::new(AtomicBool::new(false)),
         }))
     }
 
     fn dial(&self, remote: String) -> Result<BoxLink, CarrierError> {
-        let rt = tokio::runtime::Handle::try_current()
-            .map_err(|_| CarrierError::new(CarrierErrorKind::NotRunning, "dial"))?;
-        let stream = rt
-            .block_on(TcpStream::connect(&remote))
-            .map_err(|e| CarrierError {
-                kind: CarrierErrorKind::Unreachable,
-                operation: "dial",
-                retryable: true,
-                message: e.to_string(),
-            })?;
+        // The carrier trait is synchronous, while Node::connect is async.
+        // Use a blocking socket connect here so dialing from an async runtime
+        // never nests `Handle::block_on` (which panics); the caller owns the
+        // blocking boundary for the short dial operation.
+        let stream = std::net::TcpStream::connect(&remote).map_err(|e| CarrierError {
+            kind: CarrierErrorKind::Unreachable,
+            operation: "dial",
+            retryable: true,
+            message: e.to_string(),
+        })?;
+        stream.set_nonblocking(true).map_err(|e| CarrierError {
+            kind: CarrierErrorKind::Internal,
+            operation: "dial",
+            retryable: false,
+            message: e.to_string(),
+        })?;
+        let stream = TcpStream::from_std(stream).map_err(|e| CarrierError {
+            kind: CarrierErrorKind::Internal,
+            operation: "dial",
+            retryable: false,
+            message: e.to_string(),
+        })?;
         Ok(Box::new(TcpLink::new(stream)))
     }
 }
 
 #[derive(Debug)]
 pub struct TcpListenerAdapter {
-    inner: Arc<TokioListener>,
+    std_inner: Arc<std::net::TcpListener>,
+    closed: Arc<AtomicBool>,
 }
 
 impl Listener for TcpListenerAdapter {
     fn accept(&self) -> Result<BoxLink, CarrierError> {
-        let rt = tokio::runtime::Handle::try_current()
-            .map_err(|_| CarrierError::new(CarrierErrorKind::NotRunning, "accept"))?;
-        let (stream, _addr) = rt.block_on(self.inner.accept()).map_err(|e| CarrierError {
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return Err(CarrierError::new(CarrierErrorKind::NotRunning, "accept"));
+        }
+        let (stream, _addr) = self.std_inner.accept().map_err(|error| {
+            let kind = if error.kind() == std::io::ErrorKind::WouldBlock {
+                CarrierErrorKind::WouldBlock
+            } else {
+                CarrierErrorKind::Internal
+            };
+            CarrierError {
+                kind,
+                operation: "accept",
+                retryable: true,
+                message: error.to_string(),
+            }
+        })?;
+        let stream = TcpStream::from_std(stream).map_err(|error| CarrierError {
             kind: CarrierErrorKind::Internal,
             operation: "accept",
-            retryable: true,
-            message: e.to_string(),
+            retryable: false,
+            message: error.to_string(),
         })?;
         Ok(Box::new(TcpLink::new(stream)))
     }
 
     fn close(&self) -> Result<(), CarrierError> {
+        self.closed.store(true, AtomicOrdering::Release);
         Ok(())
     }
 }
@@ -123,7 +158,13 @@ impl TcpLink {
         tokio::spawn(async move {
             while let Some(packet) = rx.recv().await {
                 let mut framed = Vec::with_capacity(packet.bytes.len() + 4);
-                if umc_wire_framing::push_length(&mut framed, packet.bytes.len()).is_err() {
+                if umc_carrier::framing::push_length(
+                    &mut framed,
+                    packet.bytes.len(),
+                    MAX_PACKET_LEN,
+                )
+                .is_err()
+                {
                     writer_pending.fetch_sub(packet.bytes.len(), AtomicOrdering::Relaxed);
                     break;
                 }
@@ -144,51 +185,6 @@ impl TcpLink {
             outbound: tx,
             pending_bytes,
         }
-    }
-}
-
-/// Internal framing helper (no crate dependency on umc-wire for the carrier).
-// Lengths are range-checked before each cast; the `Result` wrapper matches the
-// umc-wire call shape.
-#[allow(clippy::cast_possible_truncation, clippy::unnecessary_wraps)]
-mod umc_wire_framing {
-    pub fn push_length(out: &mut Vec<u8>, len: usize) -> Result<(), ()> {
-        let len = len as u64;
-        if len <= 63 {
-            out.push(len as u8);
-        } else if len <= 16_383 {
-            out.push(0b0100_0000 | ((len >> 8) as u8));
-            out.push(len as u8);
-        } else if len <= 1_073_741_823 {
-            out.push(0b1000_0000 | ((len >> 24) as u8));
-            out.extend_from_slice(&(len as u32).to_be_bytes()[1..]);
-        } else {
-            out.push(0b1100_0000 | ((len >> 56) as u8));
-            out.extend_from_slice(&len.to_be_bytes()[1..]);
-        }
-        Ok(())
-    }
-
-    pub fn read_length(buf: &[u8]) -> Result<Option<(usize, usize)>, ()> {
-        let first = *buf.first().ok_or(())?;
-        let width = match first >> 6 {
-            0 => 1usize,
-            1 => 2usize,
-            2 => 4usize,
-            _ => 8usize,
-        };
-        if buf.len() < width {
-            return Ok(None);
-        }
-        let mut raw = [0u8; 8];
-        raw[..width].copy_from_slice(&buf[..width]);
-        raw[0] &= 0x3F;
-        // CORRECTED: shift the masked prefix bits into the right position.
-        let v = u64::from_be_bytes(raw) >> ((8 - width) * 8);
-        if v > 65_535 {
-            return Err(());
-        }
-        Ok(Some((v as usize, width)))
     }
 }
 
@@ -243,7 +239,7 @@ impl Link for TcpLink {
                     }
                     Ok(Ok(_)) => buf.push(b[0]),
                 }
-                match umc_wire_framing::read_length(&buf) {
+                match umc_carrier::framing::read_length(&buf, MAX_PACKET_LEN) {
                     Ok(Some((len, used))) => {
                         let mut payload = vec![0u8; len];
                         match tokio::time::timeout(READ_TIMEOUT, guard.0.read_exact(&mut payload))
@@ -266,7 +262,7 @@ impl Link for TcpLink {
                         }
                     }
                     Ok(None) => {}
-                    Err(()) => {
+                    Err(_) => {
                         return Err(CarrierError::new(CarrierErrorKind::ProtocolError, "recv"))
                     }
                 }
@@ -284,12 +280,19 @@ impl Link for TcpLink {
 
     fn close(&self, _reason: &str) -> Result<(), CarrierError> {
         let stream = self.stream.clone();
-        let rt = tokio::runtime::Handle::try_current()
-            .map_err(|_| CarrierError::new(CarrierErrorKind::NotRunning, "close"))?;
-        rt.block_on(async move {
+        let close = async move {
             let mut guard = stream.lock().await;
             let _ = guard.0.shutdown().await;
-        });
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(close);
+        } else {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| CarrierError::new(CarrierErrorKind::NotRunning, "close"))?;
+            runtime.block_on(close);
+        }
         Ok(())
     }
 }
@@ -297,16 +300,20 @@ impl Link for TcpLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener as TokioListener;
 
     #[test]
     fn framing_length_round_trip() {
         let mut buf = Vec::new();
-        umc_wire_framing::push_length(&mut buf, 64).unwrap();
-        assert_eq!(umc_wire_framing::read_length(&buf).unwrap(), Some((64, 2)));
-        let mut buf = Vec::new();
-        umc_wire_framing::push_length(&mut buf, 65_535).unwrap();
+        umc_carrier::framing::push_length(&mut buf, 64, MAX_PACKET_LEN).unwrap();
         assert_eq!(
-            umc_wire_framing::read_length(&buf).unwrap(),
+            umc_carrier::framing::read_length(&buf, MAX_PACKET_LEN).unwrap(),
+            Some((64, 2))
+        );
+        let mut buf = Vec::new();
+        umc_carrier::framing::push_length(&mut buf, 65_535, MAX_PACKET_LEN).unwrap();
+        assert_eq!(
+            umc_carrier::framing::read_length(&buf, MAX_PACKET_LEN).unwrap(),
             Some((65_535, 4))
         );
     }
@@ -314,7 +321,25 @@ mod tests {
     #[test]
     fn framing_rejects_oversize() {
         let buf = vec![0b1000_0000, 0xFF, 0xFF, 0xFF];
-        assert!(umc_wire_framing::read_length(&buf).is_err());
+        assert!(umc_carrier::framing::read_length(&buf, MAX_PACKET_LEN).is_err());
+    }
+
+    #[test]
+    fn listener_close_stops_accepting() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let listener = TcpCarrier
+                .listen("127.0.0.1:0".to_string())
+                .expect("listener");
+            listener.close().expect("close");
+            let Err(error) = listener.accept() else {
+                panic!("closed listener accepted a link")
+            };
+            assert_eq!(error.kind, CarrierErrorKind::NotRunning);
+        });
     }
 
     #[test]
@@ -389,7 +414,8 @@ mod tests {
                     reader.read_exact(&mut b).await.unwrap();
                     len_buf.push(b[0]);
                     if let Some((len, _used)) =
-                        umc_wire_framing::read_length(&len_buf).expect("valid length prefix")
+                        umc_carrier::framing::read_length(&len_buf, MAX_PACKET_LEN)
+                            .expect("valid length prefix")
                     {
                         assert_eq!(len, size, "frame length prefix");
                         break;
@@ -399,6 +425,22 @@ mod tests {
                 reader.read_exact(&mut payload).await.unwrap();
                 assert_eq!(payload, vec![0xAB; size]);
             }
+        });
+    }
+
+    #[test]
+    fn dial_is_safe_from_an_async_runtime_context() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+            let link = TcpCarrier.dial(address.to_string()).expect("dial");
+            let _ = accept.await.expect("accept");
+            link.close("test").expect("close");
         });
     }
 }

@@ -307,6 +307,13 @@ SDK methods MUST NOT:
 
 # 9. Carrier plugin API compatibility
 
+The v0.1 compatibility profile advertises no external Carrier Plugin API
+version. Built-in carriers and trusted compiled-in plugin hooks are the only
+supported carrier extension surface; the deferred external protocol is
+specified in [`carrier-plugin-api.md`](carrier-plugin-api.md). A future release
+may advertise a plugin API version only after private IPC, process lifecycle,
+and sandbox controls are implemented behind the generation-scoped supervisor.
+
 ## 9.1 Versioning
 
 The Carrier Plugin API uses:
@@ -391,10 +398,12 @@ Security fixes are supported for Tier-1 platforms:
 
 ```text
 Linux x86_64
-Linux aarch64
 macOS arm64
 Windows x86_64
 ```
+
+Linux aarch64, macOS x86_64, Windows arm64, and FreeBSD x86_64 are Tier-2
+platforms with best-effort fixes and optional release binaries.
 
 The project MUST document:
 

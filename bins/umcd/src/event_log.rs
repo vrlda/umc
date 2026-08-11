@@ -95,6 +95,9 @@ impl DaemonEvents {
         };
         let mut max_seq = 0u64;
         for entry in entries {
+            if entry.key.starts_with(b"control-token/") {
+                continue;
+            }
             let key = String::from_utf8_lossy(&entry.key);
             let Ok(seq) = key.parse::<u64>() else {
                 log::warn!("[events] skipping persisted event with non-numeric key {key:?}");

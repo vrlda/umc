@@ -1,15 +1,17 @@
-//! Provisional UMP header protection (wire-format §18; open decision #2):
-//! a 5-byte mask from the `ChaCha20` keystream over a zero nonce.
-//! This construction is provisional until the interop freeze.
+//! UMP header protection (wire-format §18).
+//!
+//! The mask is derived from the traffic-secret-separated header-protection
+//! key and a packet sample outside the masked header bytes.
 
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::ChaCha20;
 
 /// Length of the header protection mask in bytes.
 pub const MASK_LEN: usize = 5;
+pub const SAMPLE_LEN: usize = 16;
 
 /// Derives the header protection key from a traffic secret via
-/// `expand_label(secret, b"hp key", b"", 32)` (wire-format §18).
+/// `expand_label(secret, b"header protection", b"", 32)` (wire-format §18).
 ///
 /// The label is the sanctioned convention for header protection keys; it
 /// domain-separates the hp key from the AEAD packet key and IV. The
@@ -18,7 +20,8 @@ pub const MASK_LEN: usize = 5;
 #[must_use]
 pub fn header_protection_key(traffic_secret: &[u8; 32]) -> [u8; 32] {
     let mut key = [0u8; 32];
-    if let Ok(expanded) = crate::label::expand_label(traffic_secret, b"hp key", b"", 32) {
+    if let Ok(expanded) = crate::label::expand_label(traffic_secret, b"header protection", b"", 32)
+    {
         key.copy_from_slice(&expanded);
     }
     key
@@ -26,14 +29,19 @@ pub fn header_protection_key(traffic_secret: &[u8; 32]) -> [u8; 32] {
 
 /// Computes the header protection mask as 5 bytes of `ChaCha20` keystream.
 ///
-/// Provisional construction: the mask is key-only. The packet number
-/// sample does not influence the mask (the `ChaCha20` state is the header
-/// protection key with a zero nonce and block counter 0). This limitation
-/// is documented until the interop freeze (open decision #2).
+/// The first four sample bytes select the little-endian block counter and the
+/// remaining twelve bytes form the `ChaCha20` nonce. Short samples are
+/// zero-padded defensively; packet builders supply the full [`SAMPLE_LEN`].
 #[must_use]
-pub fn mask(header_protection_key: &[u8; 32], _packet_number_sample: &[u8]) -> [u8; MASK_LEN] {
-    let mut cipher = ChaCha20::new(&(*header_protection_key).into(), &([0u8; 12].into()));
-    cipher.seek(0);
+pub fn mask(header_protection_key: &[u8; 32], packet_number_sample: &[u8]) -> [u8; MASK_LEN] {
+    let mut sample = [0u8; SAMPLE_LEN];
+    let copy_len = packet_number_sample.len().min(SAMPLE_LEN);
+    sample[..copy_len].copy_from_slice(&packet_number_sample[..copy_len]);
+    let counter = u32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&sample[4..]);
+    let mut cipher = ChaCha20::new(&(*header_protection_key).into(), &nonce.into());
+    cipher.seek(u64::from(counter) * 64);
     let mut buf = [0u8; MASK_LEN];
     cipher.apply_keystream(&mut buf);
     buf
@@ -49,9 +57,10 @@ pub fn protect(
     header_protection_key: &[u8; 32],
     first_byte: u8,
     _key_phase_bit: bool,
+    packet_number_sample: &[u8],
     packet_number: &mut [u8],
 ) -> (u8, [u8; MASK_LEN]) {
-    let m = mask(header_protection_key, packet_number);
+    let m = mask(header_protection_key, packet_number_sample);
     let protected_first = first_byte ^ (m[4] & 0x10);
     for (byte, mask_byte) in packet_number.iter_mut().zip(m.iter()) {
         *byte ^= mask_byte;
@@ -69,9 +78,10 @@ pub fn protect(
 pub fn unprotect(
     header_protection_key: &[u8; 32],
     protected_first: u8,
+    packet_number_sample: &[u8],
     protected_pn: &[u8],
 ) -> (u8, bool, Vec<u8>) {
-    let m = mask(header_protection_key, protected_pn);
+    let m = mask(header_protection_key, packet_number_sample);
     let mut pn = protected_pn.to_vec();
     for (byte, mask_byte) in pn.iter_mut().zip(m.iter()) {
         *byte ^= mask_byte;
@@ -88,9 +98,10 @@ mod tests {
     fn protect_unprotect_round_trip() {
         let key = [9u8; 32];
         let mut pn = [0x0F, 0xB5];
-        let (protected_first, _) = protect(&key, 0b1000_0000, false, &mut pn);
+        let sample = [0xA5u8; SAMPLE_LEN];
+        let (protected_first, _) = protect(&key, 0b1000_0000, false, &sample, &mut pn);
         assert_ne!(protected_first, 0b1000_0000);
-        let (first, _, restored) = unprotect(&key, protected_first, &pn);
+        let (first, _, restored) = unprotect(&key, protected_first, &sample, &pn);
         assert_eq!(first, 0b1000_0000);
         assert_eq!(restored, vec![0x0F, 0xB5]);
     }
@@ -99,17 +110,25 @@ mod tests {
     fn key_phase_bit_survives() {
         let key = [9u8; 32];
         let mut pn = [0u8; 2];
-        let (pf, _) = protect(&key, 0b0001_0000, true, &mut pn);
-        let (first, phase, _) = unprotect(&key, pf, &pn);
+        let sample = [0xA5u8; SAMPLE_LEN];
+        let (pf, _) = protect(&key, 0b0001_0000, true, &sample, &mut pn);
+        let (first, phase, _) = unprotect(&key, pf, &sample, &pn);
         assert_eq!(first, 0b0001_0000);
         assert!(phase);
     }
 
     #[test]
     fn different_keys_give_different_masks() {
-        let pn = [1u8; 4];
-        let a = mask(&[1u8; 32], &pn);
-        let b = mask(&[2u8; 32], &pn);
+        let sample = [1u8; SAMPLE_LEN];
+        let a = mask(&[1u8; 32], &sample);
+        let b = mask(&[2u8; 32], &sample);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn sample_changes_mask() {
+        let a = mask(&[1u8; 32], &[0u8; SAMPLE_LEN]);
+        let b = mask(&[1u8; 32], &[1u8; SAMPLE_LEN]);
         assert_ne!(a, b);
     }
 

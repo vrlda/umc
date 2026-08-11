@@ -4,10 +4,13 @@
 //! after a restart the table is restored so operational hints survive.
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use umc_crypto::signatures::IdentityPublicKey;
+use umc_discovery::bootstrap::{BootstrapBundle, BootstrapError};
 use umc_discovery::hints::{
     apply_received_hints, apply_received_hints_with_mesh_secret, build_peer_hint,
     build_peer_hint_with_mesh_secret, select_for_share, HintError,
 };
+use umc_discovery::manager::{ProviderManager, ProviderReport, RefreshReport};
 use umc_discovery::provider::{CandidateAuth, CandidateSource, PeerCandidate, SharingPolicy};
 use umc_discovery::table::{CandidateTable, TableError};
 use umc_storage::sqlite::SqliteStore;
@@ -119,6 +122,7 @@ fn auth_to_u8(auth: CandidateAuth) -> u8 {
         CandidateAuth::IntroductionAuthenticated => 2,
         CandidateAuth::InvitationAuthenticated => 3,
         CandidateAuth::PreviousSessionBound => 4,
+        CandidateAuth::SignedBootstrap => 5,
     }
 }
 
@@ -129,6 +133,7 @@ fn auth_from_u8(value: u8) -> Option<CandidateAuth> {
         2 => Some(CandidateAuth::IntroductionAuthenticated),
         3 => Some(CandidateAuth::InvitationAuthenticated),
         4 => Some(CandidateAuth::PreviousSessionBound),
+        5 => Some(CandidateAuth::SignedBootstrap),
         _ => None,
     }
 }
@@ -177,6 +182,10 @@ fn load_candidates(store: &dyn Store) -> Vec<PeerCandidate> {
 /// candidate persistence.
 pub struct DiscoveryService {
     pub candidates: CandidateTable,
+    /// Optional provider coordinator. The composition root can register
+    /// providers without coupling candidate persistence to provider-owned
+    /// resources; failures and diversity are reported per refresh.
+    pub providers: ProviderManager,
     store: Option<Arc<SqliteStore>>,
 }
 
@@ -184,6 +193,7 @@ impl std::fmt::Debug for DiscoveryService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiscoveryService")
             .field("candidates", &self.candidates)
+            .field("providers", &self.providers)
             .field("store_attached", &self.store.is_some())
             .finish()
     }
@@ -195,14 +205,80 @@ impl DiscoveryService {
     pub fn new(cap: usize) -> Self {
         Self {
             candidates: CandidateTable::new(cap),
+            providers: ProviderManager::new(cap),
             store: None,
         }
+    }
+
+    /// Registers a discovery provider for lifecycle-managed refreshes.
+    pub fn register_provider(
+        &mut self,
+        provider: Box<dyn umc_discovery::provider::DiscoveryProvider>,
+    ) -> usize {
+        self.providers.register(provider)
+    }
+
+    /// Starts all registered providers and returns per-provider diagnostics.
+    pub fn start_providers(&mut self) -> Vec<ProviderReport> {
+        self.providers.start_all()
+    }
+
+    /// Stops all registered providers and returns per-provider diagnostics.
+    pub fn stop_providers(&mut self) -> Vec<ProviderReport> {
+        self.providers.stop_all()
+    }
+
+    /// Refreshes registered providers, mirrors accepted candidates into the
+    /// service table, and persists them through the normal candidate path.
+    #[must_use]
+    pub fn refresh_providers(&mut self, now: Instant) -> RefreshReport {
+        let report = self.providers.refresh(now);
+        for candidate in self.providers.candidates() {
+            if let Err(error) = self.record_candidate(candidate, now) {
+                log::warn!("[discovery] provider candidate was not mirrored: {error:?}");
+            }
+        }
+        report
     }
 
     /// Attaches the node database so recorded candidates persist
     /// (storage.md §16.4).
     pub fn attach_store(&mut self, store: Arc<SqliteStore>) {
         self.store = Some(store);
+    }
+
+    /// Verifies and admits a signed bootstrap bundle as candidates. The
+    /// bundle issuer authenticates the source only; endpoint identity is
+    /// still established by the subsequent handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BootstrapError`] when the bundle or its issuer is invalid.
+    pub fn apply_bootstrap_bundle(
+        &mut self,
+        bundle: &BootstrapBundle,
+        issuer_key: &IdentityPublicKey,
+        now: Instant,
+    ) -> Result<usize, BootstrapError> {
+        let candidates = bundle.verify(issuer_key, now.0)?;
+        let mut accepted = 0;
+        for candidate in candidates {
+            let id = candidate.candidate_id;
+            self.candidates
+                .upsert(candidate, now)
+                .map_err(|_| BootstrapError::TableFull)?;
+            if let Some(store) = &self.store {
+                if let Some(stored) = self.candidates.get(id) {
+                    if let Err(error) = save_candidate(store.as_ref(), stored) {
+                        log::warn!(
+                            "[discovery] failed to persist bootstrap candidate {id}: {error:?}"
+                        );
+                    }
+                }
+            }
+            accepted += 1;
+        }
+        Ok(accepted)
     }
 
     /// Loads persisted candidates back into the table (storage.md §16.4):
@@ -327,6 +403,8 @@ impl DiscoveryService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use umc_crypto::signatures::IdentityKeyPair;
+    use umc_discovery::bootstrap::{BootstrapBundle, BootstrapCandidate};
     use umc_discovery::provider::{CandidateAuth, CandidateSource, SharingPolicy};
 
     fn candidate(id: u64, policy: SharingPolicy, expires_ms: u64) -> PeerCandidate {
@@ -410,6 +488,34 @@ mod tests {
         let hint = service.build_hint(10, Instant(0)).expect("hint");
         assert_eq!(hint.entries.len(), 1);
         assert_eq!(hint.entries[0].temporary_peer_id, 4u64.to_be_bytes());
+    }
+
+    #[test]
+    fn signed_bootstrap_bundle_is_verified_before_admission() {
+        let issuer = IdentityKeyPair::generate();
+        let bundle = BootstrapBundle::sign(
+            &issuer,
+            10,
+            100,
+            vec![BootstrapCandidate {
+                candidate_id: 11,
+                carrier_type: "ump.tcp/1".into(),
+                connection_hint: b"127.0.0.1:9000".to_vec(),
+                expires_at_ms: 90,
+                sharing_policy: SharingPolicy::ShareGeneral,
+            }],
+        )
+        .unwrap();
+        let mut service = DiscoveryService::new(10);
+        assert_eq!(
+            service
+                .apply_bootstrap_bundle(&bundle, &issuer.public(), Instant(50))
+                .unwrap(),
+            1
+        );
+        let admitted = service.candidates.get(11).unwrap();
+        assert_eq!(admitted.source, CandidateSource::Bootstrap);
+        assert_eq!(admitted.authentication, CandidateAuth::SignedBootstrap);
     }
 
     #[test]

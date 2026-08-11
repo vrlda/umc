@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::str::FromStr;
 use umc_core::privacy::PrivacyProfile;
+use umc_storage::quota::Profile;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -19,14 +20,36 @@ pub struct NodeConfig {
     /// requested profile (privacy.md §43).
     pub privacy_policy_override: Option<String>,
     /// Pad application data packets to a fixed target size. This is an
-    /// explicit opt-in because P3 traffic-analysis resistance is not the
-    /// secure-by-default profile (privacy.md §P3).
+    /// explicit opt-in for P0-P2; P3 enables it automatically.
     pub traffic_padding: bool,
+    /// Maximum randomized application-send delay under P3. Zero disables
+    /// timing jitter for constrained deployments (privacy.md §27).
+    pub timing_jitter_ms: u64,
+    /// Permit authenticated, locally-budgeted cover packets under P3.
+    pub cover_traffic: bool,
+    /// Cover packet cadence. Values are clamped to the bounded 100 ms–60 s
+    /// policy range before a session is started.
+    pub cover_interval_ms: u64,
+    /// Per-session cover bandwidth ceiling in bytes per second.
+    pub cover_budget_bps: u64,
+    /// Privacy identifier/path rotation cadence. Route replacement remains
+    /// session-preserving; the live daemon rotates advertised CIDs on this
+    /// schedule until a topology-aware route manager is available.
+    pub route_rotation_interval_ms: u64,
     pub carriers: Vec<String>,
     pub tcp_listen: Option<String>,
     pub udp_listen: Option<String>,
     /// Experimental TLS-stream listener address (disabled unless set).
     pub tls_listen: Option<String>,
+    /// DER-encoded TLS server certificate used when TLS material is
+    /// provisioned for daemon deployment.
+    pub tls_certificate: Option<PathBuf>,
+    /// DER-encoded PKCS#8 TLS private key. Never exposed through status.
+    pub tls_private_key: Option<PathBuf>,
+    /// DER-encoded CA or pinned certificate roots trusted by TLS dials.
+    pub tls_trust_roots: Vec<PathBuf>,
+    /// DNS name presented to the TLS connector when dialing.
+    pub tls_server_name: String,
     /// Local mesh mode (core.md §23.3). Conservative default: off
     /// (decisions.md §3.2).
     pub mesh: bool,
@@ -42,6 +65,9 @@ pub struct NodeConfig {
     pub disabled_protocol_versions: Vec<String>,
     pub disabled_crypto_profiles: Vec<String>,
     pub disabled_carriers: Vec<String>,
+    /// Require a stateless Retry before expensive public-key work. Disabled
+    /// by default for compatibility (handshake.md §21).
+    pub require_retry: bool,
     /// Immediately refuses new public-relay circuit admission. Existing
     /// circuits are drained by their normal lifetime/close path.
     pub disable_public_relay: bool,
@@ -51,10 +77,11 @@ pub struct NodeConfig {
     /// Telemetry opt-in (core.md §61, privacy.md §38): off by default. The
     /// daemon dumps a bounded JSONL metrics file only when enabled.
     pub telemetry_enabled: bool,
-    /// Permits `IdentityService.ExportSecretIdentity` (raw seed export) on
-    /// the control socket. Off by default: without this flag the method
-    /// answers `PermissionDenied` (control-api.md §32.7 — secret material
-    /// leaves the keystore only when an operator opts in).
+    /// Permits `IdentityService.ExportSecretIdentity` on the control socket.
+    /// Off by default: without this flag the method answers
+    /// `PermissionDenied`; when enabled, callers must still provide a
+    /// passphrase protection and the explicit `EXPORT` confirmation
+    /// (control-api.md §32.7).
     pub allow_secret_export: bool,
     /// Bearer credential for the control API (control-api.md §11.3).
     /// Development-only: honored when set, never persisted or exposed.
@@ -81,10 +108,19 @@ impl Default for NodeConfig {
             privacy_profile: PrivacyProfile::P0.as_str().to_string(),
             privacy_policy_override: None,
             traffic_padding: false,
+            timing_jitter_ms: 25,
+            cover_traffic: false,
+            cover_interval_ms: 1_000,
+            cover_budget_bps: 4 * 1_024,
+            route_rotation_interval_ms: 10 * 60 * 1_000,
             carriers: vec!["ump.tcp/1".to_string(), "ump.udp/1".to_string()],
             tcp_listen: None,
             udp_listen: None,
             tls_listen: None,
+            tls_certificate: None,
+            tls_private_key: None,
+            tls_trust_roots: Vec::new(),
+            tls_server_name: "localhost".to_string(),
             mesh: false,
             mesh_secret: None,
             keystore: None,
@@ -92,6 +128,7 @@ impl Default for NodeConfig {
             disabled_protocol_versions: Vec::new(),
             disabled_crypto_profiles: Vec::new(),
             disabled_carriers: Vec::new(),
+            require_retry: false,
             disable_public_relay: false,
             static_peers: Vec::new(),
             telemetry_enabled: false,
@@ -114,8 +151,15 @@ impl NodeConfig {
                 serde_json::from_str(&text).map_err(|e| format!("config parse: {e}"))?;
             config = file_config;
         }
+        if Profile::from_name(&config.profile).is_none() {
+            return Err(format!(
+                "config profile must be one of {SUPPORTED_PROFILES:?}, got {:?}",
+                config.profile
+            ));
+        }
         config.config_path = path.cloned();
         config.normalize_privacy_profiles()?;
+        config.normalize_privacy_controls()?;
         // Safety invariants (resource-limits.md §51): conservative defaults.
         config.public_relay = false;
         config.telemetry_enabled = false;
@@ -138,6 +182,7 @@ impl NodeConfig {
     /// # Errors
     ///
     /// Returns a message for unknown keys and values that do not parse.
+    #[allow(clippy::too_many_lines)]
     pub fn set_entry(&mut self, key: &str, value: &str) -> Result<(), String> {
         match key {
             "profile" => {
@@ -166,6 +211,55 @@ impl NodeConfig {
                 self.traffic_padding = value
                     .parse::<bool>()
                     .map_err(|_| format!("traffic_padding must be a bool, got {value:?}"))?;
+            }
+            "timing_jitter_ms" => {
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("timing_jitter_ms must be an integer, got {value:?}"))?;
+                let previous = self.timing_jitter_ms;
+                self.timing_jitter_ms = parsed;
+                if let Err(error) = self.normalize_privacy_controls() {
+                    self.timing_jitter_ms = previous;
+                    return Err(error);
+                }
+            }
+            "cover_traffic" => {
+                self.cover_traffic = value
+                    .parse::<bool>()
+                    .map_err(|_| format!("cover_traffic must be a bool, got {value:?}"))?;
+            }
+            "cover_interval_ms" => {
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("cover_interval_ms must be an integer, got {value:?}"))?;
+                let previous = self.cover_interval_ms;
+                self.cover_interval_ms = parsed;
+                if let Err(error) = self.normalize_privacy_controls() {
+                    self.cover_interval_ms = previous;
+                    return Err(error);
+                }
+            }
+            "cover_budget_bps" => {
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("cover_budget_bps must be an integer, got {value:?}"))?;
+                let previous = self.cover_budget_bps;
+                self.cover_budget_bps = parsed;
+                if let Err(error) = self.normalize_privacy_controls() {
+                    self.cover_budget_bps = previous;
+                    return Err(error);
+                }
+            }
+            "route_rotation_interval_ms" => {
+                let parsed = value.parse::<u64>().map_err(|_| {
+                    format!("route_rotation_interval_ms must be an integer, got {value:?}")
+                })?;
+                let previous = self.route_rotation_interval_ms;
+                self.route_rotation_interval_ms = parsed;
+                if let Err(error) = self.normalize_privacy_controls() {
+                    self.route_rotation_interval_ms = previous;
+                    return Err(error);
+                }
             }
             "public_relay" => {
                 self.public_relay = value
@@ -217,6 +311,22 @@ impl NodeConfig {
                     Some(value.trim().to_string())
                 };
             }
+            "tls_certificate" => {
+                self.tls_certificate = optional_path(value);
+            }
+            "tls_private_key" => {
+                self.tls_private_key = optional_path(value);
+            }
+            "tls_trust_roots" => {
+                self.tls_trust_roots = parse_csv(value).into_iter().map(PathBuf::from).collect();
+            }
+            "tls_server_name" => {
+                let name = value.trim();
+                if name.is_empty() {
+                    return Err("tls_server_name must not be empty".into());
+                }
+                self.tls_server_name = name.to_string();
+            }
             "disabled_protocol_versions" => {
                 self.disabled_protocol_versions = parse_csv(value);
             }
@@ -225,6 +335,11 @@ impl NodeConfig {
             }
             "disabled_carriers" => {
                 self.disabled_carriers = parse_csv(value);
+            }
+            "require_retry" => {
+                self.require_retry = value
+                    .parse::<bool>()
+                    .map_err(|_| format!("require_retry must be a bool, got {value:?}"))?;
             }
             "static_peers" => {
                 self.static_peers = serde_json::from_str(value)
@@ -252,6 +367,13 @@ impl NodeConfig {
         self.privacy_profile_value().effective(policy)
     }
 
+    /// Returns the validated resource profile, falling back to the standard
+    /// profile for an in-memory configuration assembled by a caller.
+    #[must_use]
+    pub fn resource_profile(&self) -> Profile {
+        Profile::from_name(&self.profile).unwrap_or(Profile::Standard)
+    }
+
     fn normalize_privacy_profiles(&mut self) -> Result<(), String> {
         let requested =
             PrivacyProfile::from_str(&self.privacy_profile).map_err(|e| format!("config: {e}"))?;
@@ -260,6 +382,38 @@ impl NodeConfig {
             let policy = PrivacyProfile::from_str(value)
                 .map_err(|e| format!("config privacy_policy_override: {e}"))?;
             self.privacy_policy_override = Some(policy.as_str().to_string());
+        }
+        Ok(())
+    }
+
+    fn normalize_privacy_controls(&mut self) -> Result<(), String> {
+        const MAX_TIMING_JITTER_MS: u64 = 10_000;
+        const MIN_INTERVAL_MS: u64 = 100;
+        const MAX_INTERVAL_MS: u64 = 60_000;
+        const MAX_COVER_BUDGET_BPS: u64 = 64 * 1_024;
+        const MIN_ROUTE_ROTATION_MS: u64 = 60_000;
+        const MAX_ROUTE_ROTATION_MS: u64 = 24 * 60 * 60 * 1_000;
+        if self.timing_jitter_ms > MAX_TIMING_JITTER_MS {
+            return Err(format!(
+                "config timing_jitter_ms exceeds {MAX_TIMING_JITTER_MS}"
+            ));
+        }
+        if !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&self.cover_interval_ms) {
+            return Err(format!(
+                "config cover_interval_ms must be between {MIN_INTERVAL_MS} and {MAX_INTERVAL_MS}"
+            ));
+        }
+        if self.cover_budget_bps > MAX_COVER_BUDGET_BPS {
+            return Err(format!(
+                "config cover_budget_bps exceeds {MAX_COVER_BUDGET_BPS}"
+            ));
+        }
+        if !(MIN_ROUTE_ROTATION_MS..=MAX_ROUTE_ROTATION_MS)
+            .contains(&self.route_rotation_interval_ms)
+        {
+            return Err(format!(
+                "config route_rotation_interval_ms must be between {MIN_ROUTE_ROTATION_MS} and {MAX_ROUTE_ROTATION_MS}"
+            ));
         }
         Ok(())
     }
@@ -328,6 +482,27 @@ impl NodeConfig {
             None => self.resolved_data_dir().join("keystore"),
         }
     }
+
+    /// Resolves the configured TLS certificate path, if any.
+    #[must_use]
+    pub fn resolved_tls_certificate(&self) -> Option<PathBuf> {
+        self.tls_certificate.as_deref().map(expand_tilde)
+    }
+
+    /// Resolves the configured TLS private-key path, if any.
+    #[must_use]
+    pub fn resolved_tls_private_key(&self) -> Option<PathBuf> {
+        self.tls_private_key.as_deref().map(expand_tilde)
+    }
+
+    /// Resolves all configured TLS trust-root paths.
+    #[must_use]
+    pub fn resolved_tls_trust_roots(&self) -> Vec<PathBuf> {
+        self.tls_trust_roots
+            .iter()
+            .map(|path| expand_tilde(path))
+            .collect()
+    }
 }
 
 fn expand_tilde(path: &std::path::Path) -> PathBuf {
@@ -349,6 +524,11 @@ fn parse_csv(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn optional_path(value: &str) -> Option<PathBuf> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,11 +543,20 @@ mod tests {
         assert_eq!(config.privacy_profile_value(), PrivacyProfile::P0);
         assert_eq!(config.effective_privacy_profile(), PrivacyProfile::P0);
         assert!(!config.traffic_padding);
+        assert_eq!(config.timing_jitter_ms, 25);
+        assert!(!config.cover_traffic);
+        assert_eq!(config.cover_interval_ms, 1_000);
+        assert_eq!(config.cover_budget_bps, 4 * 1_024);
+        assert_eq!(config.route_rotation_interval_ms, 10 * 60 * 1_000);
         assert!(
             !config.allow_secret_export,
             "secret export is off by default"
         );
         assert!(config.keystore.is_none());
+        assert!(config.tls_certificate.is_none());
+        assert!(config.tls_private_key.is_none());
+        assert!(config.tls_trust_roots.is_empty());
+        assert_eq!(config.tls_server_name, "localhost");
         assert!(config.disabled_protocol_versions.is_empty());
         assert!(config.disabled_crypto_profiles.is_empty());
         assert!(config.disabled_carriers.is_empty());
@@ -446,6 +635,22 @@ mod tests {
         config.set_entry("traffic_padding", "true").unwrap();
         assert!(config.traffic_padding);
         assert!(config.set_entry("traffic_padding", "maybe").is_err());
+        config.set_entry("timing_jitter_ms", "40").unwrap();
+        assert_eq!(config.timing_jitter_ms, 40);
+        config.set_entry("cover_traffic", "true").unwrap();
+        assert!(config.cover_traffic);
+        config.set_entry("cover_interval_ms", "500").unwrap();
+        assert_eq!(config.cover_interval_ms, 500);
+        config.set_entry("cover_budget_bps", "2048").unwrap();
+        assert_eq!(config.cover_budget_bps, 2048);
+        config
+            .set_entry("route_rotation_interval_ms", "120000")
+            .unwrap();
+        assert_eq!(config.route_rotation_interval_ms, 120_000);
+        assert!(config.set_entry("cover_interval_ms", "1").is_err());
+        assert_eq!(config.cover_interval_ms, 500);
+        assert!(config.set_entry("timing_jitter_ms", "10001").is_err());
+        assert_eq!(config.timing_jitter_ms, 40);
         config.set_entry("public_relay", "false").unwrap();
         assert!(!config.public_relay);
         config.set_entry("telemetry_enabled", "true").unwrap();
@@ -458,6 +663,25 @@ mod tests {
         config.set_entry("allow_secret_export", "true").unwrap();
         assert!(config.allow_secret_export);
         assert!(config.set_entry("allow_secret_export", "maybe").is_err());
+        config.set_entry("require_retry", "true").unwrap();
+        assert!(config.require_retry);
+        config
+            .set_entry("tls_certificate", "~/mesh/server.der")
+            .unwrap();
+        config
+            .set_entry("tls_private_key", "~/mesh/server.key")
+            .unwrap();
+        config
+            .set_entry("tls_trust_roots", "~/mesh/root.der, /etc/mesh/root2.der")
+            .unwrap();
+        config.set_entry("tls_server_name", "mesh.example").unwrap();
+        assert!(config
+            .resolved_tls_certificate()
+            .expect("certificate path")
+            .ends_with("mesh/server.der"));
+        assert_eq!(config.tls_trust_roots.len(), 2);
+        assert!(config.set_entry("tls_server_name", "").is_err());
+        assert!(config.set_entry("require_retry", "maybe").is_err());
         config
             .set_entry("carriers", "ump.tcp/1, ump.udp/1")
             .unwrap();
@@ -472,6 +696,23 @@ mod tests {
         assert!(config.set_entry("no_such_key", "x").is_err());
         // A failed entry leaves the previous value intact.
         assert_eq!(config.profile, "relay");
+    }
+
+    #[test]
+    fn resource_profile_maps_to_shared_limit_table() {
+        let mut config = NodeConfig {
+            profile: "constrained".into(),
+            ..NodeConfig::default()
+        };
+        assert_eq!(
+            config.resource_profile(),
+            umc_storage::quota::Profile::Constrained
+        );
+        config.profile = "relay".into();
+        assert_eq!(
+            config.resource_profile(),
+            umc_storage::quota::Profile::Relay
+        );
     }
 
     #[test]
@@ -532,6 +773,8 @@ mod tests {
 
         let invalid_path = dir.join("invalid-privacy-node.json");
         std::fs::write(&invalid_path, r#"{"privacy_profile":"p9"}"#).unwrap();
+        assert!(NodeConfig::load(Some(&invalid_path)).is_err());
+        std::fs::write(&invalid_path, r#"{"profile":"unknown"}"#).unwrap();
         assert!(NodeConfig::load(Some(&invalid_path)).is_err());
     }
 }

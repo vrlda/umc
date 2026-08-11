@@ -418,6 +418,24 @@ A keystore format change MUST have:
 
 Keystore migration MUST NOT depend on database schema migration order.
 
+## 10.6 v0.1 file format
+
+The v0.1 file-backed implementation uses `UMC-KEYSTORE-v3`:
+
+```text
+magic             = "UMC-KEYSTORE-v3\\0"
+salt              = 16 random bytes (per file)
+check             = nonce(12) || ChaCha20-Poly1305("check")
+records           = repeated u32-be(length) || nonce(12) || ciphertext+tag
+KDF               = Argon2id, m=19 MiB, t=2, p=1, output=32 bytes
+AEAD              = ChaCha20-Poly1305, AAD="UMC-KEYSTORE-v3"
+```
+
+Every envelope receives a fresh OS-random nonce. The previous v2 envelope
+(`blake2s`-derived salt and fixed `KSV1` nonce) is accepted only for one-time
+atomic migration at open; failed authentication or malformed records leave the
+legacy file untouched and fail closed. New writes are never emitted as v2.
+
 ---
 
 # 11. Content-addressed object store
@@ -838,6 +856,12 @@ Generation identifier
 Creation time
 ```
 
+The v0.1 directory backup additionally records the node endpoint identity,
+restore-generation number, and BLAKE2s-256 hashes for every copied regular
+file. Restore rejects unsafe manifest paths, symlinks, missing hash entries,
+hash mismatches, identity mismatches, and generations older than the target's
+external restore anchor.
+
 ## 20.2 Generation binding
 
 A backup MUST be bound to:
@@ -1147,28 +1171,28 @@ An implementation MAY defer:
 
 # 29. Open design decisions
 
-The project must resolve these items before stable v0.1:
+The following v0.1 choices are resolved in this repository: SQLite schema v2
+and table layout, the v3 keystore/KDF above (with v2 migration), the directory
+backup manifest and staged restore flow, object-store fsync policy, the
+two-level content-addressed object layout, and the empty-password development
+unlock workflow (or `UMC_KEYSTORE_PASSWORD`).
 
-1. Exact SQLite schema and table layout.
-2. Exact keystore file format and KDF parameters.
-3. Backup format and archive layout.
-4. Backup and restore API placement in the Control API.
-5. Migration downgrade policy.
-6. Rollback-detection anchor per platform.
-7. Whether diagnostics persist in the database or filesystem.
-8. Audit-record retention and storage.
-9. Object-store fsync policy.
-10. Whether bundle objects are encrypted at rest.
-11. Exact reserved-capacity values per profile.
-12. Whether route cache persists by default.
-13. Peer-store persistence granularity.
-14. Content-addressed object store directory layout versioning.
-15. Whether config is stored in the database or separate files.
-16. Keystore unlock workflow and re-lock behavior.
-17. Backup scheduling and rotation policy.
-18. Restore authorization flow.
-19. Crash-recovery self-check scope.
-20. Storage schema compatibility windows per release.
+The remaining policy decisions are:
+
+1. Backup and restore API placement in the Control API.
+2. Migration downgrade policy.
+3. Rollback-detection anchor per platform.
+4. Whether diagnostics persist in the database or filesystem.
+5. Audit-record retention and storage.
+6. Whether bundle objects are encrypted at rest.
+7. Exact reserved-capacity values per profile.
+8. Whether route cache persists by default.
+9. Peer-store persistence granularity.
+10. Whether config is stored in the database or separate files.
+11. Backup scheduling and rotation policy.
+12. Restore authorization flow.
+13. Crash-recovery self-check scope.
+14. Storage schema compatibility windows per release.
 
 ---
 

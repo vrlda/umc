@@ -182,6 +182,7 @@ Managed memory hard budget: 128 MiB
 Persistent operational storage: 512 MiB
 Bundle storage: disabled by default
 Active sessions: 128
+Active relay circuits (private and public): 256
 Public relay: disabled
 ```
 
@@ -194,6 +195,7 @@ Managed memory hard budget: 512 MiB
 Persistent operational storage: 4 GiB
 Experimental bundle storage: 1 GiB
 Active sessions: 1,024
+Active relay circuits (private and public): 4,096
 Public relay: disabled
 ```
 

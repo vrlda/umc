@@ -6,12 +6,18 @@ license.workspace = true
 publish = false
 
 [dependencies]
+umc-core = { path = "../../crates/umc-core" }
 umc-handshake = { path = "../../crates/umc-handshake" }
 umc-crypto = { path = "../../crates/umc-crypto" }
 umc-session = { path = "../../crates/umc-session" }
 umc-wire = { path = "../../crates/umc-wire" }
 umc-types = { path = "../../crates/umc-types" }
 umc-routing = { path = "../../crates/umc-routing" }
+umc-bundle = { path = "../../crates/umc-bundle" }
+umc-control = { path = "../../crates/umc-control" }
+umc-metrics = { path = "../../crates/umc-metrics" }
+umc-plugin = { path = "../../crates/umc-plugin" }
+umc-relay = { path = "../../crates/umc-relay" }
 
 [lints]
 workspace = true

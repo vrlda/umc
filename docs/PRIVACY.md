@@ -8,9 +8,15 @@ must never be silently enabled or claimed.
 | Profile | Current status |
 | --- | --- |
 | P0 Secure | Implemented and the default: end-to-end authenticated encryption, encrypted identity binding, redacted peer logging, bounded discovery hints, and no TLS-to-endpoint identity conflation. |
-| P1 Identity/topology minimization | Partial: the profile and local policy floor are exposed, the handshake binds a requested minimum and fails closed above the daemon’s p1 maximum, control candidate enumeration is budgeted, the daemon rotates advertised connection IDs periodically, and optional local-mesh hints use membership authentication; bounded hints and redacted logs exist, while exact negotiated session reporting remains pending. |
-| P2 Private routing | Primitives implemented: authenticated onion layers expose only one opaque transition at a time, and sessions can reject direct paths; daemon route integration, rendezvous/introduction points, and replica privacy remain future work. |
-| P3 Traffic analysis resistance | Partial: an explicit daemon/session opt-in pads small application payloads to a fixed 1,024-byte target and the control surface reports that switch; cover traffic, timing hygiene, and profile-level enforcement remain future work. |
+| P1 Identity/topology minimization | Partial: the profile and local policy floor are exposed, the handshake binds a requested minimum through the capabilities hash, registered sessions report their negotiated profile/direct-path/padding state, candidate enumeration is budgeted, advertised connection IDs rotate on a bounded policy schedule, and optional local-mesh hints use membership authentication. Full discovery minimization remains outside this release. |
+| P2 Private routing | Bounded daemon path implemented: direct paths are forbidden for negotiated P2+, originators send a non-reversible route token, each relay resolves only its authenticated adjacent leg, private route metadata is reduced to the local adjacent leg, fresh relay circuit IDs scope downstream legs, and data waits for downstream acceptance. The terminal relay alone resolves the destination endpoint. Rendezvous/replica privacy and global-passive anonymity are outside UMP/1. |
+| P3 Traffic analysis resistance | Negotiated and policy-enforced: P3 forces 1,024-byte application padding, applies bounded configurable send jitter, rotates privacy identifiers on a session-preserving cadence, supports optional authenticated cover packets with per-session bandwidth ceilings, and selects bounded diverse relay alternatives with failover on route failure. Anonymous authorization and global-passive anonymity remain outside UMP/1. |
+
+The current live route probe path binds learned candidates to the originating
+destination and scope. The daemon's relay-chain path is bounded and
+admission-gated; intermediate relays retain only their adjacent route leg,
+while the originator may retain the path it selected. This is not a claim of
+rendezvous privacy or global-passive anonymity.
 
 Metadata classification used during review:
 
@@ -24,5 +30,6 @@ Metadata classification used during review:
 
 The project does not claim global-passive anonymity. Anonymous credentials,
 private information retrieval, private set intersection, rendezvous/replica
-privacy, mix modes, and P3 cover traffic are explicitly out of scope for the
-current release and must be documented again before any profile is promoted.
+privacy, and mix modes are outside the current UMP/1 profile. Cover traffic is
+implemented only as an optional, locally budgeted defense; it is never
+peer-triggered or mandatory.

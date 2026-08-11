@@ -178,7 +178,7 @@ message PluginError {
 
 `fuzz/fuzz_targets/bundle_frame.rs` references `umc_wire::frames::bundle::BundleFrame`, which Phase 14 Task 8 creates. Keep the file; it compiles only after that task lands.
 
-- [ ] **E12. Phase 13 Task 6 — quota recalculation no-op**
+- [x] **E12. Phase 13 Task 6 — quota recalculation no-op**
 
 Implement real recalculation: after loading persisted records, rebuild the manager's quota usage from record sizes:
 
@@ -462,7 +462,7 @@ git commit -m "feat(wire): skip unknown optional length-delimited frames"
 **Files:**
 - Create: `crates/umc-handshake/src/state.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/umc-handshake/src/state.rs`:
 
@@ -597,7 +597,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run tests**
+- [x] **Step 2: Run tests**
 
 Run: `cargo test -p umc-handshake`
 Expected: PASS (48 tests).
@@ -753,7 +753,7 @@ git commit -m "feat(handshake): handshake traffic secrets and parameter negotiat
 **Files:**
 - Modify: `crates/umc-session/src/session.rs`
 
-- [ ] **Step 1: Implement retransmission**
+- [x] **Step 1: Implement retransmission**
 
 Append to `crates/umc-session/src/session.rs`:
 
@@ -796,7 +796,7 @@ Add the buffer field and populate it in `send_stream_data`:
 
 In `send_stream_data`, after building the frame, push a clone of `(stream_id, offset, chunk, fin)` into `pending_retransmit` (bounded to 16,384 entries, popping oldest).
 
-- [ ] **Step 2: Handle inbound control frames**
+- [x] **Step 2: Handle inbound control frames**
 
 Extend `on_inbound`'s frame match with the currently-ignored control frames:
 
@@ -871,7 +871,7 @@ Add to `Stream` (stream.rs):
     }
 ```
 
-- [ ] **Step 3: Add stream-ID validation**
+- [x] **Step 3: Add stream-ID validation**
 
 Add a helper enforcing the low-bit scheme (wire-format.md §29):
 
@@ -893,12 +893,12 @@ Add a helper enforcing the low-bit scheme (wire-format.md §29):
 
 Call it in `apply_stream_frame` before `entry().or_insert_with`; reject violations with `PROTOCOL_VIOLATION`-style error. Reject stream-ID reuse: track `max_seen` per direction and error when a stream ID below the max is re-opened with `OPEN`.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test -p umc-session`
 Expected: PASS (51+ tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/umc-session/src/session.rs crates/umc-session/src/stream.rs
@@ -2969,8 +2969,8 @@ git commit -m "test(phase14): state-machine, property, fault-injection, soak"
 | --- | --- | --- |
 | Final wire and handshake vectors | open | P12 defers downgrade vectors |
 | Independent cryptographic review | open | scheduled before production claims |
-| Fuzzing of every network and local parser | partial | wire/handshake/bundle targets; add route, relay, carrier framing, control API, plugin, DB recovery |
-| Enforced resource-limit profiles | partial | constants exist; profile-enforcement tests pending |
+| Fuzzing of every network and local parser | implemented (bounded v0.1) | twelve targets cover wire/handshake/bundle/route/relay/carrier/control/plugin/SQLite and UMC storage recovery; deterministic corpus/resource report and CI smoke/nightly workflow |
+| Enforced resource-limit profiles | implemented (bounded v0.1) | shared profile matrix, bundle/session/relay admission caps, profile tests, and release-baseline queue-trend evidence |
 | Local API permission tests | partial | Phase 14 services tests |
 | Plugin process-isolation tests | partial | loopback protocol tests; OS sandbox pending |
 | Storage corruption and rollback tests | open | |
@@ -3094,6 +3094,4 @@ git commit -m "docs: phase 14 complete"
 
 **Errata applied:** E1-E13 in Part A.
 
-**Remaining known gaps (documented, not blocking):** named-pipe Windows transport, OS keychain keystore, per-platform plugin sandboxing, metrics exporter endpoint, formal protocol analysis, remaining language bindings (Kotlin/Swift/TypeScript/Go), interop with a second independent implementation, the 7 independent security reviews, and production-security claims (gated by docs/SECURITY-GATES.md).
-
-
+**Remaining known gaps (documented, not blocking):** named-pipe Windows transport, OS/platform rollback anchors, per-platform plugin sandboxing, metrics exporter endpoint, formal protocol analysis, remaining language bindings (Kotlin/Swift/TypeScript/Go), interop with a second independent implementation, the 7 independent security reviews, and production-security claims (gated by docs/SECURITY-GATES.md).

@@ -5,8 +5,11 @@ use blake2::Blake2s256;
 const BLOCK_SIZE: usize = 64;
 
 /// RFC 2104 HMAC over BLAKE2s-256.
+///
+/// This is kept as a shared primitive so protocol MACs cannot accidentally
+/// substitute BLAKE2's keyed mode, which has different wire results.
 #[must_use]
-fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
+pub fn hmac_blake2s(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut key_block = [0u8; BLOCK_SIZE];
     if key.len() > BLOCK_SIZE {
         key_block[..32].copy_from_slice(&Blake2s256::digest(key));
@@ -32,7 +35,7 @@ fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
 /// RFC 5869 HKDF-Extract with BLAKE2s-256 (handshake.md §7: HKDF-BLAKE2s).
 #[must_use]
 pub fn extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
-    hmac(salt, ikm)
+    hmac_blake2s(salt, ikm)
 }
 
 /// RFC 5869 HKDF-Expand with BLAKE2s-256.
@@ -54,7 +57,7 @@ pub fn expand(
         input.extend_from_slice(&t);
         input.extend_from_slice(info);
         input.push(counter);
-        let h = hmac(prk, &input);
+        let h = hmac_blake2s(prk, &input);
         let need = (length - out.len()).min(32);
         out.extend_from_slice(&h[..need]);
         if out.len() == length {
@@ -91,7 +94,7 @@ mod tests {
                 .unwrap()
                 .try_into()
                 .unwrap();
-        assert_eq!(hmac(b"key", b"input"), expected_hmac);
+        assert_eq!(hmac_blake2s(b"key", b"input"), expected_hmac);
         let expected_prk: [u8; 32] =
             hex::decode("8e87aebd8e26aef5fa05f31e55a5945ed348bb43130e85051253cb231b1da87d")
                 .unwrap()

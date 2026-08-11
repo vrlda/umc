@@ -8,6 +8,7 @@
 //! carriers use blocking `Handle::block_on` calls.
 use prost::Message;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -90,6 +91,15 @@ impl Drop for Daemon {
 }
 
 fn spawn_daemon(name: &str, tcp_port: u16, udp_port: u16) -> (Daemon, PathBuf) {
+    spawn_daemon_with_retry(name, tcp_port, udp_port, false)
+}
+
+fn spawn_daemon_with_retry(
+    name: &str,
+    tcp_port: u16,
+    udp_port: u16,
+    require_retry: bool,
+) -> (Daemon, PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "phase12-daemon-{name}-{}-{tcp_port}",
         std::process::id()
@@ -102,6 +112,7 @@ fn spawn_daemon(name: &str, tcp_port: u16, udp_port: u16) -> (Daemon, PathBuf) {
         "carriers": ["ump.tcp/1", "ump.udp/1"],
         "tcp_listen": format!("127.0.0.1:{tcp_port}"),
         "udp_listen": format!("127.0.0.1:{udp_port}"),
+        "require_retry": require_retry,
     });
     let config_path = dir.join("node.json");
     fs::write(
@@ -123,6 +134,61 @@ fn spawn_daemon(name: &str, tcp_port: u16, udp_port: u16) -> (Daemon, PathBuf) {
         },
         dir.join("umc.sock"),
     )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn node_connect_completes_stateless_retry_handshake() {
+    let tcp_port = free_tcp_port();
+    let udp_port = free_udp_port();
+    let (daemon, socket) = spawn_daemon_with_retry("retry", tcp_port, udp_port, true);
+    wait_for_control_socket(&socket);
+
+    let mut node = Node::new(
+        NodeConfig {
+            identity: NodeIdentity::generate(&TestEntropy),
+            dcid: vec![2u8; 8],
+        },
+        Arc::new(TestClock),
+        Arc::new(TestEntropy),
+    );
+    node.register_carrier(Box::new(umc_carrier_tcp::TcpCarrier));
+    let remote = format!("127.0.0.1:{tcp_port}");
+    let transport = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || drive_transport(&mut node, &remote)),
+    )
+    .await
+    .expect("stateless retry handshake timed out")
+    .expect("handshake thread panicked")
+    .expect("stateless retry handshake failed");
+    transport
+        .link
+        .close("retry test complete")
+        .expect("close link");
+    drop(daemon);
+}
+
+fn drive_transport(
+    node: &mut Node,
+    remote: &str,
+) -> Result<umc_core::node::ConnectedTransport, umc_core::node::NodeError> {
+    let mut future = Box::pin(node.connect_transport("ump.tcp/1", remote.to_string(), None));
+    let waker = std::task::Waker::from(Arc::new(NoopWaker));
+    let mut context = std::task::Context::from_waker(&waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(result) => return result,
+            std::task::Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+struct NoopWaker;
+
+impl std::task::Wake for NoopWaker {
+    fn wake(self: Arc<Self>) {}
+
+    fn wake_by_ref(self: &Arc<Self>) {}
 }
 
 /// Wait until the daemon's control socket exists: the carrier accept loops
@@ -193,9 +259,9 @@ struct OpenCircuitResponse {
 /// static key plus identity binding and transcript-bound signature, sealed
 /// with the provisional-chain client-auth key (the daemon's DH chain
 /// stands the ephemeral in for the static, so the auth key matches on both
-/// sides) and framed as a raw handshake message. Returns the message body
-/// (the length-prefixed ciphertext): the bytes appended to the transcript
-/// by both sides.
+/// sides) and framed inside an encrypted Handshake packet. Returns the
+/// message body (the length-prefixed ciphertext): the bytes appended to the
+/// transcript by both sides.
 fn send_client_auth(
     node: &umc_core::node::Node,
     link: &(dyn umc_carrier::Link + Send + Sync),
@@ -234,8 +300,22 @@ fn send_client_auth(
         &auth_body,
     )
     .map_err(|e| format!("auth frame: {e:?}"))?;
+    let handshake_secret = umc_handshake::traffic::derive_handshake_traffic_secret(
+        &out.handshake_secret3,
+        &out.transcript_hash,
+        true,
+    );
+    let handshake_keys = umc_handshake::traffic::traffic_keys(&handshake_secret);
+    let packet = umc_handshake::handshake_packet::build_handshake_packet(
+        &[1u8; 8],
+        &[2u8; 8],
+        0,
+        &frame,
+        &handshake_keys,
+    )
+    .map_err(|e| format!("client auth packet: {e:?}"))?;
     link.send(OutboundPacket {
-        bytes: frame,
+        bytes: packet,
         control: true,
         deadline_ms: Some(3_000),
     })
@@ -248,6 +328,7 @@ fn send_client_auth(
 /// carrier runs blocking `Handle::block_on` calls internally, so the whole
 /// handshake must run on a `spawn_blocking` thread — exactly like the
 /// daemon's accept loops.
+#[allow(clippy::too_many_lines)]
 fn tcp_handshake(node: &umc_core::node::Node, remote: &str) -> Result<(BoxLink, Session), String> {
     let carrier = node.carrier("ump.tcp/1").ok_or("tcp carrier missing")?;
     let link = carrier
@@ -256,16 +337,32 @@ fn tcp_handshake(node: &umc_core::node::Node, remote: &str) -> Result<(BoxLink, 
     let client_ephemeral = StaticHandshakeKeyPair::generate();
     let hello = ClientHello::new(node.entropy.as_ref(), &client_ephemeral);
     let hello_bytes = hello.encode().map_err(|e| format!("hello: {e:?}"))?;
+    let initial_keys = umc_handshake::initial::derive_initial_keys(&node.config.dcid);
+    let initial = umc_handshake::initial::build_initial_packet(
+        &node.config.dcid,
+        &[3u8; 8],
+        0,
+        &hello_bytes,
+        &initial_keys.client,
+    )
+    .map_err(|e| format!("initial packet: {e}"))?;
     link.send(OutboundPacket {
-        bytes: hello_bytes.clone(),
+        bytes: initial,
         control: true,
         deadline_ms: Some(3_000),
     })
     .map_err(|e| format!("send: {e:?}"))?;
     std::thread::sleep(Duration::from_millis(100));
-    let server_hello_bytes = link.recv().map_err(|e| format!("recv: {e:?}"))?.bytes;
+    let server_hello_packet = link.recv().map_err(|e| format!("recv: {e:?}"))?.bytes;
+    let server_hello_payload =
+        umc_handshake::initial::parse_initial_with_keys(&server_hello_packet, &initial_keys.server)
+            .ok_or("server Initial rejected")?
+            .2;
     let server_hello =
-        ServerHello::decode(&server_hello_bytes).map_err(|e| format!("server hello: {e:?}"))?;
+        ServerHello::decode(&server_hello_payload).map_err(|e| format!("server hello: {e:?}"))?;
+    let server_hello_bytes = server_hello
+        .encode()
+        .map_err(|e| format!("server hello encode: {e:?}"))?;
     let out = complete_client_side(
         &node.config.identity.identity,
         // The daemon stands the client's ephemeral in for the static in the
@@ -281,7 +378,7 @@ fn tcp_handshake(node: &umc_core::node::Node, remote: &str) -> Result<(BoxLink, 
     )
     .map_err(|e| format!("client side: {e}"))?;
     let auth_body = send_client_auth(node, link.as_ref(), &out)?;
-    // SERVER_FINISHED (handshake.md §19): a raw framed handshake message.
+    // SERVER_FINISHED (handshake.md §19): an encrypted Handshake packet.
     // The TCP carrier's recv yields WouldBlock while the daemon's reply is
     // buffered, so poll briefly.
     std::thread::sleep(Duration::from_millis(100));
@@ -298,7 +395,20 @@ fn tcp_handshake(node: &umc_core::node::Node, remote: &str) -> Result<(BoxLink, 
             Err(e) => return Err(format!("recv server finished: {e:?}")),
         }
     };
-    let (finished_message, _) = umc_handshake::encoding::decode_message(&finished_packet)
+    let server_handshake_secret = umc_handshake::traffic::derive_handshake_traffic_secret(
+        &out.handshake_secret3,
+        &out.transcript_hash,
+        false,
+    );
+    let server_handshake_keys = umc_handshake::traffic::traffic_keys(&server_handshake_secret);
+    let (_dcid, _scid, _pn, finished_body) =
+        umc_handshake::handshake_packet::parse_handshake_packet(
+            &finished_packet,
+            &server_handshake_keys,
+            0,
+        )
+        .map_err(|e| format!("server finished packet: {e:?}"))?;
+    let (finished_message, _) = umc_handshake::encoding::decode_message(&finished_body)
         .map_err(|e| format!("server finished framing: {e:?}"))?;
     if finished_message.message_type != SERVER_FINISHED {
         return Err(format!(
@@ -333,8 +443,22 @@ fn tcp_handshake(node: &umc_core::node::Node, remote: &str) -> Result<(BoxLink, 
     let mut finished_frame = Vec::new();
     umc_handshake::encoding::encode_message(&mut finished_frame, CLIENT_FINISHED, &confirmation)
         .map_err(|e| format!("client finished frame: {e:?}"))?;
+    let client_handshake_secret = umc_handshake::traffic::derive_handshake_traffic_secret(
+        &out.handshake_secret3,
+        &out.transcript_hash,
+        true,
+    );
+    let client_handshake_keys = umc_handshake::traffic::traffic_keys(&client_handshake_secret);
+    let finished_packet = umc_handshake::handshake_packet::build_handshake_packet(
+        &[1u8; 8],
+        &[2u8; 8],
+        1,
+        &finished_frame,
+        &client_handshake_keys,
+    )
+    .map_err(|e| format!("client finished packet: {e:?}"))?;
     link.send(OutboundPacket {
-        bytes: finished_frame,
+        bytes: finished_packet,
         control: true,
         deadline_ms: Some(3_000),
     })
@@ -361,8 +485,13 @@ async fn relay_circuit_between_two_daemons() {
     let tcp_a = free_tcp_port();
     let tcp_b = free_tcp_port();
     let (daemon_a, socket_a) = spawn_daemon("relay-a", tcp_a, free_udp_port());
-    let (daemon_b, _socket_b) = spawn_daemon("relay-b", tcp_b, free_udp_port());
+    let (daemon_b, socket_b) = spawn_daemon("relay-b", tcp_b, free_udp_port());
     wait_for_control_socket(&socket_a);
+    // The control socket is the daemon's readiness barrier. Under workspace
+    // parallel load daemon B can take longer to bind its TCP listener; wait
+    // for both children before dialing rather than turning startup jitter
+    // into a flaky connection-refused failure.
+    wait_for_control_socket(&socket_b);
 
     // Node A connects to daemon B with a live TCP XX handshake over
     // umc_core::Node's carrier, driven synchronously on a blocking thread

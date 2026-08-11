@@ -1,16 +1,12 @@
-// Stateless retry token (handshake.md §21), encrypted with a rotating Retry key.
-//
-// KNOWN LIMITATION (D7 review, follow-up): the token is a bare seal under
-// `PacketKeys::from_traffic_secret(retry_key)` at packet number 0 — for the
-// key's rotation lifetime every token shares one AEAD (key, nonce) pairing,
-// the same flaw class fixed for session tickets in ticket.rs. Unlike tickets,
-// the retry nonce lives INSIDE the sealed payload: the verifier cannot read
-// it before opening, so per-token seal-key derivation requires moving the
-// nonce to a clear prefix (a v1 wire-format change). SANCTIONED for now —
-// deferred; revisit when the retry token wire format next changes.
+// Stateless retry token (handshake.md §21), encrypted with a rotating Retry
+// key. The payload nonce is carried in a clear prefix and derives a
+// per-token seal key, so repeated issuance never reuses an AEAD (key, nonce)
+// pair under the rotating retry key.
 use umc_crypto::aead::PacketKeys;
 
 pub const RETRY_VALIDITY_MS: u64 = 5 * 60 * 1000;
+pub const RETRY_NONCE_LEN: usize = 16;
+const RETRY_SEAL_LABEL: &[u8] = b"retry seal";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryPayload {
@@ -127,9 +123,19 @@ pub fn issue_retry_token(
     if payload.expires_at <= now_ms || payload.issued_at + RETRY_VALIDITY_MS < payload.expires_at {
         return Err(RetryError::Expired);
     }
-    let keys = PacketKeys::from_traffic_secret(retry_key).map_err(|_| RetryError::InvalidTag)?;
-    keys.seal(0, b"UMP-RETRY-TOKEN-v1", &payload.encode())
-        .map_err(|_| RetryError::InvalidTag)
+    let seal_key: [u8; 32] =
+        umc_crypto::label::expand_label(retry_key, RETRY_SEAL_LABEL, &payload.nonce, 32)
+            .map_err(|_| RetryError::InvalidTag)?
+            .try_into()
+            .map_err(|_| RetryError::InvalidTag)?;
+    let keys = PacketKeys::from_traffic_secret(&seal_key).map_err(|_| RetryError::InvalidTag)?;
+    let seal = keys
+        .seal(0, b"UMP-RETRY-TOKEN-v1", &payload.encode())
+        .map_err(|_| RetryError::InvalidTag)?;
+    let mut token = Vec::with_capacity(RETRY_NONCE_LEN + seal.len());
+    token.extend_from_slice(&payload.nonce);
+    token.extend_from_slice(&seal);
+    Ok(token)
 }
 
 /// Verify a stateless retry token, returning its plaintext payload.
@@ -144,11 +150,24 @@ pub fn validate_retry_token(
     token: &[u8],
     now_ms: u64,
 ) -> Result<RetryPayload, RetryError> {
-    let keys = PacketKeys::from_traffic_secret(retry_key).map_err(|_| RetryError::InvalidTag)?;
+    let nonce: [u8; RETRY_NONCE_LEN] = token
+        .get(..RETRY_NONCE_LEN)
+        .ok_or(RetryError::InvalidTag)?
+        .try_into()
+        .map_err(|_| RetryError::InvalidTag)?;
+    let seal_key: [u8; 32] =
+        umc_crypto::label::expand_label(retry_key, RETRY_SEAL_LABEL, &nonce, 32)
+            .map_err(|_| RetryError::InvalidTag)?
+            .try_into()
+            .map_err(|_| RetryError::InvalidTag)?;
+    let keys = PacketKeys::from_traffic_secret(&seal_key).map_err(|_| RetryError::InvalidTag)?;
     let plaintext = keys
-        .open(0, b"UMP-RETRY-TOKEN-v1", token)
+        .open(0, b"UMP-RETRY-TOKEN-v1", &token[RETRY_NONCE_LEN..])
         .map_err(|_| RetryError::InvalidTag)?;
     let payload = RetryPayload::decode(&plaintext)?;
+    if payload.nonce != nonce {
+        return Err(RetryError::InvalidTag);
+    }
     if payload.token_version != 1 {
         return Err(RetryError::Version);
     }
@@ -212,5 +231,19 @@ mod tests {
         let p = payload(1);
         let enc = p.encode();
         assert_eq!(RetryPayload::decode(&enc).unwrap(), p);
+    }
+
+    #[test]
+    fn token_exposes_nonce_prefix_and_authenticates_it() {
+        let key = [7u8; 32];
+        let p = payload(1);
+        let token = issue_retry_token(&key, &p, 1).unwrap();
+        assert_eq!(token.get(..16), Some(p.nonce.as_slice()));
+        let mut tampered = token;
+        tampered[0] ^= 1;
+        assert_eq!(
+            validate_retry_token(&key, &tampered, 1),
+            Err(RetryError::InvalidTag)
+        );
     }
 }

@@ -37,9 +37,9 @@ pub const MIN_DRAIN_MS: u64 = 1_000;
 /// Rate limit between emitted stateless resets (session.md §31): 1 per
 /// minute per connection.
 pub const STATELESS_RESET_INTERVAL_MS: u64 = 60_000;
-/// Fixed payload size used by the opt-in traffic-padding policy. The target
-/// is deliberately modest and applies only to packets carrying non-control
-/// data; cover traffic and timing hygiene remain separate policy work.
+/// Fixed payload size used by the traffic-padding policy. The target is
+/// deliberately modest and applies only to packets carrying non-control
+/// data; cover traffic uses the same target when P3 is active.
 pub const TRAFFIC_PADDING_TARGET: usize = 1_024;
 
 /// Bounded set of stream ids that reached EOF and were read: re-opening
@@ -122,11 +122,16 @@ pub struct Session {
     loss: LossDetector,
     pub streams: HashMap<u64, Stream>,
     next_outgoing_stream: u64,
+    next_outgoing_unidirectional: u64,
     closed_streams: ClosedStreamRegistry,
     flow: FlowControl,
-    /// New bytes received per open stream id (session.md §20): drives
-    /// `MAX_STREAM_DATA` emission at the half-consumed watermark.
+    /// Bytes received but not yet delivered per open stream id. This keeps
+    /// unread-buffer pressure separate from application-consumption credit.
     stream_consumed: HashMap<u64, u64>,
+    /// Bytes delivered to the application per stream (session.md §20.3):
+    /// drives `MAX_STREAM_DATA` emission even when the unread buffer is
+    /// drained immediately.
+    stream_app_consumed: HashMap<u64, u64>,
     reset_final_sizes: HashSet<u64>,
     peer_initiated_streams: usize,
     default_max_stream_data: u64,
@@ -137,6 +142,19 @@ pub struct Session {
     dcid: Vec<u8>,
     key_update: crate::key_update::KeyUpdateState,
     pub paths: HashMap<u64, crate::path::Path>,
+    /// Highest authenticated `MIGRATE` sequence accepted for this session.
+    last_migration_sequence: u64,
+    /// Most recent successful primary-path migration, consumed by the
+    /// runtime event adapter without changing the session handle.
+    last_path_migration: Option<(u64, u64, bool)>,
+    /// Most recent path validation, consumed by the runtime event adapter.
+    last_path_validation: Option<u64>,
+    /// Primary carrier path used for new outbound packets. Packet numbers,
+    /// streams, flow-control state, and traffic keys remain session-scoped;
+    /// only this routing selector changes during migration.
+    primary_path_id: u64,
+    /// Monotonic sequence allocated by the local MIGRATE sender.
+    next_migration_sequence: u64,
     #[allow(dead_code)]
     cids: crate::cid::ConnectionIdManager,
     /// Whether this session may use a direct carrier path (privacy.md §45).
@@ -161,8 +179,17 @@ pub struct Session {
     last_reset_ms: Option<u64>,
     /// Whether application data should be padded to
     /// [`TRAFFIC_PADDING_TARGET`] bytes before encryption (privacy.md §P3).
-    /// Disabled by default; ACK/PING control payloads are never padded.
+    /// P3 enables this automatically; ACK/PING control payloads are never
+    /// padded.
     traffic_padding: bool,
+    /// Maximum randomized delay applied by the daemon to application sends
+    /// under P3 (privacy.md §27). The session stores policy only; the daemon
+    /// supplies entropy and performs the asynchronous sleep.
+    timing_jitter_ms: u64,
+    /// Negotiated privacy profile level (privacy.md §42). The session layer
+    /// stores the numeric wire level so the daemon can expose the exact
+    /// handshake result without depending on its policy crate.
+    privacy_profile: u8,
 }
 
 impl std::fmt::Debug for Session {
@@ -218,9 +245,11 @@ impl Session {
             loss: LossDetector::new(config.max_ack_delay_ms),
             streams: HashMap::new(),
             next_outgoing_stream: 0,
+            next_outgoing_unidirectional: 0,
             closed_streams: ClosedStreamRegistry::default(),
             flow: FlowControl::new(config.initial_max_data, INITIAL_STREAMS, INITIAL_STREAMS),
             stream_consumed: HashMap::new(),
+            stream_app_consumed: HashMap::new(),
             reset_final_sizes: HashSet::new(),
             peer_initiated_streams: 0,
             default_max_stream_data: config.initial_max_stream_data,
@@ -232,6 +261,11 @@ impl Session {
                 config.remote_traffic_secret,
             ),
             paths: HashMap::new(),
+            last_migration_sequence: 0,
+            last_path_migration: None,
+            last_path_validation: None,
+            primary_path_id: super::packet::DEFAULT_PATH_ID,
+            next_migration_sequence: 0,
             cids: crate::cid::ConnectionIdManager::new(crate::cid::DEFAULT_ACTIVE_LIMIT),
             direct_path_allowed: true,
             last_activity: None,
@@ -239,6 +273,8 @@ impl Session {
             stateless_reset_secret: None,
             last_reset_ms: None,
             traffic_padding: false,
+            timing_jitter_ms: 0,
+            privacy_profile: 0,
         })
     }
 
@@ -259,16 +295,78 @@ impl Session {
     /// [`MAX_STREAMS_PER_SESSION`] concurrent streams (resource-limits.md
     /// §20).
     pub fn open_stream(&mut self) -> Result<u64, SessionError> {
+        self.open_stream_kind(false)
+    }
+
+    fn open_stream_kind(&mut self, unidirectional: bool) -> Result<u64, SessionError> {
         if self.streams.len() >= MAX_STREAMS_PER_SESSION {
             return Err(SessionError::StreamLimit);
         }
-        let id = self.next_outgoing_stream;
-        self.next_outgoing_stream += 2; // initiator bidirectional: low bits 00
+        let sequence = if unidirectional {
+            let sequence = self.next_outgoing_unidirectional;
+            self.next_outgoing_unidirectional =
+                sequence.checked_add(1).ok_or(SessionError::StreamLimit)?;
+            sequence
+        } else {
+            let sequence = self.next_outgoing_stream;
+            self.next_outgoing_stream = sequence.checked_add(1).ok_or(SessionError::StreamLimit)?;
+            sequence
+        };
+        let initiator = match self.role {
+            Role::Client => 0,
+            Role::Server => 1,
+        };
+        let direction = u64::from(unidirectional) << 1;
+        let id = sequence
+            .checked_mul(4)
+            .and_then(|value| value.checked_add(initiator | direction))
+            .ok_or(SessionError::StreamLimit)?;
         self.streams.insert(
             id,
             Stream::new(id, Vec::new(), self.default_max_stream_data),
         );
+        if let Some(stream) = self.streams.get_mut(&id) {
+            stream.unidirectional = unidirectional;
+        }
         Ok(id)
+    }
+
+    /// Open an application stream with its protocol identifier and direction
+    /// metadata carried in the first STREAM frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::Encode`] when the protocol identifier exceeds
+    /// the wire limit, or [`SessionError::StreamLimit`] when no stream slot is
+    /// available.
+    pub fn open_stream_with_protocol(
+        &mut self,
+        protocol_id: &[u8],
+        unidirectional: bool,
+    ) -> Result<u64, SessionError> {
+        if protocol_id.len() > umc_wire::frames::stream::MAX_PROTOCOL_ID_LEN {
+            return Err(SessionError::Encode);
+        }
+        let stream_id = self.open_stream_kind(unidirectional)?;
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            stream.protocol_id = protocol_id.to_vec();
+            stream.unidirectional = unidirectional;
+        }
+        Ok(stream_id)
+    }
+
+    /// Validate the low-bit stream identifier encoding (wire-format.md §29).
+    /// `initiator_bit` is supplied separately so callers can validate a
+    /// frame before deciding whether that initiator is local or remote.
+    #[must_use]
+    pub fn validate_stream_id(
+        &self,
+        stream_id: u64,
+        initiator_bit: u64,
+        unidirectional: bool,
+    ) -> bool {
+        let direction_bit = if unidirectional { 0b10 } else { 0 };
+        initiator_bit <= 1 && (stream_id & 0b11) == (initiator_bit | direction_bit)
     }
 
     /// Build the payload for a STREAM frame carrying `data`.
@@ -289,6 +387,10 @@ impl Session {
             .get_mut(&stream_id)
             .ok_or(SessionError::StreamNotFound)?;
         let (offset, chunk) = stream.send_ready(data).map_err(SessionError::Stream)?;
+        // A FIN is valid only when this frame carries the complete caller
+        // payload. Flow-control credit may accept a prefix; never mark that
+        // prefix as the final size and silently discard the remainder.
+        let fin = fin && chunk.len() == data.len();
         let mut payload = Vec::new();
         let frame = umc_wire::frames::stream::StreamFrame {
             stream_id,
@@ -296,7 +398,7 @@ impl Session {
             offset_present: offset != 0,
             len_present: true,
             open: offset == 0,
-            unidirectional: false,
+            unidirectional: stream.unidirectional,
             offset,
             data: chunk,
             protocol_id: stream.protocol_id.clone(),
@@ -308,6 +410,93 @@ impl Session {
         Ok(payload)
     }
 
+    /// Build a zero-length FIN frame for the stream's send direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::StreamNotFound`] when the stream is unknown,
+    /// [`SessionError::Stream`] when its send side is already closed, or
+    /// [`SessionError::Encode`] when frame encoding fails.
+    pub fn close_stream_send_payload(&mut self, stream_id: u64) -> Result<Vec<u8>, SessionError> {
+        let stream = self
+            .streams
+            .get_mut(&stream_id)
+            .ok_or(SessionError::StreamNotFound)?;
+        if matches!(
+            stream.send_state,
+            super::stream::SendState::DataAcked
+                | super::stream::SendState::ResetAcked
+                | super::stream::SendState::ResetSent
+        ) {
+            return Err(SessionError::Stream(StreamError::AlreadyClosed));
+        }
+        let frame = umc_wire::frames::stream::StreamFrame {
+            stream_id,
+            fin: true,
+            offset_present: stream.next_send_offset != 0,
+            len_present: true,
+            open: stream.next_send_offset == 0,
+            unidirectional: stream.unidirectional,
+            offset: stream.next_send_offset,
+            data: Vec::new(),
+            protocol_id: if stream.next_send_offset == 0 {
+                stream.protocol_id.clone()
+            } else {
+                Vec::new()
+            },
+            metadata: Vec::new(),
+        };
+        stream.send_state = super::stream::SendState::DataSent;
+        frame.encode().map_err(|_| SessionError::Encode)
+    }
+
+    /// Build a `RESET_STREAM` frame and stop local writes for the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::StreamNotFound`] when the stream is unknown, or
+    /// [`SessionError::Encode`] when frame encoding fails.
+    pub fn reset_stream_payload(
+        &mut self,
+        stream_id: u64,
+        application_error_code: u64,
+    ) -> Result<Vec<u8>, SessionError> {
+        let stream = self
+            .streams
+            .get_mut(&stream_id)
+            .ok_or(SessionError::StreamNotFound)?;
+        stream.send_state = super::stream::SendState::ResetSent;
+        umc_wire::frames::stream::ResetStreamFrame {
+            stream_id,
+            app_error_code: application_error_code,
+            final_size: stream.next_send_offset,
+        }
+        .encode()
+        .map_err(|_| SessionError::Encode)
+    }
+
+    /// Build a `STOP_SENDING` frame for the peer's send direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::StreamNotFound`] when the stream is unknown, or
+    /// [`SessionError::Encode`] when frame encoding fails.
+    pub fn stop_stream_payload(
+        &mut self,
+        stream_id: u64,
+        application_error_code: u64,
+    ) -> Result<Vec<u8>, SessionError> {
+        if !self.streams.contains_key(&stream_id) {
+            return Err(SessionError::StreamNotFound);
+        }
+        umc_wire::frames::stream::StopSendingFrame {
+            stream_id,
+            app_error_code: application_error_code,
+        }
+        .encode()
+        .map_err(|_| SessionError::Encode)
+    }
+
     /// Queue an outbound datagram.
     ///
     /// # Errors
@@ -317,6 +506,25 @@ impl Session {
         self.datagrams
             .enqueue_outbound(d, max_size)
             .map_err(SessionError::Datagram)
+    }
+
+    /// Pop one non-expired queued datagram and encode its wire frame. The
+    /// caller still passes the resulting payload through `build_outbound` so
+    /// congestion, amplification, retransmission, and padding rules remain
+    /// centralized in the session.
+    pub fn pop_outbound_datagram_payload(&mut self, now_ms: u64) -> Option<Vec<u8>> {
+        let datagram = self.datagrams.pop_outbound(now_ms)?;
+        umc_wire::frames::datagram::DatagramFrame {
+            context_id: datagram.context_id,
+            ack_requested: datagram.ack_requested,
+            duplicate_suppression: false,
+            expiration_delta: datagram
+                .expires_at_ms
+                .map(|expires_at| expires_at.saturating_sub(now_ms)),
+            data: datagram.data,
+        }
+        .encode()
+        .ok()
     }
 
     pub fn recv_datagram(&mut self) -> Option<Datagram> {
@@ -336,24 +544,41 @@ impl Session {
         if stream.recv_state == super::stream::RecvState::ResetRecvd {
             // The peer reset its send side: the buffered data is unreachable
             // (session.md §18.5).
+            stream.recv_state = super::stream::RecvState::ResetRead;
             return Err(SessionError::Stream(StreamError::ResetByPeer));
+        }
+        if stream.recv_state == super::stream::RecvState::ResetRead {
+            return Err(SessionError::Stream(StreamError::AlreadyClosed));
         }
         let (data, eof) = stream.read_available();
         if !data.is_empty() {
-            // §20.3: credit tracks application consumption — subtract the
-            // delivered bytes from the received-not-yet-delivered delta.
+            // Keep unread-buffer accounting separate from §20.3 application
+            // consumption. The former protects local memory; the latter
+            // earns fresh peer credit even when the application drains every
+            // read immediately.
             if let Some(consumed) = self.stream_consumed.get_mut(&stream_id) {
                 *consumed = consumed.saturating_sub(data.len() as u64);
             }
+            let app_consumed = self.stream_app_consumed.entry(stream_id).or_insert(0);
+            *app_consumed = app_consumed.saturating_add(data.len() as u64);
         }
         if eof {
             // The final size was reached and read: the id is closed and any
             // further delivery on it is a protocol violation (session.md §29).
             self.closed_streams.insert(stream_id);
             self.stream_consumed.remove(&stream_id);
+            self.stream_app_consumed.remove(&stream_id);
             self.reset_final_sizes.remove(&stream_id);
         }
         Ok((data, eof))
+    }
+
+    /// Return the peer application error for a received `RESET_STREAM`.
+    #[must_use]
+    pub fn stream_reset_error(&self, stream_id: u64) -> Option<u64> {
+        self.streams
+            .get(&stream_id)
+            .and_then(|stream| stream.reset_error_code)
     }
 
     /// Build `MAX_DATA` / `MAX_STREAM_DATA` / `MAX_STREAMS` payloads when a
@@ -382,18 +607,24 @@ impl Session {
             }
         }
         // Per-stream credit: more than half of the stream's limit consumed.
-        let consumed_snapshot: Vec<(u64, u64)> = self
-            .stream_consumed
-            .iter()
-            .map(|(id, bytes)| (*id, *bytes))
-            .collect();
-        for (stream_id, consumed) in consumed_snapshot {
+        let mut stream_ids: HashSet<u64> = self.stream_consumed.keys().copied().collect();
+        stream_ids.extend(self.stream_app_consumed.keys().copied());
+        for stream_id in stream_ids {
             let Some(stream) = self.streams.get_mut(&stream_id) else {
                 continue;
             };
-            if stream.max_stream_data_local.saturating_sub(consumed)
-                < stream.max_stream_data_local / 2
-            {
+            let unread = self.stream_consumed.get(&stream_id).copied().unwrap_or(0);
+            let app_consumed = self
+                .stream_app_consumed
+                .get(&stream_id)
+                .copied()
+                .unwrap_or(0);
+            let below_unread_watermark = stream.max_stream_data_local.saturating_sub(unread)
+                < stream.max_stream_data_local / 2;
+            let below_consumption_watermark =
+                stream.max_stream_data_local.saturating_sub(app_consumed)
+                    < stream.max_stream_data_local / 2;
+            if below_unread_watermark || below_consumption_watermark {
                 let new_max = stream.max_stream_data_local.saturating_mul(2);
                 if new_max > stream.max_stream_data_local {
                     stream.max_stream_data_local = new_max;
@@ -443,11 +674,34 @@ impl Session {
         payload: &[u8],
     ) -> Result<Option<Vec<u8>>, SessionError> {
         let _ = clock;
-        self.build_outbound_inner(now, payload)
+        self.build_outbound_on_path(self.primary_path_id, clock, now, payload)
+    }
+
+    /// Build an outbound packet on a specific validated (or currently
+    /// validating control) path. This is used for `PATH_RESPONSE` and
+    /// `MIGRATE`:
+    /// validation responses must return on the candidate path, while the
+    /// migration command is sent on the old primary path before the local
+    /// selector flips.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same packet-space, congestion, amplification, and packet
+    /// assembly errors as [`Self::build_outbound`].
+    pub fn build_outbound_on_path(
+        &mut self,
+        path_id: u64,
+        clock: &dyn Clock,
+        now: Instant,
+        payload: &[u8],
+    ) -> Result<Option<Vec<u8>>, SessionError> {
+        let _ = clock;
+        self.build_outbound_inner(path_id, now, payload)
     }
 
     fn build_outbound_inner(
         &mut self,
+        path_id: u64,
         now: Instant,
         payload: &[u8],
     ) -> Result<Option<Vec<u8>>, SessionError> {
@@ -461,7 +715,7 @@ impl Session {
         // would stall the protocol (session.md §26). The gate only applies
         // when a path record exists: sessions without path accounting send
         // unrestricted.
-        if let Some(path) = self.paths.get(&super::packet::DEFAULT_PATH_ID) {
+        if let Some(path) = self.paths.get(&path_id) {
             if !path.validated
                 && !payload_is_exempt(&payload)
                 && payload.len() as u64 > path.send_allowance()
@@ -501,7 +755,7 @@ impl Session {
             &self.local_hp_key,
             ShortPacketSpace::SessionData,
             &self.dcid,
-            0,
+            path_id,
             pn,
             false,
             &payload,
@@ -522,7 +776,7 @@ impl Session {
         }
         // Charge the budget for the actual wire bytes (congestion.md §18);
         // only unvalidated paths carry a budget.
-        if let Some(path) = self.paths.get_mut(&super::packet::DEFAULT_PATH_ID) {
+        if let Some(path) = self.paths.get_mut(&path_id) {
             if !path.validated {
                 path.record_sent(pkt.len() as u64);
             }
@@ -612,6 +866,9 @@ impl Session {
         {
             self.last_activity = Some(now);
         }
+        // Path responses and other generated control frames are returned
+        // alongside the ACK so the daemon can send them in the same packet.
+        let mut response_payload = Vec::new();
         for frame in parsed.frames {
             match frame {
                 umc_wire::frame::Frame::Stream(f) => {
@@ -661,7 +918,9 @@ impl Session {
                         }
                     }
                     stream.recv_state = super::stream::RecvState::ResetRecvd;
+                    stream.reset_error_code = Some(f.app_error_code);
                     self.stream_consumed.remove(&f.stream_id);
+                    self.stream_app_consumed.remove(&f.stream_id);
                 }
                 umc_wire::frame::Frame::StopSending(f) => {
                     // The peer stopped reading our send side (session.md
@@ -671,6 +930,28 @@ impl Session {
                     if let Some(stream) = self.streams.get_mut(&f.stream_id) {
                         stream.send_state = super::stream::SendState::ResetSent;
                     }
+                }
+                umc_wire::frame::Frame::MaxData(f) => {
+                    // Peer send credit is monotonic (session.md §20.3).
+                    if f.maximum_data > self.flow.max_data_remote {
+                        self.flow.max_data_remote = f.maximum_data;
+                    }
+                }
+                umc_wire::frame::Frame::MaxStreamData(f) => {
+                    // A credit update may race stream teardown; an unknown
+                    // stream is retained as a no-op until its OPEN arrives.
+                    if let Some(stream) = self.streams.get_mut(&f.stream_id) {
+                        stream.max_stream_data_remote =
+                            stream.max_stream_data_remote.max(f.maximum_stream_data);
+                    }
+                }
+                umc_wire::frame::Frame::MaxStreams(f) => {
+                    let limit = if f.bidirectional {
+                        &mut self.flow.max_bidirectional_streams_local
+                    } else {
+                        &mut self.flow.max_unidirectional_streams_local
+                    };
+                    *limit = (*limit).max(f.maximum_streams);
                 }
                 umc_wire::frame::Frame::ConnectionClose(_) => {
                     self.state = SessionState::Closed;
@@ -693,11 +974,32 @@ impl Session {
                 umc_wire::frame::Frame::Ack(ack) => {
                     self.apply_peer_ack(&ack, now)?;
                 }
+                umc_wire::frame::Frame::KeyUpdate(update) => {
+                    self.on_key_update(update.update_sequence)?;
+                }
+                umc_wire::frame::Frame::PathChallenge(challenge) => {
+                    response_payload
+                        .extend_from_slice(&self.on_path_challenge(path_id, challenge.data));
+                }
+                umc_wire::frame::Frame::PathResponse(response) => {
+                    self.on_path_response(path_id, response.data)?;
+                }
+                umc_wire::frame::Frame::Migrate(migrate) => {
+                    if migrate.migration_sequence > self.last_migration_sequence {
+                        if migrate.old_path_id != self.primary_path_id {
+                            return Err(SessionError::PathMigration);
+                        }
+                        self.last_migration_sequence = migrate.migration_sequence;
+                        if migrate.make_primary {
+                            self.migrate_to(migrate.new_path_id, migrate.keep_old_path, now)?;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
         // Build an ACK if needed.
-        let mut ack_payload = Vec::new();
+        let mut ack_payload = response_payload;
         if let Some(state) = self.recv_acks.get_mut(&space) {
             if state.take_needs_ack() {
                 if let Some((largest, delay, first_len, extra)) = state.build_ack(0) {
@@ -730,6 +1032,28 @@ impl Session {
         &mut self,
         f: &umc_wire::frames::stream::StreamFrame,
     ) -> Result<(), SessionError> {
+        // The low two bits carry initiator and direction. A new stream must
+        // be peer-initiated; a bidirectional stream already opened locally
+        // may receive data from the peer as well.
+        let peer_initiator = match self.role {
+            Role::Client => 1,
+            Role::Server => 0,
+        };
+        let local_initiator = 1 - peer_initiator;
+        if !self.validate_stream_id(f.stream_id, f.stream_id & 1, f.unidirectional) {
+            return Err(SessionError::InvalidStreamId);
+        }
+        let existing_stream = self.streams.get(&f.stream_id);
+        if let Some(stream) = existing_stream {
+            if (f.stream_id & 1) == local_initiator && stream.unidirectional {
+                return Err(SessionError::InvalidStreamId);
+            }
+            if stream.unidirectional != f.unidirectional {
+                return Err(SessionError::InvalidStreamId);
+            }
+        } else if (f.stream_id & 1) != peer_initiator {
+            return Err(SessionError::InvalidStreamId);
+        }
         // A stream id that was closed (final size reached, read to EOF) or
         // reset MUST NOT receive more data (session.md §29).
         if self.closed_streams.contains(f.stream_id) {
@@ -751,6 +1075,9 @@ impl Session {
         });
         if is_new {
             self.peer_initiated_streams += 1;
+            stream.unidirectional = f.unidirectional;
+        } else if stream.unidirectional != f.unidirectional {
+            return Err(SessionError::InvalidStreamId);
         }
         if matches!(
             stream.recv_state,
@@ -768,8 +1095,9 @@ impl Session {
         self.flow
             .consume(new_bytes as u64)
             .map_err(SessionError::Flow)?;
-        // Per-stream consumption drives MAX_STREAM_DATA emission (session.md
-        // §20): only new bytes count, mirroring the connection accounting.
+        // Unread bytes drive the local memory watermark. Application reads
+        // are tracked separately so credit can be replenished when the
+        // receive buffer is drained immediately.
         *self.stream_consumed.entry(f.stream_id).or_insert(0) += new_bytes as u64;
         Ok(())
     }
@@ -912,7 +1240,7 @@ impl Session {
         let Some(payload) = self.retransmit_payloads.get(&pn).cloned() else {
             return Ok(None);
         };
-        let bytes = self.build_outbound_inner(now, &payload)?;
+        let bytes = self.build_outbound_inner(self.primary_path_id, now, &payload)?;
         self.retransmit_payloads.remove(&pn);
         Ok(bytes)
     }
@@ -1111,6 +1439,64 @@ impl Session {
         remote: Vec<u8>,
         now: Instant,
     ) -> Result<(), SessionError> {
+        self.add_path_with_challenge(path_id, carrier_type, local, remote, now)
+            .map(|_| ())
+    }
+
+    /// Register candidate path and return unpredictable challenge bytes that
+    /// the caller must send on that path. Keeping challenge ownership in the
+    /// session prevents a carrier adapter from fabricating validation state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PathBudget` when the path or challenge budget is exhausted, or
+    /// `DirectPathForbidden` when privacy policy rejects the carrier.
+    pub fn add_path_with_challenge(
+        &mut self,
+        path_id: u64,
+        carrier_type: String,
+        local: Vec<u8>,
+        remote: Vec<u8>,
+        now: Instant,
+    ) -> Result<[u8; 8], SessionError> {
+        let mut challenge = [0u8; 8];
+        Self::entropy_fill(&mut challenge);
+        self.add_path_with_challenge_bytes(path_id, carrier_type, local, remote, now, challenge)
+    }
+
+    /// Runtime-backed variant. Daemons MUST pass their OS CSPRNG here; the
+    /// deterministic helper above exists only for protocol-pure tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same path-policy and budget errors as
+    /// [`Self::add_path_with_challenge`].
+    pub fn add_path_with_entropy(
+        &mut self,
+        path_id: u64,
+        carrier_type: String,
+        local: Vec<u8>,
+        remote: Vec<u8>,
+        now: Instant,
+        entropy: &dyn EntropySource,
+    ) -> Result<[u8; 8], SessionError> {
+        let mut challenge = [0u8; 8];
+        entropy.fill(&mut challenge);
+        self.add_path_with_challenge_bytes(path_id, carrier_type, local, remote, now, challenge)
+    }
+
+    fn add_path_with_challenge_bytes(
+        &mut self,
+        path_id: u64,
+        carrier_type: String,
+        local: Vec<u8>,
+        remote: Vec<u8>,
+        now: Instant,
+        challenge: [u8; 8],
+    ) -> Result<[u8; 8], SessionError> {
+        if self.paths.contains_key(&path_id) {
+            return Err(SessionError::PathBudget);
+        }
         if !self.direct_path_allowed && is_direct_carrier(&carrier_type) {
             return Err(SessionError::DirectPathForbidden);
         }
@@ -1132,14 +1518,12 @@ impl Session {
         if active + validating >= 1 + crate::path::MAX_CANDIDATE_PATHS {
             return Err(SessionError::PathBudget);
         }
-        let mut challenge = [0u8; 8];
-        Self::entropy_fill(&mut challenge);
         let mut path = crate::path::Path::new(path_id, carrier_type, local, remote, now);
         let pto = self.loss.pto(&self.rtt).as_millis();
         path.start_validation(challenge, now, pto)
             .map_err(|_| SessionError::PathBudget)?;
         self.paths.insert(path_id, path);
-        Ok(())
+        Ok(challenge)
     }
 
     /// `PATH_CHALLENGE` from the peer on a candidate path (session.md §26).
@@ -1149,7 +1533,11 @@ impl Session {
             .ok();
         let frame = umc_wire::frames::path::PathResponseFrame { data: challenge };
         if let Ok(enc) = frame.encode() {
-            payload.extend_from_slice(&enc[1..]);
+            let type_len = umc_wire::varint::encode(umc_types::frame::FrameType::PATH_RESPONSE.0)
+                .map_or(0, |encoded| encoded.len());
+            if type_len <= enc.len() {
+                payload.extend_from_slice(&enc[type_len..]);
+            }
         }
         let _ = path_id;
         payload
@@ -1171,7 +1559,9 @@ impl Session {
             .get_mut(&path_id)
             .ok_or(SessionError::PathNotFound)?;
         path.confirm(&response)
-            .map_err(|_| SessionError::PathValidation)
+            .map_err(|_| SessionError::PathValidation)?;
+        self.last_path_validation = Some(path_id);
+        Ok(())
     }
 
     /// Migrate the primary path (session.md §27): the new path must be
@@ -1210,8 +1600,70 @@ impl Session {
                 }
             }
         }
+        let old_path_id = self.primary_path_id;
+        self.primary_path_id = new_path_id;
+        self.last_path_migration = Some((old_path_id, new_path_id, keep_old));
         let _ = now;
         Ok(())
+    }
+
+    /// Current primary path selector. The value is session state, not a
+    /// carrier handle, so changing carriers never creates a new app session.
+    #[must_use]
+    pub const fn primary_path_id(&self) -> u64 {
+        self.primary_path_id
+    }
+
+    /// Build a MIGRATE frame with a fresh monotonic sequence. The path is not
+    /// switched until `migrate_to` succeeds after `PATH_RESPONSE` validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PathNotFound`, `PathNotValidated`, or `Encode` when the
+    /// candidate cannot be selected or the frame cannot be encoded.
+    pub fn build_migrate_payload(
+        &mut self,
+        new_path_id: u64,
+        keep_old_path: bool,
+        duplicate_critical_frames: bool,
+    ) -> Result<Vec<u8>, SessionError> {
+        let path = self
+            .paths
+            .get(&new_path_id)
+            .ok_or(SessionError::PathNotFound)?;
+        if path.state != crate::path::PathState::Validated {
+            return Err(SessionError::PathNotValidated);
+        }
+        self.next_migration_sequence = self.next_migration_sequence.saturating_add(1);
+        umc_wire::frames::path::MigrateFrame {
+            old_path_id: self.primary_path_id,
+            new_path_id,
+            migration_sequence: self.next_migration_sequence,
+            make_primary: true,
+            keep_old_path,
+            duplicate_critical_frames,
+        }
+        .encode()
+        .map_err(|_| SessionError::Encode)
+    }
+
+    /// Expose the negotiated destination connection id for runtime routing of
+    /// an established-session attach packet.
+    #[must_use]
+    pub fn dcid(&self) -> &[u8] {
+        &self.dcid
+    }
+
+    /// Takes the most recent successful path migration for event delivery.
+    #[must_use]
+    pub fn take_path_migration(&mut self) -> Option<(u64, u64, bool)> {
+        self.last_path_migration.take()
+    }
+
+    /// Takes the most recent successful path validation for event delivery.
+    #[must_use]
+    pub fn take_path_validation(&mut self) -> Option<u64> {
+        self.last_path_validation.take()
     }
 
     #[must_use]
@@ -1268,6 +1720,25 @@ impl Session {
         self.direct_path_allowed
     }
 
+    /// Records the transcript-negotiated privacy profile (`p0`..`p3`).
+    /// Unknown levels are clamped to the highest profile defined by v1 so a
+    /// malformed caller cannot expose an invalid value.
+    pub fn set_privacy_profile(&mut self, profile: u8) {
+        self.privacy_profile = profile.min(3);
+        // P3 traffic shaping is a profile requirement, not a hidden opt-in.
+        // An explicit traffic-padding setting may still enable it for lower
+        // profiles, but selecting P3 always enables fixed-size data packets.
+        if self.privacy_profile >= 3 {
+            self.traffic_padding = true;
+        }
+    }
+
+    /// Returns the transcript-negotiated privacy profile level.
+    #[must_use]
+    pub fn privacy_profile(&self) -> u8 {
+        self.privacy_profile
+    }
+
     /// Issue a fresh connection identifier for the peer and return the
     /// encoded `NEW_CONNECTION_ID` frame that advertises it. The current
     /// packet destination remains unchanged until the peer sends its own
@@ -1322,6 +1793,18 @@ impl Session {
         self.traffic_padding
     }
 
+    /// Sets the P3 application-send jitter ceiling in milliseconds. Zero
+    /// disables timing jitter for constrained deployments.
+    pub fn set_timing_jitter_ms(&mut self, jitter_ms: u64) {
+        self.timing_jitter_ms = jitter_ms.min(10_000);
+    }
+
+    /// Returns the configured P3 application-send jitter ceiling.
+    #[must_use]
+    pub fn timing_jitter_ms(&self) -> u64 {
+        self.timing_jitter_ms
+    }
+
     fn outbound_payload(&self, payload: &[u8]) -> Vec<u8> {
         if !self.traffic_padding
             || payload_is_exempt(payload)
@@ -1353,19 +1836,18 @@ fn is_direct_carrier(carrier_type: &str) -> bool {
 /// size is estimated as `payload.len() + 64`.
 const PROTECTED_OVERHEAD_ESTIMATE: usize = 64;
 
-/// Whether `payload`'s first frame is exempt from the send gates (ACK or
-/// PING): the control reserve (congestion.md §7.3). Such payloads are a few
-/// bytes at most, so refusing them would stall the acknowledgment loop
-/// (ACK) or the PTO recovery probe (PING) instead of protecting the
-/// network; the anti-amplification gate (congestion.md §18) and the
-/// carrier backpressure gate (congestion.md §16, daemon send path) share
-/// the same rationale.
+/// Whether `payload`'s first frame is exempt from the send gates. ACK/PING
+/// keep recovery alive; `PATH_CHALLENGE/PATH_RESPONSE/MIGRATE` are bounded path
+/// control and must be allowed before a candidate path has received bytes.
 #[must_use]
 pub fn payload_is_exempt(payload: &[u8]) -> bool {
     umc_wire::varint::decode(payload).is_ok_and(|(frame_type, _)| {
         let frame_type = umc_types::frame::FrameType(frame_type);
         frame_type == umc_types::frame::FrameType::ACK
             || frame_type == umc_types::frame::FrameType::PING
+            || frame_type == umc_types::frame::FrameType::PATH_CHALLENGE
+            || frame_type == umc_types::frame::FrameType::PATH_RESPONSE
+            || frame_type == umc_types::frame::FrameType::MIGRATE
     })
 }
 
@@ -1385,6 +1867,9 @@ pub enum SessionError {
     /// Delivery on a stream id that was already closed (final size reached
     /// and read, or reset): stream ids MUST NOT be reused (session.md §29).
     StreamClosed,
+    /// The peer used an invalid stream initiator or direction bit pattern
+    /// (wire-format.md §29).
+    InvalidStreamId,
     /// The session already holds [`MAX_STREAMS_PER_SESSION`] concurrent
     /// streams: opening a new one is refused (resource-limits.md §20).
     StreamLimit,
@@ -1393,6 +1878,8 @@ pub enum SessionError {
     PathBudget,
     PathNotFound,
     PathNotValidated,
+    /// A MIGRATE frame did not identify this session's current primary path.
+    PathMigration,
     PathValidation,
     /// The anti-amplification budget of the unvalidated path is exhausted:
     /// the send would exceed 3x the bytes received on that path
@@ -1472,6 +1959,86 @@ mod tests {
         session
             .migrate_to(1, true, Instant(0))
             .expect("validated relay path can become primary");
+        assert_eq!(session.take_path_migration(), Some((0, 1, true)));
+    }
+
+    #[test]
+    fn migration_switches_primary_and_keeps_packet_path_state() {
+        let mut session = session();
+        session
+            .add_path_with_entropy(
+                1,
+                "ump.relay/1".into(),
+                vec![],
+                vec![],
+                Instant(0),
+                &TestEntropy,
+            )
+            .expect("candidate path");
+        session.force_validate(1);
+        let migrate = session
+            .build_migrate_payload(1, true, true)
+            .expect("migrate frame");
+        assert!(payload_is_exempt(&migrate));
+        let packet = session
+            .build_outbound_on_path(0, &TestClock, Instant(1), &migrate)
+            .expect("packet build")
+            .expect("active session");
+        session
+            .migrate_to(1, true, Instant(1))
+            .expect("switch primary");
+        assert_eq!(session.primary_path_id(), 1);
+        let (_, _, path_id, _, _) = crate::packet::parse_protected_packet(
+            &session.local_keys,
+            &session.local_hp_key,
+            0,
+            &packet,
+        )
+        .expect("packet parses with peer keys");
+        assert_eq!(path_id, 0);
+    }
+
+    #[test]
+    fn validated_path_is_available_to_runtime_event_adapter() {
+        let mut session = session();
+        session
+            .add_path(1, "ump.relay/1".into(), vec![], vec![], Instant(0))
+            .expect("candidate path");
+        let challenge = session
+            .path(1)
+            .expect("path")
+            .challenges
+            .first()
+            .expect("challenge")
+            .data;
+        session
+            .on_path_response(1, challenge)
+            .expect("path response");
+        assert_eq!(session.take_path_validation(), Some(1));
+        assert_eq!(session.take_path_validation(), None);
+    }
+
+    #[test]
+    fn privacy_profile_defaults_to_p0_and_records_negotiation() {
+        let mut session = session();
+        assert_eq!(session.privacy_profile(), 0);
+        assert!(!session.traffic_padding_active());
+        session.set_privacy_profile(2);
+        assert_eq!(session.privacy_profile(), 2);
+        assert!(!session.traffic_padding_active());
+        session.set_privacy_profile(99);
+        assert_eq!(session.privacy_profile(), 3);
+        assert!(session.traffic_padding_active());
+    }
+
+    #[test]
+    fn timing_jitter_policy_is_bounded() {
+        let mut session = session();
+        assert_eq!(session.timing_jitter_ms(), 0);
+        session.set_timing_jitter_ms(25);
+        assert_eq!(session.timing_jitter_ms(), 25);
+        session.set_timing_jitter_ms(u64::MAX);
+        assert_eq!(session.timing_jitter_ms(), 10_000);
     }
 
     #[test]
@@ -1558,6 +2125,123 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inbound_control_frames_update_limits_and_key_phase() {
+        let mut sender = Session::new(
+            SessionConfig {
+                role: Role::Client,
+                dcid: vec![0u8; DEFAULT_DCID_LEN],
+                local_traffic_secret: [1u8; 32],
+                remote_traffic_secret: [2u8; 32],
+                initial_max_data: 1_000_000,
+                initial_max_stream_data: DEFAULT_INITIAL_MAX_STREAM_DATA,
+                max_ack_delay_ms: 25,
+            },
+            &TestClock,
+        )
+        .expect("sender");
+        let mut receiver = Session::new(
+            SessionConfig {
+                role: Role::Server,
+                dcid: vec![0u8; DEFAULT_DCID_LEN],
+                local_traffic_secret: [2u8; 32],
+                remote_traffic_secret: [1u8; 32],
+                initial_max_data: 1_000_000,
+                initial_max_stream_data: DEFAULT_INITIAL_MAX_STREAM_DATA,
+                max_ack_delay_ms: 25,
+            },
+            &TestClock,
+        )
+        .expect("receiver");
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(
+            &umc_wire::frames::flow::MaxDataFrame {
+                maximum_data: 2_000_000,
+            }
+            .encode()
+            .expect("max data"),
+        );
+        payload.extend_from_slice(
+            &umc_wire::frames::flow::MaxStreamsFrame {
+                bidirectional: true,
+                maximum_streams: 32,
+            }
+            .encode()
+            .expect("max streams"),
+        );
+        let packet = sender
+            .build_outbound(&TestClock, Instant(0), &payload)
+            .expect("packet")
+            .expect("active");
+        receiver
+            .on_inbound(Instant(0), &packet)
+            .expect("control frames");
+        assert_eq!(receiver.flow.max_data_remote, 2_000_000);
+        assert_eq!(receiver.flow.max_bidirectional_streams_local, 32);
+
+        let key_update = sender.initiate_key_update().expect("key update");
+        let packet = sender
+            .build_outbound(&TestClock, Instant(1), &key_update)
+            .expect("packet")
+            .expect("active");
+        receiver
+            .on_inbound(Instant(1), &packet)
+            .expect("key update");
+        assert_eq!(receiver.key_update.update_sequence, 1);
+    }
+
+    #[test]
+    fn inbound_path_challenge_returns_a_decodable_response() {
+        let mut sender = Session::new(
+            SessionConfig {
+                role: Role::Client,
+                dcid: vec![0u8; DEFAULT_DCID_LEN],
+                local_traffic_secret: [1u8; 32],
+                remote_traffic_secret: [2u8; 32],
+                initial_max_data: 1_000_000,
+                initial_max_stream_data: DEFAULT_INITIAL_MAX_STREAM_DATA,
+                max_ack_delay_ms: 25,
+            },
+            &TestClock,
+        )
+        .expect("sender");
+        let mut receiver = Session::new(
+            SessionConfig {
+                role: Role::Server,
+                dcid: vec![0u8; DEFAULT_DCID_LEN],
+                local_traffic_secret: [2u8; 32],
+                remote_traffic_secret: [1u8; 32],
+                initial_max_data: 1_000_000,
+                initial_max_stream_data: DEFAULT_INITIAL_MAX_STREAM_DATA,
+                max_ack_delay_ms: 25,
+            },
+            &TestClock,
+        )
+        .expect("receiver");
+        let challenge = [0xA5; 8];
+        let packet = sender
+            .build_outbound(
+                &TestClock,
+                Instant(0),
+                &umc_wire::frames::path::PathChallengeFrame { data: challenge }
+                    .encode()
+                    .expect("challenge"),
+            )
+            .expect("packet")
+            .expect("active");
+        let response = receiver.on_inbound(Instant(0), &packet).expect("challenge");
+        let frames = umc_wire::frame::decode_frames(&response).expect("response frames");
+        assert!(frames.iter().any(|frame| {
+            matches!(
+                frame,
+                umc_wire::frame::Frame::PathResponse(
+                    umc_wire::frames::path::PathResponseFrame { data }
+                ) if data == &challenge
+            )
+        }));
+    }
+
     /// Test controller that never limits sends: for tests exercising other
     /// session mechanics (e.g. the outstanding-packet cap) beyond the Reno
     /// window.
@@ -1619,6 +2303,110 @@ mod tests {
         assert_eq!(
             s.apply_stream_frame(&stream_frame(0, 0, b"new", true)),
             Err(SessionError::StreamClosed)
+        );
+    }
+
+    #[test]
+    fn opened_stream_carries_protocol_and_direction_metadata() {
+        let mut s = session();
+        let stream_id = s
+            .open_stream_with_protocol(b"org.example.chat/1", false)
+            .expect("open");
+        let stream = s.streams.get(&stream_id).expect("stream");
+        assert_eq!(stream.protocol_id, b"org.example.chat/1");
+        assert_eq!(stream_id & 0x03, 0x01);
+    }
+
+    #[test]
+    fn stream_ids_encode_role_and_direction() {
+        let mut client = Session::new(
+            SessionConfig {
+                role: Role::Client,
+                dcid: vec![0; DEFAULT_DCID_LEN],
+                local_traffic_secret: [1; 32],
+                remote_traffic_secret: [2; 32],
+                initial_max_data: 1_000_000,
+                initial_max_stream_data: DEFAULT_INITIAL_MAX_STREAM_DATA,
+                max_ack_delay_ms: 25,
+            },
+            &TestClock,
+        )
+        .expect("client");
+        assert_eq!(client.open_stream().expect("bidi"), 0);
+        assert_eq!(
+            client
+                .open_stream_with_protocol(b"ump.test/1", true)
+                .expect("uni"),
+            2
+        );
+
+        let mut server = session();
+        assert_eq!(server.open_stream().expect("bidi"), 1);
+        assert_eq!(
+            server
+                .open_stream_with_protocol(b"ump.test/1", true)
+                .expect("uni"),
+            3
+        );
+        assert!(server.validate_stream_id(4, 0, false));
+        assert!(server.validate_stream_id(6, 0, true));
+        assert!(!server.validate_stream_id(4, 0, true));
+        assert!(server.validate_stream_id(1, 1, false));
+    }
+
+    #[test]
+    fn inbound_stream_rejects_local_initiator_and_direction_mismatch() {
+        let mut server = session();
+        assert_eq!(
+            server.apply_stream_frame(&stream_frame(1, 0, b"bad", true)),
+            Err(SessionError::InvalidStreamId)
+        );
+        assert_eq!(
+            server.apply_stream_frame(&stream_frame(2, 0, b"bad", true)),
+            Err(SessionError::InvalidStreamId)
+        );
+    }
+
+    #[test]
+    fn application_control_frames_are_encoded_from_session_state() {
+        let mut s = session();
+        let stream_id = s
+            .open_stream_with_protocol(b"org.example.chat/1", false)
+            .expect("open");
+        let fin = s.close_stream_send_payload(stream_id).expect("fin");
+        assert_eq!(
+            umc_wire::varint::decode(&fin).unwrap().0,
+            umc_types::frame::FrameType::STREAM.0
+        );
+        let reset = s.reset_stream_payload(stream_id, 17).expect("reset");
+        assert_eq!(
+            umc_wire::varint::decode(&reset).unwrap().0,
+            umc_types::frame::FrameType::RESET_STREAM.0
+        );
+        let stop = s.stop_stream_payload(stream_id, 19).expect("stop");
+        assert_eq!(
+            umc_wire::varint::decode(&stop).unwrap().0,
+            umc_types::frame::FrameType::STOP_SENDING.0
+        );
+    }
+
+    #[test]
+    fn queued_datagram_can_be_encoded_for_transport() {
+        let mut s = session();
+        s.send_datagram(
+            crate::datagram::Datagram {
+                context_id: 5,
+                data: b"hello".to_vec(),
+                expires_at_ms: None,
+                ack_requested: true,
+            },
+            1_200,
+        )
+        .expect("queue");
+        let payload = s.pop_outbound_datagram_payload(10).expect("payload");
+        assert_eq!(
+            umc_wire::varint::decode(&payload).unwrap().0,
+            umc_types::frame::FrameType::DATAGRAM.0
         );
     }
 

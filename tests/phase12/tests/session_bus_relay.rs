@@ -65,8 +65,8 @@ impl EntropySource for TestEntropy {
 /// static key plus identity binding and transcript-bound signature, sealed
 /// with the provisional-chain client-auth key (the daemon's DH chain
 /// stands the ephemeral in for the static, so the auth key matches on both
-/// sides) and framed as a raw handshake message. Returns the message body
-/// (the length-prefixed ciphertext): the bytes appended to the transcript
+/// sides) and carried in an encrypted Handshake packet. Returns the message
+/// body (the length-prefixed ciphertext): the bytes appended to the transcript
 /// by both sides.
 fn send_client_auth(
     node: &umc_core::node::Node,
@@ -106,8 +106,22 @@ fn send_client_auth(
         &auth_body,
     )
     .map_err(|e| format!("auth frame: {e:?}"))?;
+    let handshake_secret = umc_handshake::traffic::derive_handshake_traffic_secret(
+        &out.handshake_secret3,
+        &out.transcript_hash,
+        true,
+    );
+    let handshake_keys = umc_handshake::traffic::traffic_keys(&handshake_secret);
+    let packet = umc_handshake::handshake_packet::build_handshake_packet(
+        &[1u8; 8],
+        &[2u8; 8],
+        0,
+        &frame,
+        &handshake_keys,
+    )
+    .map_err(|e| format!("client auth packet: {e:?}"))?;
     link.send(OutboundPacket {
-        bytes: frame,
+        bytes: packet,
         control: true,
         deadline_ms: Some(3_000),
     })
@@ -132,16 +146,32 @@ fn tcp_handshake(
     let client_ephemeral = StaticHandshakeKeyPair::generate();
     let hello = ClientHello::new(node.entropy.as_ref(), &client_ephemeral);
     let hello_bytes = hello.encode().map_err(|e| format!("hello: {e:?}"))?;
+    let initial_keys = umc_handshake::initial::derive_initial_keys(&node.config.dcid);
+    let initial = umc_handshake::initial::build_initial_packet(
+        &node.config.dcid,
+        &[3u8; 8],
+        0,
+        &hello_bytes,
+        &initial_keys.client,
+    )
+    .map_err(|e| format!("initial packet: {e}"))?;
     link.send(OutboundPacket {
-        bytes: hello_bytes.clone(),
+        bytes: initial,
         control: true,
         deadline_ms: Some(3_000),
     })
     .map_err(|e| format!("send: {e:?}"))?;
     std::thread::sleep(Duration::from_millis(100));
-    let server_hello_bytes = link.recv().map_err(|e| format!("recv: {e:?}"))?.bytes;
+    let server_hello_packet = link.recv().map_err(|e| format!("recv: {e:?}"))?.bytes;
+    let server_hello_payload =
+        umc_handshake::initial::parse_initial_with_keys(&server_hello_packet, &initial_keys.server)
+            .ok_or("server Initial rejected")?
+            .2;
     let server_hello =
-        ServerHello::decode(&server_hello_bytes).map_err(|e| format!("server hello: {e:?}"))?;
+        ServerHello::decode(&server_hello_payload).map_err(|e| format!("server hello: {e:?}"))?;
+    let server_hello_bytes = server_hello
+        .encode()
+        .map_err(|e| format!("server hello encode: {e:?}"))?;
     let out = complete_client_side(
         &node.config.identity.identity,
         // The daemon stands the client's ephemeral in for the static in the
@@ -157,7 +187,7 @@ fn tcp_handshake(
     )
     .map_err(|e| format!("client side: {e}"))?;
     let auth_body = send_client_auth(node, link.as_ref(), &out)?;
-    // SERVER_FINISHED (handshake.md §19): a raw framed handshake message.
+    // SERVER_FINISHED (handshake.md §19): an encrypted Handshake packet.
     // The TCP carrier's recv yields WouldBlock while the daemon's reply is
     // buffered, so poll briefly.
     std::thread::sleep(Duration::from_millis(100));
@@ -174,7 +204,20 @@ fn tcp_handshake(
             Err(e) => return Err(format!("recv server finished: {e:?}")),
         }
     };
-    let (finished_message, _) = umc_handshake::encoding::decode_message(&finished_packet)
+    let server_handshake_secret = umc_handshake::traffic::derive_handshake_traffic_secret(
+        &out.handshake_secret3,
+        &out.transcript_hash,
+        false,
+    );
+    let server_handshake_keys = umc_handshake::traffic::traffic_keys(&server_handshake_secret);
+    let (_dcid, _scid, _pn, finished_body) =
+        umc_handshake::handshake_packet::parse_handshake_packet(
+            &finished_packet,
+            &server_handshake_keys,
+            0,
+        )
+        .map_err(|e| format!("server finished packet: {e:?}"))?;
+    let (finished_message, _) = umc_handshake::encoding::decode_message(&finished_body)
         .map_err(|e| format!("server finished framing: {e:?}"))?;
     if finished_message.message_type != SERVER_FINISHED {
         return Err(format!(
@@ -209,8 +252,22 @@ fn tcp_handshake(
     let mut finished_frame = Vec::new();
     umc_handshake::encoding::encode_message(&mut finished_frame, CLIENT_FINISHED, &confirmation)
         .map_err(|e| format!("client finished frame: {e:?}"))?;
+    let client_handshake_secret = umc_handshake::traffic::derive_handshake_traffic_secret(
+        &out.handshake_secret3,
+        &out.transcript_hash,
+        true,
+    );
+    let client_handshake_keys = umc_handshake::traffic::traffic_keys(&client_handshake_secret);
+    let finished_packet = umc_handshake::handshake_packet::build_handshake_packet(
+        &[1u8; 8],
+        &[2u8; 8],
+        1,
+        &finished_frame,
+        &client_handshake_keys,
+    )
+    .map_err(|e| format!("client finished packet: {e:?}"))?;
     link.send(OutboundPacket {
-        bytes: finished_frame,
+        bytes: finished_packet,
         control: true,
         deadline_ms: Some(3_000),
     })
@@ -649,7 +706,8 @@ async fn relay_data_forwarded_between_two_live_sessions() {
     )
     .await;
 
-    // B opens a circuit toward A; the daemon allocates circuit 2.
+    // B opens a circuit toward A. The daemon's process-local circuit is 2,
+    // while B's adjacent-session wire id remains the peer-selected 2000.
     let open_b = RelayOpenFrame {
         circuit_id: 2000,
         next_hop_hint: peer_a.clone(),
@@ -729,7 +787,7 @@ async fn relay_data_forwarded_between_two_live_sessions() {
             RelayDataFrame::decode(&bytes[used..]).ok().map(|(f, _)| f)
         })
         .unwrap_or_else(|| panic!("forwarded relay data never arrived; raw: {raw:?}"));
-    assert_eq!(forwarded.circuit_id, 2, "forwarded on B's circuit");
+    assert_eq!(forwarded.circuit_id, 2000, "forwarded on B's wire circuit");
     assert_eq!(forwarded.relay_sequence, 0);
     assert!(!forwarded.fin);
     assert_eq!(forwarded.data, b"inner-packet");

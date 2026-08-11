@@ -8,7 +8,12 @@ license.workspace = true
 umc-types = { path = "../umc-types" }
 
 [dev-dependencies]
+criterion = "0.5"
 proptest = "1"
+
+[[bench]]
+name = "wire"
+harness = false
 
 [lints]
 workspace = true

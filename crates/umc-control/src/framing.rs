@@ -51,6 +51,23 @@ impl EnvelopeDecoder {
         }
     }
 
+    /// Replace the maximum envelope size after a successful handshake.
+    ///
+    /// A partial frame already buffered under the old limit must still fit the
+    /// new limit; otherwise the caller must close the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FramingError::TooLarge`] when `max` is zero, exceeds the hard
+    /// framing ceiling, or cannot contain the already buffered partial frame.
+    pub fn set_max(&mut self, max: usize) -> Result<(), FramingError> {
+        if max == 0 || max > HARD_MAX_ENVELOPE || self.buf.len() > max.saturating_add(4) {
+            return Err(FramingError::TooLarge);
+        }
+        self.max = max;
+        Ok(())
+    }
+
     /// Feed bytes and extract complete envelopes.
     ///
     /// # Errors
@@ -139,5 +156,21 @@ mod tests {
     fn rejects_zero_length() {
         let mut decoder = EnvelopeDecoder::new(4096);
         assert_eq!(decoder.feed(&[0, 0, 0, 0]), Err(FramingError::ZeroLength));
+    }
+
+    #[test]
+    fn negotiated_max_applies_to_future_frames() {
+        let mut decoder = EnvelopeDecoder::new(4096);
+        decoder.set_max(1024).unwrap();
+        assert_eq!(decoder.feed(&[0, 0, 4, 1]), Err(FramingError::TooLarge));
+    }
+
+    #[test]
+    fn negotiated_max_rejects_an_oversized_partial_buffer() {
+        let mut decoder = EnvelopeDecoder::new(4096);
+        let mut partial = vec![0, 0, 16, 0];
+        partial.extend(vec![1u8; 1_029]);
+        assert!(decoder.feed(&partial).is_ok());
+        assert_eq!(decoder.set_max(1024), Err(FramingError::TooLarge));
     }
 }

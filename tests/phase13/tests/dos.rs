@@ -1,16 +1,17 @@
 //! Phase 13 DoS-resilience (resource-limits.md §49, threat-model.md
 //! scenarios 8/12/21): oversized Initials are rejected in bounded time,
-//! handshake floods are rate-limited per DCID, unknown frame types are
-//! skipped, and a closed session stops producing output.
+//! handshake floods are rate-limited per DCID, unknown optional frame types
+//! are skipped while critical types fail closed, and a closed session stops
+//! producing output.
 use umc_crypto::aead::PacketKeys;
-use umc_handshake::initial::{derive_initial_keys, try_parse_initial};
+use umc_handshake::initial::{build_initial_packet, derive_initial_keys, try_parse_initial};
 use umc_handshake::tracker::{HandshakeTracker, TrackerError};
 use umc_session::packet::build_protected_packet;
 use umc_session::session::{Role, Session, SessionConfig, SessionState};
 use umc_types::runtime::{Clock, Instant};
 use umc_types::version::PROTOCOL_VERSION;
-use umc_wire::frame::{ConnectionCloseFrame, Frame};
-use umc_wire::header::{LongHeader, LongPacketType, ShortPacketSpace};
+use umc_wire::frame::{ConnectionCloseFrame, Frame, FrameError};
+use umc_wire::header::ShortPacketSpace;
 use umc_wire::packet::{parse_payload, PacketContext};
 
 #[derive(Debug)]
@@ -25,23 +26,8 @@ impl Clock for FakeClock {
 /// Synthetic client Initial packet: valid long header + sealed payload
 /// (the mirror image of `try_parse_initial`).
 fn build_initial(dcid: &[u8], pn: u64, payload: &[u8]) -> Vec<u8> {
-    let header = LongHeader {
-        ptype: LongPacketType::Initial,
-        version: PROTOCOL_VERSION,
-        dcid: dcid.to_vec(),
-        scid: Vec::new(),
-        token: Vec::new(),
-        payload_len: u64::try_from(payload.len() + 16).expect("fits u64"),
-        packet_number: pn,
-        pn_bits: 8,
-    }
-    .encode()
-    .expect("header");
     let keys = derive_initial_keys(dcid).client;
-    let ciphertext = keys.seal(pn, &header, payload).expect("seal");
-    let mut out = header;
-    out.extend_from_slice(&ciphertext);
-    out
+    build_initial_packet(dcid, &[], pn, payload, &keys).expect("initial packet")
 }
 
 #[test]
@@ -93,21 +79,30 @@ fn rapid_hello_attempts_rate_limited() {
 }
 
 #[test]
-fn unknown_frame_types_skipped() {
-    // 0x3E (critical) and 0x3F (optional) length-delimited frame types are
-    // self-delimiting, so unknown instances are skipped (wire-format §21):
-    // the known frames around them stay intact.
+fn unknown_frame_types_follow_extension_behavior() {
+    // 0x3F is optional length-delimited and self-delimiting, so it is skipped
+    // while the known frames around it stay intact.
     let mut payload = Vec::new();
     payload.push(0x04); // PING
-    payload.extend_from_slice(&[0x3E, 0x02, 0xAA, 0xBB]); // unknown, len 2
     payload.extend_from_slice(&[0x3F, 0x01, 0xCC]); // unknown, len 1
     payload.push(0x04); // PING
     let parsed = parse_payload(
         &PacketContext::Protected(ShortPacketSpace::SessionData),
         &payload,
     )
-    .expect("unknown self-delimiting frames must be skipped");
+    .expect("unknown optional frames must be skipped");
     assert_eq!(parsed.frames, vec![Frame::Ping, Frame::Ping]);
+    // 0x3E is critical length-delimited and must fail closed even though its
+    // body is self-delimiting.
+    assert_eq!(
+        parse_payload(
+            &PacketContext::Protected(ShortPacketSpace::SessionData),
+            &[0x3E, 0x02, 0xAA, 0xBB, 0x04],
+        ),
+        Err(umc_wire::packet::PacketError::Frame(
+            FrameError::UnknownCriticalFrame(umc_types::frame::FrameType(0x3E)),
+        ))
+    );
     // A truncated declared body is an error, never a panic.
     assert!(parse_payload(
         &PacketContext::Protected(ShortPacketSpace::SessionData),

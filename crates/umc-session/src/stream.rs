@@ -27,10 +27,13 @@ pub enum RecvState {
 pub struct Stream {
     pub stream_id: u64,
     pub protocol_id: Vec<u8>,
+    pub unidirectional: bool,
     pub send_state: SendState,
     pub recv_state: RecvState,
     pub next_send_offset: u64,
     pub final_size: Option<u64>,
+    /// Application error carried by a peer `RESET_STREAM`, if received.
+    pub reset_error_code: Option<u64>,
     pub buffered: BTreeMap<u64, Vec<u8>>,
     pub buffered_bytes: usize,
     pub next_deliver_offset: u64,
@@ -57,10 +60,12 @@ impl Stream {
         Self {
             stream_id,
             protocol_id,
+            unidirectional: false,
             send_state: SendState::Ready,
             recv_state: RecvState::Recv,
             next_send_offset: 0,
             final_size: None,
+            reset_error_code: None,
             buffered: BTreeMap::new(),
             buffered_bytes: 0,
             next_deliver_offset: 0,

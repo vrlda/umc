@@ -538,7 +538,7 @@ Signature: `pub fn apply_peer_ack(&mut self, ack: &umc_wire::frames::simple::Ack
 **Source:** testing.md (whole), threat-model.md §49, audit C.22–C.33, E.40, plan phase 13 T5, phase 14 T15–T16.
 
 ### Task J1: Fuzz targets to 11 + corpus + CI
-- Add targets: `handshake_encoding.rs` (encoding.rs messages), `bundle_frame.rs` (bundle frames — phase 14 E11), `control_envelope.rs` (framing+envelope), `carrier_framing.rs` (the tcp length framing), `session_packet.rs` (protected packet parse+session), `identity_binding.rs` (binding decode+validate), `route_frames.rs`, `plugin_manifest.rs`, `db_recovery.rs` (SQLite reopen on corrupt bytes) — to reach testing.md §11.1's 11 targets.
+- Add targets: `handshake_encoding.rs` (encoding.rs messages), `bundle_frame.rs` (bundle frames — phase 14 E11), `control_envelope.rs` (framing+envelope), `carrier_framing.rs` (the shared TCP/TLS length framing), `session_packet.rs` (protected packet parse+session), `identity_binding.rs` (binding decode+validate), `route_frames.rs`, `plugin_manifest.rs`, `db_recovery.rs` (SQLite reopen on corrupt bytes), and `storage_recovery.rs` (UMC storage open/read-only schema recovery) — the current bounded corpus now has 12 targets for testing.md §11.1.
 - Corpus: seed `fuzz/corpus/` with the phase-0 vectors + edge corpus.
 - CI: `.github/workflows/fuzz.yml` — nightly cargo-fuzz run (10 min per target) + the smoke corpus in the main CI.
 - Tests: each target runs in the smoke harness (stable-friendly, like fuzz_smoke).

@@ -161,6 +161,9 @@ pub enum PluginError {
         /// The context operation that required the capability.
         operation: &'static str,
     },
+    /// The daemon supervisor rejected a lifecycle transition or resource
+    /// reservation before plugin work was admitted.
+    Supervisor(String),
 }
 
 /// An in-process plugin: lifecycle hooks driven by the registry.

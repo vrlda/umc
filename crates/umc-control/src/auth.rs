@@ -26,6 +26,15 @@ struct TokenRecord {
     expires_at_ms: Option<u64>,
 }
 
+/// Persistable token metadata. The raw bearer is deliberately absent; the
+/// daemon stores only the domain-separated hash and policy fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenRecordSnapshot {
+    pub principal_id: PrincipalId,
+    pub token_hash: Vec<u8>,
+    pub expires_at_ms: Option<u64>,
+}
+
 impl TokenRegistry {
     #[must_use]
     pub fn new() -> Self {
@@ -33,6 +42,60 @@ impl TokenRegistry {
             next_id: 1,
             tokens: HashMap::new(),
         }
+    }
+
+    /// Restores token records from protected storage. Invalid duplicate
+    /// principal ids are retained as separate hashes; the next id advances
+    /// past the largest restored principal.
+    #[must_use]
+    pub fn from_records(records: impl IntoIterator<Item = TokenRecordSnapshot>) -> Self {
+        Self::from_records_with_next_id(records, 1)
+    }
+
+    /// Restores token records and a persisted principal-id high-water mark.
+    #[must_use]
+    pub fn from_records_with_next_id(
+        records: impl IntoIterator<Item = TokenRecordSnapshot>,
+        next_id: PrincipalId,
+    ) -> Self {
+        let mut registry = Self::new();
+        registry.next_id = next_id.max(1);
+        for record in records {
+            if record.principal_id == 0
+                || record.principal_id == PrincipalId::MAX
+                || record.token_hash.len() != 32
+            {
+                continue;
+            }
+            registry.next_id = registry.next_id.max(record.principal_id.saturating_add(1));
+            registry.tokens.insert(
+                record.token_hash,
+                TokenRecord {
+                    principal_id: record.principal_id,
+                    expires_at_ms: record.expires_at_ms,
+                },
+            );
+        }
+        registry
+    }
+
+    /// Returns the next principal id reserved by this registry.
+    #[must_use]
+    pub fn next_id(&self) -> PrincipalId {
+        self.next_id
+    }
+
+    /// Returns protected metadata for one principal, if its token is live in
+    /// the registry.
+    #[must_use]
+    pub fn snapshot(&self, principal_id: PrincipalId) -> Option<TokenRecordSnapshot> {
+        self.tokens.iter().find_map(|(hash, record)| {
+            (record.principal_id == principal_id).then(|| TokenRecordSnapshot {
+                principal_id: record.principal_id,
+                token_hash: hash.clone(),
+                expires_at_ms: record.expires_at_ms,
+            })
+        })
     }
 
     /// Register a token; returns the principal id and the raw token (returned
@@ -132,6 +195,21 @@ pub fn authenticate(
                 bearer_authenticated: true,
             })
         }
+        Some(api::client_authentication::Method::Combined(combined)) => {
+            // This helper has no transport peer-credential input. A caller
+            // that requires OS-peer proof must perform that check before
+            // invoking it; fail closed here instead of treating the bearer as
+            // sufficient (control-api.md §11.4).
+            if combined.require_os_peer {
+                return Err(AuthError::Denied);
+            }
+            let principal_id = registry.authenticate(&combined.bearer_token, now_ms)?;
+            Ok(AuthenticatedPrincipal {
+                principal_id,
+                os_peer_authenticated: false,
+                bearer_authenticated: true,
+            })
+        }
         Some(api::client_authentication::Method::Development(_)) => {
             if !development_mode {
                 return Err(AuthError::DevelopmentDisabled);
@@ -198,6 +276,24 @@ mod tests {
     }
 
     #[test]
+    fn token_registry_snapshot_restores_authentication_and_next_id() {
+        let mut registry = TokenRegistry::new();
+        let (principal, token) = registry.create_token(Some(100), &E);
+        let snapshot = registry.snapshot(principal).expect("snapshot");
+        let mut restored = TokenRegistry::from_records([snapshot]);
+        assert_eq!(restored.authenticate(&token, 99).unwrap(), principal);
+        let (next, _) = restored.create_token(None, &E);
+        assert_eq!(next, principal + 1);
+    }
+
+    #[test]
+    fn token_registry_honors_persisted_id_high_water_mark() {
+        let mut restored = TokenRegistry::from_records_with_next_id([], 9);
+        let (principal, _) = restored.create_token(None, &E);
+        assert_eq!(principal, 9);
+    }
+
+    #[test]
     fn development_tokens_require_development_mode() {
         let registry = TokenRegistry::new();
         let auth = api::ClientAuthentication {
@@ -219,5 +315,32 @@ mod tests {
             authenticate(None, &registry, 0, false),
             Err(AuthError::Denied)
         );
+    }
+
+    #[test]
+    fn combined_bearer_requires_transport_os_proof() {
+        let mut registry = TokenRegistry::new();
+        let (_, token) = registry.create_token(None, &E);
+        let combined = api::ClientAuthentication {
+            method: Some(api::client_authentication::Method::Combined(
+                api::CombinedAuthentication {
+                    bearer_token: token.clone(),
+                    require_os_peer: true,
+                },
+            )),
+        };
+        assert_eq!(
+            authenticate(Some(&combined), &registry, 0, false),
+            Err(AuthError::Denied)
+        );
+        let bearer_only = api::ClientAuthentication {
+            method: Some(api::client_authentication::Method::Combined(
+                api::CombinedAuthentication {
+                    bearer_token: token,
+                    require_os_peer: false,
+                },
+            )),
+        };
+        assert!(authenticate(Some(&bearer_only), &registry, 0, false).is_ok());
     }
 }

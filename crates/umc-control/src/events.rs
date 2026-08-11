@@ -28,9 +28,16 @@ pub struct Subscription {
     pub id: u64,
     pub next_sequence: u64,
     pub out_of_sync: bool,
+    pub out_of_sync_from: Option<u64>,
+    pub out_of_sync_to: Option<u64>,
     pub queue: VecDeque<(u64, UmpEvent)>,
     pub queue_bytes: usize,
     pub max_backlog: usize,
+    /// Sequence and payload size for events handed to the transport but not
+    /// yet acknowledged. Retaining only metadata keeps the event payload
+    /// allocation single-owned while still charging the bounded backlog.
+    in_flight: VecDeque<(u64, usize)>,
+    in_flight_bytes: usize,
 }
 
 impl Subscription {
@@ -40,9 +47,13 @@ impl Subscription {
             id,
             next_sequence: 1,
             out_of_sync: false,
+            out_of_sync_from: None,
+            out_of_sync_to: None,
             queue: VecDeque::new(),
             queue_bytes: 0,
             max_backlog,
+            in_flight: VecDeque::new(),
+            in_flight_bytes: 0,
         }
     }
 
@@ -58,13 +69,19 @@ impl Subscription {
     pub fn push(&mut self, event: UmpEvent) -> Result<u64, EventError> {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
-        if self.queue.len() >= self.max_backlog
-            || self.queue_bytes + event.payload.len() > DEFAULT_EVENT_BACKLOG_BYTES
+        if self.queue.len() + self.in_flight.len() >= self.max_backlog
+            || self
+                .queue_bytes
+                .saturating_add(self.in_flight_bytes)
+                .saturating_add(event.payload.len())
+                > DEFAULT_EVENT_BACKLOG_BYTES
         {
             if event.class == EventClass::Sample {
                 return Err(EventError::SampleDropped);
             }
             self.out_of_sync = true;
+            self.out_of_sync_from.get_or_insert(sequence);
+            self.out_of_sync_to = Some(sequence);
             return Err(EventError::OutOfSync);
         }
         self.queue_bytes += event.payload.len();
@@ -76,18 +93,41 @@ impl Subscription {
         self.pop_with_sequence().map(|(_, event)| event)
     }
 
-    /// Removes the oldest queued event and returns its per-subscription
-    /// sequence alongside the payload for wire framing.
+    /// Moves the oldest queued event to the transport in-flight set and
+    /// returns its per-subscription sequence alongside the payload for wire
+    /// framing. The event remains charged against the bounded backlog until
+    /// [`Subscription::ack`] receives a contiguous acknowledgement.
     pub fn pop_with_sequence(&mut self) -> Option<(u64, UmpEvent)> {
         let (sequence, event) = self.queue.pop_front()?;
         self.queue_bytes = self.queue_bytes.saturating_sub(event.payload.len());
+        self.in_flight_bytes = self.in_flight_bytes.saturating_add(event.payload.len());
+        self.in_flight.push_back((sequence, event.payload.len()));
         Some((sequence, event))
     }
 
     pub fn ack(&mut self, highest_contiguous: u64) {
-        // Backlog retention is bounded; ack only clears out_of_sync state.
-        let _ = highest_contiguous;
+        while self
+            .in_flight
+            .front()
+            .is_some_and(|(sequence, _)| *sequence <= highest_contiguous)
+        {
+            if let Some((_sequence, payload_len)) = self.in_flight.pop_front() {
+                self.in_flight_bytes = self.in_flight_bytes.saturating_sub(payload_len);
+            }
+        }
         self.out_of_sync = false;
+        self.out_of_sync_from = None;
+        self.out_of_sync_to = None;
+    }
+
+    /// Takes the current missing sequence range so the transport can emit an
+    /// explicit `EVENT_GAP` notification. The gap is considered reported;
+    /// the client may still acknowledge it to clear any future range.
+    pub fn take_event_gap(&mut self) -> Option<(u64, u64)> {
+        let from = self.out_of_sync_from.take()?;
+        let to = self.out_of_sync_to.take().unwrap_or(from);
+        self.out_of_sync = false;
+        Some((from, to))
     }
 }
 
@@ -212,5 +252,34 @@ mod tests {
         assert!(sub.out_of_sync);
         sub.ack(1);
         assert!(!sub.out_of_sync);
+    }
+
+    #[test]
+    fn critical_drop_exposes_missing_sequence_range() {
+        let mut bus = EventBus::new();
+        let id = bus.subscribe();
+        for _ in 0..DEFAULT_EVENT_BACKLOG {
+            bus.publish(event(EventClass::State, 1));
+        }
+        bus.publish(event(EventClass::Critical, 1));
+        let sub = bus.subscription(id).unwrap();
+        assert_eq!(sub.take_event_gap(), Some((1025, 1025)));
+        assert!(!sub.out_of_sync);
+    }
+
+    #[test]
+    fn unacknowledged_delivery_consumes_backlog_until_acknowledged() {
+        let mut sub = Subscription::new(7, 1);
+        sub.push(event(EventClass::State, 4)).expect("first event");
+        assert!(sub.pop_with_sequence().is_some());
+
+        assert_eq!(
+            sub.push(event(EventClass::State, 4)),
+            Err(EventError::OutOfSync),
+            "delivered but unacknowledged events still consume the bounded backlog"
+        );
+        sub.ack(1);
+        sub.push(event(EventClass::State, 4))
+            .expect("ack releases the retained event");
     }
 }

@@ -1,18 +1,24 @@
 # Plugin Security Model
 
-Status: Phase 11 closeout — capability-based permission model enforced at the
-`PluginContext` boundary. Applies to `crates/umc-plugin`.
+Status: bounded v0.1 closeout — capability enforcement and generation-scoped
+supervision are enforced at the `PluginContext`/registry boundary. Applies to
+`crates/umc-plugin`.
 
 ## Trust model
 
-Plugins are third-party code compiled into the daemon binary and driven
-in-process by the registry. Capability enforcement is a robustness and
-defense-in-depth layer, **not a sandbox**: a plugin granted no capabilities
-still runs in the daemon's address space. **Accepted risk:** malicious native
-plugin code is not contained — it can read process memory, call arbitrary
-syscalls, and compromise the daemon. The real isolation boundary is the future
-WASM/subprocess loading path; this capability model carries over to it
-unchanged. Loading plugins is a trust decision: only load plugins you trust.
+The v0.1 implementation profile does not advertise or load external carrier
+processes. The registry accepts only trusted, compiled-in `Plugin` hooks; this
+is an explicit scope decision, not a claim of sandboxing. Capability
+enforcement is defense in depth: a plugin granted no capabilities still runs
+in the daemon's address space, so loading native plugin code remains a trust
+decision.
+
+The daemon-side `PluginSupervisor` is transport-independent and is the stable
+contract for a future subprocess loader. It gives each launch a fresh
+generation, rejects work before quota growth, invalidates permits, handles, and
+shared-memory reservations on failure, applies bounded restart backoff, and
+disables a plugin after the configured restart burst. The current registry
+uses the same lifecycle transitions for init and shutdown failures.
 
 ## Capabilities (closed set)
 
@@ -42,19 +48,30 @@ rejected, so a typo never silently widens or narrows a grant. The manifest is
 advisory (what the plugin declares); the loader is the trust anchor (what it
 actually grants), and only the loader's grant is enforced.
 
+## Supervisor limits
+
+The default supervisor limits mirror `carrier-plugin-api.md` §26: 1 MiB
+messages, a 10-second startup deadline, a 15-second heartbeat timeout, 1,024
+outstanding requests, 65,536 handles, 64 MiB shared-memory packet bytes, 100
+log events per second with a 1,000-event burst, 10,000 property events per
+second, and a three-failure restart burst with a five-minute backoff cap. Every
+reservation is generation-scoped and cleared on stop, crash, protocol failure,
+or restart.
+
 ## Threats
 
 | Threat | Status |
 |---|---|
-| Arbitrary code execution | Accepted risk — in-process plugins are native code; future process isolation |
-| Resource exhaustion | Accepted — no per-plugin CPU/memory budgets yet |
+| Arbitrary code execution | Accepted and bounded by scope — native in-process hooks are trusted; external process loading is not advertised in v0.1 |
+| Resource exhaustion | Mitigated for the bounded contract — request, message, handle, shared-memory, log, property-event, and restart quotas are enforced |
 | Data exfiltration | Mitigated by least privilege — read caps granted per plugin, never by default |
 | Control-plane abuse | Mitigated — control caps (`control.events`) are read-only; no control write surface exists |
 | Manifest forgery | Accepted — manifests are unsigned; signed manifests are future work |
 | Unknown-permission typos | Mitigated — strict validation at load time |
 
-## Future
+## Deferred extension
 
-Signed manifests, per-plugin resource budgets, and a WASM/subprocess loader
-that becomes the true isolation boundary. The capability model defined here
-is the stable contract for that path.
+An external subprocess loader, private IPC handshake, OS sandbox profiles, and
+independent carrier-plugin review remain a future extension. They must use the
+same manifest capability set and `PluginSupervisor` generation/quota contract
+before being advertised. No v0.1 production claim depends on those controls.

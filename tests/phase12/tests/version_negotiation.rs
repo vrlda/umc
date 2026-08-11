@@ -11,9 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use umc_carrier::types::OutboundPacket;
 use umc_core::node::{Node, NodeConfig, NodeIdentity};
+use umc_crypto::aead::{PacketKeys, TAG_LEN};
+use umc_crypto::header_protection::{protect, SAMPLE_LEN};
 use umc_crypto::signatures::StaticHandshakeKeyPair;
 use umc_handshake::xx::{parse_version_negotiation, ClientHello};
 use umc_types::runtime::{Clock, EntropySource};
+use umc_wire::header::{LongHeader, LongPacketType};
 
 struct TestClock;
 
@@ -28,6 +31,46 @@ struct TestEntropy;
 impl EntropySource for TestEntropy {
     fn fill(&self, out: &mut [u8]) {
         out.fill(0x5A);
+    }
+}
+
+/// Build an Initial packet for a deliberately unsupported version. The
+/// production builder fixes the negotiated v1 version, while this fixture
+/// must offer only v2 to exercise Version-Negotiation before agreement.
+fn build_initial_for_version(
+    version: u32,
+    dcid: &[u8],
+    scid: &[u8],
+    payload: &[u8],
+    keys: &PacketKeys,
+) -> Vec<u8> {
+    let mut plaintext = payload.to_vec();
+    loop {
+        let header = LongHeader {
+            ptype: LongPacketType::Initial,
+            version,
+            dcid: dcid.to_vec(),
+            scid: scid.to_vec(),
+            token: Vec::new(),
+            payload_len: u64::try_from(plaintext.len() + TAG_LEN).expect("payload length"),
+            packet_number: 0,
+            pn_bits: 8,
+        }
+        .encode()
+        .expect("initial header");
+        if header.len() + plaintext.len() + TAG_LEN >= umc_types::version::MIN_INITIAL_UDP {
+            let ciphertext = keys.seal(0, &header, &plaintext).expect("initial seal");
+            let pn_offset = header.len() - 1;
+            let sample = &ciphertext[..SAMPLE_LEN];
+            let mut pn = header[pn_offset..].to_vec();
+            let (protected_first, _) = protect(&keys.hp_key, header[0], false, sample, &mut pn);
+            let mut packet = header[..pn_offset].to_vec();
+            packet[0] = protected_first;
+            packet.extend_from_slice(&pn);
+            packet.extend_from_slice(&ciphertext);
+            return packet;
+        }
+        plaintext.push(0);
     }
 }
 
@@ -193,7 +236,8 @@ async fn client_retries_on_version_negotiation() {
     );
     node.register_carrier(Box::new(umc_carrier_tcp::TcpCarrier));
 
-    // Attempt 1: a raw hello offering ONLY version 2. The daemon answers
+    // Attempt 1: a protected Initial carrying a hello offering ONLY version 2.
+    // The daemon answers
     // with a Version-Negotiation packet listing version 1 (its only
     // supported version) and closes the connection — the handshake does
     // not continue (compatibility.md §5.2, handshake.md §16). The TCP
@@ -210,8 +254,12 @@ async fn client_retries_on_version_negotiation() {
         let mut hello = ClientHello::new(node.entropy.as_ref(), &ephemeral);
         hello.supported_protocol_versions = vec![2];
         let hello_bytes = hello.encode().map_err(|e| format!("hello: {e:?}"))?;
+        let dcid = [2u8; 8];
+        let scid = [3u8; 8];
+        let initial_keys = umc_handshake::initial::derive_initial_keys(&dcid).client;
+        let initial = build_initial_for_version(2, &dcid, &scid, &hello_bytes, &initial_keys);
         link.send(OutboundPacket {
-            bytes: hello_bytes,
+            bytes: initial,
             control: true,
             deadline_ms: Some(3_000),
         })

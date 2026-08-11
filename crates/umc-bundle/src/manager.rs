@@ -114,6 +114,12 @@ impl BundleManager {
         self.store = store;
     }
 
+    /// Current storage quota used by profile diagnostics and admission tests.
+    #[must_use]
+    pub fn quota(&self) -> &QuotaAccount {
+        &self.quota
+    }
+
     /// Restores persisted bundle records (storage.md §6.3): metadata is
     /// loaded from `store` and records are reconstructed for bundles whose
     /// ciphertext object still exists and whose expiry has not passed.
@@ -163,7 +169,22 @@ impl BundleManager {
             self.records.insert(record.id, record);
             restored += 1;
         }
+        // Recalculate from the records that actually survived validation.
+        // This makes restore idempotent and prevents a stale quota counter
+        // from accumulating when recovery is retried in-process.
+        self.rebuild_quota();
         Ok(restored)
+    }
+
+    /// Rebuilds storage usage from the live bundle records.
+    ///
+    /// Recovery and administrative repair paths may load, remove, or replace
+    /// metadata without replaying every historical quota reservation.  The
+    /// record set is authoritative, so recompute usage from its bounded sizes
+    /// while preserving the configured profile and hard limit.
+    pub fn rebuild_quota(&mut self) {
+        let used = self.records.values().map(|record| record.size as u64).sum();
+        self.quota = QuotaAccount::new(self.quota.profile, used, self.quota.hard_limit);
     }
 
     /// Admission (bundles.md §8.1): policy before allocation. Size, lifetime,
@@ -719,5 +740,36 @@ mod tests {
         assert!(m.records.is_empty());
         assert!(!m.objects.exists(&object_id));
         assert_eq!(m.quota.used(), 0);
+    }
+
+    #[test]
+    fn rebuild_quota_matches_live_records() {
+        let mut m = manager();
+        m.admit(
+            b"first",
+            b"sender",
+            b"dest-1",
+            1,
+            1_000,
+            1,
+            false,
+            Instant(0),
+        )
+        .unwrap();
+        m.admit(
+            b"second-payload",
+            b"sender",
+            b"dest-2",
+            1,
+            1_000,
+            1,
+            false,
+            Instant(0),
+        )
+        .unwrap();
+        m.quota.release(m.quota.used());
+        assert_eq!(m.quota.used(), 0);
+        m.rebuild_quota();
+        assert_eq!(m.quota.used(), 5 + 14);
     }
 }

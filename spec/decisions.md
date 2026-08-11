@@ -507,6 +507,22 @@ Carrier Plugin Protocol over a local socket or pipe
 
 Do not load arbitrary `.so`, `.dylib`, or `.dll` carrier plugins into the daemon.
 
+### v0.1 implementation profile
+
+The core v0.1 release does not advertise or launch external carrier plugin
+processes. Its carrier surface is the built-in TCP/UDP/LAN/TLS set plus the
+trusted, compiled-in `Plugin` trait used by `umc-plugin`. This keeps the solo
+maintainer release honest: no external process is accepted until the private
+IPC handshake and platform launcher exist.
+
+The generation-scoped `PluginSupervisor` is implemented now as the stable
+daemon-side contract. It enforces startup/heartbeat deadlines, message,
+outstanding-operation, handle, shared-memory, log, property-event, and restart
+budgets; invalidates all generation state on failure; and disables repeated
+crashes. A future
+subprocess loader MUST use this contract before it advertises external
+plugins.
+
 ### Plugin permissions
 
 A carrier plugin receives:
@@ -528,7 +544,7 @@ It does not receive:
 
 ### Plugin process lifecycle
 
-The daemon must:
+An external loader, when enabled, must:
 
 * Start the process
 * Negotiate plugin API version
@@ -1096,7 +1112,11 @@ A complex foundation is premature before a working core and community exist.
 
 ---
 
-## 16. Release-signing process
+## 16. Release-signing process (historical multi-maintainer plan)
+
+The multi-maintainer text in this section is retained as design history. It is
+superseded for the current v0.1 repository by Decision 65 below: one project
+owner, one Ed25519 signing key, and `signing.threshold=1`.
 
 ### Decision
 
@@ -1106,10 +1126,10 @@ Use two complementary signing mechanisms.
 
 Release manifests are signed by multiple long-lived maintainer keys.
 
-Initial policy:
+Historical initial policy (not active for v0.1):
 
 ```text
-2-of-3 release approval
+2-of-3 release approval (historical; superseded for v0.1)
 ```
 
 As the council grows:
@@ -1143,7 +1163,8 @@ The project should not make verification depend exclusively on:
 * One CI platform
 * Continuous internet connectivity
 
-Threshold maintainer signatures provide an offline-verifiable project trust root.
+Historical threshold maintainer signatures provided an offline-verifiable
+project trust root; v0.1 uses the solo operator signature defined in Decision 65.
 
 Sigstore adds:
 
@@ -1185,7 +1206,6 @@ Tier 1:
 
 ```text
 Linux x86_64
-Linux aarch64
 macOS arm64
 Windows x86_64
 ```
@@ -1193,6 +1213,7 @@ Windows x86_64
 Tier 2:
 
 ```text
+Linux aarch64
 macOS x86_64
 Windows arm64
 FreeBSD x86_64
@@ -1470,7 +1491,7 @@ Governance:
     Separate security team
 
 Releases:
-    Threshold maintainer signatures
+    Historical threshold maintainer signatures (superseded for v0.1)
     Plus Sigstore attestations
 
 Tier-1 systems:
@@ -1509,12 +1530,13 @@ The following decisions resolve the implementation questions recorded by the
 A–K gap-closure plan:
 
 1. **Fixed-layout dispatch.** Wire frames that do not carry a length prefix
-   keep their fixed layout; length-delimited relay status and unknown optional
-   frames are skipped using their declared length.
+   keep their fixed layout; known length-delimited relay status frames decode
+   by their declared length, unknown optional frames are skipped using that
+   length, and unknown critical length-delimited frames fail closed.
 2. **Protected session transition.** Initial packets protect the early
-   handshake, while the current daemon uses a provisional header-protection
-   continuation until the authenticated session keys are established. The
-   transcript still binds the real identity binding and finished messages.
+   handshake, while the daemon uses directional handshake traffic keys for
+   the authenticated continuation. The transcript still binds the real
+   identity binding and finished messages.
 3. **Bus protection.** Session-bus payloads are frame payloads, not carrier
    packets; the destination session encrypts them with its own traffic keys
    before sending them on the link.
@@ -1526,9 +1548,12 @@ A–K gap-closure plan:
    legacy hints retain the old payload behavior for compatibility.
 6. **TLS experimental status.** `ump.tls-stream/1` uses TLS 1.3, a channel
    exporter helper, bounded queues, and the TCP varint framing profile. The
-   reference daemon currently creates an ephemeral self-signed certificate;
-   independent deployments must provide a trust configuration before using
-   it between separate daemons.
+   daemon creates an ephemeral localhost self-signed certificate only when no
+   deployment material is configured; `tls_certificate`, `tls_private_key`,
+   `tls_trust_roots`, and `tls_server_name` load explicit DER trust material
+   for independent deployments. The solo implementation security review is
+   recorded; no human third-party sign-off is claimed for the experimental
+   profile.
 7. **SDK bindings.** Python is a pure-stdlib local client with a small
    dependency-free protobuf subset. The C ABI is experimental and uses opaque
    generation-tagged handles plus explicit buffer/status ownership.
@@ -1563,9 +1588,10 @@ A–K gap-closure plan:
     anonymity.
 15. **Privacy visibility shape.** `SessionService.GetSession` carries a
     `SessionPrivacyInfo` with requested/effective profile labels, direct-path
-    policy, padding opt-in, and a deliberately coarse hop count. The v1
-    registry reports the configured policy; exact negotiated profile and
-    route-state snapshots remain deferred until session metadata is persisted.
+    policy, padding opt-in, and a deliberately coarse hop count. The initial
+    shape used the configured policy; the registry now persists the negotiated
+    profile and per-session flags, while route-state snapshots remain coarse
+    until daemon route wiring is complete.
 16. **Mesh hint membership.** When `mesh_secret` is configured, each
     `PEER_HINT` entry carries an HMAC-BLAKE2s tag over a canonical, bounded
     entry encoding and the `UMP-MESH-HINT-v1` domain. Receivers without the
@@ -1577,3 +1603,452 @@ A–K gap-closure plan:
     runs `cargo-llvm-cov` over `umc-wire`, `umc-crypto`, `umc-handshake`, and
     `umc-session` with a 70% line threshold; local runs remain authoritative
     until the hosted runner produces its first report.
+
+18. **Per-session privacy reporting.** `SessionService.GetSession` reports the
+    negotiated profile, direct-path policy, and traffic-padding state captured
+    at session registration. The hop count remains deliberately coarse: one
+    for an allowed direct path and zero when a private route is required but
+    not yet wired into the daemon registry. This avoids exposing route
+    topology while preventing the control API from silently substituting the
+    node's current configuration for a live session's negotiated state.
+
+19. **Retry-token nonce separation.** Retry tokens carry a clear 16-byte
+    random nonce prefix and seal the payload with a key derived from the
+    retry key and that nonce. The nonce is authenticated as both prefix and
+    payload, so every token uses a distinct AEAD key and nonce pair; the token
+    remains opaque and authenticated to callers.
+
+20. **Protected XX continuation and opt-in Retry.** Live XX continuation
+    messages are carried in encrypted Handshake packets with directional
+    handshake traffic secrets. Stateless Retry is an explicit `require_retry`
+    opt-in: the daemon issues a bounded single-use token, binds it to the
+    original Initial/hello and carrier, and includes a synthetic Retry context
+    in the XX transcript. The current Retry integrity tag and header shape are
+    project-provisional until the final wire/vector review; PSK-XX,
+    private-mode policy, and independent vectors remain open.
+
+21. **Control page-token authentication.** Daemon-issued page tokens carry a
+    keyed BLAKE2s/HMAC tag derived from the node's protected ticket key, in
+    addition to their method, principal, offset, and expiry fields. The
+    server verifies the tag before applying principal/method checks, so local
+    clients cannot forge offsets or cross-page tokens by editing the opaque
+    bytes.
+
+22. **Control authorization boundary.** The live Unix-socket dispatcher owns
+    the capability check; service implementations remain callable by
+    protocol-focused unit tests without a synthetic credential. Same-user
+    Unix peer authorization remains the fallback when no bearer is presented;
+    a presented bearer must authenticate and carry the method capability.
+    Resource constraints, ownership, delegation, persistence, and connection
+    revocation are subsequent authorization layers, not implied by this first
+    method-capability gate.
+
+22. **Daemon modularity boundary.** Keep `umcd` as one deployable daemon and
+    one composition root, but do not keep its control plane as one source
+    file. Extract transport/connection state, authorization, service handlers,
+    and application data-plane state into modules with narrow interfaces over
+    `RuntimeState`; keep protocol, storage, carrier, and crypto policy in the
+    existing library crates. This preserves shared-state performance while
+    making each service independently testable and preventing a broad,
+    risky process split before the v0.1 data plane is stable.
+
+23. **Control hello metadata and delegation.** A successful control hello
+    receives a fresh per-process `server_instance_id`, a fresh per-connection
+    identifier, negotiated envelope limits, and the bearer principal's
+    effective grants. Version negotiation selects an exact offered `1.0`
+    version; an offered major/minor with no exact match closes the connection.
+    `TokenService.CreateToken` may delegate only a
+    `delegable` issuer grant, never a broader resource scope or later expiry;
+    invalid and under-scoped requests fail closed. Token records persist only
+    a domain-separated hash, principal, expiry, and effective protobuf grants
+    under a control-token key; raw bearer material is returned once and never
+    stored. Revocation removes the persisted record before removing the live
+    entry, and a persisted principal-id high-water mark prevents reuse after
+    revocation, so a failed storage delete fails closed. Secret export/import
+    uses the authenticated protection adapters recorded in decision 28:
+    passphrase, X25519 recipient-key, and native OS-keychain envelopes are
+    all bounded and fail closed on malformed or unavailable key material.
+
+24. **Incremental control-plane extraction.** `umcd` remains one deployable
+    daemon and keeps `server.rs` as the composition root for control services,
+    but transport state and EventService behavior are now separate modules.
+    `control_transport.rs` owns envelope sequencing, hello negotiation, and
+    per-connection replay state; `control_events.rs` owns subscription
+    lifecycle, filtering, acknowledgement, and event delivery; `control_application.rs` owns
+    the implemented application registration/listener state transitions.
+    New service modules should use the same status/payload boundary and avoid
+    reaching into transport framing.
+
+25. **Fail-closed live resource checks.** Bearer grants with endpoint/resource
+    constraints are checked at the live dispatcher before service execution.
+    Explicit peer, route, session, event, and application endpoint targets
+    must be covered; list/object methods without a durable ownership model are
+    denied for constrained grants rather than returning an unfiltered view.
+    Token administration is principal-owned: cross-principal list/revoke
+    requires an explicit `TOKEN_ADMIN` grant with `all_resources`, and
+    application handles reject other principals and are cleaned up when their
+    owning live control connection closes.
+
+26. **Carrier instance lifecycle boundary.** `CarrierService` instance
+    List/Get/Create/Update/Start/Stop/Delete methods use a daemon-local
+    registry with random 16-byte opaque handles, optimistic resource
+    revisions, redacted sensitive options, and structured lifecycle events.
+    Startup-wired built-in carrier types receive running records; control
+    creates are validated against the registered type set. The current
+    `umc-carrier::Carrier` trait has no generic instance factory or lifecycle
+    resource handle, so dynamic socket/device/plugin acquisition, per-instance
+    listener/link ownership, Dial, and CloseLink remain explicit follow-up
+    work rather than being reported as complete.
+
+27. **Control feature negotiation boundary.** The daemon accepts a bounded
+    `ClientHello` diagnostic name, an empty legacy instance id or a 16-byte
+    instance id, and at most 64 non-empty feature names of at most 128 bytes.
+    `ServerHello.enabled_features` is the stable intersection of the client's
+    requested names and the daemon's implemented control features, preserving
+    first-request order and removing duplicates; unknown names are omitted.
+    Malformed bounds close the connection before authentication completes.
+    A zero envelope request selects the 4 MiB daemon default; valid smaller
+    requests are applied to the live decoder and encoder after hello, while
+    requests below 1 KiB are rejected. Persisted grants/revocation and
+    deferred data-plane features are not advertised by this negotiation.
+
+28. **Protected secret identity exports.** `IdentityService.ExportSecretIdentity`
+    is disabled unless local policy enables it and the request carries the
+    exact `EXPORT` operator confirmation plus a non-empty passphrase
+    protection. The daemon wraps the 64-byte identity seed material in an
+    `UMC-IDENTITY-EXPORT-v1` envelope using Argon2id and
+    ChaCha20-Poly1305 with random salt/nonce, and imports decrypt only that
+    authenticated envelope. Legacy raw seed bytes are rejected, successful
+    export/import operations emit audit events. Recipient-public-key exports
+    use an ephemeral-X25519/ChaCha20-Poly1305 envelope, while OS-keychain
+    exports use a random wrapping key stored through the native platform
+    credential backend. Keychain references are authenticated as local AAD;
+    missing, malformed, or unavailable keychain entries fail closed.
+
+29. **Revocation freshness is an explicit qualification.** Persisted
+    revocation records expose `Unknown`, `Fresh`, or `Stale` relative to a
+    bounded seven-day local evidence window. The daemon emits a stale-state
+    audit event and diagnostics gauge when evidence is old or unreadable, but
+    it never treats local freshness as proof that disconnected peers have
+    received every revocation.
+
+30. **Introducer authority is scoped and transitive only within bounds.** A
+    new introduction edge is accepted only when the introducer is locally
+    `Trusted` or already has an unexpired `Introduced` path for the requested
+    scope. The graph remains depth- and cardinality-bounded; signed
+    introduction statements use the canonical bounded encoding in decision
+    36, while distributed delegation/revocation remain follow-up work.
+
+31. **Bootstrap authenticates the source, not the endpoint.** Bootstrap
+    bundles use a bounded canonical `UMP-BOOTSTRAP-v1` encoding signed by an
+    issuer identity, verify issuer/validity/candidate expiry before admission,
+    and mark admitted candidates as `SignedBootstrap`. Dialed endpoints still
+    require the normal handshake; provider lifecycle, diversity, and TLS
+    deployment trust remain separate concerns.
+
+32. **Discovery providers are independently restartable.** The provider
+    interface keeps compatibility-friendly bounded candidate collection while
+    adding default start/stop hooks and a fallible collection hook. The
+    bounded `ProviderManager` starts and stops providers independently,
+    isolates failures, rejects candidates whose source attribution disagrees
+    with the provider, enforces per-provider candidate limits, and reports the
+    number of distinct contributing sources. A configured minimum source count
+    is diagnostic policy; one healthy provider remains sufficient for basic
+    operation, while higher-diversity deployments can fail closed at their
+    own admission boundary.
+
+33. **Sample-based short-header protection.** Short-header packet protection
+    derives `HeaderProtectionKey` with the wire label `header protection` and
+    derives the five-byte ChaCha20 mask from the packet sample (counter plus
+    nonce), not from a key-only stream. The sample is taken from ciphertext
+    after the packet number so the receiver can remove protection before
+    packet-number reconstruction. Long-header protection, Retry vectors, and
+    independent interop vectors remain separate conformance work.
+
+34. **Unknown critical frame handling.** The frame decoder rejects unknown
+    critical fixed and length-delimited types, while unknown optional
+    length-delimited types are skipped only after their bounded declared body
+    is validated. This keeps extension evolution forward-compatible without
+    silently ignoring semantics a peer marked critical.
+
+35. **Static discovery is an explicit local provider.** Configured static
+    peers are exposed through a read-only provider with restartable lifecycle,
+    stable hashed candidate handles, `LOCAL_USE_ONLY` sharing, and an explicit
+    non-expiring local policy. The daemon starts and refreshes that provider at
+    runtime startup, while authenticated endpoint identity still comes only
+    from the normal static-peer handshake/dial path.
+
+36. **Signed introductions use a bounded canonical statement.** The
+    `UMP-INTRODUCTION-v1` statement signs a fixed-order encoding of the
+    introducer and subject EndpointIDs, subject binding digest or static
+    handshake key, allowed scope, expiry, scoped confidence, sharing
+    restrictions, and monotonic sequence with the introducer Ed25519 key. The
+    issuer public key is carried by the authenticated binding and persisted
+    beside accepted statements for restart-time verification. Statements are
+    rejected when malformed, expired, forged, out of scope, or sequence-
+    regressed; an accepted introduction still yields `Introduced`, never
+    `Trusted`. Delegation chains and distributed revocation are not implied by
+    this statement type.
+
+37. **Signed revocations use a bounded canonical statement.** The
+    `UMP-REVOCATION-v1` statement encodes the issuer EndpointID, a tagged
+    identity/binding/delegation/introduction/recovery-key subject, sequence,
+    issuance and optional expiry times, and an Ed25519 signature in fixed
+    order. The local store accepts only self-authorized identity and binding
+    statements, rejects forged or regressed records, persists the issuer key
+    for restart-time verification, and applies active records during binding
+    admission. Recovery/delegation authority and authenticated distribution
+    require a separate policy and propagation design.
+
+38. **Path construction is bounded before live handoff.** The routing core
+    builds opaque adjacent-hop sequences while rejecting excluded or repeated
+    peers, scope broadening, hop/relay/byte-limit violations, and insufficient
+    explicitly supplied failure-domain diversity. Direct paths remain allowed
+    by default; multi-hop forwarding and relay authorization still require the
+    live session wiring described by the routing and relay specifications.
+
+39. **TLS deployment trust is explicit in daemon configuration.** The TLS
+    carrier retains its ephemeral localhost certificate only when no material
+    is configured. If any deployment certificate, PKCS#8 key, trust-root list,
+    or non-localhost server name is supplied, startup requires all certificate
+    and trust inputs, reads DER files without exposing contents, and fails
+    closed on missing or invalid material. Status reports only presence of
+    sensitive paths; the independent live interoperability check and solo
+    implementation security review are recorded, while TLS remains
+    experimental and no human third-party sign-off is claimed.
+
+40. **Delegation certificates are canonical and narrowing.** `UMP-DELEGATION-v1`
+    certificates bind an issuer EndpointID to a delegated Ed25519 key and a
+    sorted, bounded capability set. A bounded chain verifier checks every
+    signature and validity interval, requires each child capability set to be
+    a subset of its issuer, prevents key cycles, and requires child expiry to
+    remain within the parent interval. Multi-device persistence, recovery
+    authority, and authenticated distribution remain follow-up work.
+
+41. **Handshake confirmation is an explicit key gate.** A shared,
+    runtime-independent state machine models the ten handshake states and
+    rejects invalid message ordering. Handshake traffic keys may be installed
+    during negotiation, but application traffic keys are usable only after
+    authenticated peer evidence and key confirmation transition the machine
+    to `CONFIRMED`; this guard does not alter the wire version.
+
+42. **Stream IDs are role- and direction-checked at the session boundary.**
+    Local bidirectional and unidirectional sequence spaces encode the endpoint
+    role in bit 0 and direction in bit 1. Inbound frames reject malformed
+    low-bit combinations, local unidirectional streams cannot receive peer
+    data, and reordered data may be buffered before its `OPEN` frame;
+    established bidirectional streams remain usable in both directions for
+    echo and request/response traffic.
+
+43. **Relay queue accounting is hierarchical.** Per-circuit admission remains
+    capped at 256 KiB, while a shared queue account aggregates each
+    authenticated peer's circuits and rejects the eighth-plus allocation once
+    the 2 MiB peer bound or the bounded peer-entry count is reached. Legacy
+    single-circuit callers use the same accounting path with an empty peer
+    key.
+
+44. **PSK-XX admission is a bounded pre-DH gate.** `PskAdmissionContext`
+    verifies the 16-byte `UMP-INVITE-AUTH-v1` authenticator over the client
+    random, client ephemeral key, destination connection ID, and carrier
+    binding before deriving `PSKExtract` and `HandshakeExtract1`. The
+    invitation key never enters `ClientHello`; expiry, scope, replay, and
+    source rate policy remain caller-owned until the daemon's live PSK mode is
+    enabled.
+
+45. **Delegation chains persist as re-verifiable trust records.** Accepted
+    `UMP-DELEGATION-v1` chains are stored under the trust namespace with the
+    root public key and canonical capability set. Restart reads decode and
+    re-verify every certificate, omit expired chains, fail closed on malformed
+    rows, and reject leaf sequence rollback. Recovery-key authority and
+    authenticated distribution remain separate policy work.
+
+46. **Route hard constraints fail closed on missing evidence.** Carrier,
+    minimum-trust, and hop-count constraints read only bounded NUL-separated
+    `carrier=`, `trust=`, and `hops=` metadata fields retained from a response
+    that carries authentication bytes. A route lacking the requested policy
+    evidence is ineligible; missing evidence is never treated as a match.
+
+47. **Control-plane route probes use the live session bus.**
+    `RouteService.ProbeRoute` returns cached candidates immediately while
+    fanning out at most the stable default fanout of three policy-eligible
+    `ROUTE_REQUEST` frames. Each probe uses a bounded 62-bit wire request ID
+    and local reverse state so authenticated session responses follow the
+    normal route-response validation path; response cache insertion binds the
+    destination hash and scope from bounded local request context rather than
+    the next-hop hint, and scoped `GetRoute` lookup searches every scope.
+    Default probe hop limits follow the frozen scope guidance (1/4/6/8), and a
+    branch with no remaining hop is rejected rather than reported as direct.
+    Unsupported trust requirements fail closed because session entries carry
+    observation-only evidence. Full multi-hop topology remains future work.
+
+48. **All encrypted packet spaces share sample-based header protection.**
+    `PacketKeys` derives and retains the labelled header-protection key beside
+    the packet key and IV. Initial and Handshake builders mask their packet
+    number after sealing, and parsers restore the unprotected header before
+    AEAD authentication. The pre-header-protection layouts are rejected at
+    the parser boundary; no legacy network dialect is retained.
+
+49. **Embedded identity import uses the shared passphrase envelope.** The
+    in-process SDK accepts only the same Argon2id/ChaCha20-Poly1305 secret
+    export envelope as the daemon, requires an exact 64-byte seed payload, and
+    stores imported material as a secondary endpoint without exposing keys.
+    Wrong passphrases and malformed envelopes fail closed; validate-only
+    imports do not mutate the endpoint table. Recipient envelopes are opened
+    with a 32-byte X25519 private key held by the referenced native keychain
+    item; keychain-wrapped envelopes use the same item as a random symmetric
+    wrapping key. The shared `umc-storage::SecretStore` boundary keeps the
+    embedded and daemon paths on the same envelope implementation.
+
+50. **PSK-XX mode is selected only after invitation admission.** The daemon
+    checks a bounded `ClientHello` PSK authenticator against active invitation
+    keys before allocating responder handshake state; single-use invitations
+    are consumed on a match and unmatched PSK offers fail with a generic
+    admission error. The selected mode changes the transcript label and
+    derives `HandshakeExtract1` from the invitation-bound `PSKExtract` on both
+    sides. XX clients remain on the public fallback path, while private-mode
+    policy selection and independent vectors remain follow-up work.
+
+51. **Release performance evidence uses opt-in, reproducible harnesses.**
+    Criterion benches cover representative wire varint/packet parsing,
+    cryptographic seal/open, and session send/receive paths without changing
+    protocol behavior. The simulation package exposes an ignored wall-clock
+    two-node stream/datagram soak with a ten-minute default and an explicit
+    `UMC_SOAK_DURATION_MS` override for local smoke runs. Benchmark baselines,
+    resource trends, and Tier-1 platform results are evidence artifacts rather
+    than claims implied by compilation or unit-test success. The
+    `release-baseline` harness refuses tracked or untracked changes before it
+    runs, records the committed tree id, and archives benchmark logs, a
+    portable resource summary, and SHA-256 metadata for the complete evidence
+    directory. `verify-release-baseline.sh` rejects dirty, short, out-of-bound,
+    missing, or tampered evidence.
+
+52. **Event acknowledgement owns bounded delivery retention.** The daemon
+    event bus moves sent events into a lightweight in-flight sequence/byte
+    ledger instead of treating transport delivery as acknowledgement. The
+    ledger remains charged against the per-subscription event and byte caps
+    until the client acknowledges a contiguous sequence; overflow therefore
+    reports an event gap rather than silently discarding unacknowledged state.
+    The embedded SDK mirrors the same ledger, gap, filter, and acknowledgement
+    semantics; backend differences are limited to its local execution and
+    restart/storage boundary.
+
+53. **Conformance checks stay protocol-pure and bounded.** Phase-14 tests live
+    in a dedicated workspace package and exercise handshake/relay state
+    machines, canonical varint and flow-control properties, duplicate-packet
+    rejection, and truncated-input fail-closed behavior. They do not add
+    production behavior or depend on wall-clock timing, so they can run in the
+    ordinary workspace gate while the longer simulator soak remains opt-in.
+
+54. **The deterministic XX driver uses the same client binding layout as the
+    live responder.** `run_xx_handshake` now signs an `IdentityBinding` for the
+    client static key and serializes its signed bytes and binding signature in
+    `CLIENT_AUTH`; it no longer reuses the server binding as a placeholder.
+    This keeps vector/driver coverage aligned with the authenticated daemon
+    path without changing the wire format.
+
+55. **Control request validation fails closed at the dispatch boundary.** A
+    zero request ID or negative `deadline_unix_ms` is invalid, and a positive
+    deadline at or before the current epoch is rejected with
+    `DEADLINE_EXCEEDED` before authorization, rate accounting, or service
+    mutation. Zero retains the method default. Accepted deadlines are then
+    converted once to the daemon's monotonic clock and capped by operation
+    class (30 seconds for reads, 60 seconds for mutations, dialing, and route
+    probes); asynchronous work must use that receipt-time deadline.
+
+56. **Daemon SDK waits honor the same absolute deadline.** Before sending a
+    request, the SDK rejects negative or already-expired deadlines locally; for
+    a future deadline it wraps the response read in a bounded Tokio timeout and
+    returns `DeadlineExceeded` if the peer does not answer. Zero and absent
+    deadlines retain the legacy method-default behavior.
+
+57. **SDK receive queues are explicitly bounded.** Pending responses and
+    decoded envelopes are capped at 1,024 entries, while unrelated pending
+    events are capped at 100 entries to match the control event backlog. A
+    full queue returns `RESOURCE_EXHAUSTED`; it never silently drops an event
+    or allocates unbounded client memory.
+
+58. **Encrypted long-header parsing has one authenticated wire layout.** The
+    daemon accepts only header-protected Initial packets and the handshake
+    packet parser accepts only the matching protected layout. The retired
+    pre-header-protection forms are rejected before hello/authentication
+    processing, so compatibility fixtures cannot create a second
+    unauthenticated network dialect.
+
+59. **Live control requests enforce ordinary message bounds before dispatch.**
+    The connection boundary rejects request payloads above the 1 MiB ordinary
+    limit with `RESOURCE_EXHAUSTED` and requires non-empty idempotency keys to
+    be 16–64 bytes. Protocol-focused service tests may still use synthetic
+    payloads directly; live Unix-socket requests cannot bypass these limits.
+    Idempotency entries retain a payload digest for 24 hours within the
+    bounded per-connection cache; reusing a key with different payload bytes
+    returns `IDEMPOTENCY_CONFLICT` without dispatch.
+
+60. **Native v0.1 session registration requires an eight-byte Initial DCID.**
+    Long-header parsing still accepts the wire format's bounded variable CID
+    lengths, but the daemon rejects any Initial that cannot be represented by
+    the fixed eight-byte session demultiplexer; it never derives a replacement
+    identifier from unauthenticated hello material.
+
+61. **Idempotent control replays re-check live authorization.** Cached response
+    bytes are consulted only after request validation and current capability,
+    resource-ownership, expiry, and revocation checks; a replay cannot retain
+    access after its bearer grant or owned handle is no longer valid.
+
+62. **SDK deadline expiry emits an explicit cancellation envelope.** When a
+    daemon-backed SDK request reaches its absolute wall-clock deadline before
+    receiving a response, the client sends a `Cancel` envelope for the live
+    request ID (best effort) and returns `DeadlineExceeded`. Live control
+    connections now maintain an authenticated in-flight table, process
+    cancellation concurrently with request workers, reject request-ID
+    collisions, and interrupt safe outbound connects before commit. Unknown
+    IDs remain no-ops, and cancellation never rolls back a committed mutation.
+
+63. **Idempotency replay scope is the authenticated principal.** The bounded
+    24-hour replay cache is owned by `RuntimeState`, not a control connection,
+    and keys include principal, service, method, and client key. Reconnects
+    under the same bearer grant therefore replay or conflict without
+    redispatch; unauthenticated clients are scoped to their connection ID.
+    Entries are encrypted at rest with the stable ticket key before being
+    written to the API namespace; a ticket-key rotation safely discards old
+    entries. Replay responses rebind the current request ID while retaining
+    the stored status and payload.
+
+64. **Linux aarch64 is Tier-2 for v0.1.** The first release keeps Linux
+    x86_64, macOS arm64, and Windows x86_64 as Tier-1 targets. Linux aarch64
+    remains a supported, portable build target with optional hosted-ARM CI
+    evidence, but its artifacts and integration runs are not release blockers
+    or a prerequisite for v0.1 security-fix support.
+
+65. **Solo-maintainer release governance for v0.1.** UMC is maintained by one
+    project owner. The owner performs release, security, and module-approval
+    duties until additional maintainers actually exist. Release manifests use
+    exactly one operator-controlled Ed25519 signature (`signing.threshold=1`);
+    no council, quorum, second reviewer, or multi-person signing ceremony is
+    assumed. CI verifies the published public key but never receives the
+    private key. This decision supersedes the earlier multi-maintainer and
+    earlier multi-maintainer planning text until a new explicit governance
+    decision is accepted.
+
+66. **Dependency evidence is clean-tree and self-verifying.** The locked
+    dependency audit refuses tracked or untracked changes before it runs,
+    records both the committed tree and the Cargo.lock digest, and copies the
+    exact lockfile beside the SBOM, dependency tree, and RustSec JSON result.
+    `verify-dependency-audit.sh` validates every recorded size and SHA-256,
+    re-parses the SBOM package count and advisory list, and rejects any report
+    that is dirty, incomplete, tampered, or contains a vulnerability before CI
+    retains the evidence.
+
+67. **Fuzz evidence is clean-tree and target-complete.** The corpus smoke
+    harness refuses tracked or untracked changes, records the committed tree,
+    and emits per-target logs, resource evidence, corpus inventories, and
+    SHA-256 records. `verify-fuzz-report.sh` requires exactly the twelve
+    declared targets, matching positive run counts and progress markers, and
+    rejects missing, incomplete, or tampered evidence before CI upload.
+
+68. **Recovery authority is root-signed and bounded.** A recovery Ed25519 key
+    never authenticates a session as the root identity. It receives a
+    sequence-bound, expiry-bounded, class-scoped authority signed by the root;
+    recovery revocations bind the root and recovery EndpointIDs and are
+    re-verified after restart. Signed revocation batches may be exchanged over
+    authenticated application/session channels, but every statement is
+    independently verified and imports are parsed before atomic persistence.

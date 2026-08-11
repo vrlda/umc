@@ -14,7 +14,7 @@ This document defines the security process for UMC: how vulnerabilities are repo
 
 It specifies:
 
-* Security team and authority
+* Project-owner security authority
 * Vulnerability reporting
 * Triage and severity
 * Embargo handling
@@ -44,7 +44,16 @@ This document does not define:
 
 The terms `MUST`, `MUST NOT`, `REQUIRED`, `SHOULD`, `SHOULD NOT`, `MAY`, and `OPTIONAL` have their usual normative meanings.
 
-The security team is a smaller private-contact group that handles embargoed vulnerabilities.
+## Solo-maintainer v0.1 profile
+
+UMC is currently maintained by one project owner. For v0.1, every reference to
+the security team means the project owner, and every reference to the
+maintainer council, quorum, or multiple reviewers is inactive future-governance
+text. No second person or multi-person signing ceremony is required. Release
+manifests use one operator-controlled Ed25519 key with `signing.threshold=1`.
+CI verifies the public key and signature but never stores the private key. If
+additional maintainers join, this profile must be replaced by an explicit
+governance decision before changing the release policy.
 
 ---
 
@@ -52,16 +61,16 @@ The security team is a smaller private-contact group that handles embargoed vuln
 
 ## 3.1 Membership
 
-The security team:
+For the solo-maintainer v0.1 profile, the security authority is the project
+owner:
 
-* Is appointed by the maintainer council
-* Has a defined minimum of two members
-* Has a private contact channel
-* Has clear escalation paths
+* Owns the private contact channel
+* Maintains the incident record
+* Has clear escalation paths to GitHub and affected users
 
 ## 3.2 Authority
 
-The security team MAY:
+The project owner MAY:
 
 * Triage and classify reports
 * Coordinate embargoed fixes
@@ -70,7 +79,9 @@ The security team MAY:
 * Recommend emergency key rotation
 * Act independently for time-critical containment
 
-Emergency key rotation and permanent protocol changes require council approval.
+Emergency key rotation and permanent protocol changes are recorded by the
+project owner. A future multi-maintainer governance decision may add review
+requirements, but none are required for v0.1.
 
 ## 3.3 Conflict rules
 
@@ -223,12 +234,12 @@ Security fixes are supported for Tier-1 platforms:
 
 ```text
 Linux x86_64
-Linux aarch64
 macOS arm64
 Windows x86_64
 ```
 
-Tier-2 fixes are best-effort.
+Linux aarch64, macOS x86_64, Windows arm64, and FreeBSD x86_64 are Tier-2;
+fixes for those platforms are best-effort.
 
 ## 9.2 Version policy
 
@@ -306,20 +317,20 @@ Compromise is suspected when:
 
 ## 12.2 Response
 
-The security team MUST:
+The project owner MUST:
 
 1. Stop signing with the affected key.
 2. Publish a revocation statement.
-3. Convene emergency key rotation with council approval.
-4. Establish a new threshold key set.
+3. Rotate the single operator signing key.
+4. Publish the replacement public key and its key ID.
 5. Re-issue release manifests under the new keys.
 6. Instruct users to update their verification material.
 
 ## 12.3 Constraints
 
-* CI MUST NOT possess enough long-lived keys to satisfy the threshold alone.
+* CI MUST NOT possess the private signing key.
 * Revocation documents MUST be prepared in advance.
-* Emergency rotation MUST NOT weaken the threshold policy.
+* Emergency rotation MUST preserve the one-signature v0.1 policy.
 
 # 13. Dependency response
 
@@ -470,15 +481,23 @@ After an incident, the project MUST:
 
 # 17. Security review gates
 
-Before production security claims, the project MUST obtain:
+For the current solo-maintainer v0.1 experimental profile, the project owner
+MUST perform and record the following implementation reviews using source
+tracing, independent vectors, adversarial tests, and dependency evidence:
 
-1. Independent handshake and cryptographic review.
-2. Network parser and unsafe-code audit.
+1. Handshake and cryptographic implementation review.
+2. Network parser and unsafe-code implementation audit.
 3. Adversarial review of routing, relaying, and discovery.
 4. Local API authorization review.
 5. Storage and migration review.
-6. Carrier plugin boundary review.
+6. Carrier/plugin boundary review.
 7. Reproducible-build and release-signing review.
+
+No human third-party sign-off is required for this profile because no second
+maintainer or reviewer exists. The project MUST NOT describe this evidence as
+a human audit or production-security certification. If additional maintainers
+join or production-security claims become a goal, the owner MUST obtain the
+corresponding external reviews before changing that claim.
 
 The project MUST maintain:
 
@@ -564,7 +583,7 @@ A compliant v0.1 project MUST have:
 
 * A published private security contact
 * A documented reporting process
-* A security team with private channel
+* The project owner with a private reporting channel
 * Severity classification
 * Coordinated disclosure policy
 * Advisory format
@@ -621,4 +640,3 @@ Implement security operations in this order:
 UMC treats security as a process with defined authority, timelines, and records.
 
 Reports are acknowledged, triaged, and disclosed under coordinated policy. Embargoes are minimal and enforced. Releases and keys are verifiable and revocable. Dependencies and cryptographic profiles have deprecation and emergency paths. Every incident produces containment, remediation, and lasting tests.
-

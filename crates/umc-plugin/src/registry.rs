@@ -6,18 +6,21 @@ use std::path::Path;
 use crate::contract::{Plugin, PluginContext, PluginError, PluginManifest};
 use crate::loader;
 use crate::security::{CapabilitySet, CapsContext};
+use crate::supervisor::{PluginFailure, PluginHealth, PluginLimits, PluginSupervisor};
 
 /// Registered plugins, keyed by manifest id.
 #[derive(Default)]
 pub struct PluginRegistry {
     plugins: HashMap<String, Box<dyn Plugin>>,
     manifests: HashMap<String, PluginManifest>,
+    supervisor: PluginSupervisor,
 }
 
 impl std::fmt::Debug for PluginRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PluginRegistry")
             .field("plugins", &self.manifests.keys().collect::<Vec<_>>())
+            .field("supervisor", &self.supervisor)
             .finish()
     }
 }
@@ -49,6 +52,9 @@ impl PluginRegistry {
             return Err(PluginError::Duplicate(manifest.id));
         }
         let id = manifest.id.clone();
+        self.supervisor
+            .register(&id, PluginLimits::default())
+            .map_err(|error| PluginError::Supervisor(error.to_string()))?;
         self.manifests.insert(id.clone(), manifest);
         self.plugins.insert(id, plugin);
         Ok(())
@@ -75,17 +81,62 @@ impl PluginRegistry {
     /// Panics if the registered manifest does not pass validation; manifests
     /// are validated at load time, so this is an invariant violation.
     pub fn invoke_init(&mut self, id: &str, ctx: &dyn PluginContext) -> Result<(), PluginError> {
-        let plugin = self
-            .plugins
-            .get_mut(id)
-            .ok_or_else(|| PluginError::NotFound(id.to_string()))?;
+        if !self.plugins.contains_key(id) {
+            return Err(PluginError::NotFound(id.to_string()));
+        }
         let manifest = self
             .manifests
             .get(id)
-            .ok_or_else(|| PluginError::NotFound(id.to_string()))?;
+            .ok_or_else(|| PluginError::NotFound(id.to_string()))?
+            .clone();
         let caps = CapabilitySet::from_manifest(&manifest.permissions)
             .expect("manifests are validated at load time");
-        plugin.init(&CapsContext::new(caps, ctx))
+        let generation = self
+            .supervisor
+            .start(id)
+            .map_err(|error| PluginError::Supervisor(error.to_string()))?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.plugins
+                .get_mut(id)
+                .ok_or_else(|| PluginError::NotFound(id.to_string()))?
+                .init(&CapsContext::new(caps, ctx))
+        }));
+        match result {
+            Ok(Ok(())) => {
+                if self
+                    .supervisor
+                    .poll_at(id, generation, crate::supervisor::monotonic_now_ms(), 0)
+                    .map_err(|error| PluginError::Supervisor(error.to_string()))?
+                    .is_some()
+                {
+                    return Err(PluginError::Init("plugin startup deadline exceeded".into()));
+                }
+                self.supervisor
+                    .ready(id, generation)
+                    .map_err(|error| PluginError::Supervisor(error.to_string()))?;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                let _ = self.supervisor.fail_at(
+                    id,
+                    generation,
+                    PluginFailure::InitFailure,
+                    crate::supervisor::monotonic_now_ms(),
+                    0,
+                );
+                Err(error)
+            }
+            Err(_) => {
+                let _ = self.supervisor.fail_at(
+                    id,
+                    generation,
+                    PluginFailure::FatalError,
+                    crate::supervisor::monotonic_now_ms(),
+                    0,
+                );
+                Err(PluginError::Init("plugin init panicked".into()))
+            }
+        }
     }
 
     /// Runs the plugin's `shutdown`.
@@ -95,12 +146,48 @@ impl PluginRegistry {
     /// Returns [`PluginError::NotFound`] when no plugin is registered under
     /// `id`.
     pub fn shutdown(&mut self, id: &str) -> Result<(), PluginError> {
-        let plugin = self
-            .plugins
-            .get_mut(id)
-            .ok_or_else(|| PluginError::NotFound(id.to_string()))?;
-        plugin.shutdown();
-        Ok(())
+        if !self.plugins.contains_key(id) {
+            return Err(PluginError::NotFound(id.to_string()));
+        }
+        let generation = self
+            .supervisor
+            .health(id)
+            .map_err(|error| PluginError::Supervisor(error.to_string()))?
+            .generation;
+        let shutdown_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.plugins
+                .get_mut(id)
+                .ok_or_else(|| PluginError::NotFound(id.to_string()))?
+                .shutdown();
+            Ok::<(), PluginError>(())
+        }));
+        let stop_result = self
+            .supervisor
+            .stop(id, generation)
+            .map_err(|error| PluginError::Supervisor(error.to_string()));
+        match shutdown_result {
+            Ok(Ok(())) => stop_result,
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(PluginError::Supervisor("plugin shutdown panicked".into())),
+        }
+    }
+
+    /// Returns the bounded lifecycle and quota snapshot for a plugin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginError::Supervisor`] when the plugin is not registered.
+    pub fn health(&self, id: &str) -> Result<PluginHealth, PluginError> {
+        self.supervisor
+            .health(id)
+            .map_err(|error| PluginError::Supervisor(error.to_string()))
+    }
+
+    /// Exposes the supervisor for daemon adapters that own the plugin IPC
+    /// loop. The registry remains the owner of plugin registrations.
+    #[must_use]
+    pub fn supervisor(&self) -> &PluginSupervisor {
+        &self.supervisor
     }
 }
 
@@ -138,6 +225,18 @@ mod tests {
 
         fn shutdown(&mut self) {
             self.state.lock().expect("state").inited = false;
+        }
+    }
+
+    struct PanicPlugin;
+
+    impl Plugin for PanicPlugin {
+        fn init(&mut self, _ctx: &dyn PluginContext) -> Result<(), PluginError> {
+            panic!("test plugin crash");
+        }
+
+        fn shutdown(&mut self) {
+            panic!("test plugin shutdown crash");
         }
     }
 
@@ -287,9 +386,17 @@ mod tests {
             assert_eq!(state.config_repeat.as_deref(), Some("3"));
             assert_eq!(state.registered.len(), 1);
         }
+        assert_eq!(
+            registry.health("org.example.echo").expect("health").state,
+            crate::supervisor::PluginState::Running
+        );
         assert_eq!(ctx.logs.borrow().len(), 2, "register_app + explicit log");
         registry.shutdown("org.example.echo").expect("shutdown");
         assert!(!state.lock().expect("state").inited);
+        assert_eq!(
+            registry.health("org.example.echo").expect("health").state,
+            crate::supervisor::PluginState::Stopped
+        );
     }
 
     #[test]
@@ -303,6 +410,28 @@ mod tests {
         assert_eq!(
             registry.shutdown("org.example.missing"),
             Err(PluginError::NotFound("org.example.missing".into()))
+        );
+    }
+
+    #[test]
+    fn panicking_plugin_is_contained_and_scheduled_for_restart() {
+        let path = temp_manifest(
+            "panic",
+            r#"{"id":"org.example.panic","version":[1,0,0],"entry_point":"dummy::entry","permissions":[]}"#,
+        );
+        let mut registry = PluginRegistry::new();
+        registry
+            .load_manifest(&path, Box::new(PanicPlugin))
+            .expect("load");
+        let _ = fs::remove_file(&path);
+        let result = registry.invoke_init("org.example.panic", &TestContext::default());
+        assert_eq!(
+            result,
+            Err(PluginError::Init("plugin init panicked".into()))
+        );
+        assert_eq!(
+            registry.health("org.example.panic").expect("health").state,
+            crate::supervisor::PluginState::Restarting
         );
     }
 
@@ -379,6 +508,13 @@ mod tests {
                 capability: crate::contract::Capability::AppRegister,
                 operation: "register_app",
             })
+        );
+        assert_eq!(
+            registry
+                .health("org.example.limited")
+                .expect("health")
+                .state,
+            crate::supervisor::PluginState::Restarting
         );
         registry.shutdown("org.example.limited").expect("shutdown");
     }

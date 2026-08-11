@@ -6,13 +6,20 @@ pub const LABEL_PREFIX: &[u8] = b"ump v1 ";
 ///
 /// # Errors
 /// Returns [`HkdfError::LengthOutOfRange`] if the requested `length` exceeds
-/// the HKDF output bound.
+/// the encodable output bound, or [`HkdfError::ContextTooLong`] if `context`
+/// cannot be represented by the protocol's 16-bit length field.
 pub fn expand_label(
     secret: &[u8; 32],
     label: &[u8],
     context: &[u8],
     length: usize,
 ) -> Result<Vec<u8>, HkdfError> {
+    if length > usize::from(u16::MAX) {
+        return Err(HkdfError::LengthOutOfRange);
+    }
+    if context.len() > usize::from(u16::MAX) {
+        return Err(HkdfError::ContextTooLong);
+    }
     let mut info = Vec::with_capacity(LABEL_PREFIX.len() + label.len() + context.len() + 8);
     #[allow(clippy::cast_possible_truncation)]
     info.extend_from_slice(&(length as u16).to_be_bytes());
@@ -27,6 +34,7 @@ pub fn expand_label(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HkdfError {
     LengthOutOfRange,
+    ContextTooLong,
 }
 
 #[cfg(test)]
@@ -55,5 +63,15 @@ mod tests {
         let a = expand_label(&secret, b"traffic update", b"", 32).unwrap();
         let b = expand_label(&secret, b"traffic update", b"x", 32).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn rejects_context_that_cannot_be_canonically_encoded() {
+        let secret = [8u8; 32];
+        let context = vec![0u8; usize::from(u16::MAX) + 1];
+        assert_eq!(
+            expand_label(&secret, b"review", &context, 32),
+            Err(HkdfError::ContextTooLong)
+        );
     }
 }

@@ -1,12 +1,23 @@
 # Universal Mesh Core Carrier Plugin API Specification
 
-**Status:** Draft
+**Status:** Draft / deferred extension (not advertised in v0.1)
 **Version:** 0.1
 **Document:** External Carrier Plugin Protocol
 **Project:** Universal Mesh Core, UMC
 **Protocol:** Universal Mesh Protocol, UMP
 
 ---
+
+## v0.1 implementation profile
+
+This document reserves the external Carrier Plugin Protocol for a future
+subprocess loader. UMC v0.1 does not advertise or launch external carrier
+plugins: the daemon exposes only built-in carriers and the trusted,
+compiled-in `umc-plugin` registry. The registry uses the same daemon-side
+generation, quota, crash-cleanup, and restart policy represented by
+`PluginSupervisor`; an external loader MUST adopt that contract before it is
+enabled. The process-start, IPC, and sandbox requirements below apply when
+that extension is activated and are not claims about the current v0.1 binary.
 
 # 1. Purpose
 

@@ -409,7 +409,7 @@ The adversarial suite SHOULD include:
 15. Database truncation, row mutation, and rollback.
 16. Malicious import archive and invitation.
 17. Dependency or build artifact substitution.
-18. Release-signing threshold and revocation exercise.
+18. Release-signature and revocation exercise.
 19. Clock rollback and forward jump.
 20. Randomness-source failure injection.
 21. Combined censor, Sybil, and malicious-relay attack.
@@ -500,7 +500,6 @@ Tier-1 platforms:
 
 ```text
 Linux x86_64
-Linux aarch64
 macOS arm64
 Windows x86_64
 ```
@@ -518,6 +517,7 @@ Tier-1 requires:
 Tier-2 platforms:
 
 ```text
+Linux aarch64
 macOS x86_64
 Windows arm64
 FreeBSD x86_64
@@ -546,7 +546,7 @@ CI MUST:
 
 CI MUST NOT:
 
-* Possess release-signing keys above threshold
+* Possess the operator release-signing key
 * Run unreviewed pull-request code with release secrets
 * Gate security fixes on unrelated platform flakiness
 
@@ -611,6 +611,15 @@ Before production security claims, the project MUST complete:
 9. Signed release-manifest workflow.
 10. Published vulnerability-reporting process.
 11. Documented residual risks and unsupported claims.
+
+Local API permission coverage MUST include the Unix/named-pipe permission
+boundary, peer-credential authentication before hello, bearer non-bypass of a
+failed peer check, capability/resource intersection, empty-constraint
+fail-closed behavior, administrative/application separation, and
+principal-owned handles and event streams. The Unix v0.1 suite covers the
+mode-`0600`/same-uid gate and the fail-closed transport-proof regressions;
+named-pipe coverage remains a platform-specific follow-up when that daemon
+transport is implemented.
 
 The final handshake design SHOULD be modeled using a formal protocol-analysis tool before v1.0:
 

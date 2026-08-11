@@ -138,6 +138,7 @@ struct LinkState {
     sent: u64,
     dropped: u64,
     delivered: u64,
+    peak_queued: usize,
 }
 
 /// A bounded, manually clocked, bidirectional simulated link.
@@ -233,6 +234,9 @@ impl SimLinkPair {
                 state.queues[target].push_back(packet);
             }
         }
+        state.peak_queued = state
+            .peak_queued
+            .max(state.queues[0].len() + state.queues[1].len());
         Ok(())
     }
 
@@ -268,6 +272,16 @@ impl SimLinkPair {
             state.delivered,
             state.queues[0].len() + state.queues[1].len(),
         )
+    }
+
+    /// Returns the highest total queue depth observed since link creation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another simulation thread has poisoned the link mutex.
+    #[must_use]
+    pub fn peak_queued(&self) -> usize {
+        self.state.lock().expect("simulation link lock").peak_queued
     }
 }
 
@@ -363,6 +377,86 @@ impl TwoNodeHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use umc_session::datagram::Datagram;
+    use umc_session::session::{Role, Session, SessionConfig};
+
+    #[derive(Debug)]
+    struct SessionClock;
+
+    impl Clock for SessionClock {
+        fn now(&self) -> Instant {
+            Instant(0)
+        }
+    }
+
+    fn soak_session(role: Role, local: [u8; 32], remote: [u8; 32]) -> Session {
+        Session::new(
+            SessionConfig {
+                role,
+                dcid: vec![0x53; 8],
+                local_traffic_secret: local,
+                remote_traffic_secret: remote,
+                // The release soak is intentionally application-focused; a
+                // generous transport window keeps the synthetic run from
+                // measuring a fixed fixture's flow-credit cadence while the
+                // session still exercises bounded credit replenishment.
+                initial_max_data: 1 << 30,
+                initial_max_stream_data: 1 << 26,
+                max_ack_delay_ms: 25,
+            },
+            &SessionClock,
+        )
+        .expect("session")
+    }
+
+    fn deliver_session_packet(
+        link: &SimLinkPair,
+        clock: &SimClock,
+        sender: &mut Session,
+        receiver: &mut Session,
+        side: Side,
+        payload: &[u8],
+    ) {
+        let now = clock.now();
+        let packet = sender
+            .build_outbound(&SessionClock, now, payload)
+            .expect("build session packet")
+            .expect("session packet available");
+        link.send(side, &packet).expect("send session packet");
+        clock.advance(1);
+        let inbound = link.recv(side.other()).expect("deliver session packet");
+        let mut response = receiver
+            .on_inbound(clock.now(), &inbound)
+            .expect("receive session packet");
+        response.extend(
+            receiver
+                .flow_control_frames(clock.now())
+                .into_iter()
+                .flatten(),
+        );
+        if response.is_empty() {
+            return;
+        }
+        let response_packet = receiver
+            .build_outbound(&SessionClock, clock.now(), &response)
+            .expect("build acknowledgement packet")
+            .expect("acknowledgement packet available");
+        link.send(side.other(), &response_packet)
+            .expect("send acknowledgement packet");
+        clock.advance(1);
+        let acknowledgement = link.recv(side).expect("deliver acknowledgement packet");
+        sender
+            .on_inbound(clock.now(), &acknowledgement)
+            .expect("receive acknowledgement packet");
+    }
+
+    fn stream_frame_data_len(payload: &[u8]) -> usize {
+        let (frame_type, type_len) = umc_wire::varint::decode(payload).expect("stream frame type");
+        assert_eq!(frame_type, umc_types::frame::FrameType::STREAM.0);
+        let (frame, _) = umc_wire::frames::stream::StreamFrame::decode(&payload[type_len..])
+            .expect("stream frame payload");
+        frame.data.len()
+    }
 
     #[test]
     fn clock_and_entropy_are_reproducible() {
@@ -418,6 +512,31 @@ mod tests {
     }
 
     #[test]
+    fn bounded_fault_soak_recovers_ordered_echoes() {
+        let mut harness = TwoNodeHarness::new(FaultModel {
+            queue_capacity: 64,
+            loss_every: Some(11),
+            duplicate_every: Some(7),
+            delay_ms: 2,
+            reorder_every: Some(5),
+        })
+        .expect("harness");
+
+        for index in 0..256u16 {
+            let payload = index.to_be_bytes();
+            let echoed = harness
+                .run_reliable_echo(&payload, 64)
+                .expect("bounded fault schedule recovers");
+            assert_eq!(echoed, payload);
+        }
+
+        let stats = harness.stats();
+        assert!(stats.1 > 0, "the soak must exercise loss");
+        assert!(stats.2 > 0, "the soak must deliver packets");
+        assert_eq!(stats.3, 0, "successful echoes drain the bounded queues");
+    }
+
+    #[test]
     fn queue_bound_is_enforced() {
         let link = SimLinkPair::new(FaultModel {
             queue_capacity: 1,
@@ -426,5 +545,107 @@ mod tests {
         .expect("fault model");
         link.send(Side::A, &[1]).expect("first packet");
         assert_eq!(link.send(Side::A, &[2]), Err(SimLinkError::QueueFull));
+    }
+
+    #[test]
+    fn queue_peak_tracks_bounded_burst() {
+        let link = SimLinkPair::new(FaultModel {
+            queue_capacity: 2,
+            ..FaultModel::default()
+        })
+        .expect("fault model");
+        link.send(Side::A, &[1]).expect("first packet");
+        link.send(Side::A, &[2]).expect("second packet");
+        assert_eq!(link.peak_queued(), 2);
+        assert_eq!(link.stats().3, 2);
+        assert_eq!(link.recv(Side::B), Some(vec![1]));
+        assert_eq!(link.peak_queued(), 2);
+    }
+
+    /// Release soak entry point from testing.md §17.4.
+    ///
+    /// The default is the CI-nightly ten-minute wall-clock run. Set
+    /// `UMC_SOAK_DURATION_MS` to a small value for a local smoke run, for
+    /// example `UMC_SOAK_DURATION_MS=100 cargo test -p umc-simulation --
+    /// --ignored`; the test is ignored in ordinary workspace runs
+    /// so release verification opts into the duration explicitly.
+    #[test]
+    #[ignore = "ten-minute release soak; set UMC_SOAK_DURATION_MS for a shorter validation run"]
+    fn continuous_stream_datagram_soak() {
+        let duration_ms = std::env::var("UMC_SOAK_DURATION_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(10 * 60 * 1_000);
+        let link = SimLinkPair::new(FaultModel::default()).expect("fault model");
+        let clock = link.clock();
+        let mut client = soak_session(Role::Client, [1u8; 32], [2u8; 32]);
+        let mut server = soak_session(Role::Server, [2u8; 32], [1u8; 32]);
+        let stream_id = client.open_stream().expect("open stream");
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(duration_ms);
+        let mut stream_bytes = 0usize;
+        let mut datagram_bytes = 0usize;
+        let mut iterations = 0u64;
+
+        while std::time::Instant::now() < deadline {
+            let expected_stream = b"continuous stream payload";
+            let mut remaining = expected_stream.as_slice();
+            let mut received_stream = Vec::with_capacity(expected_stream.len());
+            while !remaining.is_empty() {
+                let stream_payload = client
+                    .send_stream_data(stream_id, remaining, false)
+                    .expect("encode stream payload");
+                let consumed = stream_frame_data_len(&stream_payload);
+                assert!(consumed > 0 && consumed <= remaining.len());
+                deliver_session_packet(
+                    &link,
+                    &clock,
+                    &mut client,
+                    &mut server,
+                    Side::A,
+                    &stream_payload,
+                );
+                let (received, eof) = server.read_stream(stream_id).expect("read stream payload");
+                assert!(!eof);
+                received_stream.extend_from_slice(&received);
+                remaining = &remaining[consumed..];
+            }
+            assert_eq!(received_stream, expected_stream);
+            stream_bytes = stream_bytes.saturating_add(received_stream.len());
+
+            let datagram = Datagram {
+                context_id: iterations,
+                data: b"continuous datagram payload".to_vec(),
+                expires_at_ms: None,
+                ack_requested: true,
+            };
+            client
+                .send_datagram(datagram, 1_200)
+                .expect("queue datagram");
+            let datagram_payload = client
+                .pop_outbound_datagram_payload(clock.now().0)
+                .expect("encode datagram payload");
+            deliver_session_packet(
+                &link,
+                &clock,
+                &mut client,
+                &mut server,
+                Side::A,
+                &datagram_payload,
+            );
+            let received_datagram = server.recv_datagram().expect("receive datagram");
+            assert_eq!(received_datagram.data, b"continuous datagram payload");
+            datagram_bytes = datagram_bytes.saturating_add(received_datagram.data.len());
+            iterations = iterations.saturating_add(1);
+        }
+
+        assert!(iterations > 0, "soak must execute at least one exchange");
+        assert_eq!(link.stats().3, 0, "bounded link queues must drain");
+        eprintln!(
+            "continuous soak: iterations={iterations}, stream_bytes={stream_bytes}, datagram_bytes={datagram_bytes}, elapsed_ms={}, peak_queued={}, queue_capacity={}",
+            started.elapsed().as_millis(),
+            link.peak_queued(),
+            FaultModel::default().queue_capacity,
+        );
     }
 }

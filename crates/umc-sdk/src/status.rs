@@ -46,12 +46,27 @@ impl StatusClient {
     /// Returns [`ClientError::Status`] when the daemon rejects the request,
     /// and [`ClientError::Proto`] when the response cannot be decoded.
     pub async fn get_status(&mut self) -> Result<NodeStatusSnapshot, ClientError> {
+        self.get_status_with_deadline(None).await
+    }
+
+    /// Returns a status snapshot with an absolute Control API deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport, deadline, status, or decode error.
+    pub async fn get_status_with_deadline(
+        &mut self,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<NodeStatusSnapshot, ClientError> {
         let (code, payload) = self
             .daemon
-            .request_raw("NodeAdmin", "GetStatus", Vec::new())
+            .request_raw_with_deadline("NodeAdmin", "GetStatus", Vec::new(), deadline_unix_ms)
             .await?;
         if code != api::StatusCode::Ok as i32 {
-            return Err(ClientError::Status(code));
+            return Err(ClientError::from_status_for_method(
+                code,
+                "NodeAdmin.GetStatus",
+            ));
         }
         let response = api::GetStatusResponse::decode(payload.as_slice())
             .map_err(|e| ClientError::Proto(e.to_string()))?;

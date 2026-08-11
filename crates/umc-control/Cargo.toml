@@ -8,6 +8,7 @@ build = "build.rs"
 [dependencies]
 blake2 = "0.10"
 prost = "0.13"
+umc-crypto = { path = "../umc-crypto" }
 umc-types = { path = "../umc-types" }
 
 [build-dependencies]

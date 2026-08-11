@@ -14,10 +14,12 @@ libfuzzer-sys = "0.4"
 prost = "0.13"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde_json = "1"
+umc-carrier = { path = "../crates/umc-carrier" }
 umc-control = { path = "../crates/umc-control" }
 umc-crypto = { path = "../crates/umc-crypto" }
 umc-handshake = { path = "../crates/umc-handshake" }
 umc-plugin = { path = "../crates/umc-plugin" }
+umc-storage = { path = "../crates/umc-storage" }
 umc-wire = { path = "../crates/umc-wire" }
 
 [[bin]]
@@ -93,6 +95,13 @@ bench = false
 [[bin]]
 name = "db_recovery"
 path = "fuzz_targets/db_recovery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "storage_recovery"
+path = "fuzz_targets/storage_recovery.rs"
 test = false
 doc = false
 bench = false

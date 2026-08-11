@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::{Child, Command};
-use umc_sdk::client::{Client, ClientError};
+use umc_sdk::client::Client;
 
 fn socket_path(suffix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("umc-test-{}-{suffix}.sock", std::process::id()))
@@ -116,7 +116,7 @@ async fn daemon_persists_state_across_restart() {
 }
 
 #[tokio::test]
-async fn unimplemented_methods_return_unimplemented() {
+async fn malformed_implemented_methods_return_invalid_argument() {
     let suffix = "unimpl";
     let _ = std::fs::remove_dir_all(data_dir(suffix));
     let mut child = spawn_daemon(suffix);
@@ -125,11 +125,14 @@ async fn unimplemented_methods_return_unimplemented() {
     let mut client = Client::connect(socket.to_str().unwrap(), "phase2-test")
         .await
         .expect("connect");
-    let err = client
+    let response = client
         .request("ApplicationService", "Connect", Vec::new())
         .await
-        .unwrap_err();
-    assert!(matches!(err, ClientError::Unimplemented(_)));
+        .expect("response");
+    assert_eq!(
+        response.status.expect("status").code,
+        3, // Control API STATUS_CODE_INVALID_ARGUMENT.
+    );
     kill_child(&mut child).await;
     let _ = std::fs::remove_file(&socket);
 }

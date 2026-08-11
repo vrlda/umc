@@ -1,12 +1,15 @@
 //! Typed application surface over the daemon backend (sdk.md §8–24, §27).
 #![allow(clippy::missing_errors_doc)]
 use std::collections::HashSet;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use umc_control::proto::umc::api::v1;
 
 use crate::client::{Client, ClientError};
-use crate::handles::{AppHandle, EndpointHandle, ListenerHandle, SessionHandle, StreamHandle};
+use crate::handles::{
+    AppHandle, EndpointHandle, GenerationBound, ListenerHandle, SessionHandle, StreamHandle,
+};
 use crate::policy::Policy;
 
 /// Default daemon stream write chunk (sdk.md §27.1).
@@ -31,6 +34,13 @@ pub struct Endpoint {
 impl Endpoint {
     /// Decodes endpoint metadata from the identity service response.
     pub fn from_summary(summary: &v1::IdentitySummary) -> Result<Self, ClientError> {
+        Self::from_summary_with_generation(summary, 0)
+    }
+
+    pub(crate) fn from_summary_with_generation(
+        summary: &v1::IdentitySummary,
+        generation: u64,
+    ) -> Result<Self, ClientError> {
         let Some(handle) = summary.identity_handle.as_ref() else {
             return Err(ClientError::Proto("identity response has no handle".into()));
         };
@@ -40,7 +50,7 @@ impl Endpoint {
             ));
         }
         Ok(Self {
-            handle: EndpointHandle::from_proto(handle),
+            handle: EndpointHandle::from_proto_with_generation(handle, generation),
             endpoint_id: summary.endpoint_id.clone(),
             label: summary.label.clone(),
             kind: summary.kind,
@@ -213,11 +223,26 @@ fn require_ok(response: &v1::Response, method: &str) -> Result<(), ClientError> 
 }
 
 impl Client {
+    fn validate_handle<H: GenerationBound>(&self, handle: &H) -> Result<(), ClientError> {
+        handle.validate_backend_generation(self.generation())
+    }
+
     /// Creates a user endpoint without returning its private key.
     pub async fn create_endpoint(
         &mut self,
         label: &str,
         binding_lifetime_ms: u64,
+    ) -> Result<Endpoint, ClientError> {
+        self.create_endpoint_with_deadline(label, binding_lifetime_ms, None)
+            .await
+    }
+
+    /// Creates a user endpoint with an absolute Control API deadline.
+    pub async fn create_endpoint_with_deadline(
+        &mut self,
+        label: &str,
+        binding_lifetime_ms: u64,
+        deadline_unix_ms: Option<i64>,
     ) -> Result<Endpoint, ClientError> {
         let request = v1::CreateIdentityRequest {
             kind: v1::IdentityKind::UserEndpoint as i32,
@@ -225,24 +250,44 @@ impl Client {
             binding_lifetime_ms: i64::try_from(binding_lifetime_ms).unwrap_or(i64::MAX),
         };
         let response = self
-            .request("IdentityService", "CreateIdentity", encode(&request)?)
+            .request_with_deadline(
+                "IdentityService",
+                "CreateIdentity",
+                encode(&request)?,
+                deadline_unix_ms,
+            )
             .await?;
         require_ok(&response, "IdentityService.CreateIdentity")?;
         let created = v1::CreateIdentityResponse::decode(response.payload.as_slice())
             .map_err(|error| ClientError::Proto(error.to_string()))?;
-        Endpoint::from_summary(
+        Endpoint::from_summary_with_generation(
             created
                 .identity
                 .as_ref()
                 .ok_or_else(|| ClientError::Proto("identity response has no summary".into()))?,
+            self.generation(),
         )
     }
 
     /// Loads endpoint metadata by its daemon-side label.
     pub async fn load_endpoint(&mut self, label: &str) -> Result<Endpoint, ClientError> {
+        self.load_endpoint_with_deadline(label, None).await
+    }
+
+    /// Loads endpoint metadata with an absolute Control API deadline.
+    pub async fn load_endpoint_with_deadline(
+        &mut self,
+        label: &str,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<Endpoint, ClientError> {
         let request = v1::ListIdentitiesRequest { page: None };
         let response = self
-            .request("IdentityService", "ListIdentities", encode(&request)?)
+            .request_with_deadline(
+                "IdentityService",
+                "ListIdentities",
+                encode(&request)?,
+                deadline_unix_ms,
+            )
             .await?;
         require_ok(&response, "IdentityService.ListIdentities")?;
         let listed = v1::ListIdentitiesResponse::decode(response.payload.as_slice())
@@ -252,7 +297,7 @@ impl Client {
             .iter()
             .find(|identity| identity.label == label)
             .ok_or(ClientError::NotFound)?;
-        Endpoint::from_summary(summary)
+        Endpoint::from_summary_with_generation(summary, self.generation())
     }
 
     /// Imports an encrypted identity and returns only its public endpoint
@@ -263,6 +308,18 @@ impl Client {
         passphrase: &[u8],
         os_key_reference: &str,
     ) -> Result<Endpoint, ClientError> {
+        self.import_endpoint_with_deadline(encrypted_export, passphrase, os_key_reference, None)
+            .await
+    }
+
+    /// Imports an encrypted identity with an absolute Control API deadline.
+    pub async fn import_endpoint_with_deadline(
+        &mut self,
+        encrypted_export: &[u8],
+        passphrase: &[u8],
+        os_key_reference: &str,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<Endpoint, ClientError> {
         let request = v1::ImportIdentityRequest {
             encrypted_export: encrypted_export.to_vec(),
             passphrase: passphrase.to_vec(),
@@ -270,16 +327,22 @@ impl Client {
             validate_only: false,
         };
         let response = self
-            .request("IdentityService", "ImportIdentity", encode(&request)?)
+            .request_with_deadline(
+                "IdentityService",
+                "ImportIdentity",
+                encode(&request)?,
+                deadline_unix_ms,
+            )
             .await?;
         require_ok(&response, "IdentityService.ImportIdentity")?;
         let imported = v1::ImportIdentityResponse::decode(response.payload.as_slice())
             .map_err(|error| ClientError::Proto(error.to_string()))?;
-        Endpoint::from_summary(
+        Endpoint::from_summary_with_generation(
             imported
                 .identity
                 .as_ref()
                 .ok_or_else(|| ClientError::Proto("import response has no summary".into()))?,
+            self.generation(),
         )
     }
 
@@ -291,6 +354,19 @@ impl Client {
         instance_id: [u8; 16],
         endpoint_ids: &[&[u8]],
         protocols: &[&str],
+    ) -> Result<AppHandle, ClientError> {
+        self.register_application_with_deadline(name, instance_id, endpoint_ids, protocols, None)
+            .await
+    }
+
+    /// Registers application protocols with an absolute Control API deadline.
+    pub async fn register_application_with_deadline(
+        &mut self,
+        name: &str,
+        instance_id: [u8; 16],
+        endpoint_ids: &[&[u8]],
+        protocols: &[&str],
+        deadline_unix_ms: Option<i64>,
     ) -> Result<AppHandle, ClientError> {
         if protocols.is_empty() {
             return Err(ClientError::InvalidArgument);
@@ -311,10 +387,11 @@ impl Client {
             resumable: false,
         };
         let response = self
-            .request(
+            .request_with_deadline(
                 "ApplicationService",
                 "RegisterApplication",
                 encode(&request)?,
+                deadline_unix_ms,
             )
             .await?;
         require_ok(&response, "ApplicationService.RegisterApplication")?;
@@ -323,7 +400,7 @@ impl Client {
         registered
             .application_handle
             .as_ref()
-            .map(AppHandle::from_proto)
+            .map(|handle| AppHandle::from_proto_with_generation(handle, self.generation()))
             .ok_or_else(|| ClientError::Proto("application response has no handle".into()))
     }
 
@@ -334,15 +411,29 @@ impl Client {
         application: &AppHandle,
         close_owned_sessions: bool,
     ) -> Result<(), ClientError> {
+        self.unregister_application_with_deadline(application, close_owned_sessions, None)
+            .await
+    }
+
+    /// Removes an application registration with an absolute Control API
+    /// deadline.
+    pub async fn unregister_application_with_deadline(
+        &mut self,
+        application: &AppHandle,
+        close_owned_sessions: bool,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<(), ClientError> {
+        self.validate_handle(application)?;
         let request = v1::UnregisterApplicationRequest {
             application_handle: Some(application.to_proto()),
             close_owned_sessions,
         };
         let response = self
-            .request(
+            .request_with_deadline(
                 "ApplicationService",
                 "UnregisterApplication",
                 encode(&request)?,
+                deadline_unix_ms,
             )
             .await?;
         require_ok(&response, "ApplicationService.UnregisterApplication")
@@ -356,6 +447,20 @@ impl Client {
         protocol_id: &str,
         policy: &Policy,
     ) -> Result<Listener, ClientError> {
+        self.listen_with_deadline(application, endpoint_id, protocol_id, policy, None)
+            .await
+    }
+
+    /// Binds a protocol to an endpoint with an absolute Control API deadline.
+    pub async fn listen_with_deadline(
+        &mut self,
+        application: &AppHandle,
+        endpoint_id: &[u8],
+        protocol_id: &str,
+        policy: &Policy,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<Listener, ClientError> {
+        self.validate_handle(application)?;
         validate_protocol_id(protocol_id)?;
         let request = v1::OpenListenerRequest {
             application_handle: Some(application.to_proto()),
@@ -369,7 +474,12 @@ impl Client {
             }),
         };
         let response = self
-            .request("ApplicationService", "OpenListener", encode(&request)?)
+            .request_with_deadline(
+                "ApplicationService",
+                "OpenListener",
+                encode(&request)?,
+                deadline_unix_ms,
+            )
             .await?;
         require_ok(&response, "ApplicationService.OpenListener")?;
         let opened = v1::OpenListenerResponse::decode(response.payload.as_slice())
@@ -377,23 +487,38 @@ impl Client {
         let handle = opened
             .listener_handle
             .as_ref()
-            .map(ListenerHandle::from_proto)
+            .map(|handle| ListenerHandle::from_proto_with_generation(handle, self.generation()))
             .ok_or_else(|| ClientError::Proto("listener response has no handle".into()))?;
         Ok(Listener {
             handle,
-            endpoint: EndpointHandle::new(endpoint_id.to_vec()),
+            endpoint: EndpointHandle::with_generation(endpoint_id.to_vec(), self.generation()),
             protocol_id: protocol_id.to_string(),
         })
     }
 
     /// Closes a listener without affecting accepted sessions.
     pub async fn close_listener(&mut self, listener: &Listener) -> Result<(), ClientError> {
+        self.close_listener_with_deadline(listener, None).await
+    }
+
+    /// Closes a listener with an absolute Control API deadline.
+    pub async fn close_listener_with_deadline(
+        &mut self,
+        listener: &Listener,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<(), ClientError> {
+        self.validate_handle(&listener.handle)?;
         let request = v1::CloseListenerRequest {
             listener_handle: Some(listener.handle.to_proto()),
             close_owned_sessions: false,
         };
         let response = self
-            .request("ApplicationService", "CloseListener", encode(&request)?)
+            .request_with_deadline(
+                "ApplicationService",
+                "CloseListener",
+                encode(&request)?,
+                deadline_unix_ms,
+            )
             .await?;
         require_ok(&response, "ApplicationService.CloseListener")
     }
@@ -419,6 +544,7 @@ impl Client {
         policy: &Policy,
         deadline_unix_ms: Option<i64>,
     ) -> Result<SessionHandle, ClientError> {
+        self.validate_handle(application)?;
         validate_protocol_id(protocol_id)?;
         let request = v1::ConnectRequest {
             application_handle: Some(application.to_proto()),
@@ -441,8 +567,49 @@ impl Client {
         connected
             .session_handle
             .as_ref()
-            .map(SessionHandle::from_proto)
+            .map(|handle| SessionHandle::from_proto_with_generation(handle, self.generation()))
             .ok_or_else(|| ClientError::Proto("connect response has no session handle".into()))
+    }
+
+    /// Adds a carrier path to an established session without creating a new
+    /// application session. The daemon validates the path asynchronously and
+    /// emits MIGRATE once `PATH_RESPONSE` arrives; the returned id is the
+    /// session-scoped path selector.
+    pub async fn migrate_session(
+        &mut self,
+        session: &SessionHandle,
+        carrier_handle: &[u8],
+        remote: &str,
+        keep_old_path: bool,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<u64, ClientError> {
+        self.validate_handle(session)?;
+        if carrier_handle.is_empty() || remote.trim().is_empty() {
+            return Err(ClientError::InvalidArgument);
+        }
+        let request = v1::MigrateSessionRequest {
+            session_handle: Some(session.to_proto()),
+            carrier_handle: Some(v1::OpaqueHandle {
+                value: carrier_handle.to_vec(),
+            }),
+            remote: remote.to_string(),
+            keep_old_path,
+            deadline_ms: deadline_remaining(deadline_unix_ms).map_or(0, |remaining| {
+                u64::try_from(remaining.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
+            }),
+        };
+        let response = self
+            .request_with_deadline(
+                "SessionService",
+                "MigrateSession",
+                encode(&request)?,
+                deadline_unix_ms,
+            )
+            .await?;
+        require_ok(&response, "SessionService.MigrateSession")?;
+        let migrated = v1::MigrateSessionResponse::decode(response.payload.as_slice())
+            .map_err(|error| ClientError::Proto(error.to_string()))?;
+        Ok(migrated.path_id)
     }
 
     /// Accepts a pending incoming session owned by the application.
@@ -451,15 +618,29 @@ impl Client {
         application: &AppHandle,
         pending_session: &SessionHandle,
     ) -> Result<SessionHandle, ClientError> {
+        self.accept_session_with_deadline(application, pending_session, None)
+            .await
+    }
+
+    /// Accepts a pending session with an absolute Control API deadline.
+    pub async fn accept_session_with_deadline(
+        &mut self,
+        application: &AppHandle,
+        pending_session: &SessionHandle,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<SessionHandle, ClientError> {
+        self.validate_handle(application)?;
+        self.validate_handle(pending_session)?;
         let request = v1::AcceptIncomingSessionRequest {
             application_handle: Some(application.to_proto()),
             pending_session_handle: Some(pending_session.to_proto()),
         };
         let response = self
-            .request(
+            .request_with_deadline(
                 "ApplicationService",
                 "AcceptIncomingSession",
                 encode(&request)?,
+                deadline_unix_ms,
             )
             .await?;
         require_ok(&response, "ApplicationService.AcceptIncomingSession")?;
@@ -468,8 +649,55 @@ impl Client {
         accepted
             .session_handle
             .as_ref()
-            .map(SessionHandle::from_proto)
+            .map(|handle| SessionHandle::from_proto_with_generation(handle, self.generation()))
             .ok_or_else(|| ClientError::Proto("accept response has no session handle".into()))
+    }
+
+    /// Rejects a pending incoming session and releases its application-owned
+    /// transport state.
+    pub async fn reject_session(
+        &mut self,
+        application: &AppHandle,
+        pending_session: &SessionHandle,
+        application_error_code: u64,
+        reason: &str,
+    ) -> Result<(), ClientError> {
+        self.reject_session_with_deadline(
+            application,
+            pending_session,
+            application_error_code,
+            reason,
+            None,
+        )
+        .await
+    }
+
+    /// Rejects a pending session with an absolute Control API deadline.
+    pub async fn reject_session_with_deadline(
+        &mut self,
+        application: &AppHandle,
+        pending_session: &SessionHandle,
+        application_error_code: u64,
+        reason: &str,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<(), ClientError> {
+        self.validate_handle(application)?;
+        self.validate_handle(pending_session)?;
+        let request = v1::RejectIncomingSessionRequest {
+            application_handle: Some(application.to_proto()),
+            pending_session_handle: Some(pending_session.to_proto()),
+            application_error_code,
+            reason: reason.to_string(),
+        };
+        let response = self
+            .request_with_deadline(
+                "ApplicationService",
+                "RejectIncomingSession",
+                encode(&request)?,
+                deadline_unix_ms,
+            )
+            .await?;
+        require_ok(&response, "ApplicationService.RejectIncomingSession")
     }
 
     /// Opens one bidirectional or unidirectional stream.
@@ -479,6 +707,20 @@ impl Client {
         session: &SessionHandle,
         unidirectional: bool,
     ) -> Result<StreamHandle, ClientError> {
+        self.open_stream_with_deadline(application, session, unidirectional, None)
+            .await
+    }
+
+    /// Opens a stream with an absolute Control API deadline.
+    pub async fn open_stream_with_deadline(
+        &mut self,
+        application: &AppHandle,
+        session: &SessionHandle,
+        unidirectional: bool,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<StreamHandle, ClientError> {
+        self.validate_handle(application)?;
+        self.validate_handle(session)?;
         let request = v1::OpenStreamRequest {
             application_handle: Some(application.to_proto()),
             session_handle: Some(session.to_proto()),
@@ -486,7 +728,12 @@ impl Client {
             initial_metadata: Vec::new(),
         };
         let response = self
-            .request("ApplicationService", "OpenStream", encode(&request)?)
+            .request_with_deadline(
+                "ApplicationService",
+                "OpenStream",
+                encode(&request)?,
+                deadline_unix_ms,
+            )
             .await?;
         require_ok(&response, "ApplicationService.OpenStream")?;
         let opened = v1::OpenStreamResponse::decode(response.payload.as_slice())
@@ -494,8 +741,82 @@ impl Client {
         opened
             .stream_handle
             .as_ref()
-            .map(StreamHandle::from_proto)
+            .map(|handle| StreamHandle::from_proto_with_generation(handle, self.generation()))
             .ok_or_else(|| ClientError::Proto("stream response has no handle".into()))
+    }
+
+    /// Accepts one pending inbound stream.
+    pub async fn accept_stream(
+        &mut self,
+        application: &AppHandle,
+        pending_stream: &StreamHandle,
+    ) -> Result<StreamHandle, ClientError> {
+        self.accept_stream_with_deadline(application, pending_stream, None)
+            .await
+    }
+
+    /// Accepts a pending inbound stream with an absolute Control API deadline.
+    pub async fn accept_stream_with_deadline(
+        &mut self,
+        application: &AppHandle,
+        pending_stream: &StreamHandle,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<StreamHandle, ClientError> {
+        self.validate_handle(application)?;
+        self.validate_handle(pending_stream)?;
+        let request = v1::AcceptStreamRequest {
+            application_handle: Some(application.to_proto()),
+            pending_stream_handle: Some(pending_stream.to_proto()),
+        };
+        let response = self
+            .request_with_deadline(
+                "ApplicationService",
+                "AcceptStream",
+                encode(&request)?,
+                deadline_unix_ms,
+            )
+            .await?;
+        require_ok(&response, "ApplicationService.AcceptStream")?;
+        let accepted = v1::AcceptStreamResponse::decode(response.payload.as_slice())
+            .map_err(|error| ClientError::Proto(error.to_string()))?;
+        accepted
+            .stream_handle
+            .as_ref()
+            .map(|handle| StreamHandle::from_proto_with_generation(handle, self.generation()))
+            .ok_or_else(|| ClientError::Proto("accept response has no stream handle".into()))
+    }
+
+    /// Rejects one pending inbound stream with an application error code.
+    pub async fn reject_stream(
+        &mut self,
+        pending_stream: &StreamHandle,
+        application_error_code: u64,
+    ) -> Result<(), ClientError> {
+        self.reject_stream_with_deadline(pending_stream, application_error_code, None)
+            .await
+    }
+
+    /// Rejects a pending inbound stream with an absolute Control API deadline.
+    pub async fn reject_stream_with_deadline(
+        &mut self,
+        pending_stream: &StreamHandle,
+        application_error_code: u64,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<(), ClientError> {
+        self.validate_handle(pending_stream)?;
+        let request = v1::RejectStreamRequest {
+            pending_stream_handle: Some(pending_stream.to_proto()),
+            application_error_code,
+        };
+        let response = self
+            .request_with_deadline(
+                "ApplicationService",
+                "RejectStream",
+                encode(&request)?,
+                deadline_unix_ms,
+            )
+            .await?;
+        require_ok(&response, "ApplicationService.RejectStream")
     }
 
     /// Writes bounded chunks and returns the number of bytes accepted by the
@@ -506,6 +827,21 @@ impl Client {
         data: &[u8],
         fin: bool,
     ) -> Result<usize, ClientError> {
+        self.write_stream_with_deadline(stream, data, fin, None)
+            .await
+    }
+
+    /// Writes bounded chunks with an absolute Control API deadline. The
+    /// daemon backend enforces it on every chunk; the embedded backend
+    /// applies the same check before mutating stream state.
+    pub async fn write_stream_with_deadline(
+        &mut self,
+        stream: &StreamHandle,
+        data: &[u8],
+        fin: bool,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<usize, ClientError> {
+        self.validate_handle(stream)?;
         let mut accepted = 0usize;
         let chunks: Vec<&[u8]> = if data.is_empty() {
             vec![data]
@@ -519,7 +855,12 @@ impl Client {
                 fin: fin && index + 1 == chunks.len(),
             };
             let response = self
-                .request("ApplicationService", "WriteStream", encode(&request)?)
+                .request_with_deadline(
+                    "ApplicationService",
+                    "WriteStream",
+                    encode(&request)?,
+                    deadline_unix_ms,
+                )
                 .await?;
             require_ok(&response, "ApplicationService.WriteStream")?;
             let written = v1::WriteStreamResponse::decode(response.payload.as_slice())
@@ -537,15 +878,54 @@ impl Client {
         maximum_bytes: usize,
         wait_for_data: bool,
     ) -> Result<(Vec<u8>, bool), ClientError> {
+        self.read_stream_with_deadline(stream, maximum_bytes, wait_for_data, None)
+            .await
+    }
+
+    /// Reads a bounded chunk with an absolute Control API deadline.
+    pub async fn read_stream_with_deadline(
+        &mut self,
+        stream: &StreamHandle,
+        maximum_bytes: usize,
+        wait_for_data: bool,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<(Vec<u8>, bool), ClientError> {
+        self.validate_handle(stream)?;
         let maximum_bytes = maximum_bytes.min(SDK_MAX_CHUNK_SIZE);
         let request = v1::ReadStreamRequest {
             stream_handle: Some(stream.to_proto()),
             maximum_bytes: u32::try_from(maximum_bytes).unwrap_or(u32::MAX),
             wait_for_data,
         };
-        let response = self
-            .request("ApplicationService", "ReadStream", encode(&request)?)
-            .await?;
+        let embedded_wait = self.is_embedded()
+            && wait_for_data
+            && deadline_unix_ms.is_some_and(|deadline| deadline > 0);
+        let response = loop {
+            let response = self
+                .request_with_deadline(
+                    "ApplicationService",
+                    "ReadStream",
+                    encode(&request)?,
+                    deadline_unix_ms,
+                )
+                .await?;
+            let status = response
+                .status
+                .as_ref()
+                .map_or(v1::StatusCode::Ok as i32, |status| status.code);
+            if embedded_wait && status == v1::StatusCode::Unavailable as i32 {
+                let remaining = deadline_remaining(deadline_unix_ms);
+                if remaining.map_or(true, |remaining| remaining.is_zero()) {
+                    return Err(ClientError::DeadlineExceeded);
+                }
+                tokio::time::sleep(Duration::from_millis(
+                    remaining.map_or(1, |remaining| remaining.as_millis().min(1) as u64),
+                ))
+                .await;
+                continue;
+            }
+            break response;
+        };
         require_ok(&response, "ApplicationService.ReadStream")?;
         let read = v1::ReadStreamResponse::decode(response.payload.as_slice())
             .map_err(|error| ClientError::Proto(error.to_string()))?;
@@ -560,13 +940,24 @@ impl Client {
 
     /// Sends a FIN on a stream.
     pub async fn close_stream_send(&mut self, stream: &StreamHandle) -> Result<(), ClientError> {
-        self.stream_control(
+        self.close_stream_send_with_deadline(stream, None).await
+    }
+
+    /// Sends a FIN on a stream with an absolute Control API deadline.
+    pub async fn close_stream_send_with_deadline(
+        &mut self,
+        stream: &StreamHandle,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<(), ClientError> {
+        self.validate_handle(stream)?;
+        self.stream_control_with_deadline(
             "CloseStreamSend",
             v1::CloseStreamSendRequest {
                 stream_handle: Some(stream.to_proto()),
             }
             .encode_to_vec(),
             "ApplicationService.CloseStreamSend",
+            deadline_unix_ms,
         )
         .await
     }
@@ -577,7 +968,19 @@ impl Client {
         stream: &StreamHandle,
         error_code: u64,
     ) -> Result<(), ClientError> {
-        self.stream_control(
+        self.reset_stream_with_deadline(stream, error_code, None)
+            .await
+    }
+
+    /// Resets one stream direction with an absolute Control API deadline.
+    pub async fn reset_stream_with_deadline(
+        &mut self,
+        stream: &StreamHandle,
+        error_code: u64,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<(), ClientError> {
+        self.validate_handle(stream)?;
+        self.stream_control_with_deadline(
             "ResetStream",
             v1::ResetStreamRequest {
                 stream_handle: Some(stream.to_proto()),
@@ -585,6 +988,7 @@ impl Client {
             }
             .encode_to_vec(),
             "ApplicationService.ResetStream",
+            deadline_unix_ms,
         )
         .await
     }
@@ -595,7 +999,20 @@ impl Client {
         stream: &StreamHandle,
         error_code: u64,
     ) -> Result<(), ClientError> {
-        self.stream_control(
+        self.stop_stream_with_deadline(stream, error_code, None)
+            .await
+    }
+
+    /// Requests that the peer stop sending with an absolute Control API
+    /// deadline.
+    pub async fn stop_stream_with_deadline(
+        &mut self,
+        stream: &StreamHandle,
+        error_code: u64,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<(), ClientError> {
+        self.validate_handle(stream)?;
+        self.stream_control_with_deadline(
             "StopStream",
             v1::StopStreamRequest {
                 stream_handle: Some(stream.to_proto()),
@@ -603,18 +1020,54 @@ impl Client {
             }
             .encode_to_vec(),
             "ApplicationService.StopStream",
+            deadline_unix_ms,
         )
         .await
     }
 
-    async fn stream_control(
+    async fn stream_control_with_deadline(
         &mut self,
         method: &str,
         payload: Vec<u8>,
         label: &str,
+        deadline_unix_ms: Option<i64>,
     ) -> Result<(), ClientError> {
-        let response = self.request("ApplicationService", method, payload).await?;
+        let response = self
+            .request_with_deadline("ApplicationService", method, payload, deadline_unix_ms)
+            .await?;
         require_ok(&response, label)
+    }
+
+    /// Closes the transport link represented by a session handle.
+    pub async fn close_link(
+        &mut self,
+        session: &SessionHandle,
+        reason: &str,
+    ) -> Result<(), ClientError> {
+        self.close_link_with_deadline(session, reason, None).await
+    }
+
+    /// Closes a transport link with an absolute Control API deadline.
+    pub async fn close_link_with_deadline(
+        &mut self,
+        session: &SessionHandle,
+        reason: &str,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<(), ClientError> {
+        self.validate_handle(session)?;
+        let response = self
+            .request_with_deadline(
+                "CarrierService",
+                "CloseLink",
+                v1::CloseLinkRequest {
+                    link_handle: Some(session.to_proto()),
+                    reason: reason.to_string(),
+                }
+                .encode_to_vec(),
+                deadline_unix_ms,
+            )
+            .await?;
+        require_ok(&response, "CarrierService.CloseLink")
     }
 
     /// Accepts one complete datagram locally; delivery is not implied.
@@ -626,6 +1079,21 @@ impl Client {
         lifetime_ms: u64,
         request_ack: bool,
     ) -> Result<u64, ClientError> {
+        self.send_datagram_with_deadline(session, context_id, data, lifetime_ms, request_ack, None)
+            .await
+    }
+
+    /// Sends one datagram with an absolute Control API deadline.
+    pub async fn send_datagram_with_deadline(
+        &mut self,
+        session: &SessionHandle,
+        context_id: u64,
+        data: &[u8],
+        lifetime_ms: u64,
+        request_ack: bool,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<u64, ClientError> {
+        self.validate_handle(session)?;
         if data.len() > SDK_MAX_DATAGRAM_SIZE {
             return Err(ClientError::InvalidArgument);
         }
@@ -637,7 +1105,12 @@ impl Client {
             request_ack,
         };
         let response = self
-            .request("ApplicationService", "SendDatagram", encode(&request)?)
+            .request_with_deadline(
+                "ApplicationService",
+                "SendDatagram",
+                encode(&request)?,
+                deadline_unix_ms,
+            )
             .await?;
         require_ok(&response, "ApplicationService.SendDatagram")?;
         let sent = v1::SendDatagramResponse::decode(response.payload.as_slice())
@@ -653,6 +1126,27 @@ impl Client {
         maximum_bytes: usize,
         wait_for_data: bool,
     ) -> Result<Datagram, ClientError> {
+        self.receive_datagram_with_deadline(
+            application,
+            session,
+            maximum_bytes,
+            wait_for_data,
+            None,
+        )
+        .await
+    }
+
+    /// Receives one datagram with an absolute Control API deadline.
+    pub async fn receive_datagram_with_deadline(
+        &mut self,
+        application: &AppHandle,
+        session: &SessionHandle,
+        maximum_bytes: usize,
+        wait_for_data: bool,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<Datagram, ClientError> {
+        self.validate_handle(application)?;
+        self.validate_handle(session)?;
         let request = v1::ReceiveDatagramRequest {
             application_handle: Some(application.to_proto()),
             session_handle: Some(session.to_proto()),
@@ -660,17 +1154,49 @@ impl Client {
                 .unwrap_or(u32::MAX),
             wait_for_data,
         };
-        let response = self
-            .request("ApplicationService", "ReceiveDatagram", encode(&request)?)
-            .await?;
+        let embedded_wait = self.is_embedded()
+            && wait_for_data
+            && deadline_unix_ms.is_some_and(|deadline| deadline > 0);
+        let response = loop {
+            let response = self
+                .request_with_deadline(
+                    "ApplicationService",
+                    "ReceiveDatagram",
+                    encode(&request)?,
+                    deadline_unix_ms,
+                )
+                .await?;
+            let status = response
+                .status
+                .as_ref()
+                .map_or(v1::StatusCode::Ok as i32, |status| status.code);
+            if embedded_wait && status == v1::StatusCode::Unavailable as i32 {
+                let remaining = deadline_remaining(deadline_unix_ms);
+                if remaining.map_or(true, |remaining| remaining.is_zero()) {
+                    return Err(ClientError::DeadlineExceeded);
+                }
+                tokio::time::sleep(Duration::from_millis(
+                    remaining.map_or(1, |remaining| remaining.as_millis().min(1) as u64),
+                ))
+                .await;
+                continue;
+            }
+            break response;
+        };
         require_ok(&response, "ApplicationService.ReceiveDatagram")?;
         let received = v1::ReceiveDatagramResponse::decode(response.payload.as_slice())
             .map_err(|error| ClientError::Proto(error.to_string()))?;
-        let received_session = received
+        let Some(received_session) = received
             .session_handle
             .as_ref()
-            .map(SessionHandle::from_proto)
-            .ok_or_else(|| ClientError::Proto("datagram response has no session".into()))?;
+            .map(|handle| SessionHandle::from_proto_with_generation(handle, self.generation()))
+        else {
+            return Err(if wait_for_data {
+                ClientError::Unavailable
+            } else {
+                ClientError::WouldBlock
+            });
+        };
         if received.data.len() > maximum_bytes {
             return Err(ClientError::InvalidArgument);
         }
@@ -681,4 +1207,20 @@ impl Client {
             expired: received.expired,
         })
     }
+}
+
+fn deadline_remaining(deadline_unix_ms: Option<i64>) -> Option<Duration> {
+    let deadline = deadline_unix_ms.filter(|deadline| *deadline > 0)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(i64::MAX);
+    let remaining = deadline.saturating_sub(now);
+    if remaining <= 0 {
+        return Some(Duration::ZERO);
+    }
+    Some(Duration::from_millis(
+        u64::try_from(remaining).unwrap_or(u64::MAX),
+    ))
 }
