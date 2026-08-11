@@ -75,10 +75,8 @@ impl TicketPayload {
         let expires_at_ms = u64::from_be_bytes(take(8, &mut pos)?.try_into().ok()?);
         let protocol_version = u32::from_be_bytes(take(4, &mut pos)?.try_into().ok()?);
         let rest = take(body.len().saturating_sub(pos), &mut pos)?;
-        let (crypto_profile, nonce) = match rest.iter().position(|&b| b == 0) {
-            Some(idx) => (&rest[..idx], rest[idx + 1..].to_vec()),
-            None => return None,
-        };
+        let idx = rest.iter().position(|&b| b == 0)?;
+        let (crypto_profile, nonce) = (&rest[..idx], rest[idx + 1..].to_vec());
         let nonce: [u8; TICKET_ENTROPY] = nonce.try_into().ok()?;
         Some(Self {
             version,
