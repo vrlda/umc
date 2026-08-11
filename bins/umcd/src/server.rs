@@ -340,7 +340,7 @@ pub async fn run(state: Arc<Mutex<RuntimeState>>) {
                 };
                 tokio::spawn(handle_connection(pipe, state.clone(), permit));
             }
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            () = tokio::time::sleep(Duration::from_millis(200)) => {}
         }
     }
     log::info!("control pipe: closed");
