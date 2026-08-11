@@ -310,6 +310,7 @@ impl Client {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn connect_to_missing_socket_errors_gracefully() {
         let result = Client::connect("/nonexistent-umc-test.sock", "test").await;
