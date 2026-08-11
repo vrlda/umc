@@ -101,7 +101,7 @@ fn umcd_binary() -> PathBuf {
 /// A running daemon; kills the child on drop.
 struct Daemon {
     child: Child,
-    _dir: PathBuf,
+    dir: PathBuf,
 }
 
 impl Daemon {
@@ -166,6 +166,7 @@ fn spawn_daemon_with_token(
     let log = fs::File::create(dir.join("umcd.log")).expect("log file");
     let child = Command::new(umcd_binary())
         .args(["--config", config_path.to_str().expect("config path")])
+        .env("RUST_LOG", "info")
         .stdout(Stdio::from(log.try_clone().expect("clone log")))
         .stderr(Stdio::from(log))
         .spawn()
@@ -173,7 +174,7 @@ fn spawn_daemon_with_token(
     (
         Daemon {
             child,
-            _dir: dir.clone(),
+            dir: dir.clone(),
         },
         dir.join("umc.sock"),
     )
@@ -194,6 +195,14 @@ fn wait_for_control_socket(socket: &Path) {
         "daemon control socket never appeared at {}",
         socket.display()
     );
+}
+
+fn expect_handshake(result: Result<u64, String>, daemon: &Daemon, label: &str) -> u64 {
+    result.unwrap_or_else(|error| {
+        let log = fs::read_to_string(daemon.dir.join("umcd.log"))
+            .unwrap_or_else(|read_error| format!("<unable to read daemon log: {read_error}>"));
+        panic!("{label} failed: {error}; daemon log:\n{log}");
+    })
 }
 
 fn send_packet(link: &(dyn umc_carrier::Link + Send + Sync), bytes: &[u8]) -> Result<(), String> {
@@ -564,8 +573,8 @@ async fn live_handshake_over_tcp() {
     let result = tokio::time::timeout(Duration::from_secs(20), client)
         .await
         .expect("live TCP handshake timed out")
-        .expect("client thread panicked")
-        .expect("handshake failed");
+        .expect("client thread panicked");
+    let result = expect_handshake(result, &daemon, "live TCP handshake");
     assert_eq!(result, 1);
     drop(daemon);
 }
@@ -686,8 +695,8 @@ async fn daemon_serves_control_and_sessions_together() {
     let result = tokio::time::timeout(Duration::from_secs(20), handshake)
         .await
         .expect("live TCP handshake timed out")
-        .expect("client thread panicked")
-        .expect("handshake failed");
+        .expect("client thread panicked");
+    let result = expect_handshake(result, &daemon, "control/session TCP handshake");
     assert_eq!(result, 1);
 
     let mut saw_active = false;
