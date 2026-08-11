@@ -11,7 +11,7 @@ use umc_sdk::config::ConfigClient;
 use umc_sdk::daemon::DaemonClient;
 use umc_sdk::status::StatusClient;
 
-const DEFAULT_SOCKET: &str = "/tmp/umc.sock";
+const DEFAULT_SOCKET: &str = "~/.local/run/umc.sock";
 const CLIENT_NAME: &str = "umc-cli";
 
 /// The default node data directory, mirroring `umcd`'s `NodeConfig` default
@@ -712,7 +712,10 @@ async fn run(cli: Cli) -> Vec<String> {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    cli.socket = expand_home(Path::new(&cli.socket))
+        .to_string_lossy()
+        .into_owned();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()
@@ -792,6 +795,12 @@ mod tests {
                 action: PeersAction::Add { .. }
             }
         ));
+    }
+
+    #[test]
+    fn default_socket_matches_daemon_config() {
+        let cli = parse(&["umc", "status"]);
+        assert_eq!(cli.socket, "~/.local/run/umc.sock");
     }
 
     #[test]
