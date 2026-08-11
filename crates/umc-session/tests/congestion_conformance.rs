@@ -1,5 +1,4 @@
-//! Congestion conformance suite (spec/congestion.md §24 required tests,
-//! gap-closure plan Task C6): the full §24 matrix — slow start, congestion
+//! Congestion conformance suite: the full matrix — slow start, congestion
 //! avoidance, loss-driven reduction with the 2 × SMSS floor, PTO backoff
 //! doubling and reset, pacing rate/burst accuracy (including the two C2
 //! pacing-accuracy items: no rate overshoot and no retroactive tokens on a

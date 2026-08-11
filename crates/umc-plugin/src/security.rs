@@ -1,8 +1,8 @@
-//! Capability enforcement (Phase 11 security model): the registry grants a
-//! plugin the capabilities its manifest declares, and [`CapsContext`] wraps
-//! the daemon context to deny every call the grant does not cover. This is
-//! robustness/defense-in-depth, not a sandbox: a malicious plugin compiled
-//! into the binary is trusted native code. See `docs/plugin-security.md`.
+//! Capability enforcement: the registry grants a plugin the capabilities its
+//! manifest declares, and [`CapsContext`] wraps the daemon context to deny
+//! every call the grant does not cover. This is robustness/defense-in-depth,
+//! not a sandbox: a malicious plugin compiled into the binary is trusted
+//! native code and must be reviewed as part of the deployment trust boundary.
 use crate::contract::{Capability, ManifestError, PluginContext, PluginError};
 
 /// Bitmask of granted capabilities (one bit per [`Capability`] variant).

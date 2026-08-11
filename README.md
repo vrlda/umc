@@ -1,12 +1,83 @@
-# Universal Mesh Core (UMC)
+# Universal Mesh Core
 
-Universal Mesh Core is an open-source, identity-addressed networking runtime
-for building decentralized applications that operate across direct links,
-relays, local networks, the internet, and future transports without mandatory
-central infrastructure.
+Universal Mesh Core (UMC) is a lightweight, identity-addressed networking
+runtime for decentralized applications. It gives applications secure,
+portable communication across direct links, local networks, relays, and
+intermittent transports without requiring a central service.
 
-Reference implementation of the Universal Mesh Protocol (UMP/1).
-Specifications live in `spec/`. See `spec/decisions.md` for the accepted stack.
+UMC is the reusable core. Applications, browsers, websites, and VPN products
+build on it but remain separate projects.
+
+## What it provides
+
+- **Cryptographic identities and trust** — stable endpoint identities,
+  authenticated bindings, invitations, trust delegation, revocation, recovery
+  authorities, and bounded replay protection.
+- **Secure sessions** — authenticated handshakes, encrypted packet protection,
+  key updates, connection IDs, path validation, migration, and resumable
+  sessions.
+- **Multiple carriers** — TCP streams, TLS streams, UDP datagrams, and LAN
+  discovery through a small carrier interface that can be extended by plugins.
+- **Routing and relaying** — route discovery, bounded multi-hop paths,
+  relay circuits, onion-wrapped hop transitions, path diversity, loop and
+  duplicate suppression, and per-peer forwarding quotas.
+- **Disconnected operation** — local-first mesh routing, bounded route caches,
+  encrypted store-and-forward bundles, custody limits, expiry, and delayed
+  delivery when peers reconnect.
+- **Application transport** — registered application protocols, stream and
+  datagram dispatch, bounded flow control, typed delivery/path/session events,
+  pagination, deadlines, cancellation, and idempotent control requests.
+- **Node administration** — the `umcd` daemon, a versioned local Control API,
+  persistent configuration and state, diagnostics, event inspection, peer and
+  route management, and invitation lifecycle commands.
+- **Developer interfaces** — Rust daemon-backed and embedded SDKs, a stable C
+  ABI, a pure-stdlib asynchronous Python client, and the `umc` command-line
+  client.
+- **Resource and abuse controls** — bounded queues and caches, rate limits,
+  amplification protection, stream and packet size limits, trust-aware policy,
+  blocklists, and fail-closed malformed-input handling.
+
+## Components
+
+| Component | Purpose |
+| --- | --- |
+| `umcd` | Runs a UMC node and its carriers. |
+| `umc` | Controls and diagnoses a local node. |
+| Rust crates | Wire formats, cryptography, sessions, routing, relay, discovery, storage, SDK, and plugins. |
+| C SDK | Byte-oriented ABI for applications in C-compatible languages. |
+| Python binding | Async local Control API client. |
+| `examples/echo` | Minimal client/server example using the runtime. |
+
+## Quick start
+
+Build the workspace:
+
+```bash
+cargo build --workspace
+```
+
+Initialize a node and inspect its commands:
+
+```bash
+cargo run -p umc -- init
+cargo run -p umc -- --help
+cargo run -p umcd -- --help
+```
+
+The Rust SDK can run against a daemon or entirely in-process through its
+embedded backend. The C and Python interfaces speak the local Control API.
+
+## Platform status
+
+The Unix daemon uses a protected Unix-domain control socket. Windows builds
+compile the libraries and CLI, while named-pipe daemon control is not yet
+available. TCP, TLS, UDP, LAN, embedded transport, storage, routing, and
+security behavior are covered by the implementation and automated checks.
+
+UMC's privacy and topology mechanisms are bounded: it does not claim a global
+topology database, unrestricted multipath, anonymous credentials, or
+global-passive adversary protection. Deployments should review their threat
+model before treating the runtime as production-secure.
 
 ## License
 
@@ -16,30 +87,3 @@ Licensed under either of:
 - MIT License
 
 at your option.
-
-Specifications are licensed under Creative Commons Attribution 4.0 International.
-
-## Status
-
-- [x] Phase 0: foundations — workspace, wire parser, vectors, fuzzing, CI
-- [x] Phase 1: secure direct communication — crypto, handshake, session, TCP/UDP, echo
-- [x] Phase 2: node runtime — daemon, Control API, storage, config, diagnostics
-- [x] Phase 3: routing and relaying — route discovery, single relay, quotas
-- [x] Phase 4: mobility — paths, migration, connection IDs, key update, resumption
-- [x] Phase 5: local mesh — LAN discovery, local preference, disconnected tests
-- [x] Phase 6: store-and-forward — experimental bundles, one-hop delayed delivery
-- [x] Phase 7: adversarial resilience — enumeration, trust, rate limits, blocklist, abuse
-- [x] Phase 8: daemon loop — sessions, handshake responder, services, control API
-- [x] Phase 9: application layer — application registry, well-known protocol IDs, stream dispatch, echo application over live sessions
-- [x] Phase 10: SDK bindings — Rust daemon client and CLI surfaces; Python is stable and the C ABI is experimental
-- [x] Phase 11: plugin contract — manifest, registry, in-process lifecycle, and capability-based security model; process isolation remains deferred (see `docs/plugin-security.md`)
-- [x] Phase 12: protocol completion over sessions — relay, bundle store/forward, route requests, config persistence, key rotation, CLIENT_AUTH continuation, and two-daemon integration
-- [x] Phase 13: hardening — property tests, relay-frame fuzzing, resource limits, DoS-resilience tests, and the 22-case adversarial matrix
-- [x] Phase 14: conformance — wire errata, hostile-input bounds, stream-id reuse, relay status/sequence rules, identity binding, and control-connection caps
-
-The A–K gap-closure status is tracked in [`docs/PHASES.md`](docs/PHASES.md).
-The bounded UMP/1 migration, recovery, evidence, topology, and privacy
-mechanisms are implemented and verified. Global topology databases,
-unrestricted multipath, anonymous credentials/rendezvous, and
-global-passive anonymity remain outside this bounded profile; implemented
-mechanisms are not a claim of production security.

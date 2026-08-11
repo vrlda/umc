@@ -267,9 +267,9 @@ checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "cc"
-version = "1.4.0"
+version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5add81bb678e6cb321aff7fa0dc7689ad82b112dbc032cea19f91d6b8e3582b9"
+checksum = "5d262e149917187838d5b42777c8253bcb64500067342904e7d429499a6f277e"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -347,9 +347,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.5"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "301b56658598e48f3648647ac6fc887be7e7108eddfa4e9b63fcf3ec58c0cadf"
+checksum = "473c7e07f409a8d772161724aa8db6a765a2532a70f9667eeb7b49d3d02fbdca"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -357,9 +357,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.5"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94a65403d1a1bd28f7dc68eb8506e8874808ee5eecb59298de588e2e1407a078"
+checksum = "7b48fea5a88e9ae728a2dcbedbfc0e730f7d60da42e1cb049a83c9fb8b789889"
 dependencies = [
  "anstream",
  "anstyle",
@@ -758,9 +758,9 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.9"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+checksum = "26b73573e6edcd2af0cdf47bd6cb58f0b3839491263c314eaad1ccf24430e1de"
 
 [[package]]
 name = "fixedbitset"
@@ -782,21 +782,21 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "futures-core"
-version = "0.3.33"
+version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cd50c473c80f6d7c3670a752354b8e569b1a7cbfdc0419ec88e5edad85e0dc7"
+checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
 
 [[package]]
 name = "futures-task"
-version = "0.3.33"
+version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b231ed28831efb4a61a08580c4bc233ec56bc009f4cd8f52da2c3cb97df0c109"
+checksum = "cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd"
 
 [[package]]
 name = "futures-util"
-version = "0.3.33"
+version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a77a90a256fce34da66415271e30f94ee91c57b04b8a2c042d9cf3220179deaa"
+checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
  "futures-core",
  "futures-task",
@@ -1226,168 +1226,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "phase1-tests"
-version = "0.1.0"
-dependencies = [
- "tokio",
- "umc-carrier",
- "umc-carrier-tcp",
- "umc-carrier-udp",
- "umc-core",
- "umc-crypto",
- "umc-handshake",
- "umc-session",
- "umc-types",
- "umc-wire",
-]
-
-[[package]]
-name = "phase12-tests"
-version = "0.1.0"
-dependencies = [
- "prost",
- "serde_json",
- "tokio",
- "umc-carrier",
- "umc-carrier-tcp",
- "umc-control",
- "umc-core",
- "umc-crypto",
- "umc-handshake",
- "umc-sdk",
- "umc-session",
- "umc-storage",
- "umc-types",
- "umc-wire",
-]
-
-[[package]]
-name = "phase13-tests"
-version = "0.1.0"
-dependencies = [
- "umc-bundle",
- "umc-control",
- "umc-core",
- "umc-crypto",
- "umc-handshake",
- "umc-metrics",
- "umc-plugin",
- "umc-relay",
- "umc-routing",
- "umc-session",
- "umc-types",
- "umc-wire",
-]
-
-[[package]]
-name = "phase14-tests"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "umc-handshake",
- "umc-relay",
- "umc-session",
- "umc-types",
- "umc-wire",
-]
-
-[[package]]
-name = "phase2-tests"
-version = "0.1.0"
-dependencies = [
- "tokio",
- "umc-sdk",
-]
-
-[[package]]
-name = "phase3-tests"
-version = "0.1.0"
-dependencies = [
- "umc-discovery",
- "umc-relay",
- "umc-routing",
- "umc-types",
- "umc-wire",
-]
-
-[[package]]
-name = "phase4-tests"
-version = "0.1.0"
-dependencies = [
- "tokio",
- "umc-crypto",
- "umc-handshake",
- "umc-session",
- "umc-types",
-]
-
-[[package]]
-name = "phase5-tests"
-version = "0.1.0"
-dependencies = [
- "umc-carrier-lan",
- "umc-core",
- "umc-discovery",
- "umc-routing",
- "umc-types",
-]
-
-[[package]]
-name = "phase6-tests"
-version = "0.1.0"
-dependencies = [
- "umc-bundle",
- "umc-crypto",
- "umc-storage",
- "umc-types",
-]
-
-[[package]]
-name = "phase7-tests"
-version = "0.1.0"
-dependencies = [
- "umc-core",
- "umc-discovery",
- "umc-storage",
- "umc-types",
-]
-
-[[package]]
-name = "phase8-tests"
-version = "0.1.0"
-dependencies = [
- "prost",
- "serde_json",
- "tokio",
- "umc-carrier",
- "umc-carrier-tcp",
- "umc-carrier-udp",
- "umc-control",
- "umc-core",
- "umc-crypto",
- "umc-handshake",
- "umc-sdk",
- "umc-types",
- "umc-wire",
-]
-
-[[package]]
-name = "phase9-tests"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "tokio",
- "umc-carrier",
- "umc-carrier-tcp",
- "umc-core",
- "umc-crypto",
- "umc-handshake",
- "umc-session",
- "umc-types",
- "umc-wire",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1450,9 +1288,9 @@ dependencies = [
 
 [[package]]
 name = "portable-atomic"
-version = "1.14.0"
+version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d20d5497ef88037a52ff98267d066e7f11fcc5e99bbfbd58a42336193aacec3"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
 name = "portable-atomic-util"
@@ -1664,9 +1502,9 @@ dependencies = [
 
 [[package]]
 name = "rcgen"
-version = "0.14.8"
+version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57f6d249aad744e274e682777a50283a225a32705394ee6d5fcc01efa25e4055"
+checksum = "091e7a8e7d86e6feb87a27ce8e2cba29d49eff9507afeebefab7eeb2ca667fb4"
 dependencies = [
  "pem",
  "ring",
@@ -1790,9 +1628,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "0527518605e68109d875e248ea259b6758801cf165e4b2c2733ae3b51f12535a"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -2353,15 +2191,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "umc-simulation"
-version = "0.1.0"
-dependencies = [
- "umc-session",
- "umc-types",
- "umc-wire",
-]
-
-[[package]]
 name = "umc-storage"
 version = "0.1.0"
 dependencies = [
@@ -2778,18 +2607,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.55"
+version = "0.8.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5a105cd7b140f6eeec8acff2ea38135d3cab283ada58540f629fe51e46696eb"
+checksum = "556764e583adb45a9f8d413c2a147fa7e8d821e48e12b14fd560b607998b75eb"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.55"
+version = "0.8.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fe976fb70c78cd64cccfe3a6fc142244e8a77b70959b30faf9d0ac37ee228eb"
+checksum = "f2ab42fc20575779bd240faa45f94a74256f755c0fa9e89f0ede20d91d0cdfc1"
 dependencies = [
  "proc-macro2",
  "quote",

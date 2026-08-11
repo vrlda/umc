@@ -25,19 +25,6 @@ members = [
     "carriers/umc-carrier-udp",
     "carriers/umc-carrier-lan",
     "examples/echo",
-    "tests/phase1",
-    "tests/phase2",
-    "tests/phase3",
-    "tests/phase4",
-    "tests/phase5",
-    "tests/phase6",
-    "tests/phase7",
-    "tests/phase8",
-    "tests/phase9",
-    "tests/phase12",
-    "tests/phase13",
-    "tests/phase14",
-    "tests/simulation",
 ]
 
 [workspace.package]

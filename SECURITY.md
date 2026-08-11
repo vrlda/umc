@@ -2,8 +2,7 @@
 
 **Universal Mesh Core (UMC) / Universal Mesh Protocol (UMP)**
 
-This file is the public entry point for security reporting and handling. The full process, authority, timelines, and procedures are defined in [spec/security-operations.md](spec/security-operations.md).
-The release-facing gate tracker is [docs/SECURITY-GATES.md](docs/SECURITY-GATES.md).
+This file is the public entry point for security reporting and handling.
 
 ## Reporting a vulnerability
 
@@ -68,9 +67,3 @@ Releases are published with:
 - SHA256SUMS and SBOM
 
 Verify artifacts before installation. Revocation data is distributed through multiple channels.
-
-## Related documents
-
-- Threat model: [spec/threat-model.md](spec/threat-model.md)
-- Security operations: [spec/security-operations.md](spec/security-operations.md)
-- Release signing and governance: [spec/decisions.md](spec/decisions.md)
