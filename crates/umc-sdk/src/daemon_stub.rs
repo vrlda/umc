@@ -21,12 +21,20 @@ pub struct DaemonClient;
 
 impl DaemonClient {
     /// Returns an explicit unsupported error until named-pipe transport is implemented.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`ClientError::Unsupported`] on non-Unix platforms.
     pub async fn connect(socket: &str, client_name: &str) -> Result<Self, ClientError> {
         let _ = (socket, client_name);
         std::future::ready(Err(ClientError::Unsupported(UNSUPPORTED.into()))).await
     }
 
     /// Returns an explicit unsupported error until named-pipe transport is implemented.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`ClientError::Unsupported`] on non-Unix platforms.
     pub async fn request_raw(
         &mut self,
         service: &str,
@@ -38,6 +46,10 @@ impl DaemonClient {
     }
 
     /// Returns an explicit unsupported error until named-pipe transport is implemented.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`ClientError::Unsupported`] on non-Unix platforms.
     pub async fn request_raw_with_deadline(
         &mut self,
         service: &str,
