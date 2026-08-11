@@ -137,7 +137,7 @@ fn spawn_daemon(name: &str, tcp_port: u16, udp_port: u16) -> (Daemon, PathBuf) {
     let log = fs::File::create(dir.join("umcd.log")).expect("log file");
     let child = Command::new(umcd_binary())
         .args(["--config", config_path.to_str().expect("config path")])
-        .env("RUST_LOG", "debug")
+        .env("RUST_LOG", "info")
         .stdout(Stdio::from(log.try_clone().expect("clone log")))
         .stderr(Stdio::from(log))
         .spawn()

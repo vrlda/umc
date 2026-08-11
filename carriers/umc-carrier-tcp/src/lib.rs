@@ -116,6 +116,16 @@ impl Listener for TcpListenerAdapter {
                 message: error.to_string(),
             }
         })?;
+        // Accepted sockets do not consistently inherit the listener's
+        // nonblocking flag across platforms (Linux returns a blocking
+        // socket). Tokio rejects blocking descriptors in `from_std`, so
+        // normalize the accepted stream before handing it to Tokio.
+        stream.set_nonblocking(true).map_err(|error| CarrierError {
+            kind: CarrierErrorKind::Internal,
+            operation: "accept",
+            retryable: false,
+            message: error.to_string(),
+        })?;
         let stream = TcpStream::from_std(stream).map_err(|error| CarrierError {
             kind: CarrierErrorKind::Internal,
             operation: "accept",
@@ -339,6 +349,37 @@ mod tests {
                 panic!("closed listener accepted a link")
             };
             assert_eq!(error.kind, CarrierErrorKind::NotRunning);
+        });
+    }
+
+    #[test]
+    fn accepted_stream_is_registered_as_nonblocking() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+            std_listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let address = std_listener.local_addr().expect("listener address");
+            let adapter = TcpListenerAdapter {
+                std_inner: Arc::new(std_listener),
+                closed: Arc::new(AtomicBool::new(false)),
+            };
+            let _client = std::net::TcpStream::connect(address).expect("client connect");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                match adapter.accept() {
+                    Ok(_link) => break,
+                    Err(error) if error.kind == CarrierErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "accept timed out");
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept failed: {error:?}"),
+                }
+            }
         });
     }
 
