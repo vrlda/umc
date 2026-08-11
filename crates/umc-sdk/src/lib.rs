@@ -2,6 +2,10 @@ pub mod app;
 pub mod backpressure;
 pub mod client;
 pub mod config;
+#[cfg(unix)]
+pub mod daemon;
+#[cfg(not(unix))]
+#[path = "daemon_stub.rs"]
 pub mod daemon;
 pub mod embedded;
 mod embedded_transport;
