@@ -26,6 +26,9 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           version: "28.3"
+      - name: Install Linux keychain build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes pkg-config libdbus-1-dev
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all --check
@@ -83,6 +86,8 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           version: "28.3"
+      - name: Install Linux keychain build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes pkg-config libdbus-1-dev
       - uses: Swatinem/rust-cache@v2
       - name: Install independent peer dependencies
         run: python -m pip install --disable-pip-version-check -r interop/python/requirements.txt
@@ -110,6 +115,8 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           version: "28.3"
+      - name: Install Linux keychain build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes pkg-config libdbus-1-dev
       - uses: Swatinem/rust-cache@v2
       - name: Capture native platform evidence
         run: bash scripts/platform-evidence.sh aarch64-platform-evidence.json
@@ -161,6 +168,8 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           version: "28.3"
+      - name: Install Linux keychain build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes pkg-config libdbus-1-dev
       - uses: Swatinem/rust-cache@v2
       - name: Run benchmarks and ten-minute soak
         run: bash scripts/release-baseline.sh release-baseline
@@ -183,6 +192,8 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           version: "28.3"
+      - name: Install Linux keychain build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes pkg-config libdbus-1-dev
       - uses: Swatinem/rust-cache@v2
       - name: Run offline security operations drills
         run: bash scripts/security-operations-drill.sh security-operations-drill

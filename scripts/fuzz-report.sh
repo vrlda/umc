@@ -64,15 +64,19 @@ fi
 for target in "${targets[@]}"; do
     log="$output_dir/$target.log"
     resource_log="$output_dir/$target-resource.txt"
+    run_corpus=$(mktemp -d)
+    cp -a "$repo_root/fuzz/corpus/$target/." "$run_corpus/"
     if ! (
         cd "$repo_root/fuzz"
-        /usr/bin/time "${time_args[@]}" cargo fuzz run "$target" "corpus/$target" \
+        /usr/bin/time "${time_args[@]}" cargo fuzz run "$target" "$run_corpus" \
             --sanitizer none -- -runs="$runs" >"$log" 2>"$resource_log"
     ); then
         cat "$log" >&2
         cat "$resource_log" >&2
+        rm -rf "$run_corpus"
         exit 1
     fi
+    rm -rf "$run_corpus"
 done
 
 export UMC_FUZZ_OUTPUT="$output_dir"

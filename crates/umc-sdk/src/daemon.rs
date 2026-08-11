@@ -424,7 +424,7 @@ pub(crate) fn encode_request_with_deadline(
     Ok(bytes)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
