@@ -1,6 +1,7 @@
 //! Deterministic end-to-end XX handshake.
 use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
-use umc_handshake::xx::run_xx_handshake;
+use umc_handshake::identity::IdentityBinding;
+use umc_handshake::xx::{build_client_auth_plaintext, run_xx_handshake};
 use umc_types::runtime::EntropySource;
 
 struct TestEntropy;
@@ -68,5 +69,54 @@ fn xx_handshake_binds_carrier() {
     assert_ne!(
         a.client, b.client,
         "carrier binding must change the transcript"
+    );
+}
+
+#[test]
+fn client_auth_plaintext_carries_client_binding() {
+    let client_identity = IdentityKeyPair::generate();
+    let client_static = StaticHandshakeKeyPair::generate();
+    let server_identity = IdentityKeyPair::generate();
+    let server_static = StaticHandshakeKeyPair::generate();
+    let client_binding = IdentityBinding::sign(
+        &client_identity,
+        &client_static.public(),
+        0,
+        u64::MAX,
+        0,
+        [0u8; 32],
+    );
+    let server_binding = IdentityBinding::sign(
+        &server_identity,
+        &server_static.public(),
+        0,
+        u64::MAX,
+        0,
+        [0u8; 32],
+    );
+    let client_signature = [0xA5u8; 64];
+    let plaintext = build_client_auth_plaintext(
+        &client_static.public().0,
+        &client_binding,
+        &client_signature,
+    );
+
+    assert_eq!(&plaintext[..32], &client_static.public().0);
+    assert_eq!(
+        &plaintext[32..32 + client_binding.signed_bytes().len()],
+        client_binding.signed_bytes()
+    );
+    assert_ne!(
+        &plaintext[32..32 + client_binding.signed_bytes().len()],
+        server_binding.signed_bytes().as_slice()
+    );
+    let binding_signature_offset = 32 + client_binding.signed_bytes().len();
+    assert_eq!(
+        &plaintext[binding_signature_offset..binding_signature_offset + 64],
+        client_binding.signature
+    );
+    assert_eq!(
+        &plaintext[binding_signature_offset + 64..],
+        client_signature
     );
 }

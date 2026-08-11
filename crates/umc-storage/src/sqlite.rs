@@ -3,8 +3,10 @@ use crate::store::{Entry, Namespace, Store, StoreError};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 pub const SCHEMA_VERSION: i64 = 2;
+pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 
 #[allow(missing_debug_implementations)] // rusqlite::Connection has no Debug impl
 pub struct SqliteStore {
@@ -28,6 +30,10 @@ impl SqliteStore {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| StoreError::Corrupt(e.to_string()))?;
         conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        conn.pragma_update(None, "synchronous", "FULL")
             .map_err(|e| StoreError::Corrupt(e.to_string()))?;
         let store = Self {
             conn: Mutex::new(conn),
@@ -305,6 +311,27 @@ mod tests {
         assert_eq!(
             store.get(Namespace::Route, b"k").unwrap(),
             Some(b"route".to_vec())
+        );
+    }
+
+    #[test]
+    fn critical_sqlite_pragmas_are_configured() {
+        let store = open_temp();
+        let conn = store.connection().lock().unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(synchronous, 2, "SQLite FULL synchronous mode is 2");
+        assert_eq!(
+            busy_timeout,
+            i64::try_from(SQLITE_BUSY_TIMEOUT_MS).unwrap_or(i64::MAX)
         );
     }
 }

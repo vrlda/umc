@@ -8,23 +8,73 @@ pub enum Profile {
     Relay,
 }
 
+/// Hard resource defaults shared by the daemon's profile enforcement points.
+/// The storage quota and live-session/relay admission limits are kept in one
+/// table so a profile cannot silently drift between subsystems.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceProfileLimits {
+    pub managed_memory_bytes: u64,
+    pub operational_storage_bytes: u64,
+    pub bundle_storage_bytes: u64,
+    pub active_sessions: usize,
+    pub active_relay_circuits: usize,
+}
+
 impl Profile {
     #[must_use]
-    pub fn operational_storage_bytes(self) -> u64 {
+    pub const fn limits(self) -> ResourceProfileLimits {
         match self {
-            Profile::Constrained => 512 * 1024 * 1024,
-            Profile::Standard => 4 * 1024 * 1024 * 1024,
-            Profile::Relay => 16 * 1024 * 1024 * 1024,
+            Profile::Constrained => ResourceProfileLimits {
+                managed_memory_bytes: 128 * 1024 * 1024,
+                operational_storage_bytes: 512 * 1024 * 1024,
+                bundle_storage_bytes: 0,
+                active_sessions: 128,
+                active_relay_circuits: 256,
+            },
+            Profile::Standard => ResourceProfileLimits {
+                managed_memory_bytes: 512 * 1024 * 1024,
+                operational_storage_bytes: 4 * 1024 * 1024 * 1024,
+                bundle_storage_bytes: 1024 * 1024 * 1024,
+                active_sessions: 1_024,
+                active_relay_circuits: 4_096,
+            },
+            Profile::Relay => ResourceProfileLimits {
+                managed_memory_bytes: 2 * 1024 * 1024 * 1024,
+                operational_storage_bytes: 16 * 1024 * 1024 * 1024,
+                bundle_storage_bytes: 10 * 1024 * 1024 * 1024,
+                active_sessions: 8_192,
+                active_relay_circuits: 16_384,
+            },
         }
     }
 
     #[must_use]
-    pub fn bundle_storage_bytes(self) -> u64 {
-        match self {
-            Profile::Constrained => 0,
-            Profile::Standard => 1024 * 1024 * 1024,
-            Profile::Relay => 10_737_418_240,
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "constrained" => Some(Self::Constrained),
+            "standard" => Some(Self::Standard),
+            "relay" => Some(Self::Relay),
+            _ => None,
         }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Constrained => "constrained",
+            Self::Standard => "standard",
+            Self::Relay => "relay",
+        }
+    }
+
+    #[must_use]
+    pub const fn operational_storage_bytes(self) -> u64 {
+        self.limits().operational_storage_bytes
+    }
+
+    #[must_use]
+    pub const fn bundle_storage_bytes(self) -> u64 {
+        self.limits().bundle_storage_bytes
     }
 }
 
@@ -93,6 +143,24 @@ mod tests {
         );
         assert_eq!(Profile::Standard.bundle_storage_bytes(), 1024 * 1024 * 1024);
         assert_eq!(Profile::Constrained.bundle_storage_bytes(), 0);
+    }
+
+    #[test]
+    fn profile_limits_match_resource_profile_matrix() {
+        let constrained = Profile::Constrained.limits();
+        assert_eq!(constrained.managed_memory_bytes, 128 * 1024 * 1024);
+        assert_eq!(constrained.active_sessions, 128);
+        assert_eq!(constrained.active_relay_circuits, 256);
+
+        let standard = Profile::Standard.limits();
+        assert_eq!(standard.managed_memory_bytes, 512 * 1024 * 1024);
+        assert_eq!(standard.active_sessions, 1_024);
+        assert_eq!(standard.active_relay_circuits, 4_096);
+
+        let relay = Profile::Relay.limits();
+        assert_eq!(relay.managed_memory_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(relay.active_sessions, 8_192);
+        assert_eq!(relay.active_relay_circuits, 16_384);
     }
 
     #[test]

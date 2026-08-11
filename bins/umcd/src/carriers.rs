@@ -37,12 +37,16 @@ pub fn wire_carriers(state: &mut RuntimeState) {
             other => log::warn!("[carrier] {other} not built in"),
         }
     }
+    crate::control_carriers::register_static_instances(state);
 }
 
 fn bind_tls(state: &mut RuntimeState, bind: Option<String>) {
-    let Ok(carrier) = TlsCarrier::new() else {
-        log::error!("[carrier] ump.tls-stream/1 configuration failed");
-        return;
+    let carrier = match configured_tls_carrier(&state.config) {
+        Ok(carrier) => carrier,
+        Err(error) => {
+            log::error!("[carrier] ump.tls-stream/1 configuration failed: {error}");
+            return;
+        }
     };
     state.node.register_carrier(Box::new(carrier.clone()));
     let Some(addr) = bind else {
@@ -60,6 +64,52 @@ fn bind_tls(state: &mut RuntimeState, bind: Option<String>) {
         }
         Err(e) => log::error!("[carrier] ump.tls-stream/1 failed to listen on {addr}: {e:?}"),
     }
+}
+
+fn configured_tls_carrier(config: &crate::config::NodeConfig) -> Result<TlsCarrier, String> {
+    let has_provisioned_material = config.tls_certificate.is_some()
+        || config.tls_private_key.is_some()
+        || !config.tls_trust_roots.is_empty()
+        || config.tls_server_name != "localhost";
+    if !has_provisioned_material {
+        return TlsCarrier::new().map_err(|error| format!("{error:?}"));
+    }
+    let certificate_path = config
+        .resolved_tls_certificate()
+        .ok_or_else(|| "tls_certificate is required with provisioned TLS material".to_string())?;
+    let private_key_path = config
+        .resolved_tls_private_key()
+        .ok_or_else(|| "tls_private_key is required with provisioned TLS material".to_string())?;
+    let root_paths = config.resolved_tls_trust_roots();
+    if root_paths.is_empty() {
+        return Err("tls_trust_roots must contain at least one DER root".into());
+    }
+    let certificate = std::fs::read(&certificate_path).map_err(|error| {
+        format!(
+            "read TLS certificate {}: {error}",
+            certificate_path.display()
+        )
+    })?;
+    let private_key = std::fs::read(&private_key_path).map_err(|error| {
+        format!(
+            "read TLS private key {}: {error}",
+            private_key_path.display()
+        )
+    })?;
+    let mut roots = Vec::with_capacity(root_paths.len());
+    for root_path in root_paths {
+        roots
+            .push(std::fs::read(&root_path).map_err(|error| {
+                format!("read TLS trust root {}: {error}", root_path.display())
+            })?);
+    }
+    TlsCarrier::from_der(
+        certificate,
+        private_key,
+        roots,
+        config.tls_server_name.clone(),
+    )
+    .map_err(|error| format!("{error:?}"))
 }
 
 fn bind_tcp(state: &mut RuntimeState, bind: Option<String>) {
@@ -113,6 +163,23 @@ mod tests {
     use crate::config::NodeConfig;
     use tokio::sync::mpsc;
 
+    #[test]
+    fn provisioned_tls_configuration_requires_all_material() {
+        let config = NodeConfig {
+            tls_certificate: Some("/tmp/server.der".into()),
+            ..NodeConfig::default()
+        };
+        let error = configured_tls_carrier(&config).expect_err("incomplete TLS material");
+        assert!(error.contains("tls_private_key"));
+        let config = NodeConfig {
+            tls_certificate: Some("/tmp/server.der".into()),
+            tls_private_key: Some("/tmp/server.key".into()),
+            ..NodeConfig::default()
+        };
+        let error = configured_tls_carrier(&config).expect_err("missing TLS roots");
+        assert!(error.contains("tls_trust_roots"));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn wires_configured_carriers_and_binds() {
         let dir = std::env::temp_dir().join(format!("umcd-carriers-{}", std::process::id()));
@@ -129,6 +196,12 @@ mod tests {
         assert_eq!(state.listeners.len(), 2);
         assert!(state.node.carrier("ump.tcp/1").is_some());
         assert!(state.node.carrier("ump.udp/1").is_some());
+        assert_eq!(state.carrier_instances.len(), 2);
+        assert!(state
+            .carrier_instances
+            .values()
+            .all(|instance| instance.state
+                == umc_control::proto::umc::api::v1::CarrierInstanceState::Running as i32));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -149,5 +222,15 @@ mod tests {
         assert_eq!(state.listeners.len(), 1);
         assert!(state.node.carrier("ump.tcp/1").is_none());
         assert!(state.node.carrier("ump.udp/1").is_some());
+        assert_eq!(state.carrier_instances.len(), 1);
+        assert_eq!(
+            state
+                .carrier_instances
+                .values()
+                .next()
+                .expect("udp instance")
+                .type_id,
+            "ump.udp/1"
+        );
     }
 }

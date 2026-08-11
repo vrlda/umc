@@ -393,11 +393,10 @@ pub fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, FrameError> {
                     _ => return Err(FrameError::UnknownCriticalFrame(ty)),
                 }
             }
-            ExtensionBehavior::CriticalLengthDelimited
-            | ExtensionBehavior::OptionalLengthDelimited => {
-                // Known length-delimited frames decode with their declared
-                // length; unknown ones are self-delimiting and skipped
-                // (wire-format §80).
+            ExtensionBehavior::CriticalLengthDelimited => {
+                // Known critical length-delimited frames decode with their
+                // declared length. An unknown critical extension must abort
+                // the packet rather than being silently ignored.
                 if ty == FrameType::RELAY_STATUS {
                     let (f, used) =
                         crate::frames::relay::RelayStatusFrame::decode_length_delimited(
@@ -406,14 +405,19 @@ pub fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, FrameError> {
                     pos += used;
                     out.push(Frame::RelayStatus(f));
                 } else {
-                    let (len, used) =
-                        crate::varint::decode(&payload[pos..]).map_err(FrameError::Varint)?;
-                    pos += used;
-                    let len = usize::try_from(len).map_err(|_| FrameError::LengthExceedsLimit)?;
-                    pos = pos.checked_add(len).ok_or(FrameError::LengthExceedsLimit)?;
-                    if pos > payload.len() {
-                        return Err(FrameError::Truncated);
-                    }
+                    return Err(FrameError::UnknownCriticalFrame(ty));
+                }
+            }
+            ExtensionBehavior::OptionalLengthDelimited => {
+                // Unknown optional length-delimited frames are self-delimiting
+                // and can be skipped without changing the rest of the packet.
+                let (len, used) =
+                    crate::varint::decode(&payload[pos..]).map_err(FrameError::Varint)?;
+                pos += used;
+                let len = usize::try_from(len).map_err(|_| FrameError::LengthExceedsLimit)?;
+                pos = pos.checked_add(len).ok_or(FrameError::LengthExceedsLimit)?;
+                if pos > payload.len() {
+                    return Err(FrameError::Truncated);
                 }
             }
         }
@@ -491,6 +495,31 @@ mod tests {
         assert_eq!(
             decode_frames(&[0x01]),
             Err(FrameError::UnknownOptionalFixedFrame(FrameType(0x01)))
+        );
+    }
+
+    #[test]
+    fn unknown_critical_length_delimited_is_rejected() {
+        // Type 0x02 is an unknown critical length-delimited extension.
+        assert_eq!(
+            decode_frames(&[0x02, 0x01, 0xAA]),
+            Err(FrameError::UnknownCriticalFrame(FrameType(0x02)))
+        );
+    }
+
+    #[test]
+    fn unknown_optional_length_delimited_is_skipped() {
+        // Type 0x0F is optional length-delimited; its two-byte body is
+        // skipped and the following PING remains visible.
+        let payload = [0x0F, 0x02, 0xAA, 0xBB, 0x04];
+        assert_eq!(decode_frames(&payload).unwrap(), vec![Frame::Ping]);
+    }
+
+    #[test]
+    fn truncated_optional_length_delimited_is_rejected() {
+        assert_eq!(
+            decode_frames(&[0x0F, 0x05, 0xAA]),
+            Err(FrameError::Truncated)
         );
     }
 }

@@ -36,6 +36,7 @@ members = [
     "tests/phase9",
     "tests/phase12",
     "tests/phase13",
+    "tests/phase14",
     "tests/simulation",
 ]
 

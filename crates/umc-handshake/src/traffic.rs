@@ -12,6 +12,55 @@ pub struct SessionSecrets {
     pub stateless_reset: [u8; 32],
 }
 
+/// Directional Handshake traffic secrets (handshake.md §25).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandshakeTrafficSecrets {
+    pub client: [u8; 32],
+    pub server: [u8; 32],
+}
+
+/// Derives the client and server Handshake traffic secrets as a tuple.
+///
+/// This compatibility-shaped helper mirrors the notation in handshake.md
+/// §25; [`derive_handshake_traffic_secrets`] is the typed equivalent.
+#[must_use]
+pub fn derive_handshake_traffic(
+    handshake_secret3: &[u8; 32],
+    transcript: &[u8; 32],
+) -> ([u8; 32], [u8; 32]) {
+    let secrets = derive_handshake_traffic_secrets(handshake_secret3, transcript);
+    (secrets.client, secrets.server)
+}
+
+/// Derive both directional Handshake traffic secrets from `HandshakeSecret3`
+/// and the transcript through `SERVER_HELLO`.
+#[must_use]
+pub fn derive_handshake_traffic_secrets(
+    handshake_secret3: &[u8; 32],
+    transcript_hash: &[u8; 32],
+) -> HandshakeTrafficSecrets {
+    HandshakeTrafficSecrets {
+        client: derive_handshake_traffic_secret(handshake_secret3, transcript_hash, true),
+        server: derive_handshake_traffic_secret(handshake_secret3, transcript_hash, false),
+    }
+}
+
+/// Derive one directional Handshake traffic secret. `client_direction` is
+/// true for packets sent by the initiator and false for responder packets.
+#[must_use]
+pub fn derive_handshake_traffic_secret(
+    handshake_secret3: &[u8; 32],
+    transcript_hash: &[u8; 32],
+    client_direction: bool,
+) -> [u8; 32] {
+    let label = if client_direction {
+        b"client handshake traffic".as_slice()
+    } else {
+        b"server handshake traffic".as_slice()
+    };
+    expand(handshake_secret3, label, transcript_hash)
+}
+
 /// Derives the session traffic secrets for both endpoints (handshake.md §26).
 ///
 /// The handshake secret and final transcript are bound into a master secret
@@ -91,5 +140,25 @@ mod tests {
         let a = derive_session_secrets(&[1u8; 32], &tr);
         let b = derive_session_secrets(&[4u8; 32], &tr);
         assert_ne!(a.client, b.client);
+    }
+
+    #[test]
+    fn handshake_traffic_secrets_are_directional_and_transcript_bound() {
+        let secret = [7u8; 32];
+        let transcript = [8u8; 32];
+        let pair = derive_handshake_traffic_secrets(&secret, &transcript);
+        assert_ne!(pair.client, pair.server);
+        assert_eq!(
+            pair.client,
+            derive_handshake_traffic_secret(&secret, &transcript, true)
+        );
+        assert_eq!(
+            pair.server,
+            derive_handshake_traffic_secret(&secret, &transcript, false)
+        );
+        assert_ne!(
+            pair.client,
+            derive_handshake_traffic_secret(&secret, &[9u8; 32], true)
+        );
     }
 }

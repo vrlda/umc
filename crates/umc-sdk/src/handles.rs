@@ -16,6 +16,10 @@ pub enum HandleKind {
     Operation,
 }
 
+pub(crate) trait GenerationBound {
+    fn validate_backend_generation(&self, expected: u64) -> Result<(), ClientError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OpaqueValue {
     bytes: Vec<u8>,
@@ -85,10 +89,11 @@ macro_rules! opaque_handle {
                 self.0.validate_generation(expected)
             }
 
-            pub(crate) fn from_proto(
+            pub(crate) fn from_proto_with_generation(
                 value: &umc_control::proto::umc::api::v1::OpaqueHandle,
+                generation: u64,
             ) -> Self {
-                Self::new(value.value.clone())
+                Self::with_generation(value.value.clone(), generation)
             }
 
             #[allow(dead_code)]
@@ -96,6 +101,12 @@ macro_rules! opaque_handle {
                 umc_control::proto::umc::api::v1::OpaqueHandle {
                     value: self.as_bytes().to_vec(),
                 }
+            }
+        }
+
+        impl GenerationBound for $name {
+            fn validate_backend_generation(&self, expected: u64) -> Result<(), ClientError> {
+                self.validate_generation(expected)
             }
         }
     };
@@ -106,3 +117,28 @@ opaque_handle!(AppHandle, HandleKind::Application);
 opaque_handle!(ListenerHandle, HandleKind::Listener);
 opaque_handle!(SessionHandle, HandleKind::Session);
 opaque_handle!(StreamHandle, HandleKind::Stream);
+opaque_handle!(SubscriptionHandle, HandleKind::Subscription);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use umc_control::proto::umc::api::v1::OpaqueHandle;
+
+    #[test]
+    fn proto_handles_preserve_backend_generation() {
+        let handle = OpaqueHandle {
+            value: b"session".to_vec(),
+        };
+        let decoded = SessionHandle::from_proto_with_generation(&handle, 42);
+        assert_eq!(decoded.as_bytes(), b"session");
+        assert_eq!(decoded.generation(), 42);
+        assert!(decoded.validate_generation(42).is_ok());
+        assert!(matches!(
+            decoded.validate_generation(7),
+            Err(ClientError::HandleGenerationMismatch {
+                expected: 7,
+                actual: 42
+            })
+        ));
+    }
+}

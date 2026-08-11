@@ -244,9 +244,12 @@ impl RelayStatusFrame {
     pub fn decode_length_delimited(payload: &[u8]) -> Result<(Self, usize), FrameError> {
         let (len, used) = crate::varint::decode(payload).map_err(FrameError::Varint)?;
         let len = usize::try_from(len).map_err(|_| FrameError::LengthExceedsLimit)?;
-        let body = payload.get(used..used + len).ok_or(FrameError::Truncated)?;
+        let end = used
+            .checked_add(len)
+            .ok_or(FrameError::LengthExceedsLimit)?;
+        let body = payload.get(used..end).ok_or(FrameError::Truncated)?;
         let (frame, _) = Self::decode(body)?;
-        Ok((frame, used + len))
+        Ok((frame, end))
     }
 }
 
@@ -461,6 +464,15 @@ mod tests {
                 .unwrap();
         assert_eq!(dec, f);
         assert_eq!(used + type_len(FrameType::RELAY_STATUS.0), enc.len());
+    }
+
+    #[test]
+    fn relay_status_rejects_length_that_overflows_slice_bounds() {
+        let encoded_length = crate::varint::encode(crate::varint::MAX_VARINT).unwrap();
+        assert_eq!(
+            RelayStatusFrame::decode_length_delimited(&encoded_length),
+            Err(FrameError::Truncated)
+        );
     }
 
     #[test]

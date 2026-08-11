@@ -3,17 +3,19 @@
 **Universal Mesh Core (UMC) / Universal Mesh Protocol (UMP)**
 
 This file is the public entry point for security reporting and handling. The full process, authority, timelines, and procedures are defined in [spec/security-operations.md](spec/security-operations.md).
+The release-facing gate tracker is [docs/SECURITY-GATES.md](docs/SECURITY-GATES.md).
 
 ## Reporting a vulnerability
 
 Do NOT open a public issue for security vulnerabilities.
 
-Report privately to the security team. The production reporting channel has
-not yet been assigned; its owner must replace `TBD-contact` before a public
-release:
+Report privately through GitHub's private vulnerability reporting flow. Open
+the repository's **Security** tab, choose **Advisories**, and select **Report a
+vulnerability**. This routes the report to the project owner without exposing
+it in the public issue tracker:
 
-- **Contact:** `TBD-contact`
-- **Signing:** reports containing sensitive detail SHOULD be signed with the published security key
+- **Contact:** [GitHub private vulnerability report](https://github.com/varpn/openmesh/security/advisories/new)
+- **Signing:** reports containing sensitive detail MAY be signed with the published operator key
 - **Response target:** acknowledgment within 3 business days; severity assessment within 7 days; a fix, mitigation, or agreed disclosure plan within the 90-day SLA
 
 Include:
@@ -29,7 +31,7 @@ Disclosure constraints
 
 ## Handling
 
-The security team triages reports using the severity classes in the threat model:
+The project owner triages reports using the severity classes in the threat model:
 
 | Severity | Meaning |
 | --- | --- |
@@ -51,7 +53,6 @@ Security fixes are supported for Tier-1 platforms:
 
 ```text
 Linux x86_64
-Linux aarch64
 macOS arm64
 Windows x86_64
 ```
@@ -62,7 +63,7 @@ Tier-2 fixes are best-effort. Nightly and beta releases receive no security-supp
 
 Releases are published with:
 
-- Threshold maintainer signatures on release manifests
+- One operator Ed25519 signature on each release manifest
 - Sigstore-compatible provenance
 - SHA256SUMS and SBOM
 

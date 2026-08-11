@@ -4,6 +4,43 @@ use umc_wire::header::{HeaderByte, ShortPacketSpace};
 
 pub const DEFAULT_PATH_ID: u64 = 0;
 
+/// Read the routing-visible portion of a protected short header without
+/// decrypting it. Header protection masks only key phase and packet number;
+/// fixed-size DCID and path id remain available so a daemon can attach an
+/// established-session packet to the correct session before it has the
+/// session's traffic keys in hand.
+///
+/// This helper deliberately returns no packet number or payload. Callers
+/// MUST still authenticate the complete packet with
+/// [`parse_protected_packet`] before accepting it.
+///
+/// # Errors
+///
+/// Returns a packet/header error when the buffer is truncated or is not a
+/// protected short-header packet.
+pub fn peek_protected_header(
+    bytes: &[u8],
+) -> Result<(ShortPacketSpace, Vec<u8>, u64), PacketBuildError> {
+    let first = *bytes.first().ok_or(PacketBuildError::TooLarge)?;
+    let hb = umc_wire::header::HeaderByte::decode(first).map_err(PacketBuildError::Header)?;
+    if hb.long {
+        return Err(PacketBuildError::Header(
+            umc_wire::header::HeaderError::InvalidType,
+        ));
+    }
+    let space = hb.short_space().ok_or(PacketBuildError::Header(
+        umc_wire::header::HeaderError::InvalidSpace,
+    ))?;
+    let dcid = bytes
+        .get(1..1 + 8)
+        .ok_or(PacketBuildError::TooLarge)?
+        .to_vec();
+    let (path_id, _) =
+        umc_wire::varint::decode(bytes.get(1 + 8..).ok_or(PacketBuildError::TooLarge)?)
+            .map_err(|_| PacketBuildError::TooLarge)?;
+    Ok((space, dcid, path_id))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PacketBuildError {
     Header(umc_wire::header::HeaderError),
@@ -59,7 +96,10 @@ pub fn build_protected_packet(
         .map_err(PacketBuildError::Aead)?;
     // Header protection AFTER sealing: the mask covers the pn bytes and
     // the key-phase bit of the first byte.
-    let (protected_first, _) = protect(hp_key, hb.encode(), key_phase, &mut pn_bytes);
+    let sample = ciphertext
+        .get(..umc_crypto::header_protection::SAMPLE_LEN)
+        .ok_or(PacketBuildError::TooLarge)?;
+    let (protected_first, _) = protect(hp_key, hb.encode(), key_phase, sample, &mut pn_bytes);
     let mut out = header;
     out[0] = protected_first;
     out.extend_from_slice(&pn_bytes);
@@ -110,10 +150,13 @@ pub fn parse_protected_packet(
     let pn_bytes = bytes
         .get(pos..pos + pn_len)
         .ok_or(PacketBuildError::TooLarge)?;
+    let sample = bytes
+        .get(pos + pn_len..pos + pn_len + umc_crypto::header_protection::SAMPLE_LEN)
+        .ok_or(PacketBuildError::TooLarge)?;
     // Unprotect FIRST (wire-format §18): the packet number and the first
     // byte are masked; the pn and the header byte are meaningful only after
     // unprotection.
-    let (first, _phase, unprotected_pn) = unprotect(hp_key, protected_first, pn_bytes);
+    let (first, _phase, unprotected_pn) = unprotect(hp_key, protected_first, sample, pn_bytes);
     let hb = umc_wire::header::HeaderByte::decode(first).map_err(PacketBuildError::Header)?;
     if hb.long {
         return Err(PacketBuildError::Header(
@@ -174,6 +217,28 @@ mod tests {
         assert_eq!(path, 0);
         assert_eq!(pn, 42);
         assert_eq!(payload, b"frames");
+    }
+
+    #[test]
+    fn peek_header_routes_without_keys() {
+        let secret = [1u8; 32];
+        let keys = PacketKeys::from_traffic_secret(&secret).unwrap();
+        let dcid = vec![7u8; 8];
+        let pkt = build_protected_packet(
+            &keys,
+            &hp(&secret),
+            ShortPacketSpace::SessionData,
+            &dcid,
+            9,
+            1,
+            false,
+            b"frames",
+        )
+        .unwrap();
+        let (space, peek_dcid, path_id) = peek_protected_header(&pkt).unwrap();
+        assert_eq!(space, ShortPacketSpace::SessionData);
+        assert_eq!(peek_dcid, dcid);
+        assert_eq!(path_id, 9);
     }
 
     #[test]

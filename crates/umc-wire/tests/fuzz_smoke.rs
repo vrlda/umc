@@ -1,5 +1,6 @@
 //! Deterministic pseudo-fuzzing: feed seeded random buffers through the parser.
 //! Runs on stable; never panics on malformed input.
+use umc_types::frame::FrameType;
 use umc_wire::frame::{decode_frames, Frame, FrameError};
 use umc_wire::header::ShortPacketSpace;
 use umc_wire::packet::{parse_payload, PacketContext};
@@ -81,19 +82,20 @@ fn hostile_length_inputs_return_errors_never_panic() {
     // BUNDLE (0x60): 2-byte type varint, then a continuation-bit varint
     // where the declared length exceeds every limit.
     assert!(decode_frames(&[0x60, 0xFF, 0xFF]).is_err());
-    // Unknown length-delimited types (0x3E critical, 0x3F optional) with a
-    // declared body that is not present in the buffer.
-    assert_eq!(
-        decode_frames(&[0x3E, 0x40, 0x40]),
-        Err(FrameError::Truncated)
-    );
+    // Unknown optional length-delimited types (0x3F) with a declared body
+    // that is not present in the buffer. Unknown critical types are rejected
+    // before their body is interpreted.
     assert_eq!(
         decode_frames(&[0x3F, 0x40, 0x40]),
         Err(FrameError::Truncated)
     );
+    assert_eq!(
+        decode_frames(&[0x3E, 0x40, 0x40]),
+        Err(FrameError::UnknownCriticalFrame(FrameType(0x3E)))
+    );
     // Declared-but-absent length of 1 MiB (4-byte varint 0x80 0x10 0x00 0x00).
     assert_eq!(
-        decode_frames(&[0x3E, 0x80, 0x10, 0x00, 0x00]),
+        decode_frames(&[0x3F, 0x80, 0x10, 0x00, 0x00]),
         Err(FrameError::Truncated)
     );
     // STREAM (0x10) with a declared data length beyond the buffer.
@@ -132,19 +134,19 @@ fn pure_padding_packet_accepted() {
     }
 }
 
-/// An unknown length-delimited frame is self-delimiting: its declared length
-/// is consumed and the frames after it still parse (wire-format §21).
+/// An unknown optional length-delimited frame is self-delimiting: its declared
+/// length is consumed and the frames after it still parse (wire-format §21).
 #[test]
-fn unknown_length_delimited_is_skipped_with_length_consumed() {
-    // 0x3E (unknown critical length-delimited), declared body 2 bytes, then
+fn unknown_optional_length_delimited_is_skipped_with_length_consumed() {
+    // 0x3F (unknown optional length-delimited), declared body 2 bytes, then
     // 0x04 = PING. The skip must consume exactly the declared body.
     assert_eq!(
-        decode_frames(&[0x3E, 0x02, 0xAA, 0xBB, 0x04]).unwrap(),
+        decode_frames(&[0x3F, 0x02, 0xAA, 0xBB, 0x04]).unwrap(),
         vec![Frame::Ping]
     );
     // Two unknown frames back to back, then a known one.
     assert_eq!(
-        decode_frames(&[0x3E, 0x01, 0xAA, 0x3F, 0x00, 0x04]).unwrap(),
+        decode_frames(&[0x3F, 0x01, 0xAA, 0x3F, 0x00, 0x04]).unwrap(),
         vec![Frame::Ping]
     );
 }

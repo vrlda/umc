@@ -23,6 +23,8 @@ use crate::state::RuntimeState;
 use umc_crypto::signatures::{IdentityPublicKey, StaticHandshakeKeyPair, StaticHandshakePublicKey};
 use umc_handshake::encoding::{CLIENT_AUTH, CLIENT_HELLO, SERVER_HELLO};
 use umc_handshake::identity::{endpoint_id, IdentityBinding};
+use umc_handshake::psk::{PskAdmissionContext, MODE_PSK_XX};
+use umc_handshake::state::{HandshakeEvent, HandshakeMachine, HandshakeState};
 use umc_handshake::traffic::{derive_session_secrets, SessionSecrets};
 use umc_handshake::transcript::Transcript;
 use umc_handshake::xx::{
@@ -68,6 +70,8 @@ pub struct HandshakePending {
     secret4: [u8; 32],
     server_eid: [u8; 32],
     session_secrets: SessionSecrets,
+    selected_privacy: u8,
+    machine: HandshakeMachine,
 }
 
 /// The client's verified identity recovered from `CLIENT_AUTH`: the real
@@ -100,12 +104,44 @@ pub enum ResponderResponse {
 }
 
 impl HandshakePending {
+    /// Current protocol state for this pending responder handshake.
+    #[must_use]
+    pub const fn handshake_state(&self) -> HandshakeState {
+        self.machine.state
+    }
+
+    /// Whether the peer was authenticated and the confirmation MAC advanced
+    /// this handshake to the application-key gate.
+    #[must_use]
+    pub fn application_keys_ready(&self) -> bool {
+        self.machine.may_install_application_keys()
+    }
+
+    /// Numeric privacy profile selected during the transcript-bound hello
+    /// negotiation (privacy.md §42).
+    #[must_use]
+    pub const fn selected_privacy_profile(&self) -> u8 {
+        self.selected_privacy
+    }
+
     /// The session secrets this handshake derives, computed at
     /// [`respond_hello`] time from the DH chain (es/se/ss).
     #[must_use]
     #[allow(dead_code)] // accessor for the secrets `complete` also returns
     pub fn session_secrets(&self) -> &SessionSecrets {
         &self.session_secrets
+    }
+
+    /// Directional Handshake traffic key material for the protected
+    /// continuation (handshake.md §25). The transcript is frozen through
+    /// `SERVER_HELLO`; later finished messages do not change these keys.
+    #[must_use]
+    pub fn handshake_traffic_secret(&self, client_direction: bool) -> [u8; 32] {
+        umc_handshake::traffic::derive_handshake_traffic_secret(
+            &self.secret3,
+            &self.transcript.hash,
+            client_direction,
+        )
     }
 
     /// Complete the server side of the handshake with the client's
@@ -132,11 +168,18 @@ impl HandshakePending {
     /// verify.
     #[allow(clippy::similar_names)]
     pub fn complete(
-        &self,
+        &mut self,
         state: &RuntimeState,
         auth_bytes: &[u8],
         now_ms: u64,
     ) -> Result<(Vec<u8>, SessionSecrets, PeerIdentity), String> {
+        // Stage the transition so malformed authentication leaves the
+        // pending object unchanged, while a successful CLIENT_AUTH cannot be
+        // replayed against the same handshake.
+        let mut machine = self.machine;
+        machine
+            .apply(HandshakeEvent::ReceiveClientAuth)
+            .map_err(|e| format!("handshake state: {e:?}"))?;
         // The client-auth key derives from the transcript hash BEFORE the
         // CLIENT_AUTH message is appended (handshake.md §18).
         let client_auth_transcript = self.transcript.hash;
@@ -216,6 +259,10 @@ impl HandshakePending {
         let mut server_finished = Vec::with_capacity(96);
         server_finished.extend_from_slice(&server_signature);
         server_finished.extend_from_slice(&server_mac);
+        machine
+            .apply(HandshakeEvent::SendServerFinished)
+            .map_err(|e| format!("handshake state: {e:?}"))?;
+        self.machine = machine;
         Ok((server_finished, self.session_secrets.clone(), peer))
     }
 
@@ -231,11 +278,15 @@ impl HandshakePending {
     /// Returns a message when the confirmation MAC does not match (the
     /// session is refused and nothing is registered).
     pub fn verify_client_finished(
-        &self,
+        &mut self,
         auth_bytes: &[u8],
         server_finished: &[u8],
         client_finished: &[u8],
     ) -> Result<(), String> {
+        let mut machine = self.machine;
+        machine
+            .apply(HandshakeEvent::ReceiveClientFinished)
+            .map_err(|e| format!("handshake state: {e:?}"))?;
         let mut transcript = self.transcript.clone();
         umc_handshake::xx::verify_client_finished(
             &self.secret4,
@@ -243,7 +294,12 @@ impl HandshakePending {
             auth_bytes,
             server_finished,
             client_finished,
-        )
+        )?;
+        machine
+            .apply(HandshakeEvent::Confirm)
+            .map_err(|e| format!("handshake state: {e:?}"))?;
+        self.machine = machine;
+        Ok(())
     }
 }
 
@@ -332,6 +388,7 @@ pub(crate) fn expand(secret: &[u8; 32], label: &[u8], context: &[u8; 32]) -> [u8
 // DH_ss) as in the deterministic driver.
 #[allow(clippy::similar_names)]
 #[allow(clippy::too_many_lines)]
+#[allow(dead_code)]
 pub fn respond_hello(
     state: &RuntimeState,
     carrier_binding: &[u8],
@@ -339,6 +396,59 @@ pub fn respond_hello(
     client_static_public_key: &StaticHandshakePublicKey,
     initial_dcid: &[u8],
     initial_scid: &[u8],
+) -> Result<ResponderResponse, String> {
+    respond_hello_with_retry_context(
+        state,
+        carrier_binding,
+        hello_bytes,
+        client_static_public_key,
+        initial_dcid,
+        initial_scid,
+        None,
+    )
+}
+
+/// Variant of [`respond_hello`] that incorporates the synthetic transcript
+/// input after a stateless Retry exchange (handshake.md §21.1).
+#[allow(clippy::similar_names, clippy::too_many_lines)]
+pub fn respond_hello_with_retry_context(
+    state: &RuntimeState,
+    carrier_binding: &[u8],
+    hello_bytes: &[u8],
+    client_static_public_key: &StaticHandshakePublicKey,
+    initial_dcid: &[u8],
+    initial_scid: &[u8],
+    retry_context: Option<&[u8; 32]>,
+) -> Result<ResponderResponse, String> {
+    respond_hello_with_retry_context_and_psk(
+        state,
+        carrier_binding,
+        hello_bytes,
+        client_static_public_key,
+        initial_dcid,
+        initial_scid,
+        retry_context,
+        None,
+    )
+}
+
+/// Variant of [`respond_hello_with_retry_context`] that can select PSK-XX
+/// when the caller has matched the client's invitation authenticator against
+/// a live invitation key. The key is never serialized into the handshake.
+#[allow(
+    clippy::similar_names,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+pub fn respond_hello_with_retry_context_and_psk(
+    state: &RuntimeState,
+    carrier_binding: &[u8],
+    hello_bytes: &[u8],
+    client_static_public_key: &StaticHandshakePublicKey,
+    initial_dcid: &[u8],
+    initial_scid: &[u8],
+    retry_context: Option<&[u8; 32]>,
+    invitation_key: Option<&[u8; 32]>,
 ) -> Result<ResponderResponse, String> {
     if state
         .config
@@ -387,6 +497,12 @@ pub fn respond_hello(
         .ok_or_else(|| "invalid minimum privacy profile".to_string())?;
     let max_privacy = privacy_profile_level(MAX_SUPPORTED_PRIVACY_PROFILE)
         .expect("the implementation maximum is a valid profile");
+    let local_privacy = state.config.effective_privacy_profile() as u8;
+    if local_privacy > max_privacy {
+        return Err(format!(
+            "local privacy profile p{local_privacy} unsupported; maximum is p{max_privacy}"
+        ));
+    }
     if requested_privacy > max_privacy {
         return Err(format!(
             "privacy profile {} unsupported; maximum is {}",
@@ -397,21 +513,65 @@ pub fn respond_hello(
     if hello.capabilities_hash != capabilities_hash_for_minimum_privacy(&hello.minimum_privacy) {
         return Err("client capabilities hash mismatch".into());
     }
+    // Select the stronger requested/local floor. Both values were checked
+    // against `max_privacy` above, so applying the implementation maximum
+    // here would incorrectly raise every p0 session to p1.
+    let selected_privacy = requested_privacy.max(local_privacy);
+
+    let psk_offered = hello
+        .supported_handshake_modes
+        .iter()
+        .any(|mode| mode.as_slice() == MODE_PSK_XX);
+    let selected_mode = if psk_offered {
+        if let Some(invitation_key) = invitation_key {
+            let admission = PskAdmissionContext {
+                invitation_key: *invitation_key,
+                destination_connection_id: initial_dcid.to_vec(),
+                carrier_binding: carrier_binding.to_vec(),
+            };
+            admission
+                .verify_client_hello(&hello)
+                .map_err(|_| "handshake admission failed".to_string())?;
+            MODE_PSK_XX
+        } else {
+            return Err("handshake admission failed".into());
+        }
+    } else {
+        // Legacy IK-only hellos that did not resume a ticket intentionally
+        // continue through the full XX responder path. This preserves the
+        // pre-mode-negotiation fallback used by existing callers; PSK offers
+        // never take this branch because they require admission above.
+        MODE_XX
+    };
 
     let server_ephemeral = StaticHandshakeKeyPair::generate();
     let mut server_random = [0u8; 32];
     OsEntropy.fill(&mut server_random);
 
     // Transcript through CLIENT_HELLO (handshake.md §14-15).
-    let mut transcript = Transcript::new(MODE_XX, CRYPTO_PROFILE, carrier_binding);
+    let mut transcript = Transcript::new(selected_mode, CRYPTO_PROFILE, carrier_binding);
     transcript
         .update_message(CLIENT_HELLO, hello_bytes)
         .map_err(|e| format!("transcript: {e:?}"))?;
+    if let Some(retry_context) = retry_context {
+        transcript.update_bytes(retry_context);
+    }
 
     // DH_ee -> extract1 -> server-auth key (handshake.md §16.1).
     let dh_ee = server_ephemeral
         .diffie_hellman(&StaticHandshakePublicKey(hello.client_ephemeral_public_key));
-    let extract1 = umc_crypto::hkdf::extract(&[0u8; 32], &dh_ee);
+    let extract1 = if selected_mode == MODE_PSK_XX {
+        let invitation_key = invitation_key.ok_or("handshake admission failed")?;
+        let psk_extract = umc_handshake::psk::derive_psk_extract(
+            invitation_key,
+            &hello.client_random,
+            &hello.client_ephemeral_public_key,
+            carrier_binding,
+        );
+        umc_crypto::hkdf::extract(&psk_extract, &dh_ee)
+    } else {
+        umc_crypto::hkdf::extract(&[0u8; 32], &dh_ee)
+    };
     let binding = IdentityBinding::sign(
         &state.node_identity.identity,
         &state.node_identity.static_handshake.public(),
@@ -441,7 +601,7 @@ pub fn respond_hello(
         server_ephemeral_public_key: server_ephemeral.public().0,
         selected_protocol_version: selected_version,
         selected_crypto_profile: CRYPTO_PROFILE.to_vec(),
-        selected_handshake_mode: MODE_XX.to_vec(),
+        selected_handshake_mode: selected_mode.to_vec(),
         encrypted_server_authentication: encrypted_auth,
         // The server's capabilities hash rides in the first 32 bytes of
         // the padding (compatibility.md §5.4, documented convention): the
@@ -452,7 +612,7 @@ pub fn respond_hello(
         padding: {
             let mut padding = Vec::with_capacity(64);
             padding.extend_from_slice(&capabilities_hash(&canonical_capabilities()));
-            padding.push(max_privacy);
+            padding.push(selected_privacy);
             padding.extend_from_slice(&[0u8; 31]);
             padding
         },
@@ -489,6 +649,20 @@ pub fn respond_hello(
         secret4,
         server_eid,
         session_secrets: derive_session_secrets(&secret4, &final_transcript),
+        selected_privacy,
+        machine: {
+            let mut machine = HandshakeMachine::new();
+            machine
+                .apply(HandshakeEvent::ReceiveClientHello)
+                .map_err(|e| format!("handshake state: {e:?}"))?;
+            machine
+                .apply(HandshakeEvent::SendServerHello)
+                .map_err(|e| format!("handshake state: {e:?}"))?;
+            machine
+                .apply(HandshakeEvent::InstallHandshakeKeys)
+                .map_err(|e| format!("handshake state: {e:?}"))?;
+            machine
+        },
     };
     Ok(ResponderResponse::ServerHello {
         bytes: server_hello_bytes,
@@ -647,7 +821,7 @@ mod tests {
         let hello = ClientHello::new(&TestEntropy, &client_ephemeral);
         let hello_bytes = hello.encode().expect("hello");
 
-        let (server_hello_bytes, pending) = expect_server_hello(
+        let (server_hello_bytes, mut pending) = expect_server_hello(
             respond_hello(
                 &state,
                 b"ump.tcp/1",
@@ -719,12 +893,69 @@ mod tests {
     }
 
     #[test]
+    fn responder_selects_psk_xx_and_client_derives_matching_auth_keys() {
+        let state = test_state();
+        let invitation_key = [0x3Cu8; 32];
+        let client_identity = IdentityKeyPair::generate();
+        let client_static = StaticHandshakeKeyPair::generate();
+        let client_ephemeral = StaticHandshakeKeyPair::generate();
+        let hello = ClientHello::new_psk_xx(
+            &TestEntropy,
+            &client_ephemeral,
+            &invitation_key,
+            b"dcid",
+            b"ump.tcp/1",
+        );
+        let hello_bytes = hello.encode().expect("hello");
+
+        let (server_hello_bytes, _pending) = expect_server_hello(
+            respond_hello_with_retry_context_and_psk(
+                &state,
+                b"ump.tcp/1",
+                &hello_bytes,
+                &client_ephemeral.public(),
+                b"dcid",
+                b"scid",
+                None,
+                Some(&invitation_key),
+            )
+            .expect("psk responder"),
+        );
+        let server_hello = ServerHello::decode(&server_hello_bytes).expect("server hello");
+        assert_eq!(server_hello.selected_handshake_mode, MODE_PSK_XX.to_vec());
+        umc_handshake::xx::complete_client_side_with_psk(
+            &client_identity,
+            &client_static,
+            &client_ephemeral,
+            &hello,
+            &server_hello,
+            &TestEntropy,
+            b"ump.tcp/1",
+            &invitation_key,
+        )
+        .expect("client derives PSK auth keys");
+
+        let wrong_key = [0x3Du8; 32];
+        assert!(respond_hello_with_retry_context_and_psk(
+            &state,
+            b"ump.tcp/1",
+            &hello_bytes,
+            &client_ephemeral.public(),
+            b"dcid",
+            b"scid",
+            None,
+            Some(&wrong_key),
+        )
+        .is_err());
+    }
+
+    #[test]
     fn responder_rejects_a_mismatched_client_static_key() {
         let state = test_state();
         let (_client_identity, client_static, client_ephemeral) = client_identity();
         let hello = ClientHello::new(&TestEntropy, &client_ephemeral);
         let hello_bytes = hello.encode().expect("hello");
-        let (server_hello_bytes, pending) = expect_server_hello(
+        let (server_hello_bytes, mut pending) = expect_server_hello(
             respond_hello(
                 &state,
                 b"ump.tcp/1",
@@ -774,7 +1005,7 @@ mod tests {
         let hello = ClientHello::new(&TestEntropy, &client_ephemeral);
         let hello_bytes = hello.encode().expect("hello");
 
-        let (server_hello_bytes, pending) = expect_server_hello(
+        let (server_hello_bytes, mut pending) = expect_server_hello(
             respond_hello(
                 &state,
                 b"ump.tcp/1",
@@ -823,7 +1054,7 @@ mod tests {
         let (_identity, client_static, client_ephemeral) = client_identity();
         let hello = ClientHello::new(&TestEntropy, &client_ephemeral);
         let hello_bytes = hello.encode().expect("hello");
-        let (_server_hello_bytes, pending) = expect_server_hello(
+        let (_server_hello_bytes, mut pending) = expect_server_hello(
             respond_hello(
                 &state,
                 b"ump.tcp/1",
@@ -835,6 +1066,60 @@ mod tests {
             .expect("responder"),
         );
         assert!(pending.complete(&state, b"garbage", 1_000).is_err());
+    }
+
+    #[test]
+    fn pending_handshake_state_is_advanced_by_authenticated_messages() {
+        let state = test_state();
+        let (client_identity, client_static, client_ephemeral) = client_identity();
+        let hello = ClientHello::new(&TestEntropy, &client_ephemeral);
+        let hello_bytes = hello.encode().expect("hello");
+        let (server_hello_bytes, mut pending) = expect_server_hello(
+            respond_hello(
+                &state,
+                b"ump.tcp/1",
+                &hello_bytes,
+                &client_static.public(),
+                &[1u8; 8],
+                &[2u8; 8],
+            )
+            .expect("responder"),
+        );
+        assert_eq!(pending.handshake_state(), HandshakeState::HandshakeKeys);
+
+        let server_hello = ServerHello::decode(&server_hello_bytes).expect("server hello");
+        let server_binding = IdentityBinding::sign(
+            &state.node_identity.identity,
+            &state.node_identity.static_handshake.public(),
+            0,
+            1_800_000_000_000,
+            0,
+            [0u8; 32],
+        );
+        let auth_bytes = build_client_auth(
+            &client_identity,
+            &client_static,
+            &client_ephemeral,
+            &hello,
+            &server_hello,
+            &server_binding,
+            b"ump.tcp/1",
+            &client_binding(&client_identity, &client_static),
+        );
+        let (server_finished, _, _) = pending
+            .complete(&state, &auth_bytes, 1_000)
+            .expect("complete");
+        assert_eq!(pending.handshake_state(), HandshakeState::SessionKeys);
+
+        // A second CLIENT_AUTH is rejected by the runtime state gate even
+        // when its cryptographic body is otherwise valid.
+        assert!(pending.complete(&state, &auth_bytes, 1_000).is_err());
+        assert_eq!(pending.handshake_state(), HandshakeState::SessionKeys);
+
+        // Confirmation transition is exercised by the live accept-loop
+        // tests; this unit test stops at SERVER_FINISHED to avoid duplicating
+        // the full packet exchange fixture.
+        assert_eq!(server_finished.len(), 96);
     }
 
     /// Version negotiation (compatibility.md §5.2, handshake.md §16): a
@@ -1004,11 +1289,11 @@ mod tests {
     }
 
     #[test]
-    fn respond_hello_refuses_privacy_above_supported_profile() {
+    fn respond_hello_accepts_p3_privacy_profile() {
         let state = test_state();
         let (_identity, _static_key, client_ephemeral) = client_identity();
-        let hello = ClientHello::new_with_minimum_privacy(&TestEntropy, &client_ephemeral, b"p2");
-        let error = respond_hello(
+        let hello = ClientHello::new_with_minimum_privacy(&TestEntropy, &client_ephemeral, b"p3");
+        let response = respond_hello(
             &state,
             b"ump.tcp/1",
             &hello.encode().expect("hello"),
@@ -1016,9 +1301,40 @@ mod tests {
             &[1u8; 8],
             &[2u8; 8],
         )
-        .expect_err("p2 must fail closed while the daemon supports p1");
-        assert!(error.contains("privacy profile"), "{error}");
-        assert!(error.contains("p1"), "{error}");
+        .expect("p3 is within the p3 implementation maximum");
+        match response {
+            ResponderResponse::ServerHello { pending, .. } => {
+                assert_eq!(pending.selected_privacy_profile(), 3);
+            }
+            ResponderResponse::VersionNegotiation { .. } => {
+                panic!("privacy request unexpectedly triggered version negotiation")
+            }
+        }
+    }
+
+    #[test]
+    fn local_privacy_policy_cannot_be_silently_downgraded() {
+        let mut state = test_state();
+        state.config.privacy_profile = "p2".into();
+        let (_identity, _static_key, client_ephemeral) = client_identity();
+        let hello = ClientHello::new(&TestEntropy, &client_ephemeral);
+        let response = respond_hello(
+            &state,
+            b"ump.tcp/1",
+            &hello.encode().expect("hello"),
+            &client_ephemeral.public(),
+            &[1u8; 8],
+            &[2u8; 8],
+        )
+        .expect("a local p2 policy must raise the selected floor");
+        match response {
+            ResponderResponse::ServerHello { pending, .. } => {
+                assert_eq!(pending.selected_privacy_profile(), 2);
+            }
+            ResponderResponse::VersionNegotiation { .. } => {
+                panic!("local privacy policy unexpectedly triggered version negotiation")
+            }
+        }
     }
 
     #[test]
@@ -1069,6 +1385,35 @@ mod tests {
             server_hello.server_capabilities_hash().expect("hash"),
             capabilities_hash(&canonical_capabilities())
         );
-        assert_eq!(server_hello.selected_privacy_level(), Some(1));
+        assert_eq!(server_hello.selected_privacy_level(), Some(0));
+    }
+
+    #[test]
+    fn p0_request_with_p0_policy_stays_p0() {
+        let state = test_state();
+        let (_identity, _static_key, client_ephemeral) = client_identity();
+        let hello = ClientHello::new_with_minimum_privacy(&TestEntropy, &client_ephemeral, b"p0");
+        let response = respond_hello(
+            &state,
+            b"ump.tcp/1",
+            &hello.encode().expect("hello"),
+            &client_ephemeral.public(),
+            &[1u8; 8],
+            &[2u8; 8],
+        )
+        .expect("responder");
+        let bytes = match response {
+            ResponderResponse::ServerHello { bytes, .. } => bytes,
+            ResponderResponse::VersionNegotiation { .. } => {
+                panic!("expected a SERVER_HELLO")
+            }
+        };
+        assert_eq!(
+            ServerHello::decode(&bytes)
+                .expect("server hello")
+                .selected_privacy_level(),
+            Some(0),
+            "negotiation must not raise p0 to the implementation maximum"
+        );
     }
 }

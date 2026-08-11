@@ -68,7 +68,13 @@ impl SybilGuard {
     }
 
     fn prune(&mut self, now: Instant) {
-        let cutoff = now.0.saturating_sub(self.retention.as_millis());
+        // Saturating subtraction would make events recorded at epoch zero
+        // look expired immediately while the clock is still below the
+        // retention window. Keep the zero-time bucket until a full window
+        // has elapsed.
+        let Some(cutoff) = now.0.checked_sub(self.retention.as_millis()) else {
+            return;
+        };
         self.groups.retain(|_, timestamps| {
             while timestamps
                 .front()
@@ -106,5 +112,15 @@ mod tests {
         let mut guard = SybilGuard::new(1);
         assert!(guard.admit(SybilGroup::from_requester(&[1, 2, 3, 4], &[1]), Instant(0)));
         assert!(guard.admit(SybilGroup::from_requester(&[1, 2, 3, 4], &[2]), Instant(0)));
+    }
+
+    #[test]
+    fn epoch_zero_events_still_consume_the_budget() {
+        let mut guard = SybilGuard::default();
+        let group = SybilGroup::from_requester(&[1, 2, 3, 4], &[]);
+        for _ in 0..REQUESTS_PER_GROUP_PER_MINUTE {
+            assert!(guard.admit(group.clone(), Instant(0)));
+        }
+        assert!(!guard.admit(group, Instant(0)));
     }
 }

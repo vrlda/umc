@@ -1,5 +1,6 @@
 //! Content-addressed object store (storage.md §11): two-level hash directories.
 use crate::store::StoreError;
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,15 +31,31 @@ impl ObjectStore {
     /// Atomic write: temp file + rename (storage.md §11.2).
     ///
     /// # Errors
-    /// Returns [`StoreError::Corrupt`] if the write or rename fails.
+    /// Returns [`StoreError::Corrupt`] if the content hash is wrong or the
+    /// write, sync, or rename fails.
     pub fn put(&self, id: &[u8; 32], bytes: &[u8]) -> Result<(), StoreError> {
+        if blake2s(bytes) != *id {
+            return Err(StoreError::Corrupt("object hash mismatch".into()));
+        }
         let path = self.object_path(id);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| StoreError::Corrupt(e.to_string()))?;
         }
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, bytes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-        std::fs::rename(&tmp, &path).map_err(|e| StoreError::Corrupt(e.to_string()))
+        let mut file =
+            std::fs::File::create(&tmp).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        file.write_all(bytes)
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        file.sync_all()
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        drop(file);
+        std::fs::rename(&tmp, &path).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Read with hash validation (storage.md §11.2): mismatched content is corrupt.
@@ -126,5 +143,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let store = ObjectStore::open(root).unwrap();
         assert_eq!(store.get(&[0u8; 32]), Err(StoreError::NotFound));
+    }
+
+    #[test]
+    fn wrong_content_hash_is_rejected_before_write() {
+        let root = temp_root();
+        let _ = std::fs::remove_dir_all(&root);
+        let store = ObjectStore::open(root).unwrap();
+        let id = [0u8; 32];
+        assert!(matches!(
+            store.put(&id, b"payload"),
+            Err(StoreError::Corrupt(message)) if message == "object hash mismatch"
+        ));
+        assert!(!store.exists(&id));
     }
 }

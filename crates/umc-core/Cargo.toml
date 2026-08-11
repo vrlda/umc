@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blake2 = "0.10"
 umc-types = { path = "../umc-types" }
 umc-wire = { path = "../umc-wire" }
 umc-crypto = { path = "../umc-crypto" }

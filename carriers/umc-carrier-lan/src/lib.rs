@@ -6,7 +6,7 @@
 //! a varint payload length, followed by the opaque node hint. The varint is
 //! width-tagged in the top two bits of the first byte (1/2/4/8-byte payload
 //! widths), mirroring umc-wire framing without depending on it.
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
@@ -34,9 +34,7 @@ pub struct LanDiscoveryConfig {
 impl Default for LanDiscoveryConfig {
     fn default() -> Self {
         Self {
-            group: format!("{DEFAULT_ANNOUNCE_GROUP}:{DEFAULT_ANNOUNCE_PORT}")
-                .parse()
-                .expect("group"),
+            group: SocketAddr::new(Ipv4Addr::new(224, 0, 0, 251).into(), DEFAULT_ANNOUNCE_PORT),
             interface: None,
             announce_interval_ms: DEFAULT_ANNOUNCE_INTERVAL_MS,
             node_hint: Vec::new(),
@@ -88,7 +86,7 @@ impl Carrier for LanDiscoveryCarrier {
         );
         if let std::net::IpAddr::V4(multicast) = self.config.group.ip() {
             socket
-                .join_multicast_v4(multicast, "0.0.0.0".parse().unwrap())
+                .join_multicast_v4(multicast, Ipv4Addr::UNSPECIFIED)
                 .ok();
         }
         Ok(Box::new(LanListenerAdapter {

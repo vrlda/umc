@@ -15,6 +15,10 @@ pub enum AeadError {
 pub struct PacketKeys {
     pub key: [u8; 32],
     pub iv: [u8; IV_LEN],
+    /// Header-protection key derived from the same traffic secret. Keeping
+    /// it beside the packet key prevents long-header callers from falling
+    /// back to an unprotected packet-number field.
+    pub hp_key: [u8; 32],
 }
 
 impl PacketKeys {
@@ -32,7 +36,12 @@ impl PacketKeys {
         k.copy_from_slice(&key);
         let mut iv_arr = [0u8; IV_LEN];
         iv_arr.copy_from_slice(&iv);
-        Ok(Self { key: k, iv: iv_arr })
+        let hp_key = crate::header_protection::header_protection_key(secret);
+        Ok(Self {
+            key: k,
+            iv: iv_arr,
+            hp_key,
+        })
     }
 
     /// Nonce = `PacketIV` XOR Encode96(PacketNumber) (handshake.md §27).
@@ -131,5 +140,15 @@ mod tests {
         // Packet number is XORed into the low 8 bytes: pn 0 == raw iv.
         let zero = keys.nonce_for(0);
         assert_eq!(&zero[..4], &keys.iv[..4]);
+    }
+
+    #[test]
+    fn packet_keys_include_header_protection_key() {
+        let secret = [3u8; 32];
+        let keys = PacketKeys::from_traffic_secret(&secret).unwrap();
+        assert_eq!(
+            keys.hp_key,
+            crate::header_protection::header_protection_key(&secret)
+        );
     }
 }

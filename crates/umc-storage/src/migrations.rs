@@ -59,6 +59,12 @@ pub fn run_migrations(store: &SqliteStore) -> Result<i64, StoreError> {
 mod tests {
     use super::*;
 
+    fn failing_migration(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch("CREATE TABLE transient_migration (value INTEGER NOT NULL);")
+            .map_err(|e| e.to_string())?;
+        Err("intentional migration failure".into())
+    }
+
     fn open_temp() -> SqliteStore {
         let dir = std::env::temp_dir().join(format!("umc-migrate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -98,5 +104,33 @@ mod tests {
         run_migrations(&store).unwrap();
         run_migrations(&store).unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_schema_and_version() {
+        let store = open_temp();
+        store
+            .connection()
+            .lock()
+            .unwrap()
+            .execute("UPDATE schema_version SET version = 1", [])
+            .unwrap();
+        let result = store.run_migration(1, failing_migration);
+        assert!(
+            matches!(result, Err(StoreError::Corrupt(message)) if message.contains("intentional migration failure"))
+        );
+        assert_eq!(store.schema_version().unwrap(), 1);
+        let conn = store.connection().lock().unwrap();
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'transient_migration'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            table_count, 0,
+            "failed migration must leave no partial schema"
+        );
     }
 }

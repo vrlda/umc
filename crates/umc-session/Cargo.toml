@@ -11,7 +11,12 @@ umc-crypto = { path = "../umc-crypto" }
 umc-handshake = { path = "../umc-handshake" }
 
 [dev-dependencies]
+criterion = "0.5"
 proptest = "1"
+
+[[bench]]
+name = "session"
+harness = false
 
 [lints]
 workspace = true

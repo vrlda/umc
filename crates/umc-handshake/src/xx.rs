@@ -16,7 +16,10 @@ pub const SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 pub const CLIENT_RANDOM_LEN: usize = 32;
 pub const MAX_SUPPORTED_PARAMETERS: usize = 16;
 /// Maximum privacy profile this v1 implementation can negotiate.
-pub const MAX_SUPPORTED_PRIVACY_PROFILE: &[u8] = b"p1";
+///
+/// P3 is negotiated only when both peers advertise it; local policy still
+/// decides whether the node may accept or initiate that profile.
+pub const MAX_SUPPORTED_PRIVACY_PROFILE: &[u8] = b"p3";
 /// Secure-by-default privacy profile requested by a new client.
 pub const DEFAULT_MINIMUM_PRIVACY_PROFILE: &[u8] = b"p0";
 
@@ -81,6 +84,30 @@ impl ClientHello {
             invitation_authenticator: Vec::new(),
             padding: vec![0u8; 64],
         }
+    }
+
+    /// Builds a PSK-XX offer with its invitation authenticator populated over
+    /// the destination connection ID and carrier binding (handshake.md
+    /// §§15.4, 22). The invitation key is never copied into the encoded hello.
+    #[must_use]
+    pub fn new_psk_xx(
+        entropy: &dyn EntropySource,
+        ephemeral: &StaticHandshakeKeyPair,
+        invitation_key: &[u8; 32],
+        destination_connection_id: &[u8],
+        carrier_binding: &[u8],
+    ) -> Self {
+        let mut hello = Self::new(entropy, ephemeral);
+        hello.supported_handshake_modes = vec![crate::psk::MODE_PSK_XX.to_vec()];
+        hello.invitation_authenticator = crate::psk::invitation_authenticator(
+            invitation_key,
+            &hello.client_random,
+            &hello.client_ephemeral_public_key,
+            destination_connection_id,
+            carrier_binding,
+        )
+        .to_vec();
+        hello
     }
 
     /// Returns the requested privacy level, or `None` for an invalid wire
@@ -349,7 +376,7 @@ pub const CANONICAL_CAPABILITY_IDS: &[&[u8]] = &[
     b"bundle",
     b"route",
     b"mobility",
-    b"privacy=p1",
+    b"privacy=p3",
 ];
 
 /// The canonical capability set serialized for hashing (compatibility.md
@@ -552,11 +579,7 @@ pub fn decrypt_server_auth(
 /// Panics if `finished_key` is not exactly 32 bytes (it always is by type).
 #[must_use]
 pub fn finished_mac(finished_key: &[u8; 32], transcript: &[u8; 32]) -> [u8; 32] {
-    use blake2::digest::{KeyInit, Mac};
-    let mut mac =
-        <blake2::Blake2sMac256 as KeyInit>::new_from_slice(finished_key).expect("32-byte key");
-    mac.update(transcript);
-    mac.finalize().into_bytes().into()
+    umc_crypto::hkdf::hmac_blake2s(finished_key, transcript)
 }
 
 /// Derives a finished key from the handshake secret (handshake.md §19.2).
@@ -742,6 +765,9 @@ pub struct ClientHandshakeOutput {
     /// keys over the transcript hash AFTER `CLIENT_AUTH` is appended
     /// (handshake.md §19.2).
     pub handshake_secret4: [u8; 32],
+    /// `HandshakeSecret3` used to derive directional Handshake packet keys
+    /// for the protected `CLIENT_AUTH` continuation (handshake.md §25).
+    pub handshake_secret3: [u8; 32],
     /// The client-auth key sealing `CLIENT_AUTH` (handshake.md §18).
     pub client_auth_key: [u8; 32],
     /// The transcript hash BEFORE `CLIENT_AUTH` is appended: the AEAD AAD
@@ -913,16 +939,19 @@ pub fn run_xx_handshake(
         &server_static_pub.0,
     );
     let client_signature = client_identity.sign(&sig_input);
-    // NOTE (placeholder): the client identity binding is represented by the
-    // server binding's bytes here; the real client binding serialization lands
-    // with the live handshake path (Phase 1 Task 25).
-    let client_auth_plaintext = {
-        let mut p = Vec::new();
-        p.extend_from_slice(&client_static.public().0);
-        p.extend_from_slice(&binding.signed_bytes());
-        p.extend_from_slice(&client_signature);
-        p
-    };
+    let client_binding = crate::identity::IdentityBinding::sign(
+        client_identity,
+        &client_static.public(),
+        0,
+        u64::MAX,
+        0,
+        [0u8; 32],
+    );
+    let client_auth_plaintext = build_client_auth_plaintext(
+        &client_static.public().0,
+        &client_binding,
+        &client_signature,
+    );
     let client_auth_encrypted = umc_crypto::aead::PacketKeys::from_traffic_secret(&client_auth_key)
         .map_err(|e| format!("{e:?}"))?
         .seal(0, &transcript.hash, &client_auth_plaintext)
@@ -1063,8 +1092,102 @@ pub fn complete_client_side(
     entropy: &dyn EntropySource,
     carrier_binding: &[u8],
 ) -> Result<ClientHandshakeOutput, String> {
+    complete_client_side_with_retry_context(
+        client_identity,
+        client_static,
+        client_ephemeral,
+        client_hello,
+        server_hello,
+        entropy,
+        carrier_binding,
+        None,
+    )
+}
+
+/// Variant of [`complete_client_side`] that incorporates the synthetic
+/// transcript input after a stateless Retry exchange (handshake.md §21.1).
+///
+/// # Errors
+///
+/// Returns an error when the server capabilities, authentication transcript,
+/// identity binding, or key derivation is invalid.
+#[allow(clippy::too_many_arguments)]
+pub fn complete_client_side_with_retry_context(
+    client_identity: &IdentityKeyPair,
+    client_static: &StaticHandshakeKeyPair,
+    client_ephemeral: &StaticHandshakeKeyPair,
+    client_hello: &ClientHello,
+    server_hello: &ServerHello,
+    entropy: &dyn EntropySource,
+    carrier_binding: &[u8],
+    retry_context: Option<&[u8; 32]>,
+) -> Result<ClientHandshakeOutput, String> {
+    complete_client_side_with_mode(
+        client_identity,
+        client_static,
+        client_ephemeral,
+        client_hello,
+        server_hello,
+        entropy,
+        carrier_binding,
+        MODE_XX,
+        None,
+        retry_context,
+    )
+}
+
+/// Client-side continuation of a PSK-XX handshake. The invitation key is
+/// used only to derive the context-bound first extract; it is never included
+/// in the encoded hello or any continuation message.
+///
+/// # Errors
+///
+/// Returns an error when the responder selects a different mode, the
+/// capability binding is invalid, or the PSK-protected server-auth block
+/// cannot be opened.
+#[allow(clippy::too_many_arguments, clippy::similar_names)]
+pub fn complete_client_side_with_psk(
+    client_identity: &IdentityKeyPair,
+    client_static: &StaticHandshakeKeyPair,
+    client_ephemeral: &StaticHandshakeKeyPair,
+    client_hello: &ClientHello,
+    server_hello: &ServerHello,
+    entropy: &dyn EntropySource,
+    carrier_binding: &[u8],
+    invitation_key: &[u8; 32],
+) -> Result<ClientHandshakeOutput, String> {
+    complete_client_side_with_mode(
+        client_identity,
+        client_static,
+        client_ephemeral,
+        client_hello,
+        server_hello,
+        entropy,
+        carrier_binding,
+        crate::psk::MODE_PSK_XX,
+        Some(invitation_key),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::similar_names)]
+fn complete_client_side_with_mode(
+    client_identity: &IdentityKeyPair,
+    client_static: &StaticHandshakeKeyPair,
+    client_ephemeral: &StaticHandshakeKeyPair,
+    client_hello: &ClientHello,
+    server_hello: &ServerHello,
+    entropy: &dyn EntropySource,
+    carrier_binding: &[u8],
+    mode: &[u8],
+    invitation_key: Option<&[u8; 32]>,
+    retry_context: Option<&[u8; 32]>,
+) -> Result<ClientHandshakeOutput, String> {
     let _ = client_identity;
     let _ = entropy;
+    if server_hello.selected_handshake_mode.as_slice() != mode {
+        return Err("server selected an unexpected handshake mode".into());
+    }
     // Capability negotiation (compatibility.md §5.4): the server's
     // capabilities hash rides in the first 32 bytes of the SERVER_HELLO
     // padding; verify it against the canonical set before any secret
@@ -1076,19 +1199,33 @@ pub fn complete_client_side(
     }
     // Transcript through CLIENT_HELLO; SERVER_HELLO fields are the preceding
     // unencrypted fields for the auth-block AAD (handshake.md §16.1).
-    let mut transcript = Transcript::new(MODE_XX, CRYPTO_PROFILE, carrier_binding);
+    let mut transcript = Transcript::new(mode, CRYPTO_PROFILE, carrier_binding);
     transcript
         .update_message(
             crate::encoding::CLIENT_HELLO,
             &client_hello.encode().map_err(|e| format!("{e:?}"))?,
         )
         .map_err(|e| format!("{e:?}"))?;
+    if let Some(retry_context) = retry_context {
+        transcript.update_bytes(retry_context);
+    }
     let server_auth_transcript = transcript.hash;
 
     let dh_ee = client_ephemeral.diffie_hellman(&StaticHandshakePublicKey(
         server_hello.server_ephemeral_public_key,
     ));
-    let extract1 = umc_crypto::hkdf::extract(&[0u8; 32], &dh_ee);
+    let extract1 = if mode == crate::psk::MODE_PSK_XX {
+        let invitation_key = invitation_key.ok_or("PSK-XX invitation key missing")?;
+        let psk_extract = crate::psk::derive_psk_extract(
+            invitation_key,
+            &client_hello.client_random,
+            &client_hello.client_ephemeral_public_key,
+            carrier_binding,
+        );
+        umc_crypto::hkdf::extract(&psk_extract, &dh_ee)
+    } else {
+        umc_crypto::hkdf::extract(&[0u8; 32], &dh_ee)
+    };
     let server_block = decrypt_server_auth(
         &extract1,
         &server_auth_transcript,
@@ -1120,12 +1257,12 @@ pub fn complete_client_side(
         )
         .map_err(|e| format!("{e:?}"))?;
 
-    let dh_es = client_ephemeral.diffie_hellman(&server_static_pub);
-    let secret2 = umc_crypto::hkdf::extract(&extract1, &dh_es);
-    let dh_se = client_static.diffie_hellman(&StaticHandshakePublicKey(
+    let dh_ephemeral_static = client_ephemeral.diffie_hellman(&server_static_pub);
+    let secret2 = umc_crypto::hkdf::extract(&extract1, &dh_ephemeral_static);
+    let dh_static_ephemeral = client_static.diffie_hellman(&StaticHandshakePublicKey(
         server_hello.server_ephemeral_public_key,
     ));
-    let secret3 = umc_crypto::hkdf::extract(&secret2, &dh_se);
+    let secret3 = umc_crypto::hkdf::extract(&secret2, &dh_static_ephemeral);
     let dh_ss = client_static.diffie_hellman(&server_static_pub);
     let secret4 = umc_crypto::hkdf::extract(&secret3, &dh_ss);
 
@@ -1141,6 +1278,7 @@ pub fn complete_client_side(
     Ok(ClientHandshakeOutput {
         session_secrets: client_secrets,
         handshake_secret4: secret4,
+        handshake_secret3: secret3,
         client_auth_key,
         transcript_hash,
         server_endpoint_id,
@@ -1334,7 +1472,7 @@ mod tests {
             b"bundle",
             b"route",
             b"mobility",
-            b"privacy=p1",
+            b"privacy=p3",
         ];
         assert_eq!(CANONICAL_CAPABILITY_IDS, expected.as_slice());
     }
@@ -1459,6 +1597,18 @@ mod tests {
         let b = finished_mac(&key, &[3u8; 32]);
         assert_ne!(a, b);
         assert_eq!(finished_mac(&key, &[2u8; 32]), a);
+    }
+
+    #[test]
+    fn finished_mac_matches_rfc2104_hmac_blake2s() {
+        let key = [1u8; 32];
+        let transcript = [2u8; 32];
+        let expected = [
+            0x84, 0x08, 0x02, 0xa0, 0x55, 0x49, 0xb5, 0x9b, 0x3d, 0xee, 0x05, 0xa6, 0x59, 0x1a,
+            0x78, 0x1c, 0x1e, 0x5b, 0xd5, 0x7c, 0x39, 0x76, 0xf1, 0x2c, 0x60, 0x6c, 0x5f, 0x40,
+            0xee, 0x3d, 0x53, 0x89,
+        ];
+        assert_eq!(finished_mac(&key, &transcript), expected);
     }
 
     #[test]

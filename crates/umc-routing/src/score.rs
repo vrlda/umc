@@ -61,11 +61,34 @@ pub fn score_balanced(
 pub fn passes_hard_constraints(record: &RouteRecord, constraints: &[HardConstraint]) -> bool {
     constraints.iter().all(|c| match c {
         HardConstraint::MaxHops(hops) => {
-            record.metadata.iter().filter(|b| **b == b'h').count() as u64 <= *hops
+            metadata_u64(&record.metadata, b"hops=").is_some_and(|route_hops| route_hops <= *hops)
         }
         HardConstraint::LocalOnly => record.scope != crate::types::RouteScope::General,
-        HardConstraint::AllowedCarrier(_) | HardConstraint::MinTrust(_) => true, // policy fields on RouteRecord land in Phase 4
+        // Route metadata is an authenticated, bounded policy snapshot. A
+        // record without the requested field fails closed; treating missing
+        // carrier/trust evidence as a match would turn hard constraints into
+        // advisory hints (routing.md §§22.1, 29).
+        HardConstraint::AllowedCarrier(carrier) => {
+            metadata_value(&record.metadata, b"carrier=") == Some(carrier.as_bytes())
+        }
+        HardConstraint::MinTrust(minimum) => metadata_u64(&record.metadata, b"trust=")
+            .is_some_and(|trust| trust >= u64::from(*minimum)),
     })
+}
+
+/// Finds one canonical `key=value` field in route metadata. Metadata is
+/// deliberately opaque to the route scorer; producers use NUL-separated
+/// bounded fields so arbitrary binary extension fields remain possible.
+fn metadata_value<'a>(metadata: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    metadata
+        .split(|byte| *byte == 0)
+        .find_map(|field| field.strip_prefix(key))
+}
+
+fn metadata_u64(metadata: &[u8], key: &[u8]) -> Option<u64> {
+    let value = metadata_value(metadata, key)?;
+    let value = std::str::from_utf8(value).ok()?;
+    value.parse().ok()
 }
 
 #[cfg(test)]
@@ -126,6 +149,47 @@ mod tests {
         assert!(!passes_hard_constraints(
             &record,
             &[HardConstraint::LocalOnly]
+        ));
+    }
+
+    #[test]
+    fn policy_constraints_fail_closed_without_authenticated_metadata() {
+        let now = umc_types::runtime::Instant(0);
+        let record = usable_record(now);
+        assert!(!passes_hard_constraints(
+            &record,
+            &[HardConstraint::AllowedCarrier("ump.tcp/1".into())]
+        ));
+        assert!(!passes_hard_constraints(
+            &record,
+            &[HardConstraint::MinTrust(1)]
+        ));
+        assert!(!passes_hard_constraints(
+            &record,
+            &[HardConstraint::MaxHops(2)]
+        ));
+    }
+
+    #[test]
+    fn policy_constraints_read_bounded_metadata_fields() {
+        let now = umc_types::runtime::Instant(0);
+        let mut record = usable_record(now);
+        record.metadata = b"carrier=ump.tcp/1\0trust=4\0hops=2".to_vec();
+        assert!(passes_hard_constraints(
+            &record,
+            &[
+                HardConstraint::AllowedCarrier("ump.tcp/1".into()),
+                HardConstraint::MinTrust(3),
+                HardConstraint::MaxHops(2),
+            ]
+        ));
+        assert!(!passes_hard_constraints(
+            &record,
+            &[HardConstraint::AllowedCarrier("ump.udp/1".into())]
+        ));
+        assert!(!passes_hard_constraints(
+            &record,
+            &[HardConstraint::MaxHops(1)]
         ));
     }
 }

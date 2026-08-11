@@ -1,19 +1,24 @@
 //! Runtime state (core.md §8): the daemon's shared mutable runtime context,
 //! built once at startup and shared (behind an `Arc`) with the control
 //! socket and carrier tasks.
+use crate::application_data::ApplicationDataPlane;
 use crate::bundle_service::BundleService;
 use crate::config::NodeConfig;
+use crate::control_authorization::restore_control_tokens;
 use crate::discovery_service::DiscoveryService;
 use crate::event_log::DaemonEvents;
 use crate::relay_service::RelayService;
 use crate::routing_service::RoutingService;
 use crate::runtime_adapters::{OsClock, OsEntropy, TokioAdaptor};
 use crate::session_bus::SessionBus;
+use crate::session_manager::SessionControl;
 use crate::session_manager::SessionManager;
+#[cfg(not(test))]
+use blake2::{Blake2s256, Digest};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc::SyncSender, Arc, Mutex};
 use tokio::sync::mpsc;
 use umc_carrier::Listener;
 use umc_control::auth::TokenRegistry;
@@ -25,7 +30,9 @@ use umc_core::block::Blocklist;
 use umc_core::mesh::MeshConfig;
 use umc_core::node::{Node, NodeConfig as NodeRuntimeConfig, NodeIdentity};
 use umc_core::rate_limiter::RateLimiter;
-use umc_core::revocation::{RevocationError, RevocationStore, TofuError, TofuStore};
+use umc_core::revocation::{
+    RevocationError, RevocationFreshness, RevocationStore, TofuError, TofuStore,
+};
 use umc_core::trust::{TrustLevel, TrustState, TrustStore};
 use umc_core::well_known::WELL_KNOWN_APP;
 use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
@@ -33,11 +40,15 @@ use umc_discovery::invitation::InvitationStore;
 use umc_discovery::limit::EnumerationGuard;
 use umc_handshake::identity::IdentityBinding;
 use umc_metrics::Registry;
+use umc_storage::keychain::KeychainError;
+#[cfg(not(test))]
+use umc_storage::keychain::{OsKeychain, SecretStore};
 use umc_storage::keystore::{KeyClass, Keystore, KeystoreError};
 use umc_storage::objects::ObjectStore;
-use umc_storage::quota::{Profile, QuotaAccount};
+use umc_storage::quota::QuotaAccount;
 use umc_storage::sqlite::SqliteStore;
-use umc_types::runtime::{Clock, Instant};
+use umc_storage::store::{Namespace, Store};
+use umc_types::runtime::{Clock, EntropySource, Instant};
 
 /// Keystore file name inside the keystore directory (core.md §19).
 pub(crate) const KEYSTORE_FILE: &str = "keystore.ks";
@@ -62,6 +73,11 @@ const SECONDARY_RECORD_LEN: usize = 64 + 8 + 8 + 8 + 32;
 /// Binding record layout: `[sequence || not_before || not_after ||
 /// capabilities_hash]`.
 const BINDING_RECORD_LEN: usize = 8 + 8 + 8 + 32;
+
+/// Local policy window for qualifying revocation-state claims. This is not a
+/// guarantee that disconnected peers have seen every revocation; it bounds
+/// how long persisted evidence is reported as fresh.
+pub const DEFAULT_REVOCATION_FRESHNESS_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 /// Serializes `UMC_KEYSTORE_PASSWORD` mutations across test modules that
 /// open keystores under a known password. Production code never touches it.
@@ -107,6 +123,16 @@ struct SecondaryIndexEntry {
 /// identity change must re-seal future tickets under the new identity.
 pub(crate) fn ticket_key_for(identity: &NodeIdentity) -> [u8; 32] {
     umc_crypto::hkdf::extract(&[0u8; 32], &identity.identity.to_seed())
+}
+
+/// Retry-token key derived separately from the ticket key so a token cannot
+/// be confused with a resumption ticket (handshake.md §21).
+pub(crate) fn retry_key_for(identity: &NodeIdentity) -> [u8; 32] {
+    let ticket_key = ticket_key_for(identity);
+    umc_crypto::label::expand_label(&ticket_key, b"retry key", b"", 32)
+        .expect("fixed retry key length")
+        .try_into()
+        .expect("fixed retry key length")
 }
 
 /// Loads the full identity registry from the keystore (task F2): the
@@ -332,6 +358,189 @@ pub(crate) fn wall_now() -> Instant {
     Instant(millis)
 }
 
+/// File kept outside the backup payload so a validated restore can advance a
+/// generation that an older snapshot cannot roll back.
+pub(crate) const RESTORE_ANCHOR_FILE: &str = ".restore-anchor";
+const RESTORE_ANCHOR_KEY: &[u8] = b"runtime/restore-anchor";
+#[cfg(not(test))]
+const PLATFORM_RESTORE_ANCHOR_PREFIX: &str = "restore-anchor-v1/";
+
+/// Reads the external restore generation. A missing or malformed anchor is
+/// treated as generation zero and logged; startup still fails closed when the
+/// persisted database anchor disagrees with the external value.
+pub(crate) fn read_restore_anchor(data_dir: &std::path::Path) -> u64 {
+    let path = data_dir.join(RESTORE_ANCHOR_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(value) => match value.trim().parse::<u64>() {
+            Ok(generation) => generation,
+            Err(error) => {
+                log::warn!(
+                    "[restore] ignoring malformed anchor {}: {error}",
+                    path.display()
+                );
+                0
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            log::warn!("[restore] cannot read anchor {}: {error}", path.display());
+            0
+        }
+    }
+}
+
+/// Stable, non-sensitive keychain reference for one node data directory. The
+/// path itself never enters the OS credential store account name.
+#[cfg(not(test))]
+fn platform_restore_anchor_reference(data_dir: &std::path::Path) -> String {
+    let mut hasher = Blake2s256::new();
+    hasher.update(b"UMC-RESTORE-ANCHOR-v1\0");
+    hasher.update(data_dir.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let mut reference = String::with_capacity(PLATFORM_RESTORE_ANCHOR_PREFIX.len() + 64);
+    reference.push_str(PLATFORM_RESTORE_ANCHOR_PREFIX);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(reference, "{byte:02x}");
+    }
+    reference
+}
+
+/// Reads the external OS-keychain generation. The native keychain is an
+/// independent store from the backup payload; missing or unavailable native
+/// backends are reported to the caller so the file anchor can remain the
+/// bounded fallback.
+#[cfg(test)]
+#[allow(clippy::unnecessary_wraps)]
+fn read_platform_restore_anchor(_data_dir: &std::path::Path) -> Result<Option<u64>, KeychainError> {
+    Ok(None)
+}
+
+#[cfg(not(test))]
+fn read_platform_restore_anchor(data_dir: &std::path::Path) -> Result<Option<u64>, KeychainError> {
+    let keychain = OsKeychain;
+    match keychain.get_secret(&platform_restore_anchor_reference(data_dir)) {
+        Ok(bytes) if bytes.len() == 8 => Ok(Some(u64::from_be_bytes(
+            bytes.as_slice().try_into().expect("eight-byte anchor"),
+        ))),
+        Ok(_) => Err(KeychainError::Unavailable),
+        Err(KeychainError::Missing) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unnecessary_wraps)]
+fn write_platform_restore_anchor(
+    _data_dir: &std::path::Path,
+    _generation: u64,
+) -> Result<(), KeychainError> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn write_platform_restore_anchor(
+    data_dir: &std::path::Path,
+    generation: u64,
+) -> Result<(), KeychainError> {
+    #[cfg(test)]
+    {
+        let _ = (data_dir, generation);
+        return Ok(());
+    }
+    #[cfg(not(test))]
+    {
+        let keychain = OsKeychain;
+        keychain.set_secret(
+            &platform_restore_anchor_reference(data_dir),
+            &generation.to_be_bytes(),
+        )
+    }
+}
+
+/// Advances and atomically persists the external restore generation.
+///
+/// # Errors
+/// Returns a message when the anchor cannot be written or renamed into place.
+pub(crate) fn advance_restore_anchor(data_dir: &std::path::Path) -> Result<u64, String> {
+    let file_generation = read_restore_anchor(data_dir);
+    let platform_generation = match read_platform_restore_anchor(data_dir) {
+        Ok(value) => value.unwrap_or(0),
+        Err(error) => {
+            log::warn!("[restore] platform anchor unavailable while advancing: {error:?}");
+            0
+        }
+    };
+    let generation = file_generation.max(platform_generation).saturating_add(1);
+    let path = data_dir.join(RESTORE_ANCHOR_FILE);
+    let temporary = data_dir.join(format!("{RESTORE_ANCHOR_FILE}.tmp"));
+    std::fs::write(&temporary, format!("{generation}\n"))
+        .map_err(|error| format!("write restore anchor {}: {error}", temporary.display()))?;
+    std::fs::rename(&temporary, &path)
+        .map_err(|error| format!("install restore anchor {}: {error}", path.display()))?;
+    if let Err(error) = write_platform_restore_anchor(data_dir, generation) {
+        log::warn!("[restore] platform anchor update unavailable: {error:?}");
+    }
+    Ok(generation)
+}
+
+/// Compares the database's last-seen restore generation with the external
+/// anchor and persists the highest value. A mismatch is a warning rather than
+/// an automatic refusal: operators may intentionally restore an older,
+/// validated snapshot, but trust/revocation claims must then be treated as
+/// potentially stale (identity-trust.md §21.3, storage.md §21.3).
+fn reconcile_restore_anchor(
+    store: &dyn Store,
+    data_dir: &std::path::Path,
+) -> Result<Option<String>, String> {
+    let file_external = read_restore_anchor(data_dir);
+    let platform_external = match read_platform_restore_anchor(data_dir) {
+        Ok(value) => value,
+        Err(error) => {
+            log::warn!("[restore] platform anchor unavailable at startup: {error:?}");
+            None
+        }
+    };
+    let external = file_external.max(platform_external.unwrap_or(0));
+    let persisted = store
+        .get(Namespace::Trust, RESTORE_ANCHOR_KEY)
+        .map_err(|error| format!("restore anchor read: {error:?}"))?
+        .map(|bytes| {
+            if bytes.len() != 8 {
+                return Err("malformed persisted restore anchor".to_string());
+            }
+            Ok(u64::from_be_bytes(bytes.as_slice().try_into().map_err(
+                |_| "malformed persisted restore anchor".to_string(),
+            )?))
+        })
+        .transpose()?;
+    let effective = persisted.unwrap_or(external).max(external);
+    let warning = match persisted {
+        Some(value) if value != external => Some(format!(
+            "trust/revocation state may be stale: restore anchor differs (database={value}, external={external})"
+        )),
+        None if external != 0 => Some(format!(
+            "trust/revocation state may be stale: database has no restore anchor (external={external})"
+        )),
+        _ => None,
+    };
+    if persisted != Some(effective) {
+        store
+            .put(
+                Namespace::Trust,
+                RESTORE_ANCHOR_KEY,
+                &effective.to_be_bytes(),
+            )
+            .map_err(|error| format!("restore anchor write: {error:?}"))?;
+    }
+    if effective > 0 && platform_external != Some(effective) {
+        if let Err(error) = write_platform_restore_anchor(data_dir, effective) {
+            log::warn!("[restore] platform anchor reconciliation unavailable: {error:?}");
+        }
+    }
+    Ok(warning)
+}
+
 pub(crate) fn keystore_password() -> Vec<u8> {
     let Ok(pw) = std::env::var("UMC_KEYSTORE_PASSWORD") else {
         // Dev default: the keystore then protects identity with file
@@ -396,6 +605,15 @@ pub struct RuntimeState {
     pub config: NodeConfig,
     /// Monotonic startup timestamp.
     pub started_at: Instant,
+    /// Warning captured when the persisted trust/revocation anchor differs
+    /// from the external restore-generation anchor.
+    pub restore_warning: Option<String>,
+    /// Startup warning when persisted revocation evidence is older than the
+    /// local freshness window or cannot be read.
+    pub revocation_warning: Option<String>,
+    /// Random identifier for this daemon process instance. It changes on
+    /// every startup and scopes control-plane handles and resume cursors.
+    pub server_instance_id: [u8; 16],
     /// Resolved control socket path.
     pub control_socket: PathBuf,
     /// Node database (namespaces: config, trust, records).
@@ -409,9 +627,8 @@ pub struct RuntimeState {
     /// refuses sessions from blocked endpoints
     /// ([`Self::refuse_if_blocked`]).
     pub blocklist: Blocklist,
-    /// Per-peer rate limiter. Placeholder: wired into admission paths in
-    /// Task 20+.
-    #[allow(dead_code)]
+    /// Per-peer rate limiter for live control requests
+    /// (resource-limits.md §47).
     pub rate_limiter: RateLimiter,
     /// Per-control-principal enumeration budget (discovery.md §18): list and
     /// query surfaces consume bounded work without revealing whether a
@@ -436,6 +653,8 @@ pub struct RuntimeState {
     /// it are opaque to peers — the ticket only carries its nonce in the
     /// clear (v1 wire format).
     pub ticket_key: [u8; 32],
+    /// Stateless Retry token/integrity key, rotated with the node identity.
+    pub retry_key: [u8; 32],
     /// Bounded single-use ticket cache: a ticket nonce seen before refuses
     /// the resume (handshake.md §35), so one ticket grants at most one
     /// session under the victim's endpoint id.
@@ -444,10 +663,29 @@ pub struct RuntimeState {
     pub mesh: MeshConfig,
     /// The runtime node: registered carriers, sessions (core.md §8).
     pub node: Node,
+    /// `CarrierService` instance records and lifecycle revisions. Concrete
+    /// carrier wiring is registered at startup; control-created records keep
+    /// their options here until per-instance factories are available.
+    pub carrier_instances:
+        std::collections::HashMap<Vec<u8>, crate::control_carriers::CarrierInstanceRecord>,
+    /// Whether carrier control records have been initialized for this runtime.
+    /// This distinguishes an empty registry from a deliberately deleted last
+    /// instance when type-only legacy operations are still in use.
+    pub carrier_registry_initialized: bool,
     /// Bound carrier listeners; held here so the sockets stay alive.
     pub listeners: Vec<Box<dyn Listener + Send + Sync>>,
+    /// Runtime listeners owned by control-created carrier instances. The
+    /// accept task holds a clone of each `Arc`, while this map gives
+    /// `StopCarrier` an idempotent close path for the underlying resource.
+    pub carrier_listeners: HashMap<Vec<u8>, Arc<dyn Listener + Send + Sync>>,
     /// Live session registry (core.md §9.5); populated by the accept loops.
     pub sessions: Arc<SessionManager>,
+    /// Session transport objects addressable by live application handles.
+    pub session_controls: HashMap<u64, Arc<SessionControl>>,
+    /// Outbound carrier links created through `CarrierService.Dial`. Keeping
+    /// ownership here makes link handles independent from session handles and
+    /// lets lifecycle operations close/drain them deterministically.
+    pub carrier_links: HashMap<Vec<u8>, CarrierLinkRecord>,
     /// Weak self-reference so runtime handlers (e.g. CarrierService.Listen)
     /// can spawn state-bound tasks without deadlocking the held lock.
     pub self_arc: std::sync::Weak<std::sync::Mutex<RuntimeState>>,
@@ -462,6 +700,10 @@ pub struct RuntimeState {
     pub invitations: InvitationStore,
     /// Relay service: circuit registry, admission, forwarding.
     pub relay: RelayService,
+    /// Bounded endpoint handoffs created by relay-delivered Initial packets.
+    /// The key is the authenticated adjacent session plus its peer-scoped
+    /// wire circuit id; values feed the one destination-side `RelayLink`.
+    pub relay_endpoint_handoffs: HashMap<(u64, u64), SyncSender<Vec<u8>>>,
     /// Bundle service: object-store-backed bundle admission and expiry.
     pub bundle: BundleService,
     /// Routing service: request admission, reverse paths, route cache.
@@ -471,6 +713,9 @@ pub struct RuntimeState {
     pub events: Arc<Mutex<DaemonEvents>>,
     /// Live event subscriptions for control-plane clients.
     pub event_bus: Arc<Mutex<EventBus>>,
+    /// Bounded idempotency replay state shared across control connections and
+    /// restored from encrypted API-namespace records on daemon restart.
+    pub idempotency: crate::control_transport::IdempotencyCache,
     /// Bearer-token registry and grants for local control clients.
     pub token_registry: TokenRegistry,
     pub token_grants: HashMap<u64, Vec<api::CapabilityGrant>>,
@@ -488,11 +733,25 @@ pub struct RuntimeState {
     /// handle is the first requested protocol id, so this side table keeps
     /// multi-protocol registrations removable as one application.
     pub application_protocols: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    /// Authorization principal that owns each control-plane application
+    /// handle. Principal zero is the same-user OS-peer fallback.
+    pub application_principals: HashMap<Vec<u8>, u64>,
+    /// Control connection that owns each application handle. Empty IDs are
+    /// used by in-process protocol tests, not live socket registrations.
+    pub application_connections: HashMap<Vec<u8>, Vec<u8>>,
+    /// Listener handles opened by applications. Listener handles are the
+    /// application handle in the current v1 surface, but tracking their
+    /// lifecycle separately lets `CloseListener` stop admission without
+    /// unregistering the application itself.
+    pub application_listeners: HashSet<Vec<u8>>,
+    /// Bounded application-owned stream/datagram queues and pending accepts.
+    pub application_data: ApplicationDataPlane,
     /// Per-application echo receivers: the application's outbound channel,
     /// drained by the session writers and sent back on the same stream.
     pub app_echo_rx: Arc<Mutex<HashMap<Vec<u8>, AppRx>>>,
     /// Development-only control API bearer credential (control-api.md
-    /// §11.3). `None` in production: every request is accepted at hello.
+    /// §11.3). `None` in production: same-user Unix peer auth remains the
+    /// local fallback, while presented bearer requests use grant checks.
     pub development_token: Option<Vec<u8>>,
     /// Set when a graceful shutdown was requested.
     pub shutdown_requested: Arc<AtomicBool>,
@@ -500,11 +759,20 @@ pub struct RuntimeState {
     pub shutdown_channel: mpsc::Sender<()>,
 }
 
+/// One daemon-owned raw outbound carrier link.
+pub struct CarrierLinkRecord {
+    pub carrier_handle: Vec<u8>,
+    pub carrier_type: String,
+    pub link: Arc<umc_carrier::BoxLink>,
+}
+
 impl std::fmt::Debug for RuntimeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RuntimeState")
             .field("started_at", &self.started_at)
             .field("control_socket", &self.control_socket)
+            .field("restore_warning", &self.restore_warning.is_some())
+            .field("revocation_warning", &self.revocation_warning.is_some())
             .field("listeners", &self.listeners.len())
             .finish_non_exhaustive()
     }
@@ -523,6 +791,7 @@ impl RuntimeState {
     /// ([`UMC_KEYSTORE_PASSWORD`](keystore_password)).
     #[allow(clippy::too_many_lines)] // startup composes all bounded daemon subsystems
     pub fn new(config: NodeConfig, shutdown_channel: mpsc::Sender<()>) -> Result<Self, String> {
+        let resource_profile = config.resource_profile();
         let data_dir = config.resolved_data_dir();
         std::fs::create_dir_all(&data_dir).map_err(|e| format!("data dir: {e}"))?;
         std::fs::create_dir_all(config.resolved_keystore_dir())
@@ -530,6 +799,7 @@ impl RuntimeState {
         let store = Arc::new(
             SqliteStore::open(&data_dir.join("node.db")).map_err(|e| format!("store: {e:?}"))?,
         );
+        let restore_warning = reconcile_restore_anchor(store.as_ref(), &data_dir)?;
 
         let (node_identity, primary_binding, secondaries) = load_identity_registry(&config)?;
         // The runtime node and the state share the same key material.
@@ -541,6 +811,7 @@ impl RuntimeState {
         // seed hash — persistent across restarts and bound to the node's
         // identity (see the field docs).
         let ticket_key = ticket_key_for(&state_identity);
+        let retry_key = retry_key_for(&state_identity);
         let dcid = node_identity.endpoint_id()[..8].to_vec();
         let node = Node::new(
             NodeRuntimeConfig {
@@ -568,11 +839,8 @@ impl RuntimeState {
             .map(|token| token.as_bytes().to_vec());
         let bundle_objects = ObjectStore::open(data_dir.join("objects"))
             .map_err(|e| format!("bundle object store: {e:?}"))?;
-        let bundle_quota = QuotaAccount::new(
-            Profile::Standard,
-            0,
-            Profile::Standard.bundle_storage_bytes(),
-        );
+        let bundle_quota =
+            QuotaAccount::new(resource_profile, 0, resource_profile.bundle_storage_bytes());
 
         let mut apps = AppRegistry::new();
         apps.register(
@@ -582,6 +850,17 @@ impl RuntimeState {
         .map_err(|e| format!("echo app registration: {e:?}"))?;
 
         let started_at = OsClock.now();
+        let revocation_warning = match RevocationStore::new(store.as_ref())
+            .freshness(started_at.0, DEFAULT_REVOCATION_FRESHNESS_MS)
+        {
+            Ok(RevocationFreshness::Stale {
+                latest_recorded_at_ms,
+            }) => Some(format!(
+                "revocation state may be stale: newest local record is from {latest_recorded_at_ms}"
+            )),
+            Ok(RevocationFreshness::Fresh { .. } | RevocationFreshness::Unknown) => None,
+            Err(error) => Some(format!("revocation state freshness unavailable: {error:?}")),
+        };
         // Services bound to the node database restore persisted state at
         // startup: routes as candidates (storage.md §15.2), candidates as
         // operational hints (§16.4), bundle metadata (§6.3). Restore
@@ -589,6 +868,23 @@ impl RuntimeState {
         let mut discovery = DiscoveryService::new(umc_discovery::table::DEFAULT_TABLE_CAP);
         discovery.attach_store(store.clone());
         discovery.restore_candidates(store.as_ref(), started_at);
+        let static_provider =
+            crate::static_peers::StaticPeerProvider::new(&config.static_peers, started_at);
+        if !static_provider.is_empty() {
+            discovery.register_provider(Box::new(static_provider));
+            let startup_reports = discovery.start_providers();
+            if startup_reports
+                .iter()
+                .any(|report| report.state != umc_discovery::manager::ProviderState::Running)
+            {
+                log::warn!("[discovery] static provider did not start cleanly");
+            }
+            let refresh = discovery.refresh_providers(started_at);
+            log::debug!(
+                "[discovery] static provider admitted {} candidate(s)",
+                refresh.admitted_candidates
+            );
+        }
         let mut routing = RoutingService::new();
         routing.attach_store(store.clone());
         routing.restore(store.as_ref(), started_at);
@@ -610,11 +906,39 @@ impl RuntimeState {
             let mut events_guard = events.lock().expect("event log");
             events_guard.attach_store(store.clone());
             events_guard.restore_persisted(store.as_ref());
+            if let Some(detail) = &restore_warning {
+                log::warn!("[restore] {detail}");
+                events_guard.push(crate::event_log::DaemonEvent {
+                    kind: "restore_stale_state".into(),
+                    at_ms: started_at.0,
+                    detail: detail.clone(),
+                });
+            }
+            if let Some(detail) = &revocation_warning {
+                log::warn!("[trust] {detail}");
+                events_guard.push(crate::event_log::DaemonEvent {
+                    kind: "revocation_state_stale".into(),
+                    at_ms: started_at.0,
+                    detail: detail.clone(),
+                });
+            }
         }
+
+        let mut server_instance_id = [0u8; 16];
+        OsEntropy.fill(&mut server_instance_id);
+        let (token_registry, token_grants) = restore_control_tokens(store.as_ref());
+        let idempotency = crate::control_transport::IdempotencyCache::restore(
+            store.as_ref(),
+            &ticket_key,
+            wall_now().0,
+        );
 
         Ok(Self {
             control_socket: config.resolved_socket(),
             started_at,
+            restore_warning,
+            revocation_warning,
+            server_instance_id,
             config,
             store,
             trust_default_level: TrustLevel::Unknown,
@@ -625,26 +949,38 @@ impl RuntimeState {
             primary_binding,
             secondaries,
             ticket_key,
+            retry_key,
             ticket_replay_cache: std::sync::Mutex::new(TicketReplayCache::new()),
             mesh,
             node,
+            carrier_instances: HashMap::new(),
+            carrier_registry_initialized: false,
             listeners: Vec::new(),
+            carrier_listeners: HashMap::new(),
             sessions: Arc::new(SessionManager::new()),
+            session_controls: HashMap::new(),
+            carrier_links: HashMap::new(),
             self_arc: std::sync::Weak::new(),
             bus: Arc::new(Mutex::new(SessionBus::new())),
             discovery,
             invitations: InvitationStore::new(),
             relay: RelayService::new(events.clone()),
+            relay_endpoint_handoffs: HashMap::new(),
             bundle,
             routing,
             events,
             event_bus,
-            token_registry: TokenRegistry::new(),
-            token_grants: HashMap::new(),
+            idempotency,
+            token_registry,
+            token_grants,
             metrics: Arc::new(Registry::new()),
             apps,
             app_channels: Arc::new(Mutex::new(HashMap::new())),
             application_protocols: HashMap::new(),
+            application_principals: HashMap::new(),
+            application_connections: HashMap::new(),
+            application_listeners: HashSet::new(),
+            application_data: ApplicationDataPlane::new(),
             app_echo_rx: Arc::new(Mutex::new(HashMap::new())),
             development_token,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
@@ -657,6 +993,40 @@ impl RuntimeState {
     #[must_use]
     pub fn trust_store(&self) -> TrustStore<'_> {
         TrustStore::new(self.store.as_ref(), self.trust_default_level)
+    }
+
+    /// Returns the current local revocation-freshness classification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the trust namespace cannot be scanned or a
+    /// revocation record is corrupt.
+    pub fn revocation_freshness(&self, now_ms: u64) -> Result<RevocationFreshness, String> {
+        RevocationStore::new(self.store.as_ref())
+            .freshness(now_ms, DEFAULT_REVOCATION_FRESHNESS_MS)
+            .map_err(|error| format!("revocation freshness: {error:?}"))
+    }
+
+    /// Produces the operator-facing qualification for trust/revocation
+    /// claims. An unknown local record set is intentionally qualified rather
+    /// than presented as proof that no revocation exists.
+    #[must_use]
+    pub fn revocation_claim_warning(&self, now_ms: u64) -> Option<String> {
+        if let Some(detail) = &self.restore_warning {
+            return Some(detail.clone());
+        }
+        match self.revocation_freshness(now_ms) {
+            Ok(RevocationFreshness::Fresh { .. }) => None,
+            Ok(RevocationFreshness::Unknown) => {
+                Some("revocation state freshness unknown: no locally recorded update".into())
+            }
+            Ok(RevocationFreshness::Stale {
+                latest_recorded_at_ms,
+            }) => Some(format!(
+                "revocation state may be stale: newest local record is from {latest_recorded_at_ms}"
+            )),
+            Err(error) => Some(error),
+        }
     }
 
     /// Checks a verified handshake binding against revocation and TOFU state
@@ -875,6 +1245,7 @@ impl RuntimeState {
             };
             self.node.config.dcid = self.node_identity.endpoint_id()[..8].to_vec();
             self.ticket_key = ticket_key_for(&self.node_identity);
+            self.retry_key = retry_key_for(&self.node_identity);
             self.primary_binding = binding.clone();
         } else {
             let updated = SecondaryIdentity {
@@ -1101,6 +1472,9 @@ pub mod metric_names {
     pub const HANDSHAKE_FAILURES: &str = "handshake_failures";
     /// IK-mode resumed sessions established (counter).
     pub const RESUMPTION_SESSIONS: &str = "resumption_sessions";
+    /// Whether current trust claims require a revocation-freshness warning
+    /// (gauge: 1 when unknown/stale/unreadable, otherwise 0).
+    pub const REVOCATION_STATE_STALE: &str = "revocation_state_stale";
     /// Inbound protected packets fed to the session layer (counter).
     pub const PACKETS_RECEIVED: &str = "packets_received";
     /// Lost packets re-sent under fresh numbers (counter).
@@ -1143,6 +1517,7 @@ mod tests {
     use super::*;
     use crate::config::NodeConfig;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use umc_storage::quota::Profile;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1198,6 +1573,17 @@ mod tests {
                 .refuse_if_trust_disallowed(&endpoint)
                 .expect_err("revoked peer must be refused");
             assert!(error.contains("IDENTITY_REVOKED"), "{error}");
+        });
+    }
+
+    #[test]
+    fn runtime_uses_configured_resource_profile_for_bundle_quota() {
+        with_password("state-profile-test", || {
+            let mut config = fresh_config();
+            config.profile = "constrained".into();
+            let state = build(config);
+            assert_eq!(state.bundle.manager.quota().profile, Profile::Constrained);
+            assert_eq!(state.bundle.manager.quota().hard_limit, 0);
         });
     }
 
@@ -1479,6 +1865,22 @@ mod tests {
     }
 
     #[test]
+    fn restore_anchor_advances_monotonically() {
+        let dir = std::env::temp_dir().join(format!(
+            "umcd-restore-anchor-{}-{}",
+            std::process::id(),
+            wall_now().0
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("anchor dir");
+        assert_eq!(read_restore_anchor(&dir), 0);
+        assert_eq!(advance_restore_anchor(&dir).expect("first anchor"), 1);
+        assert_eq!(advance_restore_anchor(&dir).expect("second anchor"), 2);
+        assert_eq!(read_restore_anchor(&dir), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn events_survive_restart() {
         with_password("test-password", || {
             let config = fresh_config();
@@ -1500,6 +1902,26 @@ mod tests {
             assert_eq!(recent.len(), 1);
             assert_eq!(recent[0].kind, "session_active");
             assert_eq!(recent[0].at_ms, 42);
+        });
+    }
+
+    #[test]
+    fn startup_warns_when_external_restore_anchor_is_newer() {
+        with_password("test-password", || {
+            let config = fresh_config();
+            let first = build(config.clone());
+            let data_dir = config.resolved_data_dir();
+            drop(first);
+            advance_restore_anchor(&data_dir).expect("advance external anchor");
+            let second = build(config);
+            assert!(second.restore_warning.is_some());
+            assert!(second
+                .events
+                .lock()
+                .unwrap()
+                .recent(10)
+                .iter()
+                .any(|event| event.kind == "restore_stale_state"));
         });
     }
 }

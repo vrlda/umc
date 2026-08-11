@@ -236,6 +236,53 @@ fn credit_emitted_on_app_consumption() {
 }
 
 #[test]
+fn credit_replenished_after_immediate_app_consumption() {
+    let (mut client, mut server) = pipe_pair();
+    let sid = client.open_stream().expect("stream");
+    client.set_congestion_controller(Box::new(UnlimitedCongestion));
+    let chunk = vec![0xEF; 8_000];
+
+    // Consume each segment as soon as it arrives. The unread buffer stays
+    // empty, so this specifically exercises the application-consumed credit
+    // watermark rather than the memory-pressure watermark.
+    for i in 0..17u64 {
+        let frame = umc_wire::frames::stream::StreamFrame {
+            stream_id: sid,
+            fin: false,
+            offset_present: i != 0,
+            len_present: true,
+            open: true,
+            unidirectional: false,
+            offset: i * 8_000,
+            data: chunk.clone(),
+            protocol_id: Vec::new(),
+            metadata: Vec::new(),
+        };
+        deliver_frame(&mut client, &mut server, &frame.encode().unwrap());
+        let (data, eof) = server.read_stream(sid).expect("read");
+        assert_eq!(data.len(), chunk.len());
+        assert!(!eof);
+    }
+
+    let frames = server.flow_control_frames(Instant(0));
+    assert!(
+        frames.iter().any(|frame| {
+            umc_wire::frame::decode_frames(frame)
+                .unwrap()
+                .iter()
+                .any(|decoded| {
+                    matches!(
+                        decoded,
+                        umc_wire::frame::Frame::MaxStreamData(update)
+                            if update.stream_id == sid && update.maximum_stream_data == 512 * 1024
+                    )
+                })
+        }),
+        "MAX_STREAM_DATA must follow immediate application consumption"
+    );
+}
+
+#[test]
 fn unknown_id_reset_is_noop() {
     let (mut client, mut server) = pipe_pair();
     let reset = umc_wire::frames::stream::ResetStreamFrame {
@@ -617,7 +664,7 @@ fn stream_limit_enforced_on_inbound() {
     client.set_congestion_controller(Box::new(UnlimitedCongestion));
     let t0 = Instant(4_000_000);
     for i in 0..MAX_STREAMS_PER_SESSION {
-        let payload = stream_payload((i * 2) as u64, b"x");
+        let payload = stream_payload((i * 4) as u64, b"x");
         let pkt = client
             .build_outbound(&TestClock, t0, &payload)
             .unwrap()
@@ -626,7 +673,7 @@ fn stream_limit_enforced_on_inbound() {
     }
     // One more distinct inbound id: the packet is rejected with the stream
     // limit error (resource-limits.md §20).
-    let payload = stream_payload((MAX_STREAMS_PER_SESSION * 2) as u64, b"y");
+    let payload = stream_payload((MAX_STREAMS_PER_SESSION * 4) as u64, b"y");
     let pkt = client
         .build_outbound(&TestClock, t0, &payload)
         .unwrap()

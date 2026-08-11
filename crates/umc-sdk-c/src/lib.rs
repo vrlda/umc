@@ -10,6 +10,7 @@ use std::ptr;
 use umc_sdk::client::{Client, ClientError};
 
 const ABI_VERSION: &[u8] = b"umc-sdk-c/0.1.0\0";
+const MAX_C_ABI_PAYLOAD: usize = 1024 * 1024;
 
 #[derive(Debug)]
 #[repr(C)]
@@ -191,6 +192,9 @@ pub unsafe extern "C" fn umc_client_request(
         Ok(value) => value,
         Err(status) => return status,
     };
+    if payload_len > MAX_C_ABI_PAYLOAD {
+        return error_status(9, "payload exceeds the 1 MiB C ABI limit");
+    }
     if payload_len > 0 && payload.is_null() {
         return error_status(3, "null payload");
     }
@@ -281,5 +285,32 @@ mod tests {
         let handle = umc_client_new();
         assert!(!handle.is_null());
         unsafe { umc_client_close(handle) };
+    }
+
+    #[test]
+    fn request_rejects_oversized_payload_before_dereference() {
+        let handle = umc_client_new();
+        assert!(!handle.is_null());
+        let mut response = umc_bytes {
+            data: ptr::null_mut(),
+            len: 0,
+        };
+        let status = unsafe {
+            umc_client_request(
+                handle,
+                c"service".as_ptr(),
+                c"method".as_ptr(),
+                ptr::null(),
+                MAX_C_ABI_PAYLOAD + 1,
+                &mut response,
+            )
+        };
+        assert_eq!(status.code, 9);
+        assert!(response.data.is_null());
+        assert_eq!(response.len, 0);
+        unsafe {
+            umc_status_free(status);
+            umc_client_close(handle);
+        }
     }
 }

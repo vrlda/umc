@@ -24,6 +24,10 @@ pub struct RouteRecordSnapshot {
     pub lifetime_ms: u64,
     pub learned_at_ms: u64,
     pub scope: u8,
+    /// Authenticated, bounded route-policy metadata retained for topology
+    /// diversity and hard constraint checks after restart.
+    #[serde(default)]
+    pub metadata: Vec<u8>,
 }
 
 /// Persists a peer record under its raw endpoint id (storage.md §16.4).
@@ -101,6 +105,7 @@ mod tests {
     use super::*;
     use crate::sqlite::SqliteStore;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -108,7 +113,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("umc-storage-records-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let c = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!("records-{c}.db"));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = dir.join(format!("records-{now}-{c}.db"));
         SqliteStore::open(&path).unwrap()
     }
 
@@ -129,7 +138,17 @@ mod tests {
             lifetime_ms: 600_000,
             learned_at_ms: 42,
             scope: 3,
+            metadata: Vec::new(),
         }
+    }
+
+    #[test]
+    fn route_metadata_round_trips_for_policy_evidence() {
+        let store = temp_store();
+        let mut snapshot = route(4);
+        snapshot.metadata = b"domain=mesh-a\0carrier=ump.tcp/1".to_vec();
+        save_route(&store, &snapshot).unwrap();
+        assert_eq!(list_routes(&store).unwrap()[0].metadata, snapshot.metadata);
     }
 
     #[test]

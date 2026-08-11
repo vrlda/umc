@@ -1,6 +1,5 @@
 //! `PEER_HINT` exchange (discovery.md §13, wire-format.md §51).
 use crate::provider::{CandidateAuth, CandidateSource, PeerCandidate, SharingPolicy};
-use blake2::{Blake2s256, Digest};
 use umc_types::runtime::Instant;
 use umc_wire::frames::misc::{PeerHintEntry, PeerHintFrame};
 use umc_wire::frames::misc::{
@@ -195,7 +194,6 @@ pub fn apply_received_hints_with_mesh_secret(
 }
 
 const MESH_HINT_DOMAIN: &[u8] = b"UMP-MESH-HINT-v1";
-const BLAKE2_BLOCK: usize = 64;
 
 fn mesh_authenticator(secret: &[u8], entry: &PeerHintEntry) -> [u8; 32] {
     let mut data = Vec::with_capacity(128);
@@ -210,27 +208,7 @@ fn mesh_authenticator(secret: &[u8], entry: &PeerHintEntry) -> [u8; 32] {
     data.push(u8::from(entry.ephemeral));
     data.push(u8::from(entry.do_not_reshare));
 
-    let mut key = [0u8; BLAKE2_BLOCK];
-    if secret.len() > BLAKE2_BLOCK {
-        let digest = Blake2s256::digest(secret);
-        key[..digest.len()].copy_from_slice(&digest);
-    } else {
-        key[..secret.len()].copy_from_slice(secret);
-    }
-    let mut inner = [0u8; BLAKE2_BLOCK];
-    let mut outer = [0u8; BLAKE2_BLOCK];
-    for (index, byte) in key.iter().enumerate() {
-        inner[index] = *byte ^ 0x36;
-        outer[index] = *byte ^ 0x5C;
-    }
-    let mut inner_hasher = Blake2s256::new();
-    inner_hasher.update(inner);
-    inner_hasher.update(&data);
-    let inner_digest = inner_hasher.finalize();
-    let mut outer_hasher = Blake2s256::new();
-    outer_hasher.update(outer);
-    outer_hasher.update(inner_digest);
-    outer_hasher.finalize().into()
+    umc_crypto::hkdf::hmac_blake2s(secret, &data)
 }
 
 fn append_bytes(out: &mut Vec<u8>, value: &[u8]) {

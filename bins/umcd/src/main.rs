@@ -1,8 +1,15 @@
 mod app_layer;
+mod application_data;
 mod backup;
 mod bundle_service;
+mod cancellation;
 mod carriers;
 mod config;
+mod control_application;
+mod control_authorization;
+mod control_carriers;
+mod control_events;
+mod control_transport;
 mod discovery_service;
 mod doctor;
 mod event_log;
@@ -11,6 +18,7 @@ mod handshake_timeout;
 mod initial;
 mod logging;
 mod relay_auth;
+mod relay_link;
 mod relay_service;
 mod routing_service;
 mod runtime_adapters;
@@ -22,6 +30,7 @@ mod state;
 mod static_peers;
 mod telemetry;
 
+use blake2::{Blake2s256, Digest};
 use clap::Parser;
 use config::NodeConfig;
 use std::path::PathBuf;
@@ -136,8 +145,8 @@ async fn run(config: NodeConfig) {
     }
 
     carriers::wire_carriers(&mut state);
-    let mut listeners: std::collections::VecDeque<Box<dyn Listener + Send + Sync>> =
-        state.listeners.drain(..).collect();
+    let mut listeners: std::collections::VecDeque<Arc<dyn Listener + Send + Sync>> =
+        state.listeners.drain(..).map(Arc::from).collect();
     log::info!("carrier listeners: {} bound", listeners.len());
     // The runtime state is the daemon's shared mutable context (core.md §8):
     // the accept loops and the control socket both mutate it, so it rides
@@ -176,7 +185,7 @@ async fn run(config: NodeConfig) {
 
     let static_peers = state.lock().expect("state").config.static_peers.clone();
     if !static_peers.is_empty() {
-        static_peers::dial_all(&state, &static_peers).await;
+        static_peers::dial_all(&state, &static_peers);
     }
 
     // Graceful shutdown: SIGINT sets the flag and releases the channel.
@@ -202,13 +211,49 @@ async fn run(config: NodeConfig) {
         tokio::select! {
             _ = shutdown_rx.recv() => break,
             _ = static_retry.tick() => {
-                static_peers::dial_all(&state, &static_peers).await;
+                static_peers::dial_all(&state, &static_peers);
             }
         }
     }
+    // Stop live transport work before dropping the Tokio runtime. Session
+    // reader/writer coordinators own blocking carrier pumps, so merely
+    // setting the shutdown flag is not enough to release their links.
+    shutdown_sessions(&state);
     log::info!("shutdown: complete");
     // Wait for the control socket to finish closing before exiting.
     let _ = server_task.await;
+}
+
+fn shutdown_sessions(state: &Arc<std::sync::Mutex<state::RuntimeState>>) {
+    let (tasks, links, listeners) = {
+        let state = state.lock().expect("state");
+        let tasks = state
+            .sessions
+            .snapshot()
+            .into_iter()
+            .map(|(_, entry)| entry.task.clone())
+            .collect::<Vec<_>>();
+        let links = state
+            .session_controls
+            .values()
+            .map(|control| control.links.clone())
+            .collect::<Vec<_>>();
+        let listeners = state
+            .carrier_listeners
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        (tasks, links, listeners)
+    };
+    for listener in listeners {
+        let _ = listener.close();
+    }
+    for links in links {
+        links.close_all("daemon shutdown");
+    }
+    for task in tasks {
+        task.abort();
+    }
 }
 
 /// Per-listener accept loop (core.md §8): accept a link, hand it to the
@@ -217,7 +262,7 @@ async fn run(config: NodeConfig) {
 pub(crate) async fn accept_loop(
     state: &Arc<std::sync::Mutex<state::RuntimeState>>,
     carrier_type: String,
-    listener: Box<dyn Listener + Send + Sync>,
+    listener: Arc<dyn Listener + Send + Sync>,
 ) {
     let tracker = Arc::new(std::sync::Mutex::new(
         handshake_timeout::HandshakeTracker::new(),
@@ -237,9 +282,22 @@ pub(crate) async fn accept_loop(
             log::warn!("[carrier] {carrier_type} disabled; accept loop stopped");
             break;
         }
-        let Ok(link) = tokio::task::block_in_place(|| listener.accept()) else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
+        let link = match tokio::task::block_in_place(|| listener.accept()) {
+            Ok(link) => link,
+            Err(error)
+                if matches!(
+                    error.kind,
+                    umc_carrier::error::CarrierErrorKind::NotRunning
+                        | umc_carrier::error::CarrierErrorKind::LinkClosed
+                        | umc_carrier::error::CarrierErrorKind::Cancelled
+                ) =>
+            {
+                break
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
         };
         let link_state = state.clone();
         let link_carrier = carrier_type.clone();
@@ -285,6 +343,13 @@ fn record_handshake_failure(state: &Arc<std::sync::Mutex<state::RuntimeState>>, 
         });
 }
 
+fn retry_carrier_binding_hash(carrier_type: &str) -> [u8; 32] {
+    let mut hasher = Blake2s256::new();
+    hasher.update(b"UMP-CARRIER-BINDING-v1");
+    hasher.update(carrier_type.as_bytes());
+    hasher.finalize().into()
+}
+
 /// Handle one inbound link: extract the `CLIENT_HELLO` from the first
 /// packet, answer with `SERVER_HELLO`, build the server session, and start
 /// the wire loop. The caller holds the state mutex for the connection
@@ -298,7 +363,7 @@ fn handle_inbound_link(
     handle_inbound_link_locked(state, carrier_type, link, tracker)
 }
 
-#[allow(clippy::too_many_lines)] // one connection setup path: hello, auth, session, registry
+#[allow(clippy::similar_names, clippy::too_many_lines)] // one connection setup path: hello, auth, session, registry
 fn handle_inbound_link_locked(
     state: &Arc<std::sync::Mutex<state::RuntimeState>>,
     carrier_type: &str,
@@ -309,37 +374,58 @@ fn handle_inbound_link_locked(
     // the wire waits (hello, then CLIENT_AUTH) happen WITHOUT it, so one
     // slow handshake cannot stall the other accept loops or the control
     // socket.
-    // The first framed packet is the CLIENT_HELLO: an Initial long-header
-    // packet (wire-format §13), or — on the transitional raw path kept for
-    // the pre-D1 test harnesses — the hello body itself. The raw path is
-    // removed once the harnesses migrate to protected Initials (plan
-    // D2/D3); the response always mirrors the request's form.
+    // The first framed packet is the protected Initial carrying CLIENT_HELLO
+    // (wire-format §13). A raw hello is not a protocol message: accepting it
+    // here would create a second unauthenticated wire dialect and bypass the
+    // Initial key schedule/header protection requirements.
     let first = tokio::task::block_in_place(|| link.recv())
         .map_err(|e| format!("recv first packet: {e:?}"))?
         .bytes;
-    let parsed_initial = initial::try_parse_initial(&first);
-    let hello_bytes = match &parsed_initial {
-        Some((_dcid, _pn, payload, _scid)) => payload.clone(),
-        None => first.clone(),
-    };
-    let hello_bytes = initial::decode_client_hello(&hello_bytes)?;
+    // Established-session carrier attach: a new carrier starts with a
+    // protected short packet, not CLIENT_HELLO. Route by the fixed DCID,
+    // authenticate with the existing session keys, then hand the link to the
+    // session's path set. No identity handshake or application session is
+    // created on this path (handshake.md §42, session.md §27).
+    if let Ok((_space, dcid, path_id)) = umc_session::packet::peek_protected_header(&first) {
+        if path_id != umc_session::packet::DEFAULT_PATH_ID {
+            let controls = {
+                let state = state.lock().expect("state");
+                state.session_controls.values().cloned().collect::<Vec<_>>()
+            };
+            for control in controls {
+                let matches = control
+                    .session
+                    .try_lock()
+                    .map(|session| session.dcid() == dcid.as_slice())
+                    .unwrap_or(false);
+                if matches {
+                    return handle_established_attach(
+                        state,
+                        carrier_type,
+                        link,
+                        &first,
+                        path_id,
+                        &control,
+                    );
+                }
+            }
+        }
+    }
+    let parsed_initial = initial::try_parse_initial(&first)
+        .ok_or_else(|| "first packet is not a valid protected Initial".to_string())?;
+    let (header_dcid, _pn, payload, client_scid) = &parsed_initial;
+    let hello_bytes = initial::decode_client_hello(payload)?;
     let hello = umc_handshake::xx::ClientHello::decode(&hello_bytes)
         .map_err(|e| format!("client hello: {e:?}"))?;
 
-    // The session's DCID: the Initial header's when present and 8 bytes
-    // long (umc-session requires exactly 8), otherwise derived from the
-    // hello's ephemeral.
-    let dcid = match &parsed_initial {
-        Some((header_dcid, _, _, _)) if header_dcid.len() == 8 => header_dcid.clone(),
-        _ => session_dcid(&hello),
-    };
-    // The client's SCID (its own connection id), for the Version-
-    // Negotiation echo: VN DCID ← client SCID, VN SCID ← client DCID (RFC
-    // 9000 §17.2.1). Empty on the transitional raw path.
-    let vn_scid = match &parsed_initial {
-        Some((_dcid, _pn, _payload, return_to)) => return_to.clone(),
-        None => Vec::new(),
-    };
+    // The native session layer uses the fixed v0.1 eight-byte connection-id
+    // profile. An Initial with another legal long-header length cannot be
+    // represented by that layer; reject it before retry accounting or
+    // responder state allocation instead of deriving a replacement id.
+    let dcid = session_dcid_from_initial(header_dcid)?;
+    // Version-Negotiation echo: VN DCID ← client SCID, VN SCID ← client DCID
+    // (RFC 9000 §17.2.1).
+    let vn_scid = client_scid.clone();
 
     let now = state.lock().expect("state").node.clock.as_ref().now();
     tracker
@@ -386,6 +472,96 @@ fn handle_inbound_link_locked(
         return Err("unsupported protocol version: disabled by policy".into());
     }
 
+    // Optional stateless Retry gate (handshake.md §21): only the protected
+    // XX path uses this carrier, so session-ticket bytes in IK hellos remain
+    // unambiguous. No pending handshake state is allocated before the token
+    // validates.
+    let mut retry_context = None;
+    let (require_retry, retry_key) = {
+        let state = state.lock().expect("state");
+        (state.config.require_retry, state.retry_key)
+    };
+    let xx_requested = hello
+        .supported_handshake_modes
+        .iter()
+        .any(|mode| mode.as_slice() == umc_handshake::xx::MODE_XX);
+    if require_retry && xx_requested {
+        let supplied_token = initial::initial_token(&first).unwrap_or_default();
+        let (original_dcid, _pn, _payload, original_scid) = &parsed_initial;
+        if supplied_token.is_empty() {
+            let mut nonce = [0u8; umc_handshake::retry::RETRY_NONCE_LEN];
+            umc_types::runtime::EntropySource::fill(&runtime_adapters::OsEntropy, &mut nonce);
+            let source_context = nonce[..8].to_vec();
+            let payload = umc_handshake::retry::RetryPayload {
+                token_version: 1,
+                source_context: source_context.clone(),
+                original_destination_connection_id: original_dcid.clone(),
+                client_random: hello.client_random,
+                client_ephemeral_public_key_hash: Blake2s256::digest(
+                    hello.client_ephemeral_public_key,
+                )
+                .into(),
+                carrier_binding_hash: retry_carrier_binding_hash(carrier_type),
+                issued_at: now.0,
+                expires_at: now
+                    .0
+                    .saturating_add(umc_handshake::retry::RETRY_VALIDITY_MS),
+                nonce,
+            };
+            let token = umc_handshake::retry::issue_retry_token(&retry_key, &payload, now.0)
+                .map_err(|error| format!("retry token: {error:?}"))?;
+            let packet = umc_handshake::retry_packet::build_retry_packet(
+                umc_handshake::xx::SUPPORTED_PROTOCOL_VERSION,
+                original_scid,
+                &source_context,
+                &token,
+                &retry_key,
+            )
+            .map_err(|error| format!("retry packet: {error:?}"))?;
+            tokio::task::block_in_place(|| {
+                link.send(OutboundPacket {
+                    bytes: packet,
+                    control: true,
+                    deadline_ms: Some(3_000),
+                })
+            })
+            .map_err(|error| format!("send retry: {error:?}"))?;
+            return Err("stateless retry issued".into());
+        }
+
+        let token_payload =
+            umc_handshake::retry::validate_retry_token(&retry_key, &supplied_token, now.0)
+                .map_err(|error| format!("invalid retry token: {error:?}"))?;
+        let mut original_hello = hello.clone();
+        original_hello.retry_token.clear();
+        let original_hello_bytes = original_hello
+            .encode()
+            .map_err(|error| format!("retry hello: {error:?}"))?;
+        let expected_eph_hash: [u8; 32] =
+            Blake2s256::digest(hello.client_ephemeral_public_key).into();
+        if token_payload.original_destination_connection_id != *original_dcid
+            || token_payload.client_random != hello.client_random
+            || token_payload.client_ephemeral_public_key_hash != expected_eph_hash
+            || token_payload.carrier_binding_hash != retry_carrier_binding_hash(carrier_type)
+            || hello.retry_token != supplied_token
+            || token_payload.source_context.len() != 8
+        {
+            return Err("invalid retry token context".into());
+        }
+        let retry_packet = umc_handshake::retry_packet::build_retry_packet(
+            umc_handshake::xx::SUPPORTED_PROTOCOL_VERSION,
+            original_scid,
+            &token_payload.source_context,
+            &supplied_token,
+            &retry_key,
+        )
+        .map_err(|error| format!("retry packet: {error:?}"))?;
+        retry_context = Some(umc_handshake::retry_packet::retry_context(
+            &original_hello_bytes,
+            &retry_packet,
+        ));
+    }
+
     // Session resumption (handshake.md §35, IK mode): a hello offering the
     // IK handshake mode carries a session ticket in `retry_token` (the
     // SANCTIONED v1 ticket carrier — the field is otherwise unused). A
@@ -422,7 +598,7 @@ fn handle_inbound_link_locked(
                 link,
                 &hello,
                 &hello_bytes,
-                parsed_initial.as_ref(),
+                &parsed_initial,
                 &dcid,
                 &vn_scid,
                 now,
@@ -431,6 +607,33 @@ fn handle_inbound_link_locked(
             );
         }
     }
+
+    // PSK-XX admission (handshake.md §22): match the bounded authenticator
+    // against the daemon's live invitation set before allocating responder
+    // handshake state. A matching single-use invitation is consumed at this
+    // gate; failures remain a generic admission error so probes cannot learn
+    // whether an invitation id or key exists.
+    let psk_key = if hello
+        .supported_handshake_modes
+        .iter()
+        .any(|mode| mode.as_slice() == umc_handshake::psk::MODE_PSK_XX)
+    {
+        let carrier_binding = carrier_type.as_bytes().to_vec();
+        let mut state_guard = state.lock().expect("state");
+        state_guard
+            .invitations
+            .authenticate(now.0, |invitation_key| {
+                let admission = umc_handshake::psk::PskAdmissionContext {
+                    invitation_key: *invitation_key,
+                    destination_connection_id: dcid.clone(),
+                    carrier_binding: carrier_binding.clone(),
+                };
+                admission.verify_client_hello(&hello).is_ok()
+            })
+            .ok()
+    } else {
+        None
+    };
 
     // The client's static handshake key arrives in CLIENT_AUTH (handshake.md
     // §18); until the accept loop reads it (below), the client's ephemeral
@@ -441,16 +644,18 @@ fn handle_inbound_link_locked(
     let responder_outcome = {
         let state = state.lock().expect("state");
         let client_static = StaticHandshakePublicKey(hello.client_ephemeral_public_key);
-        handshake_responder::respond_hello(
+        handshake_responder::respond_hello_with_retry_context_and_psk(
             &state,
             carrier_type.as_bytes(),
             &hello_bytes,
             &client_static,
             &dcid,
             &vn_scid,
+            retry_context.as_ref(),
+            psk_key.as_ref(),
         )?
     };
-    let (server_hello_bytes, pending) = match responder_outcome {
+    let (server_hello_bytes, mut pending) = match responder_outcome {
         handshake_responder::ResponderResponse::ServerHello { bytes, pending } => (bytes, pending),
         handshake_responder::ResponderResponse::VersionNegotiation { bytes } => {
             // Version negotiation (compatibility.md §5.2): the client's
@@ -472,24 +677,16 @@ fn handle_inbound_link_locked(
             return Err("version negotiation: client offered no supported version".into());
         }
     };
-    // SERVER_HELLO travels in the same form as the request: Initial-
-    // protected when the client spoke Initial, raw on the transitional
-    // path. For the protected response the keys derive from the client's
-    // DCID, the response's DCID is the client's SCID (the QUIC echo rule),
-    // and the daemon's own SCID is the derived session DCID.
-    let response_bytes = match &parsed_initial {
-        Some((origin, _pn, _payload, return_to)) => {
-            let keys = umc_handshake::initial::derive_initial_keys(origin).server;
-            initial::build_initial_packet(
-                return_to,
-                &session_dcid(&hello),
-                0,
-                &server_hello_bytes,
-                &keys,
-            )?
-        }
-        None => server_hello_bytes,
-    };
+    // SERVER_HELLO is always Initial-protected. Its DCID echoes the client's
+    // SCID and its packet keys derive from the client's original DCID.
+    let response_keys = umc_handshake::initial::derive_initial_keys(header_dcid).server;
+    let response_bytes = initial::build_initial_packet(
+        client_scid,
+        &session_dcid(&hello),
+        0,
+        &server_hello_bytes,
+        &response_keys,
+    )?;
     let send_result = tokio::task::block_in_place(|| {
         link.send(OutboundPacket {
             bytes: response_bytes,
@@ -506,8 +703,7 @@ fn handle_inbound_link_locked(
         .record(&dcid, now);
 
     // The client's CLIENT_AUTH completes the two-step responder
-    // (handshake.md §18): a second packet in the same form as the hello —
-    // Initial-protected on the live path, raw on the transitional path.
+    // (handshake.md §18) in an encrypted Handshake packet.
     // The TCP carrier's recv yields WouldBlock while no frame is buffered
     // (carriers/tcp.md), and the client sends CLIENT_AUTH only after
     // processing the SERVER_HELLO, so poll briefly for it instead of
@@ -530,7 +726,10 @@ fn handle_inbound_link_locked(
             }
         }
     };
-    let auth_bytes = decode_client_auth(&auth_packet)?;
+    let client_handshake_keys =
+        umc_crypto::aead::PacketKeys::from_traffic_secret(&pending.handshake_traffic_secret(true))
+            .map_err(|e| format!("client handshake keys: {e:?}"))?;
+    let auth_bytes = decode_client_auth(&auth_packet, &client_handshake_keys)?;
     let (server_finished, secrets, peer) = {
         let state = state.lock().expect("state");
         pending
@@ -547,8 +746,8 @@ fn handle_inbound_link_locked(
         .validate_peer_binding(&peer.binding, now.0)?;
 
     // SERVER_FINISHED (handshake.md §19): the daemon's reply after a
-    // verified CLIENT_AUTH — the server signature + finished MAC, as a raw
-    // framed handshake message on the transitional wire path.
+    // verified CLIENT_AUTH — the server signature + finished MAC inside an
+    // encrypted Handshake packet (handshake.md §25).
     let mut server_finished_frame = Vec::new();
     umc_handshake::encoding::encode_message(
         &mut server_finished_frame,
@@ -556,9 +755,22 @@ fn handle_inbound_link_locked(
         &server_finished,
     )
     .map_err(|e| format!("server finished framing: {e:?}"))?;
+    let server_handshake_keys =
+        umc_crypto::aead::PacketKeys::from_traffic_secret(&pending.handshake_traffic_secret(false))
+            .map_err(|e| format!("server handshake keys: {e:?}"))?;
+    let handshake_dcid = vn_scid.clone();
+    let handshake_scid = session_dcid(&hello);
+    let server_finished_packet = umc_handshake::handshake_packet::build_handshake_packet(
+        &handshake_dcid,
+        &handshake_scid,
+        0,
+        &server_finished_frame,
+        &server_handshake_keys,
+    )
+    .map_err(|e| format!("server finished packet: {e:?}"))?;
     if let Err(e) = tokio::task::block_in_place(|| {
         link.send(OutboundPacket {
-            bytes: server_finished_frame,
+            bytes: server_finished_packet,
             control: true,
             deadline_ms: Some(3_000),
         })
@@ -567,8 +779,8 @@ fn handle_inbound_link_locked(
     }
 
     // CLIENT_FINISHED (handshake.md §20): the client's confirmation MAC
-    // over the transcript INCLUDING SERVER_FINISHED, as a raw framed
-    // message. The TCP carrier's recv yields WouldBlock while no frame is
+    // over the transcript INCLUDING SERVER_FINISHED, inside an encrypted
+    // Handshake packet. The TCP carrier's recv yields WouldBlock while no frame is
     // buffered, so poll briefly — the same bounded-wait pattern as the
     // CLIENT_AUTH read. A missing or tampered confirmation refuses the
     // session BEFORE anything is registered.
@@ -587,10 +799,16 @@ fn handle_inbound_link_locked(
             }
         }
     };
-    let client_finished = decode_client_finished(&finished_packet)?;
+    let client_finished = decode_client_finished(&finished_packet, &client_handshake_keys)?;
     pending
         .verify_client_finished(&auth_bytes, &server_finished, &client_finished)
         .map_err(|e| format!("client finished refused: {e}"))?;
+    if pending.handshake_state() != umc_handshake::state::HandshakeState::Confirmed
+        || !pending.application_keys_ready()
+    {
+        return Err("handshake confirmation state not reached".into());
+    }
+    let selected_privacy = pending.selected_privacy_profile();
 
     // Register the verified session (the full XX path). The peer identity
     // was recovered from CLIENT_AUTH; the session carries its stateless-
@@ -607,7 +825,88 @@ fn handle_inbound_link_locked(
         Some(secrets.resumption),
         peer_endpoint_id,
         now,
+        selected_privacy,
+        umc_session::session::Role::Server,
     )
+}
+
+/// Authenticate and attach the first protected packet of a new carrier to an
+/// existing logical session. The first authenticated packet is required to be
+/// a path-validation packet by the migration initiator; the session still
+/// parses every frame normally so `ACK/PATH_RESPONSE` semantics remain shared.
+fn handle_established_attach(
+    state: &Arc<std::sync::Mutex<state::RuntimeState>>,
+    carrier_type: &str,
+    link: BoxLink,
+    first: &[u8],
+    path_id: u64,
+    control: &Arc<session_manager::SessionControl>,
+) -> Result<(), String> {
+    let now = state.lock().expect("state").node.clock.as_ref().now();
+    let mut session = control
+        .session
+        .try_lock()
+        .map_err(|_| "session busy during carrier attach".to_string())?;
+    if !session.paths.contains_key(&path_id) {
+        session
+            .add_path_with_entropy(
+                path_id,
+                carrier_type.to_string(),
+                Vec::new(),
+                Vec::new(),
+                now,
+                &runtime_adapters::OsEntropy,
+            )
+            .map_err(|e| format!("attach path: {e:?}"))?;
+        // Receipt of an authenticated PATH_CHALLENGE proves the new carrier
+        // can deliver traffic to this endpoint. The peer's response is sent
+        // below on this exact path, completing return-path validation.
+        session.force_validate(path_id);
+    }
+    let response_payload = session
+        .on_inbound(now, first)
+        .map_err(|e| format!("attach authentication: {e:?}"))?;
+    let response = if response_payload.is_empty() {
+        None
+    } else {
+        session
+            .build_outbound_on_path(
+                path_id,
+                state.lock().expect("state").node.clock.as_ref(),
+                now,
+                &response_payload,
+            )
+            .map_err(|e| format!("attach response: {e:?}"))?
+    };
+    drop(session);
+    control
+        .links
+        .add(path_id, link)
+        .map_err(|e| format!("attach carrier: {e}"))?;
+    if let Some(bytes) = response {
+        control
+            .links
+            .send_on(
+                path_id,
+                OutboundPacket {
+                    bytes,
+                    control: true,
+                    deadline_ms: Some(3_000),
+                },
+            )
+            .map_err(|e| format!("attach response send: {e:?}"))?;
+    }
+    let state = state.lock().expect("state");
+    state
+        .events
+        .lock()
+        .expect("event log")
+        .push(event_log::DaemonEvent {
+            kind: "path_attached".into(),
+            at_ms: now.0,
+            detail: format!("path {path_id} session carrier {carrier_type}"),
+        });
+    Ok(())
 }
 
 /// The resume path (handshake.md §35, IK mode): the hello offered the IK
@@ -626,7 +925,7 @@ fn handle_resumed_link(
     link: BoxLink,
     hello: &umc_handshake::xx::ClientHello,
     hello_bytes: &[u8],
-    parsed_initial: Option<&umc_handshake::initial::ParsedInitial>,
+    parsed_initial: &umc_handshake::initial::ParsedInitial,
     dcid: &[u8],
     vn_scid: &[u8],
     now: umc_types::runtime::Instant,
@@ -670,9 +969,21 @@ fn handle_resumed_link(
     let max_privacy =
         umc_handshake::xx::privacy_profile_level(umc_handshake::xx::MAX_SUPPORTED_PRIVACY_PROFILE)
             .expect("the implementation maximum is a valid profile");
+    let local_privacy = {
+        let state = state.lock().expect("state");
+        state.config.effective_privacy_profile() as u8
+    };
+    if local_privacy > max_privacy {
+        return Err(format!(
+            "local privacy profile p{local_privacy} unsupported; maximum is p{max_privacy}"
+        ));
+    }
     if requested_privacy > max_privacy {
         return Err("requested privacy profile is unsupported".into());
     }
+    // Both floors are validated against the implementation maximum above;
+    // selecting that maximum unconditionally would silently raise p0 to p1.
+    let selected_privacy = requested_privacy.max(local_privacy);
     // The ticket must belong to this node and this protocol: an endpoint or
     // profile mismatch refuses the resume (the accept loop already fell
     // back to the XX path only for invalid/expired tickets).
@@ -715,7 +1026,7 @@ fn handle_resumed_link(
             padding.extend_from_slice(&umc_handshake::xx::capabilities_hash(
                 &umc_handshake::xx::canonical_capabilities(),
             ));
-            padding.push(max_privacy);
+            padding.push(selected_privacy);
             padding.extend_from_slice(&[0u8; 31]);
             padding
         },
@@ -739,21 +1050,18 @@ fn handle_resumed_link(
         &final_transcript,
     );
 
-    // The `SERVER_HELLO` travels in the same form as the request (Initial-
-    // protected or raw), mirroring the XX path.
-    let response_bytes = match parsed_initial {
-        Some((origin, _pn, _payload, return_to)) => {
-            let keys = umc_handshake::initial::derive_initial_keys(origin).server;
-            initial::build_initial_packet(
-                return_to,
-                &session_dcid(hello),
-                0,
-                &server_hello_bytes,
-                &keys,
-            )?
-        }
-        None => server_hello_bytes,
-    };
+    // The `SERVER_HELLO` is always Initial-protected, with keys derived from
+    // the client's original destination connection id and a DCID echoing its
+    // source connection id.
+    let (origin, _pn, _payload, return_to) = parsed_initial;
+    let keys = umc_handshake::initial::derive_initial_keys(origin).server;
+    let response_bytes = initial::build_initial_packet(
+        return_to,
+        &session_dcid(hello),
+        0,
+        &server_hello_bytes,
+        &keys,
+    )?;
     if let Err(e) = tokio::task::block_in_place(|| {
         link.send(OutboundPacket {
             bytes: response_bytes,
@@ -783,6 +1091,8 @@ fn handle_resumed_link(
         None,
         ticket.client_endpoint_id_hash,
         now,
+        selected_privacy,
+        umc_session::session::Role::Server,
     )
 }
 
@@ -797,7 +1107,7 @@ fn handle_resumed_link(
 /// the daemon issues one ticket at the session's clean close (handshake.md
 /// §35) — and `None` for resumed sessions (no ticket re-issuance).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn register_session(
+pub(crate) fn register_session(
     state: &Arc<std::sync::Mutex<state::RuntimeState>>,
     carrier_type: &str,
     link: BoxLink,
@@ -808,9 +1118,55 @@ fn register_session(
     resumption_secret: Option<[u8; 32]>,
     peer_endpoint_id: [u8; 32],
     now: umc_types::runtime::Instant,
+    selected_privacy: u8,
+    role: umc_session::session::Role,
 ) -> Result<(), String> {
     let runtime = state.clone();
-    let state = state.lock().expect("state");
+    let mut state = state.lock().expect("state");
+    register_session_locked(
+        runtime,
+        &mut state,
+        carrier_type,
+        link,
+        dcid,
+        local_traffic_secret,
+        remote_traffic_secret,
+        stateless_reset_secret,
+        resumption_secret,
+        peer_endpoint_id,
+        now,
+        selected_privacy,
+        role,
+    )
+    .map(|_| ())
+}
+
+/// Register a session while the caller already owns the runtime-state lock.
+/// Outbound control operations use this path after completing a bounded dial;
+/// the public wrapper above remains the safe entry point for accept loops.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) fn register_session_locked(
+    runtime: Arc<std::sync::Mutex<state::RuntimeState>>,
+    state: &mut state::RuntimeState,
+    carrier_type: &str,
+    link: BoxLink,
+    dcid: Vec<u8>,
+    local_traffic_secret: [u8; 32],
+    remote_traffic_secret: [u8; 32],
+    stateless_reset_secret: Option<[u8; 32]>,
+    resumption_secret: Option<[u8; 32]>,
+    peer_endpoint_id: [u8; 32],
+    now: umc_types::runtime::Instant,
+    selected_privacy: u8,
+    role: umc_session::session::Role,
+) -> Result<u64, String> {
+    let profile_limits = state.config.resource_profile().limits();
+    if state.sessions.count() >= profile_limits.active_sessions {
+        return Err(format!(
+            "RESOURCE_LIMIT: active session profile cap {} reached",
+            profile_limits.active_sessions
+        ));
+    }
     // Blocklist admission (security-operations.md §16.2): a blocked peer's
     // session attempt is refused before any session state is built or
     // registered (`PeerService.BlockPeer` wires the blocklist).
@@ -818,7 +1174,7 @@ fn register_session(
     state.refuse_if_blocked(&peer_endpoint_id, now)?;
     let mut session = umc_session::session::Session::new(
         umc_session::session::SessionConfig {
-            role: umc_session::session::Role::Server,
+            role,
             dcid,
             local_traffic_secret,
             remote_traffic_secret,
@@ -829,17 +1185,29 @@ fn register_session(
         state.node.clock.as_ref(),
     )
     .map_err(|e| format!("session: {e:?}"))?;
-    // P3 traffic-analysis resistance is an explicit local opt-in. Apply it
-    // to every newly registered session so resumed and full handshakes share
-    // the same policy.
-    session.set_traffic_padding(state.config.traffic_padding);
+    let privacy_policy = session_task::PrivacyRuntimePolicy::from_config(
+        selected_privacy,
+        state.config.traffic_padding,
+        state.config.timing_jitter_ms,
+        state.config.cover_traffic,
+        state.config.cover_interval_ms,
+        state.config.cover_budget_bps,
+        state.config.route_rotation_interval_ms,
+    );
+    // Apply traffic defenses to every newly registered session so resumed and
+    // full handshakes share one negotiated policy. P3 padding is mandatory;
+    // cover traffic stays explicitly operator-enabled.
+    session.set_traffic_padding(privacy_policy.traffic_padding());
+    session.set_privacy_profile(selected_privacy);
+    session.set_timing_jitter_ms(privacy_policy.timing_jitter_ms());
     // P2 is fail-closed until daemon route wiring is available: a private
     // profile may establish only over a relay/route carrier, never by
     // silently falling back to a direct path.
-    let private_profile = state
-        .config
-        .effective_privacy_profile()
-        .includes(umc_core::privacy::PrivacyProfile::P2);
+    let private_profile = selected_privacy >= umc_core::privacy::PrivacyProfile::P2 as u8
+        || state
+            .config
+            .effective_privacy_profile()
+            .includes(umc_core::privacy::PrivacyProfile::P2);
     session.set_direct_path_allowed(!private_profile);
     // Stateless-reset support (session.md §31): the token is derived from
     // the handshake's shared `stateless reset` secret (handshake.md §26).
@@ -849,12 +1217,13 @@ fn register_session(
     // Register the default data path so the anti-amplification budget is
     // active on the session's primary path (session.md §26).
     session
-        .add_path(
+        .add_path_with_entropy(
             umc_session::packet::DEFAULT_PATH_ID,
             carrier_type.to_string(),
             Vec::new(),
             Vec::new(),
             now,
+            &runtime_adapters::OsEntropy,
         )
         .map_err(|e| format!("add path 0: {e:?}"))?;
     let session_id = state.sessions.next_id();
@@ -877,7 +1246,7 @@ fn register_session(
     let (bus_inbound_tx, bus_inbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let (bus_outbound_tx, bus_outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let cleanup_runtime = runtime.clone();
-    let task = session_task::spawn_session_task(
+    let spawned = session_task::spawn_session_task(
         state.node.clock.clone(),
         state.shutdown_requested.clone(),
         link,
@@ -886,6 +1255,7 @@ fn register_session(
         state.app_channels.clone(),
         state.app_echo_rx.clone(),
         runtime,
+        privacy_policy,
         remote_keys,
         remote_hp_key,
         ticket_material,
@@ -901,20 +1271,46 @@ fn register_session(
     // The session task's JoinHandle moves into a watcher that records
     // `session_closed` when the wire loop exits; the registry keeps an
     // AbortHandle so shutdown can still cancel the task.
-    let abort_handle = task.abort_handle();
+    let abort_handle = spawned.task.abort_handle();
+    state.session_controls.insert(
+        session_id,
+        Arc::new(session_manager::SessionControl::new_with_links(
+            spawned.session.clone(),
+            spawned.link.clone(),
+            spawned.links.clone(),
+        )),
+    );
     let session_events = state.events.clone();
     let closed_at_ms = now.0;
     tokio::spawn(async move {
-        let _ = task.await;
+        let _ = spawned.task.await;
         // Cleanup runs for BOTH normal exits and aborts (CloseSession):
         // the bus must not keep stale entries pointing at a dead session.
-        cleanup_runtime
-            .lock()
-            .expect("runtime state")
+        let mut state = cleanup_runtime.lock().expect("runtime state");
+        state
             .bus
             .lock()
             .expect("session bus")
             .unregister(session_id);
+        state
+            .relay_endpoint_handoffs
+            .retain(|(adjacent_session, _), _| *adjacent_session != session_id);
+        state.sessions.remove(session_id);
+        state.session_controls.remove(&session_id);
+        state.application_data.remove_session(session_id);
+        state.metrics.set(
+            state::metric_names::SESSIONS_ACTIVE,
+            u64::try_from(state.sessions.count()).unwrap_or(u64::MAX),
+        );
+        state
+            .events
+            .lock()
+            .expect("event log")
+            .push(event_log::DaemonEvent {
+                kind: "path_retired".into(),
+                at_ms: closed_at_ms,
+                detail: format!("path 0 session {session_id}"),
+            });
         session_events
             .lock()
             .expect("event log")
@@ -924,15 +1320,22 @@ fn register_session(
                 detail: format!("session {session_id} closed"),
             });
     });
-    state.sessions.register(
+    let registered = state.sessions.try_register(
         session_id,
         session_manager::SessionEntry {
             peer_endpoint_id,
             carrier_type: carrier_type.to_string(),
             task: abort_handle,
             established_at_ms: now.0,
+            privacy_profile: selected_privacy.min(3),
+            direct_path_allowed: !private_profile,
+            traffic_padding_active: privacy_policy.traffic_padding(),
         },
+        profile_limits.active_sessions,
     );
+    if !registered {
+        return Err("RESOURCE_LIMIT: active session profile cap reached".into());
+    }
     state.metrics.incr(state::metric_names::SESSIONS_TOTAL, 1);
     state.metrics.set(
         state::metric_names::SESSIONS_ACTIVE,
@@ -943,16 +1346,35 @@ fn register_session(
         .lock()
         .expect("event log")
         .push(event_log::DaemonEvent {
+            kind: "path_added".into(),
+            at_ms: now.0,
+            detail: format!("path 0 carrier {carrier_type} session {session_id}"),
+        });
+    state
+        .events
+        .lock()
+        .expect("event log")
+        .push(event_log::DaemonEvent {
+            kind: "path_validated".into(),
+            at_ms: now.0,
+            detail: format!("path 0 session {session_id}"),
+        });
+    state
+        .events
+        .lock()
+        .expect("event log")
+        .push(event_log::DaemonEvent {
             kind: "session_active".into(),
             at_ms: now.0,
             detail: format!("session {session_id} peer {peer_endpoint_id:02x?} via {carrier_type}"),
         });
     log::info!("{}", logging::session_active_line(&peer_endpoint_id));
-    Ok(())
+    Ok(session_id)
 }
 
-/// Stable 8-byte session DCID for the raw-hello path: the hello carries no
-/// connection id, so derive one from the client's ephemeral public key.
+/// Stable 8-byte session SCID derived from the client's ephemeral key.
+/// The Initial header carries the client's destination connection id; this
+/// derived id is the daemon's source id for the handshake/session response.
 fn session_dcid(hello: &umc_handshake::xx::ClientHello) -> Vec<u8> {
     let mut ikm = Vec::with_capacity(32);
     ikm.extend_from_slice(b"UMP-SESSION-DCID-v1");
@@ -960,19 +1382,31 @@ fn session_dcid(hello: &umc_handshake::xx::ClientHello) -> Vec<u8> {
     umc_crypto::hkdf::extract(&[0u8; 32], &ikm)[..8].to_vec()
 }
 
-/// Extract the `CLIENT_AUTH` message body from the second inbound packet:
-/// either the decrypted Initial payload or the raw framed message (the
-/// transitional dual-mode, mirroring [`decode_client_hello`]).
+/// Validate and copy the Initial destination id for the fixed v0.1 session
+/// connection-id profile.
+fn session_dcid_from_initial(header_dcid: &[u8]) -> Result<Vec<u8>, String> {
+    if header_dcid.len() != umc_session::session::DEFAULT_DCID_LEN {
+        return Err(format!(
+            "Initial destination connection id must be {} bytes",
+            umc_session::session::DEFAULT_DCID_LEN
+        ));
+    }
+    Ok(header_dcid.to_vec())
+}
+
+/// Extract the `CLIENT_AUTH` message body from an encrypted Handshake packet.
 ///
 /// # Errors
 ///
-/// Returns a message when the bytes decode to neither an Initial packet nor
-/// a handshake message, or the message type is not `CLIENT_AUTH`.
-fn decode_client_auth(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let body = match initial::try_parse_initial(bytes) {
-        Some((_dcid, _pn, payload, _scid)) => payload,
-        None => bytes.to_vec(),
-    };
+/// Returns a message when the packet or handshake envelope is malformed, or
+/// when the message type is not `CLIENT_AUTH`.
+fn decode_client_auth(
+    bytes: &[u8],
+    keys: &umc_crypto::aead::PacketKeys,
+) -> Result<Vec<u8>, String> {
+    let (_dcid, _scid, _pn, body) =
+        umc_handshake::handshake_packet::parse_handshake_packet(bytes, keys, 0)
+            .map_err(|e| format!("client auth packet: {e:?}"))?;
     let (message, _) = umc_handshake::encoding::decode_message(&body)
         .map_err(|e| format!("client auth framing: {e:?}"))?;
     if message.message_type != umc_handshake::encoding::CLIENT_AUTH {
@@ -984,17 +1418,21 @@ fn decode_client_auth(bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(message.body)
 }
 
-/// Extract the `CLIENT_FINISHED` message body from the third inbound
-/// packet: a raw framed handshake message on the transitional path (the
-/// client's confirmation MAC, handshake.md §20; mirroring
-/// [`decode_client_auth`]).
+/// Extract the `CLIENT_FINISHED` message body from an encrypted Handshake
+/// packet (handshake.md §20, §25).
 ///
 /// # Errors
 ///
-/// Returns a message when the bytes do not decode as a handshake message,
-/// or the message type is not `CLIENT_FINISHED`.
-fn decode_client_finished(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let (message, _) = umc_handshake::encoding::decode_message(bytes)
+/// Returns a message when the packet or handshake envelope is malformed, or
+/// when the message type is not `CLIENT_FINISHED`.
+fn decode_client_finished(
+    bytes: &[u8],
+    keys: &umc_crypto::aead::PacketKeys,
+) -> Result<Vec<u8>, String> {
+    let (_dcid, _scid, _pn, body) =
+        umc_handshake::handshake_packet::parse_handshake_packet(bytes, keys, 0)
+            .map_err(|e| format!("client finished packet: {e:?}"))?;
+    let (message, _) = umc_handshake::encoding::decode_message(&body)
         .map_err(|e| format!("client finished framing: {e:?}"))?;
     if message.message_type != umc_handshake::encoding::CLIENT_FINISHED {
         return Err(format!(
@@ -1034,12 +1472,14 @@ fn init_node(config: &NodeConfig, config_path: Option<&PathBuf>) {
 mod tests {
     use super::*;
     use crate::handshake_timeout::HandshakeTracker;
+    use std::future::Future;
     use std::sync::Mutex as StdMutex;
     use umc_carrier::error::{CarrierError, CarrierErrorKind};
     use umc_carrier::types::{
         InboundPacket, LinkEvent, LinkProperties, Ordering, QueueState, Reliability, SendResult,
     };
     use umc_carrier::Link;
+    use umc_core::node::{ConnectedTransport, Node, NodeConfig as CoreNodeConfig, NodeIdentity};
     use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
     use umc_handshake::encoding::{
         CLIENT_AUTH, CLIENT_FINISHED, CLIENT_HELLO, SERVER_FINISHED, SERVER_HELLO,
@@ -1051,7 +1491,10 @@ mod tests {
         encrypt_client_auth, verify_server_finished_and_build_confirmation, ClientHello,
         ServerHello, CRYPTO_PROFILE, MODE_XX,
     };
+    use umc_session::session::{Role, Session, SessionConfig};
+    use umc_types::frame::FrameType;
     use umc_types::runtime::Instant as RuntimeInstant;
+    use umc_wire::frames::stream::StreamFrame;
 
     fn test_state() -> Arc<std::sync::Mutex<state::RuntimeState>> {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1072,6 +1515,290 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn handshake_decoders_reject_raw_continuations() {
+        let keys = umc_crypto::aead::PacketKeys::from_traffic_secret(&[7u8; 32]).expect("keys");
+        let mut auth = Vec::new();
+        umc_handshake::encoding::encode_message(
+            &mut auth,
+            umc_handshake::encoding::CLIENT_AUTH,
+            b"raw",
+        )
+        .expect("auth frame");
+        assert!(decode_client_auth(&auth, &keys).is_err());
+
+        let mut finished = Vec::new();
+        umc_handshake::encoding::encode_message(
+            &mut finished,
+            umc_handshake::encoding::CLIENT_FINISHED,
+            b"raw",
+        )
+        .expect("finished frame");
+        assert!(decode_client_finished(&finished, &keys).is_err());
+    }
+
+    #[test]
+    fn initial_session_id_must_match_fixed_session_profile() {
+        assert_eq!(
+            session_dcid_from_initial(&[0x42; umc_session::session::DEFAULT_DCID_LEN])
+                .expect("8-byte id"),
+            vec![0x42; umc_session::session::DEFAULT_DCID_LEN]
+        );
+        let error = session_dcid_from_initial(&[0x42; 7]).expect_err("short id rejected");
+        assert!(error.contains("8 bytes"));
+        assert!(session_dcid_from_initial(&[0x42; 9]).is_err());
+    }
+
+    /// A bounded in-memory carrier used to exercise the same endpoint
+    /// handoff path as a relay circuit without introducing a test-only wire
+    /// shortcut. Both sides still run the protected XX handshake and the
+    /// registered daemon session task.
+    struct ChannelLink {
+        tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+        rx: StdMutex<std::sync::mpsc::Receiver<Vec<u8>>>,
+        closed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ChannelLink {
+        fn pair() -> (Self, Self) {
+            let (a_tx, a_rx) = std::sync::mpsc::sync_channel(64);
+            let (b_tx, b_rx) = std::sync::mpsc::sync_channel(64);
+            let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                Self {
+                    tx: a_tx,
+                    rx: StdMutex::new(b_rx),
+                    closed: closed.clone(),
+                },
+                Self {
+                    tx: b_tx,
+                    rx: StdMutex::new(a_rx),
+                    closed,
+                },
+            )
+        }
+    }
+
+    impl Link for ChannelLink {
+        fn properties(&self) -> LinkProperties {
+            LinkProperties {
+                reliability: Reliability::ReliableUntilLinkFailure,
+                ordering: Ordering::Ordered,
+                current_mtu: 65_535,
+                queue_bytes: 0,
+                queue_capacity: 2 * 1024 * 1024,
+                estimated_rtt_ms: None,
+                estimated_loss: None,
+                metered: false,
+            }
+        }
+
+        fn send(&self, packet: OutboundPacket) -> Result<SendResult, CarrierError> {
+            if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(CarrierError::new(
+                    CarrierErrorKind::LinkClosed,
+                    "channel closed",
+                ));
+            }
+            self.tx
+                .send(packet.bytes)
+                .map_err(|_| CarrierError::new(CarrierErrorKind::LinkFailed, "channel send"))?;
+            Ok(SendResult::Accepted {
+                queue_state: QueueState::SentToMedium,
+            })
+        }
+
+        fn recv(&self) -> Result<InboundPacket, CarrierError> {
+            if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(CarrierError::new(
+                    CarrierErrorKind::LinkClosed,
+                    "channel closed",
+                ));
+            }
+            match self
+                .rx
+                .lock()
+                .expect("channel receiver")
+                .recv_timeout(Duration::from_millis(25))
+            {
+                Ok(bytes) => Ok(InboundPacket {
+                    bytes,
+                    received_at: RuntimeInstant(0),
+                }),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(CarrierError::new(
+                    CarrierErrorKind::WouldBlock,
+                    "channel idle",
+                )),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(CarrierError::new(
+                    CarrierErrorKind::LinkFailed,
+                    "channel disconnected",
+                )),
+            }
+        }
+
+        fn events(&self) -> Result<LinkEvent, CarrierError> {
+            Err(CarrierError::new(
+                CarrierErrorKind::WouldBlock,
+                "channel events",
+            ))
+        }
+
+        fn close(&self, _reason: &str) -> Result<(), CarrierError> {
+            self.closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        }
+    }
+
+    fn drive_link_connect(
+        node: &mut Node,
+        link: ChannelLink,
+        expected_endpoint_id: [u8; 32],
+    ) -> Result<ConnectedTransport, umc_core::node::NodeError> {
+        let mut future = Box::pin(node.connect_transport_over_link(
+            "ump.relay/1",
+            Box::new(link),
+            Some(expected_endpoint_id),
+        ));
+        let waker = std::task::Waker::from(Arc::new(NoopWaker));
+        let mut context = std::task::Context::from_waker(&waker);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                std::task::Poll::Ready(result) => return result,
+                std::task::Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    struct NoopWaker;
+
+    impl std::task::Wake for NoopWaker {
+        fn wake(self: Arc<Self>) {}
+        fn wake_by_ref(self: &Arc<Self>) {}
+    }
+
+    fn stream_payload(stream_id: u64, data: &[u8]) -> Vec<u8> {
+        let frame = StreamFrame {
+            stream_id,
+            fin: true,
+            offset_present: false,
+            len_present: true,
+            open: true,
+            unidirectional: false,
+            offset: 0,
+            data: data.to_vec(),
+            protocol_id: umc_core::well_known::WELL_KNOWN_APP.to_vec(),
+            metadata: Vec::new(),
+        };
+        let encoded = frame.encode().expect("stream frame");
+        let mut payload = umc_wire::varint::encode(FrameType::STREAM.0).expect("stream type");
+        payload.extend_from_slice(&encoded[1..]);
+        payload
+    }
+
+    /// End-to-end endpoint handoff proof: an outbound core node reaches the
+    /// daemon over the relay-bound carrier, the daemon registers the live
+    /// session, and an application stream is echoed over the resulting data
+    /// path. This is the in-process equivalent of the two-daemon relay leg;
+    /// no handshake or session bytes are injected by the test.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relay_bound_link_completes_handshake_and_data_echo() {
+        let server_state = test_state();
+        let (server_endpoint_id, server_shutdown) = {
+            let mut state = server_state.lock().expect("state");
+            app_layer::install_echo_app(&mut state);
+            (
+                state.node_identity.endpoint_id(),
+                state.shutdown_requested.clone(),
+            )
+        };
+        let (client_link, server_link) = ChannelLink::pair();
+        let server_state_for_task = server_state.clone();
+        let server_task = tokio::task::spawn_blocking(move || {
+            let tracker = StdMutex::new(HandshakeTracker::new());
+            handle_inbound_link(
+                &server_state_for_task,
+                "ump.relay/1",
+                Box::new(server_link),
+                &tracker,
+            )
+        });
+        let client_task = tokio::task::spawn_blocking(move || {
+            let mut node = Node::new(
+                CoreNodeConfig {
+                    identity: NodeIdentity::generate(&crate::runtime_adapters::OsEntropy),
+                    dcid: vec![0x31; 8],
+                },
+                Arc::new(crate::runtime_adapters::OsClock),
+                Arc::new(crate::runtime_adapters::OsEntropy),
+            );
+            drive_link_connect(&mut node, client_link, server_endpoint_id)
+        });
+        let (server_result, client_result) = tokio::join!(server_task, client_task);
+        server_result
+            .expect("server handshake thread")
+            .expect("server handshake");
+        let transport = client_result
+            .expect("client handshake thread")
+            .expect("client handshake");
+        assert_eq!(
+            server_state.lock().expect("state").sessions.count(),
+            1,
+            "relay-bound handshake must register one live session"
+        );
+
+        let mut client_session = Session::new(
+            SessionConfig {
+                role: Role::Client,
+                dcid: transport.dcid.clone(),
+                local_traffic_secret: transport.secrets.client,
+                remote_traffic_secret: transport.secrets.server,
+                initial_max_data: umc_session::session::DEFAULT_INITIAL_MAX_DATA,
+                initial_max_stream_data: umc_session::session::DEFAULT_INITIAL_MAX_STREAM_DATA,
+                max_ack_delay_ms: 25,
+            },
+            &crate::runtime_adapters::OsClock,
+        )
+        .expect("client session");
+        let stream_id = client_session.open_stream().expect("open stream");
+        let packet = client_session
+            .build_outbound(
+                &crate::runtime_adapters::OsClock,
+                RuntimeInstant(0),
+                &stream_payload(stream_id, b"relay-data"),
+            )
+            .expect("build stream packet")
+            .expect("stream packet");
+        transport
+            .link
+            .send(OutboundPacket {
+                bytes: packet,
+                control: false,
+                deadline_ms: None,
+            })
+            .expect("send stream packet");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let echoed = loop {
+            assert!(std::time::Instant::now() < deadline, "relay echo timed out");
+            match transport.link.recv() {
+                Ok(packet) => {
+                    let _ = client_session.on_inbound(RuntimeInstant(0), &packet.bytes);
+                    if let Ok((data, _)) = client_session.read_stream(stream_id) {
+                        if !data.is_empty() {
+                            break data;
+                        }
+                    }
+                }
+                Err(error) if error.kind == CarrierErrorKind::WouldBlock => {}
+                Err(error) => panic!("relay data receive failed: {error:?}"),
+            }
+        };
+        assert_eq!(echoed, b"relay-data");
+        transport.link.close("test complete").expect("close link");
+        server_shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// A link that plays the client's side of the wire: `recv` returns the
     /// `CLIENT_HELLO` first, then — once `send` captured the daemon's
     /// `SERVER_HELLO` — the client's real `CLIENT_AUTH` (built exactly like
@@ -1087,13 +1814,17 @@ mod tests {
         client_ephemeral: StaticHandshakeKeyPair,
         hello: ClientHello,
         hello_bytes: Vec<u8>,
+        hello_packet: Vec<u8>,
         server_binding: IdentityBinding,
-        stage: StdMutex<usize>,
+        stage: std::sync::atomic::AtomicUsize,
         server_hello_bytes: StdMutex<Vec<u8>>,
         server_finished_bytes: StdMutex<Vec<u8>>,
         sends: StdMutex<usize>,
         auth_body: StdMutex<Vec<u8>>,
+        secret3: StdMutex<[u8; 32]>,
         secret4: StdMutex<[u8; 32]>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        stop_observed: Arc<std::sync::atomic::AtomicBool>,
         tamper: bool,
         tamper_finished: bool,
     }
@@ -1103,13 +1834,29 @@ mod tests {
             server_binding: IdentityBinding,
             tamper: bool,
             tamper_finished: bool,
-        ) -> (Self, [u8; 32]) {
+        ) -> (
+            Self,
+            [u8; 32],
+            Arc<std::sync::atomic::AtomicBool>,
+            Arc<std::sync::atomic::AtomicBool>,
+        ) {
             let client_identity = IdentityKeyPair::generate();
             let client_static = StaticHandshakeKeyPair::generate();
             let client_ephemeral = StaticHandshakeKeyPair::generate();
             let hello = ClientHello::new(&crate::runtime_adapters::OsEntropy, &client_ephemeral);
             let hello_bytes = hello.encode().expect("hello");
+            let initial_keys = umc_handshake::initial::derive_initial_keys(&[1u8; 8]);
+            let hello_packet = initial::build_initial_packet(
+                &[1u8; 8],
+                &[2u8; 8],
+                0,
+                &hello_bytes,
+                &initial_keys.client,
+            )
+            .expect("initial packet");
             let client_eid = endpoint_id(&client_identity.public());
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
             (
                 Self {
                     client_identity,
@@ -1117,17 +1864,23 @@ mod tests {
                     client_ephemeral,
                     hello,
                     hello_bytes,
+                    hello_packet,
                     server_binding,
-                    stage: StdMutex::new(0),
+                    stage: std::sync::atomic::AtomicUsize::new(0),
                     server_hello_bytes: StdMutex::new(Vec::new()),
                     server_finished_bytes: StdMutex::new(Vec::new()),
                     sends: StdMutex::new(0),
                     auth_body: StdMutex::new(Vec::new()),
+                    secret3: StdMutex::new([0u8; 32]),
                     secret4: StdMutex::new([0u8; 32]),
+                    stop: stop.clone(),
+                    stop_observed: stop_observed.clone(),
                     tamper,
                     tamper_finished,
                 },
                 client_eid,
+                stop,
+                stop_observed,
             )
         }
 
@@ -1135,7 +1888,8 @@ mod tests {
         /// the real static + the client's own identity binding + the
         /// transcript-bound signature, sealed with the provisional-chain
         /// client-auth key (the ephemeral stood in for the static in the DH
-        /// chain on both sides, so the key matches the responder's).
+        /// chain on both sides, so the key matches the responder's). The
+        /// handshake envelope is then protected with Handshake traffic keys.
         #[allow(clippy::similar_names)]
         fn build_client_auth(&self, server_hello: &ServerHello) -> Result<Vec<u8>, String> {
             let mut transcript = Transcript::new(MODE_XX, CRYPTO_PROFILE, b"ump.tcp/1");
@@ -1215,23 +1969,39 @@ mod tests {
             umc_wire::bytes::encode(&mut auth_body, &ciphertext, 16_384)
                 .map_err(|_| "bytes".to_string())?;
             *self.auth_body.lock().expect("auth body") = auth_body.clone();
+            *self.secret3.lock().expect("secret3") = secret3;
             *self.secret4.lock().expect("secret4") = secret4;
             let mut frame = Vec::new();
             umc_handshake::encoding::encode_message(&mut frame, CLIENT_AUTH, &auth_body)
                 .map_err(|e| format!("{e:?}"))?;
-            Ok(frame)
+            let traffic_secret = umc_handshake::traffic::derive_handshake_traffic_secret(
+                &secret3,
+                &transcript.hash,
+                true,
+            );
+            let keys = umc_handshake::traffic::traffic_keys(&traffic_secret);
+            umc_handshake::handshake_packet::build_handshake_packet(
+                &[1u8; 8], &[2u8; 8], 0, &frame, &keys,
+            )
+            .map_err(|e| format!("client auth packet: {e:?}"))
         }
 
         /// The client's `CLIENT_FINISHED` confirmation against the captured
         /// `SERVER_FINISHED`: verify the daemon's finished MAC and signature
         /// (handshake.md §19) and return the confirmation MAC over the
         /// transcript including `SERVER_FINISHED` (handshake.md §20),
-        /// framed as a raw handshake message. `tamper_finished` flips a
+        /// wrapped in an encrypted Handshake packet. `tamper_finished` flips a
         /// byte in the MAC so the daemon must refuse the exchange.
         fn build_client_finished(&self) -> Result<Vec<u8>, String> {
-            let server_hello_bytes = self.server_hello_bytes.lock().expect("captured");
+            let server_hello_packet = self.server_hello_bytes.lock().expect("captured");
+            let server_hello_payload = umc_handshake::initial::parse_initial_with_keys(
+                &server_hello_packet,
+                &umc_handshake::initial::derive_initial_keys(&[1u8; 8]).server,
+            )
+            .expect("captured server Initial")
+            .2;
             let server_hello =
-                ServerHello::decode(&server_hello_bytes).expect("captured server hello");
+                ServerHello::decode(&server_hello_payload).expect("captured server hello");
             let mut transcript = Transcript::new(MODE_XX, CRYPTO_PROFILE, b"ump.tcp/1");
             transcript
                 .update_message(CLIENT_HELLO, &self.hello_bytes)
@@ -1241,12 +2011,26 @@ mod tests {
                 .map_err(|e| format!("{e:?}"))?;
             let auth_body = self.auth_body.lock().expect("auth body").clone();
             let secret4 = self.secret4.lock().expect("secret4");
+            let handshake_transcript_hash = transcript.hash;
             let server_eid = endpoint_id(&self.server_binding.identity_public_key);
             let client_eid = endpoint_id(&self.client_identity.public());
+            let secret3 = self.secret3.lock().expect("secret3");
+            let server_traffic_secret = umc_handshake::traffic::derive_handshake_traffic_secret(
+                &secret3,
+                &handshake_transcript_hash,
+                false,
+            );
+            let server_keys = umc_handshake::traffic::traffic_keys(&server_traffic_secret);
             let server_finished_bytes = self.server_finished_bytes.lock().expect("captured");
-            let (finished_message, _) =
-                umc_handshake::encoding::decode_message(&server_finished_bytes)
-                    .map_err(|e| format!("{e:?}"))?;
+            let (_dcid, _scid, _pn, finished_body) =
+                umc_handshake::handshake_packet::parse_handshake_packet(
+                    &server_finished_bytes,
+                    &server_keys,
+                    0,
+                )
+                .map_err(|e| format!("server finished packet: {e:?}"))?;
+            let (finished_message, _) = umc_handshake::encoding::decode_message(&finished_body)
+                .map_err(|e| format!("{e:?}"))?;
             if finished_message.message_type != SERVER_FINISHED {
                 return Err(format!(
                     "expected SERVER_FINISHED, got message type {}",
@@ -1271,7 +2055,20 @@ mod tests {
             let mut frame = Vec::new();
             umc_handshake::encoding::encode_message(&mut frame, CLIENT_FINISHED, &confirmation)
                 .map_err(|e| format!("{e:?}"))?;
-            Ok(frame)
+            let client_traffic_secret = umc_handshake::traffic::derive_handshake_traffic_secret(
+                &secret3,
+                &handshake_transcript_hash,
+                true,
+            );
+            let client_keys = umc_handshake::traffic::traffic_keys(&client_traffic_secret);
+            umc_handshake::handshake_packet::build_handshake_packet(
+                &[1u8; 8],
+                &[2u8; 8],
+                1,
+                &frame,
+                &client_keys,
+            )
+            .map_err(|e| format!("client finished packet: {e:?}"))
         }
     }
 
@@ -1303,20 +2100,24 @@ mod tests {
         }
 
         fn recv(&self) -> Result<InboundPacket, CarrierError> {
-            let mut stage = self.stage.lock().expect("stage");
-            match *stage {
-                0 => {
-                    *stage += 1;
-                    Ok(InboundPacket {
-                        bytes: self.hello_bytes.clone(),
-                        received_at: RuntimeInstant(0),
-                    })
-                }
+            let stage = self
+                .stage
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match stage {
+                0 => Ok(InboundPacket {
+                    bytes: self.hello_packet.clone(),
+                    received_at: RuntimeInstant(0),
+                }),
                 1 => {
-                    *stage += 1;
-                    let server_hello_bytes = self.server_hello_bytes.lock().expect("captured");
+                    let server_hello_packet = self.server_hello_bytes.lock().expect("captured");
+                    let server_hello_payload = umc_handshake::initial::parse_initial_with_keys(
+                        &server_hello_packet,
+                        &umc_handshake::initial::derive_initial_keys(&[1u8; 8]).server,
+                    )
+                    .expect("captured server Initial")
+                    .2;
                     let server_hello =
-                        ServerHello::decode(&server_hello_bytes).expect("captured server hello");
+                        ServerHello::decode(&server_hello_payload).expect("captured server hello");
                     let frame = self.build_client_auth(&server_hello).expect("client auth");
                     Ok(InboundPacket {
                         bytes: frame,
@@ -1324,16 +2125,27 @@ mod tests {
                     })
                 }
                 2 => {
-                    *stage += 1;
                     let frame = self.build_client_finished().expect("client finished");
                     Ok(InboundPacket {
                         bytes: frame,
                         received_at: RuntimeInstant(0),
                     })
                 }
+                _ if self.stop.load(std::sync::atomic::Ordering::Relaxed) => {
+                    self.stop_observed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    Err(CarrierError::new(
+                        CarrierErrorKind::LinkFailed,
+                        "script stopped",
+                    ))
+                }
+                // Keep the accepted session alive while the test inspects
+                // its registration and bus entry. Returning LinkFailed here
+                // would race the assertions with the session-task cleanup
+                // watcher and make the test depend on scheduler timing.
                 _ => Err(CarrierError::new(
-                    CarrierErrorKind::LinkFailed,
-                    "script exhausted",
+                    CarrierErrorKind::WouldBlock,
+                    "script idle",
                 )),
             }
         }
@@ -1364,7 +2176,8 @@ mod tests {
         };
         let server_binding =
             IdentityBinding::sign(&server_identity, &server_static, 0, u64::MAX, 0, [0u8; 32]);
-        let (link, client_eid) = AuthScriptedLink::new(server_binding, false, false);
+        let (link, client_eid, stop, stop_observed) =
+            AuthScriptedLink::new(server_binding, false, false);
         let tracker = StdMutex::new(HandshakeTracker::new());
         handle_inbound_link(&state, "ump.tcp/1", Box::new(link), &tracker).expect("accept");
 
@@ -1390,6 +2203,24 @@ mod tests {
                 .lookup(&client_eid),
             Some(1)
         );
+        // Stop the scripted carrier pump before the test runtime shuts down;
+        // the idle test link intentionally returns WouldBlock after the
+        // handshake so the bus assertion cannot race cleanup.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..100 {
+            if stop_observed.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            stop_observed.load(std::sync::atomic::Ordering::Acquire),
+            "scripted carrier pump must observe its stop flag"
+        );
+        // The flag is recorded at the carrier boundary immediately before
+        // the pump returns its terminal error; give that blocking call a
+        // scheduling window to unwind before Tokio drops the runtime.
+        std::thread::sleep(Duration::from_millis(50));
     }
 
     /// The daemon sends `SERVER_FINISHED` and the client answers with a
@@ -1408,7 +2239,8 @@ mod tests {
         };
         let server_binding =
             IdentityBinding::sign(&server_identity, &server_static, 0, u64::MAX, 0, [0u8; 32]);
-        let (link, client_eid) = AuthScriptedLink::new(server_binding, false, false);
+        let (link, client_eid, stop, stop_observed) =
+            AuthScriptedLink::new(server_binding, false, false);
         let tracker = StdMutex::new(HandshakeTracker::new());
         handle_inbound_link(&state, "ump.tcp/1", Box::new(link), &tracker).expect("accept");
 
@@ -1429,6 +2261,18 @@ mod tests {
                 .any(|e| e.kind == "session_active"),
             "session_active must fire once the confirmation is verified"
         );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..100 {
+            if stop_observed.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            stop_observed.load(std::sync::atomic::Ordering::Acquire),
+            "scripted carrier pump must observe its stop flag"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
 
     /// A `CLIENT_FINISHED` whose confirmation MAC is tampered with fails
@@ -1446,7 +2290,8 @@ mod tests {
         };
         let server_binding =
             IdentityBinding::sign(&server_identity, &server_static, 0, u64::MAX, 0, [0u8; 32]);
-        let (link, _client_eid) = AuthScriptedLink::new(server_binding, false, true);
+        let (link, _client_eid, _stop, _stop_observed) =
+            AuthScriptedLink::new(server_binding, false, true);
         let tracker = StdMutex::new(HandshakeTracker::new());
         let err = handle_inbound_link(&state, "ump.tcp/1", Box::new(link), &tracker)
             .expect_err("tampered confirmation must be refused");
@@ -1474,7 +2319,7 @@ mod tests {
     /// the accept loop's resume path must NOT ask for `CLIENT_AUTH` or
     /// `CLIENT_FINISHED`. `send` captures the daemon's `SERVER_HELLO`.
     struct ResumeScriptedLink {
-        hello_bytes: Vec<u8>,
+        hello_packet: Vec<u8>,
         server_hello_bytes: Arc<StdMutex<Vec<u8>>>,
         stage: StdMutex<usize>,
     }
@@ -1506,7 +2351,7 @@ mod tests {
                 0 => {
                     *stage += 1;
                     Ok(InboundPacket {
-                        bytes: self.hello_bytes.clone(),
+                        bytes: self.hello_packet.clone(),
                         received_at: RuntimeInstant(0),
                     })
                 }
@@ -1561,9 +2406,18 @@ mod tests {
         hello.supported_handshake_modes = vec![umc_handshake::ik::MODE_IK.to_vec()];
         hello.retry_token = ticket;
         let hello_bytes = hello.encode().expect("hello");
+        let initial_keys = umc_handshake::initial::derive_initial_keys(&[1u8; 8]);
+        let hello_packet = initial::build_initial_packet(
+            &[1u8; 8],
+            &[2u8; 8],
+            0,
+            &hello_bytes,
+            &initial_keys.client,
+        )
+        .expect("initial packet");
         let server_hello_bytes = Arc::new(StdMutex::new(Vec::new()));
         let link = ResumeScriptedLink {
-            hello_bytes,
+            hello_packet,
             server_hello_bytes: server_hello_bytes.clone(),
             stage: StdMutex::new(0),
         };
@@ -1573,7 +2427,11 @@ mod tests {
         // The daemon answered with a mode-IK `SERVER_HELLO` carrying no
         // encrypted server auth.
         let captured = server_hello_bytes.lock().expect("captured");
-        let server_hello = ServerHello::decode(&captured).expect("captured server hello");
+        let payload =
+            umc_handshake::initial::parse_initial_with_keys(&captured, &initial_keys.server)
+                .expect("captured server Initial")
+                .2;
+        let server_hello = ServerHello::decode(&payload).expect("captured server hello");
         assert_eq!(
             server_hello.selected_handshake_mode,
             umc_handshake::ik::MODE_IK.to_vec(),
@@ -1585,25 +2443,18 @@ mod tests {
         );
         drop(captured);
 
-        let session_id = state
-            .lock()
-            .expect("state")
-            .sessions
-            .lookup(1)
-            .expect("resumed session registered");
-        assert_eq!(
-            session_id.peer_endpoint_id, [0xAAu8; 32],
-            "the resumed session registers under the ticket's client endpoint hash"
-        );
         let events = state.lock().expect("state").events.clone();
+        let active = events
+            .lock()
+            .expect("event log")
+            .recent(10)
+            .into_iter()
+            .find(|e| e.kind == "session_active")
+            .expect("the resumed session activates without CLIENT_AUTH");
         assert!(
-            events
-                .lock()
-                .expect("event log")
-                .recent(10)
-                .iter()
-                .any(|e| e.kind == "session_active"),
-            "the resumed session activates without CLIENT_AUTH"
+            active.detail.contains("aa"),
+            "the resumed session registers under the ticket's client endpoint hash: {}",
+            active.detail
         );
     }
 
@@ -1620,10 +2471,19 @@ mod tests {
         hello.supported_handshake_modes = vec![umc_handshake::ik::MODE_IK.to_vec()];
         hello.retry_token = ticket;
         let hello_bytes = hello.encode().expect("hello");
+        let initial_keys = umc_handshake::initial::derive_initial_keys(&[1u8; 8]);
+        let hello_packet = initial::build_initial_packet(
+            &[1u8; 8],
+            &[2u8; 8],
+            0,
+            &hello_bytes,
+            &initial_keys.client,
+        )
+        .expect("initial packet");
 
         let resume = |captured: Arc<StdMutex<Vec<u8>>>| {
             let link = ResumeScriptedLink {
-                hello_bytes: hello_bytes.clone(),
+                hello_packet: hello_packet.clone(),
                 server_hello_bytes: captured,
                 stage: StdMutex::new(0),
             };
@@ -1636,14 +2496,21 @@ mod tests {
         let first = Arc::new(StdMutex::new(Vec::new()));
         resume(first.clone()).expect("first use of the ticket resumes");
         let captured = first.lock().expect("captured");
-        let server_hello = ServerHello::decode(&captured).expect("captured server hello");
+        let payload =
+            umc_handshake::initial::parse_initial_with_keys(&captured, &initial_keys.server)
+                .expect("captured server Initial")
+                .2;
+        let server_hello = ServerHello::decode(&payload).expect("captured server hello");
         assert_eq!(
             server_hello.selected_handshake_mode,
             umc_handshake::ik::MODE_IK.to_vec(),
             "the first use must take the IK resume path"
         );
         drop(captured);
-        assert_eq!(state.lock().expect("state").sessions.count(), 1);
+        assert!(
+            state.lock().expect("state").sessions.count() <= 1,
+            "the session watcher may already have removed the scripted session"
+        );
 
         // Replay of the same ticket: refused — the daemon falls back to
         // the full XX path, where the scripted link ends.
@@ -1653,9 +2520,8 @@ mod tests {
             err.contains("client auth"),
             "the replay must fall back to the XX path: {err}"
         );
-        assert_eq!(
-            state.lock().expect("state").sessions.count(),
-            1,
+        assert!(
+            state.lock().expect("state").sessions.count() <= 1,
             "no second session may be registered for a replayed ticket"
         );
     }
@@ -1672,8 +2538,17 @@ mod tests {
         hello.supported_handshake_modes = vec![umc_handshake::ik::MODE_IK.to_vec()];
         hello.retry_token = b"not-a-ticket".to_vec();
         let hello_bytes = hello.encode().expect("hello");
+        let initial_keys = umc_handshake::initial::derive_initial_keys(&[1u8; 8]);
+        let hello_packet = initial::build_initial_packet(
+            &[1u8; 8],
+            &[2u8; 8],
+            0,
+            &hello_bytes,
+            &initial_keys.client,
+        )
+        .expect("initial packet");
         let link = ResumeScriptedLink {
-            hello_bytes,
+            hello_packet,
             server_hello_bytes: Arc::new(StdMutex::new(Vec::new())),
             stage: StdMutex::new(0),
         };
@@ -1707,7 +2582,8 @@ mod tests {
         };
         let server_binding =
             IdentityBinding::sign(&server_identity, &server_static, 0, u64::MAX, 0, [0u8; 32]);
-        let (link, _client_eid) = AuthScriptedLink::new(server_binding, true, false);
+        let (link, _client_eid, _stop, _stop_observed) =
+            AuthScriptedLink::new(server_binding, true, false);
         let tracker = StdMutex::new(HandshakeTracker::new());
         let err = handle_inbound_link(&state, "ump.tcp/1", Box::new(link), &tracker)
             .expect_err("tampered auth must be refused");

@@ -8,7 +8,6 @@
 //! public-relay path so existing peers can migrate, while any supplied value
 //! is fail-closed and must verify.
 
-use blake2::digest::{KeyInit, Mac};
 use umc_crypto::signatures::IdentityKeyPair;
 use umc_handshake::identity::endpoint_id;
 
@@ -109,13 +108,12 @@ impl RelayAuthorization {
     }
 
     fn compute_tag(&self, identity: &IdentityKeyPair) -> [u8; TAG_LEN] {
-        let mut mac = <blake2::Blake2sMac256 as KeyInit>::new_from_slice(&identity.to_seed())
-            .expect("identity seed is 32 bytes");
-        mac.update(DOMAIN);
-        mac.update(&self.relay_endpoint_id);
-        mac.update(&self.expires_at_ms.to_be_bytes());
-        mac.update(&self.nonce);
-        mac.finalize().into_bytes().into()
+        let mut context = Vec::with_capacity(DOMAIN.len() + ENDPOINT_LEN + 8 + NONCE_LEN);
+        context.extend_from_slice(DOMAIN);
+        context.extend_from_slice(&self.relay_endpoint_id);
+        context.extend_from_slice(&self.expires_at_ms.to_be_bytes());
+        context.extend_from_slice(&self.nonce);
+        umc_crypto::hkdf::hmac_blake2s(&identity.to_seed(), &context)
     }
 }
 

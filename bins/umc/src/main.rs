@@ -94,7 +94,7 @@ enum Command {
 enum ConfigAction {
     /// Print config entries.
     Get,
-    /// Set config entries (key=value); unimplemented until Phase 12.
+    /// Set config entries (key=value).
     Set { entries: Vec<String> },
 }
 
@@ -200,7 +200,7 @@ async fn cmd_config_set(socket: &str, entries: Vec<String>) -> Result<Vec<String
     let mut client = ConfigClient::connect(socket, CLIENT_NAME)
         .await
         .map_err(|e| format!("config: {e:?}"))?;
-    match client.set_config(map) {
+    match client.set_config(map).await {
         Ok(()) => Ok(vec!["config updated".to_string()]),
         Err(e) => Err(format!("config: {e:?}")),
     }

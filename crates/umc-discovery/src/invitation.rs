@@ -102,6 +102,39 @@ impl InvitationStore {
         Ok(())
     }
 
+    /// Authenticates a bounded admission proof against the live invitation
+    /// set without exposing stored invitation keys to callers. Expired and
+    /// already-consumed invitations are ignored; a matching single-use
+    /// invitation is consumed before its key is returned to the handshake
+    /// driver.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvitationError::Unknown`] when no active invitation matches
+    /// the supplied predicate.
+    pub fn authenticate<F>(
+        &mut self,
+        now_ms: u64,
+        mut matches: F,
+    ) -> Result<[u8; INVITATION_KEY_LEN], InvitationError>
+    where
+        F: FnMut(&[u8; INVITATION_KEY_LEN]) -> bool,
+    {
+        self.prune_expired(now_ms);
+        let Some(invitation) = self
+            .invitations
+            .values_mut()
+            .find(|invitation| !invitation.single_use || !invitation.used)
+            .filter(|invitation| matches(&invitation.key))
+        else {
+            return Err(InvitationError::Unknown);
+        };
+        if invitation.single_use {
+            invitation.used = true;
+        }
+        Ok(invitation.key)
+    }
+
     pub fn revoke(&mut self, id: &[u8; 16]) {
         self.invitations.remove(id);
     }
@@ -121,7 +154,8 @@ impl InvitationStore {
     }
 }
 
-/// HMAC-style admission authenticator (handshake.md §15.4), truncated to 16 bytes.
+/// HMAC-BLAKE2s admission authenticator (handshake.md §15.4), truncated to
+/// 16 bytes.
 #[must_use]
 pub fn invitation_authenticator(
     invitation_key: &[u8; 32],
@@ -130,15 +164,19 @@ pub fn invitation_authenticator(
     destination_connection_id: &[u8],
     carrier_binding: &[u8],
 ) -> [u8; 16] {
-    use blake2::{Blake2s256, Digest};
-    let mut hasher = Blake2s256::new();
-    hasher.update(b"UMP-INVITE-AUTH-v1");
-    hasher.update(invitation_key);
-    hasher.update(client_random);
-    hasher.update(client_ephemeral_public_key);
-    hasher.update(destination_connection_id);
-    hasher.update(carrier_binding);
-    let full: [u8; 32] = hasher.finalize().into();
+    let mut context = Vec::with_capacity(
+        b"UMP-INVITE-AUTH-v1".len()
+            + client_random.len()
+            + client_ephemeral_public_key.len()
+            + destination_connection_id.len()
+            + carrier_binding.len(),
+    );
+    context.extend_from_slice(b"UMP-INVITE-AUTH-v1");
+    context.extend_from_slice(client_random);
+    context.extend_from_slice(client_ephemeral_public_key);
+    context.extend_from_slice(destination_connection_id);
+    context.extend_from_slice(carrier_binding);
+    let full = umc_crypto::hkdf::hmac_blake2s(invitation_key, &context);
     let mut truncated = [0u8; 16];
     truncated.copy_from_slice(&full[..16]);
     truncated
@@ -188,6 +226,20 @@ mod tests {
         let invitation = store.create(u64::MAX, false, &E).unwrap();
         assert_eq!(
             store.validate(&invitation.id, &[0u8; 32], 0),
+            Err(InvitationError::Unknown)
+        );
+    }
+
+    #[test]
+    fn authenticate_matches_and_consumes_single_use() {
+        let mut store = InvitationStore::new();
+        let invitation = store.create(u64::MAX, true, &E).unwrap();
+        assert_eq!(
+            store.authenticate(0, |key| key == &invitation.key),
+            Ok(invitation.key)
+        );
+        assert_eq!(
+            store.authenticate(0, |key| key == &invitation.key),
             Err(InvitationError::Unknown)
         );
     }
