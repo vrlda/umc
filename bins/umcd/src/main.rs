@@ -396,8 +396,7 @@ fn handle_inbound_link_locked(
                 let matches = control
                     .session
                     .try_lock()
-                    .map(|session| session.dcid() == dcid.as_slice())
-                    .unwrap_or(false);
+                    .is_ok_and(|session| session.dcid() == dcid.as_slice());
                 if matches {
                     return handle_established_attach(
                         state,

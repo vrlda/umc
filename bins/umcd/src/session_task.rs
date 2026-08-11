@@ -95,7 +95,7 @@ pub const ECHO_POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// Period of the reader's idle/draining sweep (session.md §6.4, §22). The
 /// sweep only checks the session's idle and draining timers; it never
 /// touches the PTO schedule.
-pub const IDLE_SWEEP_INTERVAL: Duration = Duration::from_millis(1_000);
+pub const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// Pause after processing a packet before the next blocking recv. The TCP
 /// carrier serializes reads and writes behind one mutex, so a recv in
 /// flight starves the carrier's background writer; the pause gives queued
@@ -2446,7 +2446,7 @@ fn handle_control_frames(
                     }
                     Ok(umc_routing::request::Admission::Admit {
                         hop_limit,
-                        remaining_lifetime_ms,
+                        remaining_lifetime_ms: _,
                         forward_to,
                     }) if !forward_to.is_empty() && hop_limit > 0 => {
                         let mut path_exclusions = request.path_exclusions.clone();
