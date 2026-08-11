@@ -2261,14 +2261,12 @@ fn route_state_str(state: RouteState) -> &'static str {
 /// hash doubles as the opaque handle, the next hop rides in
 /// `carrier_class` (the same field `ListRoutes` uses).
 fn route_summary(record: &umc_routing::types::RouteRecord) -> api::RouteSummary {
-    let (hop_count, relay_count) = decode_path_metadata(&record.metadata)
-        .map(|hops| {
-            (
-                u32::try_from(hops.len()).unwrap_or(u32::MAX),
-                u32::try_from(hops.iter().filter(|hop| hop.relay).count()).unwrap_or(u32::MAX),
-            )
-        })
-        .unwrap_or((1, 0));
+    let (hop_count, relay_count) = decode_path_metadata(&record.metadata).map_or((1, 0), |hops| {
+        (
+            u32::try_from(hops.len()).unwrap_or(u32::MAX),
+            u32::try_from(hops.iter().filter(|hop| hop.relay).count()).unwrap_or(u32::MAX),
+        )
+    });
     api::RouteSummary {
         route_handle: Some(api::OpaqueHandle {
             value: record.key.destination_hash.to_vec(),
