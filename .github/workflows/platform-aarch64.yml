@@ -1,0 +1,92 @@
+name: Linux aarch64 evidence
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  aarch64-platform-evidence:
+    name: Linux aarch64 platform evidence
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "28.3"
+      - name: Install Linux keychain build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes pkg-config libdbus-1-dev
+      - name: Verify native architecture
+        run: test "$(uname -m)" = aarch64
+      - name: Run locked workspace tests
+        run: cargo test --workspace --locked
+      - name: Build release daemon
+        run: cargo build --package umcd --release --locked
+      - name: Write platform evidence
+        env:
+          UMC_GIT_COMMIT: ${{ github.sha }}
+        run: |
+          set -eu
+          dirty=false
+          if test -n "$(git status --porcelain --untracked-files=all)"; then dirty=true; fi
+          mkdir -p artifacts
+          sha256sum Cargo.lock > artifacts/Cargo.lock.sha256
+          sha256sum target/release/umcd > artifacts/umcd.sha256
+          UMC_DIRTY="$dirty" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import platform
+          import subprocess
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          def digest(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+          record = {
+              "schema": "umc-platform-evidence-v1",
+              "captured_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+              "git_commit": os.environ["UMC_GIT_COMMIT"],
+              "working_tree_dirty": os.environ["UMC_DIRTY"] == "true",
+              "host": {
+                  "os": platform.system(),
+                  "architecture": platform.machine(),
+                  "kernel": platform.release(),
+                  "rust_target": subprocess.check_output(
+                      ["rustc", "-vV"], text=True
+                  ).split("host: ", 1)[1].splitlines()[0],
+              },
+              "toolchain": {
+                  "cargo": subprocess.check_output(["cargo", "-V"], text=True).strip(),
+                  "rustc": subprocess.check_output(["rustc", "-vV"], text=True),
+              },
+              "verification": {
+                  "workspace_tests": "pass",
+                  "release_build": "pass",
+                  "cargo_lock_sha256": digest("Cargo.lock"),
+                  "release_binary": {
+                      "path": "target/release/umcd",
+                      "sha256": digest("target/release/umcd"),
+                  },
+              },
+          }
+          Path("artifacts/aarch64-platform-evidence.json").write_text(
+              json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
+      - name: Verify evidence artifact
+        run: |
+          test -s artifacts/aarch64-platform-evidence.json
+          test "$(python3 -c 'import json; print(json.load(open("artifacts/aarch64-platform-evidence.json"))["schema"])')" = umc-platform-evidence-v1
+          test "$(python3 -c 'import json; print(json.load(open("artifacts/aarch64-platform-evidence.json"))["host"]["architecture"])')" = aarch64
+          test "$(python3 -c 'import json; print(json.load(open("artifacts/aarch64-platform-evidence.json"))["working_tree_dirty"])')" = False
+          sha256sum -c artifacts/Cargo.lock.sha256
+          sha256sum -c artifacts/umcd.sha256
+      - name: Upload aarch64 evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-platform-evidence
+          path: artifacts/

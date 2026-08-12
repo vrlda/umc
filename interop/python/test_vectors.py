@@ -49,6 +49,18 @@ class IndependentVectorTests(unittest.TestCase):
         self.assertIn("lcov.info", workflow)
         self.assertIn("protocol-coverage", workflow)
 
+    def test_ci_exposes_optional_aarch64_evidence_workflow(self) -> None:
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github"
+            / "workflows"
+            / "platform-aarch64.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch", workflow)
+        self.assertIn("ubuntu-24.04-arm", workflow)
+        self.assertIn("aarch64-platform-evidence.json", workflow)
+        self.assertIn("sha256sum", workflow)
+
     def test_security_reporting_link_matches_published_repository(self) -> None:
         policy = (Path(__file__).resolve().parents[2] / "SECURITY.md").read_text(
             encoding="utf-8"
