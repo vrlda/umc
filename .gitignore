@@ -16,3 +16,18 @@ interop/python/__pycache__/
 /scripts/
 /tests/
 /umeps/
+
+# Published interoperability conformance artifacts. These are consumed by
+# the independent protocol-vector CI job rather than treated as local plans.
+!/interop/
+!/interop/python/
+!/interop/python/requirements.txt
+!/interop/python/test_vectors.py
+!/interop/python/verify_vectors.py
+!/interop/vectors/
+!/interop/vectors/README.md
+!/interop/vectors/ump1-v0.1.json
+interop/python/live_runner.py
+interop/python/test_live_runner.py
+interop/README.md
+interop/python/__pycache__/

@@ -1,0 +1,84 @@
+{
+  "format": "ump-independent-vectors",
+  "version": "0.1",
+  "generated_by": "python-cryptography-45.0.7",
+  "generated_at": "2026-08-10",
+  "notes": "Private seeds are test-only and must never be used for deployment.",
+  "identity": {
+    "ed25519_seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "public_key": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "endpoint_id": "e502984d2fdd0d0e343b6c01020913ba249bdf34a4e5abd6b26adede67f84418"
+  },
+  "x25519": {
+    "static_seed": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "static_public": "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254",
+    "peer_seed": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+    "peer_public": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51a",
+    "diffie_hellman": "04c304fb1ca83cee75e206344231f33797e07d9929db670994b7c6fbeb1dc255"
+  },
+  "initial_keys": {
+    "destination_connection_id": "0102030405060708",
+    "client_key": "d433c4a5429ce9f65ce45e70c293f052712e0717500915bf59e52a05ef07cadf",
+    "client_iv": "b6cc267f72c8bb4c2486cdb7",
+    "client_header_protection_key": "234899b2b2843979c4a32fdfc0dbfe06b3ee4f67f4a27683eeda829170e2347d",
+    "server_key": "80c9b3db7f4f034d7462cf30d624aa518c143b20a39de69908aff716fab0551d"
+  },
+  "identity_binding": {
+    "signed_message_digest": "a840d3367a5593f347ed56bc80c66ba2859f737a6d4772cb315f11c74b3d77ec",
+    "signature": "cdebd592e5039322a0ab784ef8e71274bd071d05f94f47daa8cb183eb8131b316e64048b383a3998132da2a17af943d4d0f0659e0f9a5a9f4fc092f39951a90c"
+  },
+  "session_packet": {
+    "traffic_secret": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "packet_key": "e35b0ea4725b90115d4b141a6baa7034c3c473d845e26fe6de7c3f9d351d3876",
+    "packet_iv": "fa2e1e919501d028f5dddae2",
+    "header_protection_key": "b4b971d113f877890fddf804e2e7cf116fb8d7a9e5faad38c2a3ca9a05091817",
+    "destination_connection_id": "0102030405060708",
+    "path_id": 0,
+    "packet_number": 1,
+    "plaintext_payload": "04",
+    "protected_packet": "14010203040506070800e2d146f33eacb0e06aec527ce2dc57a4391a69"
+  },
+  "handshake_transcript": {
+    "mode": "XX",
+    "crypto_profile": "UMP-CRYPTO-1",
+    "carrier_binding": "ump.tcp/1",
+    "initial_hash": "41a93a180624756a6a69c922e9a7759d78454ae35ad70e96b27416d239983c97",
+    "messages": [
+      {
+        "type": 0,
+        "body": "0001020304050607",
+        "encoded": "00080001020304050607",
+        "hash": "de900c05a9d8c004d334faf7642c57c5550bc4f112fbad2c4f7eff1bd70fed35"
+      },
+      {
+        "type": 1,
+        "body": "101112131415161718191a1b1c1d1e1f",
+        "encoded": "0110101112131415161718191a1b1c1d1e1f",
+        "hash": "10367d849034070101fbd620dca35fa29abc4195dce4604796e34ea70381c250"
+      },
+      {
+        "type": 2,
+        "body": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+        "encoded": "0220202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+        "hash": "ef1749ac735a49f067cba9682556e0bd53cf1c45428bd95a52a323aab45f12e4"
+      },
+      {
+        "type": 3,
+        "body": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+        "encoded": "0320404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+        "hash": "f7698e0aadbc2fe2492688cbfb63ed83e42d6607736b7d42568a93aa3678fd2f"
+      },
+      {
+        "type": 4,
+        "body": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+        "encoded": "0420606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+        "hash": "4b8374c66bef9eb1f79e95b2e623d83e5fbbfbd9a5c807b08236f385c4a93faa"
+      }
+    ]
+  },
+  "finished_mac": {
+    "key": "0101010101010101010101010101010101010101010101010101010101010101",
+    "transcript_hash": "0202020202020202020202020202020202020202020202020202020202020202",
+    "tag": "840802a05549b59b3dee05a6591a781c1e5bd57c3976f12c606c5f40ee3d5389"
+  }
+}
