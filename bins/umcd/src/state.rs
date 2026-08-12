@@ -598,6 +598,49 @@ impl TicketReplayCache {
         }
         true
     }
+
+}
+
+/// Bounded single-use identity-deletion confirmation cache. Confirmation
+/// tokens are process-local and one-time; FIFO eviction keeps replay state
+/// bounded without persisting sensitive authorization artifacts.
+#[derive(Debug, Default)]
+pub struct DeletionPlanReplayCache {
+    seen: HashSet<[u8; 16]>,
+    order: VecDeque<[u8; 16]>,
+}
+
+impl DeletionPlanReplayCache {
+    /// Maximum confirmation nonces retained.
+    pub const CAP: usize = 1_024;
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    /// Records `nonce`; returns `false` when already consumed.
+    #[must_use]
+    pub fn insert(&mut self, nonce: [u8; 16]) -> bool {
+        if !self.seen.insert(nonce) {
+            return false;
+        }
+        self.order.push_back(nonce);
+        if self.order.len() > Self::CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+        true
+    }
+
+    #[must_use]
+    pub fn seen(&self, nonce: [u8; 16]) -> bool {
+        self.seen.contains(&nonce)
+    }
 }
 
 /// The daemon's shared runtime context.
@@ -617,6 +660,9 @@ pub struct RuntimeState {
     /// Secret used to authenticate event resume cursors. It is intentionally
     /// process-local, so a daemon restart invalidates outstanding cursors.
     pub event_cursor_key: [u8; 32],
+    /// Secret used to authenticate identity-deletion confirmation tokens.
+    /// Process-local scope makes tokens invalid after restart.
+    pub deletion_plan_key: [u8; 32],
     /// Resolved control socket path.
     pub control_socket: PathBuf,
     /// Node database (namespaces: config, trust, records).
@@ -662,6 +708,8 @@ pub struct RuntimeState {
     /// the resume (handshake.md §35), so one ticket grants at most one
     /// session under the victim's endpoint id.
     pub ticket_replay_cache: std::sync::Mutex<TicketReplayCache>,
+    /// Bounded single-use identity-deletion confirmation nonces.
+    pub deletion_plan_replay: std::sync::Mutex<DeletionPlanReplayCache>,
     /// Operating mode profile (local mesh vs endpoint).
     pub mesh: MeshConfig,
     /// The runtime node: registered carriers, sessions (core.md §8).
@@ -931,6 +979,8 @@ impl RuntimeState {
         OsEntropy.fill(&mut server_instance_id);
         let mut event_cursor_key = [0u8; 32];
         OsEntropy.fill(&mut event_cursor_key);
+        let mut deletion_plan_key = [0u8; 32];
+        OsEntropy.fill(&mut deletion_plan_key);
         let (token_registry, token_grants) = restore_control_tokens(store.as_ref());
         let idempotency = crate::control_transport::IdempotencyCache::restore(
             store.as_ref(),
@@ -945,6 +995,7 @@ impl RuntimeState {
             revocation_warning,
             server_instance_id,
             event_cursor_key,
+            deletion_plan_key,
             config,
             store,
             trust_default_level: TrustLevel::Unknown,
@@ -957,6 +1008,7 @@ impl RuntimeState {
             ticket_key,
             retry_key,
             ticket_replay_cache: std::sync::Mutex::new(TicketReplayCache::new()),
+            deletion_plan_replay: std::sync::Mutex::new(DeletionPlanReplayCache::new()),
             mesh,
             node,
             carrier_instances: HashMap::new(),

@@ -26,12 +26,14 @@ use crate::runtime_adapters::OsEntropy;
 use crate::state::{
     metric_names, wall_now, CarrierLinkRecord, IdentityRef, RuntimeState, NODE_IDENTITY_RECORD,
 };
+use blake2::{Blake2s256, Digest};
 use prost::Message;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::fmt::Write as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
@@ -1021,7 +1023,7 @@ fn dispatch_request(
         ("IdentityService", "ExportPublicIdentity") => export_public_identity(state, request),
         ("IdentityService", "ExportSecretIdentity") => export_secret_identity(state, request),
         ("IdentityService", "ImportIdentity") => import_identity(state, request),
-        ("IdentityService", "DeleteIdentity") => delete_identity(state, request),
+        ("IdentityService", "DeleteIdentity") => delete_identity(state, request, principal_id),
         // CarrierService instance lifecycle is owned by the modular
         // registry-backed control_carriers module. Raw Dial links are owned
         // here; CloseLink operates on either a raw link or a live session.
@@ -4078,12 +4080,211 @@ fn import_identity(state: &mut RuntimeState, request: &api::Request) -> (i32, Op
     }
 }
 
+const DELETION_PLAN_TOKEN_VERSION: u8 = 1;
+const DELETION_PLAN_TOKEN_TTL_MS: u64 = 5 * 60 * 1_000;
+const DELETION_PLAN_TOKEN_NONCE_LEN: usize = 16;
+const DELETION_PLAN_TOKEN_BODY_LEN: usize = 1 + 16 + 8 + 8 + 8 + 32 + 32 + 32 + 16;
+const DELETION_PLAN_TOKEN_LEN: usize = DELETION_PLAN_TOKEN_BODY_LEN + 32;
+const IDENTITY_TRUST_PREFIXES: [&[u8]; 5] = [
+    b"revoke/",
+    b"tofu/",
+    b"intro/",
+    b"intro-signed/",
+    b"revoke-signed/",
+];
+
+#[derive(Debug)]
+struct DeletionPlanToken {
+    nonce: [u8; DELETION_PLAN_TOKEN_NONCE_LEN],
+}
+
+fn deletion_digest(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Blake2s256::new();
+    hasher.update(domain);
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+fn deletion_mac(key: &[u8; 32], body: &[u8]) -> [u8; 32] {
+    let mut hasher = Blake2s256::new();
+    hasher.update(b"UMC identity deletion plan v1");
+    hasher.update(key);
+    hasher.update(body);
+    hasher.finalize().into()
+}
+
+fn constant_time_bytes_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (left, right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn deletion_dependency_digest(dependencies: &[String]) -> [u8; 32] {
+    let mut canonical = Vec::new();
+    for dependency in dependencies {
+        let bytes = dependency.as_bytes();
+        canonical.extend_from_slice(
+            &u32::try_from(bytes.len())
+                .expect("identity deletion dependency names are bounded")
+                .to_be_bytes(),
+        );
+        canonical.extend_from_slice(bytes);
+    }
+    deletion_digest(b"UMC identity deletion dependencies v1", &canonical)
+}
+
+fn identity_deletion_dependencies(
+    state: &RuntimeState,
+    endpoint_id: &[u8; 32],
+) -> Result<Vec<String>, String> {
+    let mut dependencies = Vec::new();
+    for (session_id, entry) in state.sessions.snapshot() {
+        if entry.peer_endpoint_id == *endpoint_id {
+            dependencies.push(format!("session/{session_id}"));
+        }
+    }
+    for bundle_id in state.bundle.manager.records_iter().map(|record| record.id) {
+        let Some(record) = state.bundle.record(&bundle_id) else {
+            continue;
+        };
+        if record.sender.as_slice() == endpoint_id || record.destination_hint.as_slice() == endpoint_id
+        {
+            dependencies.push(format!("bundle/{}", hex_bytes(&bundle_id)));
+        }
+    }
+    for listener_handle in &state.application_listeners {
+        if listener_handle.as_slice() == endpoint_id {
+            dependencies.push(format!("listener/{}", hex_bytes(listener_handle)));
+        }
+    }
+    for entry in state
+        .store
+        .scan(Namespace::Trust)
+        .map_err(|error| format!("trust dependency scan failed: {error:?}"))?
+    {
+        let key_mentions_identity = entry.key == endpoint_id
+            || IDENTITY_TRUST_PREFIXES.iter().any(|prefix| {
+                entry.key.starts_with(prefix)
+                    && entry.key[prefix.len()..]
+                        .windows(endpoint_id.len())
+                        .any(|window| window == endpoint_id)
+            });
+        if key_mentions_identity {
+            dependencies.push(format!("trust/{}", hex_bytes(&entry.key)));
+        }
+    }
+    dependencies.sort();
+    dependencies.dedup();
+    Ok(dependencies)
+}
+
+fn encode_deletion_plan_token(
+    state: &RuntimeState,
+    principal_id: u64,
+    handle: &[u8],
+    endpoint_id: &[u8; 32],
+    revision: u64,
+    dependency_digest: &[u8; 32],
+    now_ms: u64,
+) -> Vec<u8> {
+    let mut nonce = [0u8; DELETION_PLAN_TOKEN_NONCE_LEN];
+    OsEntropy.fill(&mut nonce);
+    let expires_at_ms = now_ms.saturating_add(DELETION_PLAN_TOKEN_TTL_MS);
+    let handle_digest = deletion_digest(b"UMC identity deletion handle v1", handle);
+    let mut body = Vec::with_capacity(DELETION_PLAN_TOKEN_BODY_LEN);
+    body.push(DELETION_PLAN_TOKEN_VERSION);
+    body.extend_from_slice(&nonce);
+    body.extend_from_slice(&expires_at_ms.to_be_bytes());
+    body.extend_from_slice(&principal_id.to_be_bytes());
+    body.extend_from_slice(&revision.to_be_bytes());
+    body.extend_from_slice(endpoint_id);
+    body.extend_from_slice(&handle_digest);
+    body.extend_from_slice(dependency_digest);
+    body.extend_from_slice(&state.server_instance_id);
+    debug_assert_eq!(body.len(), DELETION_PLAN_TOKEN_BODY_LEN);
+    let mac = deletion_mac(&state.deletion_plan_key, &body);
+    body.extend_from_slice(&mac);
+    body
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_deletion_plan_token(
+    state: &RuntimeState,
+    token: &[u8],
+    principal_id: u64,
+    handle: &[u8],
+    endpoint_id: &[u8; 32],
+    revision: u64,
+    dependency_digest: &[u8; 32],
+    now_ms: u64,
+) -> Option<DeletionPlanToken> {
+    if token.len() != DELETION_PLAN_TOKEN_LEN
+        || token[0] != DELETION_PLAN_TOKEN_VERSION
+        || !constant_time_bytes_equal(
+            &token[DELETION_PLAN_TOKEN_BODY_LEN..],
+            &deletion_mac(
+                &state.deletion_plan_key,
+                &token[..DELETION_PLAN_TOKEN_BODY_LEN],
+            ),
+        )
+    {
+        return None;
+    }
+    let mut offset = 1;
+    let nonce = token[offset..offset + DELETION_PLAN_TOKEN_NONCE_LEN]
+        .try_into()
+        .ok()?;
+    offset += DELETION_PLAN_TOKEN_NONCE_LEN;
+    let expires_at_ms = u64::from_be_bytes(token[offset..offset + 8].try_into().ok()?);
+    offset += 8;
+    let token_principal_id = u64::from_be_bytes(token[offset..offset + 8].try_into().ok()?);
+    offset += 8;
+    let token_revision = u64::from_be_bytes(token[offset..offset + 8].try_into().ok()?);
+    offset += 8;
+    let token_endpoint_id: [u8; 32] = token[offset..offset + 32].try_into().ok()?;
+    offset += 32;
+    let token_handle_digest: [u8; 32] = token[offset..offset + 32].try_into().ok()?;
+    offset += 32;
+    let token_dependency_digest: [u8; 32] = token[offset..offset + 32].try_into().ok()?;
+    offset += 32;
+    let token_server_instance_id: [u8; 16] = token[offset..offset + 16].try_into().ok()?;
+    if expires_at_ms < now_ms
+        || token_principal_id != principal_id
+        || token_revision != revision
+        || token_endpoint_id != *endpoint_id
+        || token_handle_digest != deletion_digest(b"UMC identity deletion handle v1", handle)
+        || token_dependency_digest != *dependency_digest
+        || token_server_instance_id != state.server_instance_id
+    {
+        return None;
+    }
+    Some(DeletionPlanToken {
+        nonce,
+    })
+}
+
 /// `IdentityService.DeleteIdentity`: deletes a SECONDARY identity from the
 /// registry and keystore. The primary is `FailedPrecondition` — a full
-/// replacement is `RotateIdentityKey`. `plan_only` reports the would-be
-/// deletion without executing; the deletion-plan token is accepted but
-/// ignored (no dependency planning in v1).
-fn delete_identity(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+/// replacement is `RotateIdentityKey`. `plan_only` returns a deterministic
+/// dependency report and a short-lived, principal-bound, single-use token.
+fn delete_identity(
+    state: &mut RuntimeState,
+    request: &api::Request,
+    principal_id: u64,
+) -> (i32, Option<Vec<u8>>) {
     let Ok(delete) = api::DeleteIdentityRequest::decode(request.payload.as_slice()) else {
         return (api::StatusCode::InvalidArgument as i32, None);
     };
@@ -4096,25 +4297,69 @@ fn delete_identity(state: &mut RuntimeState, request: &api::Request) -> (i32, Op
     if let IdentityRef::Primary = resolved {
         return (api::StatusCode::FailedPrecondition as i32, None);
     }
+    let (endpoint_id, revision) = match resolved {
+        IdentityRef::Secondary(entry) => (entry.identity.endpoint_id(), entry.binding.sequence),
+        IdentityRef::Primary => unreachable!("primary rejected above"),
+    };
     if let Some(expected) = delete.expected_revision {
-        if let IdentityRef::Secondary(entry) = resolved {
-            if expected.value != entry.binding.sequence {
-                return (api::StatusCode::Conflict as i32, None);
-            }
+        if expected.value != revision {
+            return (api::StatusCode::Conflict as i32, None);
         }
     }
+    let dependencies = match identity_deletion_dependencies(state, &endpoint_id) {
+        Ok(dependencies) => dependencies,
+        Err(error) => {
+            log::warn!("[identity] delete dependency planning failed: {error}");
+            return (api::StatusCode::Internal as i32, None);
+        }
+    };
+    let dependency_digest = deletion_dependency_digest(&dependencies);
     if delete.plan_only {
+        let token = encode_deletion_plan_token(
+            state,
+            principal_id,
+            &handle.value,
+            &endpoint_id,
+            revision,
+            &dependency_digest,
+            wall_now().0,
+        );
         let response = api::DeleteIdentityResponse {
             deleted: false,
-            deletion_plan_token: Vec::new(),
-            dependencies: Vec::new(),
+            deletion_plan_token: token,
+            dependencies,
         };
         let mut payload = Vec::new();
         Message::encode(&response, &mut payload).expect("encode");
         return (api::StatusCode::Ok as i32, Some(payload));
     }
+    let Some(plan_token) = decode_deletion_plan_token(
+        state,
+        &delete.deletion_plan_token,
+        principal_id,
+        &handle.value,
+        &endpoint_id,
+        revision,
+        &dependency_digest,
+        wall_now().0,
+    ) else {
+        return (api::StatusCode::FailedPrecondition as i32, None);
+    };
+    if state
+        .deletion_plan_replay
+        .lock()
+        .expect("deletion plan replay cache")
+        .seen(plan_token.nonce)
+    {
+        return (api::StatusCode::Conflict as i32, None);
+    }
     match state.delete_secondary_identity(&handle.value) {
         Ok(()) => {
+            let _ = state
+                .deletion_plan_replay
+                .lock()
+                .expect("deletion plan replay cache")
+                .insert(plan_token.nonce);
             let response = api::DeleteIdentityResponse {
                 deleted: true,
                 deletion_plan_token: Vec::new(),
@@ -9280,11 +9525,29 @@ mod tests {
             );
             let handle = state.secondaries[0].record_name.as_bytes().to_vec();
 
+            let plan = api::DeleteIdentityRequest {
+                identity_handle: Some(api::OpaqueHandle {
+                    value: handle.clone(),
+                }),
+                plan_only: true,
+                expected_revision: Some(api::ResourceRevision { value: 0 }),
+                ..Default::default()
+            };
+            let plan_bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "DeleteIdentity", encode_request(&plan)),
+                None,
+            );
+            let plan_response = decode_response(&plan_bytes);
+            let plan = api::DeleteIdentityResponse::decode(plan_response.payload.as_slice())
+                .expect("plan payload");
+
             let delete = api::DeleteIdentityRequest {
                 identity_handle: Some(api::OpaqueHandle {
                     value: handle.clone(),
                 }),
                 plan_only: false,
+                deletion_plan_token: plan.deletion_plan_token,
                 ..Default::default()
             };
             let bytes = dispatch_request(
@@ -9307,6 +9570,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn delete_identity_plan_only_and_revision_checks() {
         with_password("test-password", || {
             let (mut state, _tx) = test_state();
@@ -9321,6 +9585,11 @@ mod tests {
                 None,
             );
             let handle = state.secondaries[0].record_name.as_bytes().to_vec();
+            let endpoint_id = state.secondaries[0].identity.endpoint_id();
+            state
+                .trust_store()
+                .set_state(&endpoint_id, TrustState::Observed, 1)
+                .expect("trust dependency");
             // plan_only reports without deleting.
             let delete = api::DeleteIdentityRequest {
                 identity_handle: Some(api::OpaqueHandle {
@@ -9346,11 +9615,45 @@ mod tests {
                     .deleted,
                 "plan_only must not delete"
             );
+            let plan = api::DeleteIdentityResponse::decode(response.payload.as_slice())
+                .expect("plan payload");
+            assert!(
+                !plan.deletion_plan_token.is_empty(),
+                "plan_only must return a confirmation token"
+            );
+            assert_eq!(plan.dependencies.len(), 1);
+            assert!(plan.dependencies[0].starts_with("trust/"));
+            assert_eq!(state.secondaries.len(), 1);
+
+            // A final delete without the plan token is rejected.
+            let delete_without_plan = api::DeleteIdentityRequest {
+                identity_handle: Some(api::OpaqueHandle {
+                    value: handle.clone(),
+                }),
+                plan_only: false,
+                expected_revision: Some(api::ResourceRevision { value: 0 }),
+                ..Default::default()
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request(
+                    "IdentityService",
+                    "DeleteIdentity",
+                    encode_request(&delete_without_plan),
+                ),
+                None,
+            );
+            assert_eq!(
+                decode_response(&bytes).status.unwrap().code,
+                api::StatusCode::FailedPrecondition as i32
+            );
             assert_eq!(state.secondaries.len(), 1);
 
             // A stale expected_revision is Conflict.
             let delete = api::DeleteIdentityRequest {
-                identity_handle: Some(api::OpaqueHandle { value: handle }),
+                identity_handle: Some(api::OpaqueHandle {
+                    value: handle.clone(),
+                }),
                 plan_only: false,
                 expected_revision: Some(api::ResourceRevision { value: 99 }),
                 ..Default::default()
@@ -9369,6 +9672,26 @@ mod tests {
                 1,
                 "a rejected delete changes nothing"
             );
+
+            let delete = api::DeleteIdentityRequest {
+                identity_handle: Some(api::OpaqueHandle { value: handle }),
+                plan_only: false,
+                expected_revision: Some(api::ResourceRevision { value: 0 }),
+                deletion_plan_token: plan.deletion_plan_token,
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "DeleteIdentity", encode_request(&delete)),
+                None,
+            );
+            let response = decode_response(&bytes);
+            assert_eq!(response.status.unwrap().code, api::StatusCode::Ok as i32);
+            assert!(
+                api::DeleteIdentityResponse::decode(response.payload.as_slice())
+                    .expect("payload")
+                    .deleted
+            );
+            assert!(state.secondaries.is_empty());
         });
     }
 
