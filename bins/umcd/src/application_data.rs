@@ -217,6 +217,45 @@ impl ApplicationDataPlane {
         }
     }
 
+    /// Rebind every local data-plane record owned by an application to a new
+    /// control connection. This is used only after the registration layer has
+    /// authenticated a resumable principal and instance id.
+    pub fn rebind_application(
+        &mut self,
+        application_handle: &[u8],
+        principal_id: u64,
+        connection_id: &[u8],
+    ) -> Result<(), ApplicationDataError> {
+        if self.listeners.iter().any(|listener| {
+            listener.application_handle.as_slice() == application_handle
+                && listener.principal_id != principal_id
+        }) || self.sessions.values().any(|session| {
+            session.application_handle.as_slice() == application_handle
+                && session.principal_id != principal_id
+        }) || self.streams.values().any(|stream| {
+            stream.application_handle.as_slice() == application_handle
+                && stream.principal_id != principal_id
+        }) {
+            return Err(ApplicationDataError::PermissionDenied);
+        }
+        for listener in &mut self.listeners {
+            if listener.application_handle.as_slice() == application_handle {
+                listener.connection_id = connection_id.to_vec();
+            }
+        }
+        for session in self.sessions.values_mut() {
+            if session.application_handle.as_slice() == application_handle {
+                session.connection_id = connection_id.to_vec();
+            }
+        }
+        for stream in self.streams.values_mut() {
+            if stream.application_handle.as_slice() == application_handle {
+                stream.connection_id = connection_id.to_vec();
+            }
+        }
+        Ok(())
+    }
+
     pub fn remove_session(&mut self, session_id: u64) {
         self.sessions.remove(&session_id);
         self.datagrams.remove(&session_id);
@@ -916,5 +955,38 @@ mod tests {
                 .data,
             vec![1, 2, 3]
         );
+    }
+
+    #[test]
+    fn resumable_application_rebinds_all_owned_records() {
+        let mut data = ApplicationDataPlane::new();
+        data.register_listener(
+            b"proto/1".to_vec(),
+            b"app".to_vec(),
+            7,
+            b"old-connection".to_vec(),
+        );
+        let stream = data
+            .open_stream(
+                7,
+                b"old-connection".to_vec(),
+                b"app".to_vec(),
+                11,
+                3,
+                b"proto/1".to_vec(),
+            )
+            .expect("stream");
+        data.rebind_application(b"app", 7, b"new-connection")
+            .expect("rebind");
+        data.push_stream_data(&stream, b"ok".to_vec(), false)
+            .expect("data");
+        assert!(data
+            .read_stream(&stream, 7, b"new-connection", 8, false)
+            .expect("read")
+            .is_some());
+        assert!(matches!(
+            data.read_stream(&stream, 7, b"old-connection", 8, false),
+            Err(ApplicationDataError::PermissionDenied)
+        ));
     }
 }

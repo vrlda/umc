@@ -8,7 +8,8 @@
 use crate::cancellation::CancellationHandle;
 use crate::relay_link::RelayLink;
 use crate::server::push_event;
-use crate::state::RuntimeState;
+use crate::runtime_adapters::OsEntropy;
+use crate::state::{wall_now, ApplicationRegistration, RuntimeState};
 use prost::Message;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,12 +17,92 @@ use umc_carrier::types::OutboundPacket;
 use umc_control::proto::umc::api::v1 as api;
 use umc_routing::types::{RouteKey, RouteScope, RouteState};
 use umc_session::datagram::Datagram;
+use umc_types::runtime::EntropySource;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StaticDialTarget {
     carrier: String,
     address: String,
     endpoint_id: [u8; 32],
+}
+
+fn is_application_capability(capability: api::Capability) -> bool {
+    matches!(
+        capability,
+        api::Capability::ApplicationConnect
+            | api::Capability::ApplicationListen
+            | api::Capability::ApplicationStream
+            | api::Capability::ApplicationDatagram
+    )
+}
+
+fn requested_application_capabilities(
+    requested: &[i32],
+) -> Result<Vec<i32>, api::StatusCode> {
+    let mut capabilities = requested
+        .iter()
+        .map(|raw| {
+            let capability = api::Capability::try_from(*raw)
+                .map_err(|_| api::StatusCode::InvalidArgument)?;
+            if !is_application_capability(capability) {
+                return Err(api::StatusCode::InvalidArgument);
+            }
+            Ok(capability as i32)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    capabilities.sort_unstable();
+    capabilities.dedup();
+    Ok(capabilities)
+}
+
+fn effective_application_grants(
+    state: &RuntimeState,
+    principal_id: u64,
+    requested: &[i32],
+) -> Result<Vec<api::CapabilityGrant>, api::StatusCode> {
+    let requested = requested_application_capabilities(requested)?;
+    // Principal zero is the authenticated same-user OS peer. Its authority
+    // is local policy, not a bearer grant, so it must not manufacture grants
+    // in the application response (control-api.md §11.1).
+    if principal_id == 0 {
+        return Ok(Vec::new());
+    }
+    let now_ms = wall_now().0;
+    Ok(state
+        .token_grants
+        .get(&principal_id)
+        .into_iter()
+        .flatten()
+        .filter_map(|grant| {
+            let capability = api::Capability::try_from(grant.capability).ok()?;
+            if !is_application_capability(capability)
+                || grant.expires_at_unix_ms < 0
+                || (grant.expires_at_unix_ms > 0
+                    && u64::try_from(grant.expires_at_unix_ms)
+                        .ok()
+                        .is_some_and(|expires| now_ms >= expires))
+                || (!requested.is_empty() && !requested.contains(&grant.capability))
+            {
+                return None;
+            }
+            Some(grant.clone())
+        })
+        .collect())
+}
+
+fn registration_response(
+    handle: Vec<u8>,
+    effective_grants: Vec<api::CapabilityGrant>,
+    resume_token: Vec<u8>,
+) -> (i32, Option<Vec<u8>>) {
+    let response = api::RegisterApplicationResponse {
+        application_handle: Some(api::OpaqueHandle { value: handle }),
+        effective_grants,
+        resume_token,
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
 }
 
 fn resolve_static_peer(
@@ -614,6 +695,7 @@ pub(crate) fn connect(
 }
 
 /// Register an application and all of its requested protocol identifiers.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn register(
     state: &mut RuntimeState,
     request: &api::Request,
@@ -626,6 +708,75 @@ pub(crate) fn register(
     if register.application_name.is_empty() || register.requested_protocol_ids.is_empty() {
         return (api::StatusCode::InvalidArgument as i32, None);
     }
+    if register.resumable && principal_id == 0 {
+        return (api::StatusCode::PermissionDenied as i32, None);
+    }
+    if register.resumable && register.application_instance_id.len() != 16 {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    let normalized_capabilities = match requested_application_capabilities(
+        &register.requested_capabilities,
+    ) {
+        Ok(capabilities) => capabilities,
+        Err(status) => return (status as i32, None),
+    };
+    let effective_grants = match effective_application_grants(
+        state,
+        principal_id,
+        &normalized_capabilities,
+    ) {
+        Ok(grants) => grants,
+        Err(status) => return (status as i32, None),
+    };
+
+    // Re-registration is the resumable-principal handshake. The bearer
+    // principal and stable application instance id are the authenticated
+    // lookup key; the opaque token is returned for client persistence and
+    // audit, while the transport's ClientHello still authenticates the
+    // principal before this method runs.
+    if register.resumable {
+        let existing = state
+            .application_registrations
+            .iter()
+            .find_map(|(handle, metadata)| {
+                (metadata.resumable
+                    && metadata.application_instance_id == register.application_instance_id
+                    && state.application_principals.get(handle) == Some(&principal_id))
+                    .then(|| (handle.clone(), metadata.clone()))
+            });
+        if let Some((handle, metadata)) = existing {
+            if state
+                .application_connections
+                .get(&handle)
+                .is_some_and(|owner| !owner.is_empty() && owner.as_slice() != connection_id)
+            {
+                return (api::StatusCode::AlreadyExists as i32, None);
+            }
+            if metadata.application_name != register.application_name
+                || metadata.requested_endpoint_ids != register.requested_endpoint_ids
+                || metadata.requested_protocol_ids != register.requested_protocol_ids
+                || metadata.requested_capabilities != normalized_capabilities
+            {
+                return (api::StatusCode::AlreadyExists as i32, None);
+            }
+            state
+                .application_connections
+                .insert(handle.clone(), connection_id.to_vec());
+            if state
+                .application_data
+                .rebind_application(&handle, principal_id, connection_id)
+                .is_err()
+            {
+                return (api::StatusCode::PermissionDenied as i32, None);
+            }
+            if let Some(registration) = state.application_registrations.get_mut(&handle) {
+                registration.effective_grants.clone_from(&effective_grants);
+            }
+            push_event(state, "application_resumed", register.application_name);
+            return registration_response(handle, effective_grants, metadata.resume_token);
+        }
+    }
+
     let mut registered_protocols = Vec::with_capacity(register.requested_protocol_ids.len());
     for protocol_id in &register.requested_protocol_ids {
         match state.apps.register(
@@ -673,6 +824,25 @@ pub(crate) fn register(
         register.requested_protocol_ids[0].as_bytes().to_vec(),
         connection_id.to_vec(),
     );
+    let mut resume_token = Vec::new();
+    if register.resumable {
+        resume_token.resize(32, 0);
+        OsEntropy.fill(&mut resume_token);
+    }
+    let handle = register.requested_protocol_ids[0].as_bytes().to_vec();
+    state.application_registrations.insert(
+        handle.clone(),
+        ApplicationRegistration {
+            application_name: register.application_name.clone(),
+            application_instance_id: register.application_instance_id.clone(),
+            requested_endpoint_ids: register.requested_endpoint_ids.clone(),
+            requested_protocol_ids: register.requested_protocol_ids.clone(),
+            requested_capabilities: normalized_capabilities,
+            resumable: register.resumable,
+            effective_grants: effective_grants.clone(),
+            resume_token: resume_token.clone(),
+        },
+    );
     push_event(
         state,
         "application_registered",
@@ -682,17 +852,7 @@ pub(crate) fn register(
             register.requested_protocol_ids.len()
         ),
     );
-    let response = api::RegisterApplicationResponse {
-        application_handle: Some(api::OpaqueHandle {
-            value: register.requested_protocol_ids[0].as_bytes().to_vec(),
-        }),
-        // v1: no capability-grant or resumable-principal model yet.
-        effective_grants: Vec::new(),
-        resume_token: Vec::new(),
-    };
-    let mut payload = Vec::new();
-    Message::encode(&response, &mut payload).expect("encode");
-    (api::StatusCode::Ok as i32, Some(payload))
+    registration_response(handle, effective_grants, resume_token)
 }
 
 /// Unregister an application and every protocol/channel belonging to it.
@@ -731,6 +891,7 @@ pub(crate) fn unregister(
     };
     state.application_principals.remove(&handle.value);
     state.application_connections.remove(&handle.value);
+    state.application_registrations.remove(&handle.value);
     state.application_listeners.remove(&handle.value);
     if unregister.close_owned_sessions {
         for session_id in state
@@ -1744,6 +1905,26 @@ pub(crate) fn close_connection(state: &mut RuntimeState, connection_id: &[u8]) {
     let mut channels = state.app_channels.lock().expect("app channels");
     let mut receivers = state.app_echo_rx.lock().expect("app echo receivers");
     for handle in handles {
+        if state
+            .application_registrations
+            .get(&handle)
+            .is_some_and(|registration| registration.resumable)
+        {
+            state
+                .application_connections
+                .insert(handle.clone(), Vec::new());
+            if let Some(principal_id) = state.application_principals.get(&handle).copied() {
+                let _ = state
+                    .application_data
+                    .rebind_application(&handle, principal_id, &[]);
+            }
+            push_event(
+                state,
+                "application_suspended",
+                "control connection closed".to_string(),
+            );
+            continue;
+        }
         for session_id in state.application_data.session_ids_for_application(&handle) {
             if let Some(entry) = state.sessions.lookup(session_id) {
                 entry.task.abort();
@@ -1758,6 +1939,7 @@ pub(crate) fn close_connection(state: &mut RuntimeState, connection_id: &[u8]) {
         }
         state.application_principals.remove(&handle);
         state.application_connections.remove(&handle);
+        state.application_registrations.remove(&handle);
         state.application_listeners.remove(&handle);
         state.application_data.remove_application(&handle);
         push_event(
@@ -1853,6 +2035,126 @@ mod tests {
             shutdown,
         )
         .expect("runtime state")
+    }
+
+    #[test]
+    fn register_returns_effective_application_grants_without_expanding_authority() {
+        let mut state = state();
+        let principal_id = 42;
+        state.token_grants.insert(
+            principal_id,
+            vec![
+                api::CapabilityGrant {
+                    capability: api::Capability::ApplicationRegister as i32,
+                    ..Default::default()
+                },
+                api::CapabilityGrant {
+                    capability: api::Capability::ApplicationListen as i32,
+                    constraints: Some(api::ResourceConstraints {
+                        protocol_ids: vec!["org.notes/1".into()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                api::CapabilityGrant {
+                    capability: api::Capability::NodeAdmin as i32,
+                    ..Default::default()
+                },
+            ],
+        );
+        let response = register(
+            &mut state,
+            &request(
+                "RegisterApplication",
+                encode(&api::RegisterApplicationRequest {
+                    application_name: "notes".into(),
+                    application_instance_id: vec![7; 16],
+                    requested_protocol_ids: vec!["org.notes/1".into()],
+                    requested_capabilities: vec![
+                        api::Capability::ApplicationListen as i32,
+                        api::Capability::ApplicationConnect as i32,
+                    ],
+                    ..Default::default()
+                }),
+            ),
+            principal_id,
+            b"connection-1",
+        );
+        assert_eq!(response.0, api::StatusCode::Ok as i32);
+        let response = api::RegisterApplicationResponse::decode(
+            response.1.expect("registration response").as_slice(),
+        )
+        .expect("decode registration response");
+        assert_eq!(response.effective_grants.len(), 1);
+        assert_eq!(
+            response.effective_grants[0].capability,
+            api::Capability::ApplicationListen as i32
+        );
+        assert!(response.resume_token.is_empty());
+    }
+
+    #[test]
+    fn resumable_registration_reclaims_application_after_connection_loss() {
+        let mut state = state();
+        let request = request(
+            "RegisterApplication",
+            encode(&api::RegisterApplicationRequest {
+                application_name: "notes".into(),
+                application_instance_id: vec![9; 16],
+                requested_protocol_ids: vec!["org.notes/1".into()],
+                resumable: true,
+                ..Default::default()
+            }),
+        );
+        let first = register(&mut state, &request, 42, b"connection-1");
+        assert_eq!(first.0, api::StatusCode::Ok as i32);
+        let first = api::RegisterApplicationResponse::decode(
+            first.1.expect("first registration response").as_slice(),
+        )
+        .expect("decode first registration response");
+        assert!(!first.resume_token.is_empty());
+        let handle = first
+            .application_handle
+            .expect("first application handle")
+            .value;
+        state.application_data.register_listener(
+            b"org.notes/1".to_vec(),
+            handle.clone(),
+            42,
+            b"connection-1".to_vec(),
+        );
+
+        close_connection(&mut state, b"connection-1");
+        assert!(state.apps.lookup(&handle).is_some());
+
+        let second = register(&mut state, &request, 42, b"connection-2");
+        assert_eq!(second.0, api::StatusCode::Ok as i32);
+        let second = api::RegisterApplicationResponse::decode(
+            second.1.expect("second registration response").as_slice(),
+        )
+        .expect("decode second registration response");
+        assert_eq!(second.application_handle.expect("second handle").value, handle);
+        assert_eq!(second.resume_token, first.resume_token);
+        assert_eq!(
+            state.application_connections.get(&handle).map(Vec::as_slice),
+            Some(b"connection-2".as_slice())
+        );
+        state
+            .application_data
+            .route_incoming_stream(9, 1, b"org.notes/1", b"pending".to_vec(), false)
+            .expect("rebound listener");
+        let pending = state
+            .application_data
+            .pending_streams()
+            .into_iter()
+            .next()
+            .expect("pending stream handle");
+        assert!(matches!(
+            state
+                .application_data
+                .read_stream(&pending, 42, b"connection-2", 32, false),
+            Err(crate::application_data::ApplicationDataError::Pending)
+        ));
     }
 
     #[test]

@@ -199,8 +199,13 @@ struct EmbeddedEndpoint {
 
 #[derive(Debug)]
 struct EmbeddedApplication {
+    application_name: String,
+    application_instance_id: Vec<u8>,
     endpoint_ids: Vec<Vec<u8>>,
     protocols: HashSet<String>,
+    effective_grants: Vec<api::CapabilityGrant>,
+    resumable: bool,
+    resume_token: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -685,12 +690,34 @@ impl EmbeddedBackend {
         label
     }
 
+    #[allow(clippy::too_many_lines)]
     fn register_application(&mut self, payload: &[u8]) -> (i32, Vec<u8>) {
         let Ok(request) = api::RegisterApplicationRequest::decode(payload) else {
             return (api::StatusCode::InvalidArgument as i32, Vec::new());
         };
         if request.application_name.trim().is_empty() || request.requested_protocol_ids.is_empty() {
             return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        }
+        if request.resumable && request.application_instance_id.len() != 16 {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        }
+        let mut requested_capabilities = Vec::new();
+        for raw in &request.requested_capabilities {
+            let Ok(capability) = api::Capability::try_from(*raw) else {
+                return (api::StatusCode::InvalidArgument as i32, Vec::new());
+            };
+            if !matches!(
+                capability,
+                api::Capability::ApplicationConnect
+                    | api::Capability::ApplicationListen
+                    | api::Capability::ApplicationStream
+                    | api::Capability::ApplicationDatagram
+            ) {
+                return (api::StatusCode::InvalidArgument as i32, Vec::new());
+            }
+            if !requested_capabilities.contains(raw) {
+                requested_capabilities.push(*raw);
+            }
         }
         if request.requested_endpoint_ids.iter().any(|endpoint| {
             !self
@@ -700,14 +727,60 @@ impl EmbeddedBackend {
         }) {
             return (api::StatusCode::NotFound as i32, Vec::new());
         }
+        if request.resumable {
+            if let Some((application, existing)) =
+                self.applications.iter().find(|(_, application)| {
+                    application.resumable
+                        && application.application_instance_id == request.application_instance_id
+                })
+            {
+                if existing.application_name != request.application_name
+                    || existing.endpoint_ids != request.requested_endpoint_ids
+                    || existing.protocols
+                        != request.requested_protocol_ids.iter().cloned().collect()
+                {
+                    return (api::StatusCode::AlreadyExists as i32, Vec::new());
+                }
+                return encoded_ok(&api::RegisterApplicationResponse {
+                    application_handle: Some(api::OpaqueHandle {
+                        value: application.clone(),
+                    }),
+                    effective_grants: existing.effective_grants.clone(),
+                    resume_token: existing.resume_token.clone(),
+                });
+            }
+        }
         let application = self.next_handle(16);
         let endpoint_ids = request.requested_endpoint_ids;
         let protocols = request.requested_protocol_ids;
+        let mut resume_token = Vec::new();
+        if request.resumable {
+            resume_token.resize(32, 0);
+            rand_core::OsRng.fill_bytes(&mut resume_token);
+        }
+        let effective_grants: Vec<api::CapabilityGrant> = requested_capabilities
+            .iter()
+            .map(|capability| api::CapabilityGrant {
+                capability: *capability,
+                constraints: Some(api::ResourceConstraints {
+                    endpoint_ids: endpoint_ids.clone(),
+                    protocol_ids: protocols.clone(),
+                    all_resources: endpoint_ids.is_empty(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .collect();
         self.applications.insert(
             application.clone(),
             EmbeddedApplication {
+                application_name: request.application_name,
+                application_instance_id: request.application_instance_id,
                 endpoint_ids: endpoint_ids.clone(),
                 protocols: protocols.into_iter().collect(),
+                effective_grants: effective_grants.clone(),
+                resumable: request.resumable,
+                resume_token: resume_token.clone(),
             },
         );
         self.publish_event(
@@ -720,8 +793,8 @@ impl EmbeddedBackend {
         );
         encoded_ok(&api::RegisterApplicationResponse {
             application_handle: Some(api::OpaqueHandle { value: application }),
-            effective_grants: Vec::new(),
-            resume_token: Vec::new(),
+            effective_grants,
+            resume_token,
         })
     }
 
@@ -2686,6 +2759,47 @@ mod tests {
             Some(1),
         );
         assert_eq!(status, api::StatusCode::DeadlineExceeded as i32);
+    }
+
+    #[test]
+    fn embedded_application_registration_returns_grants_and_reclaims_instance() {
+        let config = super::EmbeddedConfig::default();
+        let mut backend = super::EmbeddedBackend::new(&config).expect("embedded backend");
+        let request = api::RegisterApplicationRequest {
+            application_name: "embedded-notes".into(),
+            application_instance_id: vec![4; 16],
+            requested_protocol_ids: vec!["org.example.notes/1".into()],
+            requested_capabilities: vec![api::Capability::ApplicationStream as i32],
+            resumable: true,
+            ..Default::default()
+        };
+        let (status, payload) = backend.request_raw(
+            "ApplicationService",
+            "RegisterApplication",
+            &request.encode_to_vec(),
+            None,
+        );
+        assert_eq!(status, api::StatusCode::Ok as i32);
+        let first = api::RegisterApplicationResponse::decode(payload.as_slice())
+            .expect("registration response");
+        assert_eq!(first.effective_grants.len(), 1);
+        assert_eq!(
+            first.effective_grants[0].capability,
+            api::Capability::ApplicationStream as i32
+        );
+        assert_eq!(first.resume_token.len(), 32);
+
+        let (status, payload) = backend.request_raw(
+            "ApplicationService",
+            "RegisterApplication",
+            &request.encode_to_vec(),
+            None,
+        );
+        assert_eq!(status, api::StatusCode::Ok as i32);
+        let second = api::RegisterApplicationResponse::decode(payload.as_slice())
+            .expect("re-registration response");
+        assert_eq!(second.application_handle, first.application_handle);
+        assert_eq!(second.resume_token, first.resume_token);
     }
 
     #[tokio::test]

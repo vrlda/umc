@@ -643,6 +643,22 @@ impl DeletionPlanReplayCache {
     }
 }
 
+/// Application registration metadata retained for the lifetime of the
+/// runtime. Resumable registrations keep this record when their control
+/// connection closes so a later registration with the same authenticated
+/// principal and instance id can reclaim the application handle.
+#[derive(Debug, Clone)]
+pub struct ApplicationRegistration {
+    pub application_name: String,
+    pub application_instance_id: Vec<u8>,
+    pub requested_endpoint_ids: Vec<Vec<u8>>,
+    pub requested_protocol_ids: Vec<String>,
+    pub requested_capabilities: Vec<i32>,
+    pub resumable: bool,
+    pub effective_grants: Vec<api::CapabilityGrant>,
+    pub resume_token: Vec<u8>,
+}
+
 /// The daemon's shared runtime context.
 pub struct RuntimeState {
     pub config: NodeConfig,
@@ -790,6 +806,9 @@ pub struct RuntimeState {
     /// Control connection that owns each application handle. Empty IDs are
     /// used by in-process protocol tests, not live socket registrations.
     pub application_connections: HashMap<Vec<u8>, Vec<u8>>,
+    /// Registration metadata needed to return effective grants and reclaim a
+    /// resumable application after its control connection is replaced.
+    pub application_registrations: HashMap<Vec<u8>, ApplicationRegistration>,
     /// Listener handles opened by applications. Listener handles are the
     /// application handle in the current v1 surface, but tracking their
     /// lifecycle separately lets `CloseListener` stop admission without
@@ -1037,6 +1056,7 @@ impl RuntimeState {
             application_protocols: HashMap::new(),
             application_principals: HashMap::new(),
             application_connections: HashMap::new(),
+            application_registrations: HashMap::new(),
             application_listeners: HashSet::new(),
             application_data: ApplicationDataPlane::new(),
             app_echo_rx: Arc::new(Mutex::new(HashMap::new())),

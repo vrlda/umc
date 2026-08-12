@@ -18,7 +18,7 @@ pub mod status;
 #[cfg(test)]
 mod f7_surface_tests;
 
-pub use app::{Datagram, Endpoint, Listener, ServiceRegistry};
+pub use app::{ApplicationRegistration, Datagram, Endpoint, Listener, ServiceRegistry};
 pub use backpressure::BoundedSendQueue;
 pub use client::{Client, ClientError};
 pub use embedded::EmbeddedConfig;

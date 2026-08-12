@@ -31,6 +31,33 @@ pub struct Endpoint {
     secret_available: bool,
 }
 
+/// Result of an application registration. The daemon may narrow requested
+/// capabilities to the authenticated principal's effective grants and may
+/// issue a resumable registration token.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApplicationRegistration {
+    handle: AppHandle,
+    effective_grants: Vec<v1::CapabilityGrant>,
+    resume_token: Vec<u8>,
+}
+
+impl ApplicationRegistration {
+    #[must_use]
+    pub fn handle(&self) -> &AppHandle {
+        &self.handle
+    }
+
+    #[must_use]
+    pub fn effective_grants(&self) -> &[v1::CapabilityGrant] {
+        &self.effective_grants
+    }
+
+    #[must_use]
+    pub fn resume_token(&self) -> &[u8] {
+        &self.resume_token
+    }
+}
+
 impl Endpoint {
     /// Decodes endpoint metadata from the identity service response.
     pub fn from_summary(summary: &v1::IdentitySummary) -> Result<Self, ClientError> {
@@ -368,6 +395,56 @@ impl Client {
         protocols: &[&str],
         deadline_unix_ms: Option<i64>,
     ) -> Result<AppHandle, ClientError> {
+        Ok(self
+            .register_application_with_options_and_deadline(
+                name,
+                instance_id,
+                endpoint_ids,
+                protocols,
+                &[],
+                false,
+                deadline_unix_ms,
+            )
+            .await?
+            .handle)
+    }
+
+    /// Registers an application while requesting a capability subset and an
+    /// optional resumable principal. The returned grants are the daemon's
+    /// effective subset after bearer authorization and resource constraints.
+    pub async fn register_application_with_options(
+        &mut self,
+        name: &str,
+        instance_id: [u8; 16],
+        endpoint_ids: &[&[u8]],
+        protocols: &[&str],
+        requested_capabilities: &[v1::Capability],
+        resumable: bool,
+    ) -> Result<ApplicationRegistration, ClientError> {
+        self.register_application_with_options_and_deadline(
+            name,
+            instance_id,
+            endpoint_ids,
+            protocols,
+            requested_capabilities,
+            resumable,
+            None,
+        )
+        .await
+    }
+
+    /// Deadline-aware variant of [`Self::register_application_with_options`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_application_with_options_and_deadline(
+        &mut self,
+        name: &str,
+        instance_id: [u8; 16],
+        endpoint_ids: &[&[u8]],
+        protocols: &[&str],
+        requested_capabilities: &[v1::Capability],
+        resumable: bool,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<ApplicationRegistration, ClientError> {
         if protocols.is_empty() {
             return Err(ClientError::InvalidArgument);
         }
@@ -383,8 +460,11 @@ impl Client {
             application_instance_id: instance_id.to_vec(),
             requested_endpoint_ids: endpoint_ids.iter().map(|id| id.to_vec()).collect(),
             requested_protocol_ids: protocols.iter().map(|id| (*id).to_string()).collect(),
-            requested_capabilities: Vec::new(),
-            resumable: false,
+            requested_capabilities: requested_capabilities
+                .iter()
+                .map(|capability| *capability as i32)
+                .collect(),
+            resumable,
         };
         let response = self
             .request_with_deadline(
@@ -397,11 +477,16 @@ impl Client {
         require_ok(&response, "ApplicationService.RegisterApplication")?;
         let registered = v1::RegisterApplicationResponse::decode(response.payload.as_slice())
             .map_err(|error| ClientError::Proto(error.to_string()))?;
-        registered
+        let handle = registered
             .application_handle
             .as_ref()
             .map(|handle| AppHandle::from_proto_with_generation(handle, self.generation()))
-            .ok_or_else(|| ClientError::Proto("application response has no handle".into()))
+            .ok_or_else(|| ClientError::Proto("application response has no handle".into()))?;
+        Ok(ApplicationRegistration {
+            handle,
+            effective_grants: registered.effective_grants,
+            resume_token: registered.resume_token,
+        })
     }
 
     /// Removes an application registration. This is idempotent only when the
