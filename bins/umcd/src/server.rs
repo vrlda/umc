@@ -10039,8 +10039,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::too_many_lines)] // end-to-end deadline and worker-lifetime contract
     async fn carrier_dial_returns_deadline_before_blocking_carrier_finishes() {
-        struct SlowCarrier;
+        struct SlowCarrier {
+            started: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+            finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
 
         impl Carrier for SlowCarrier {
             fn type_id(&self) -> umc_carrier::types::CarrierTypeId {
@@ -10081,7 +10086,12 @@ mod tests {
                 &self,
                 _remote: String,
             ) -> Result<umc_carrier::BoxLink, umc_carrier::error::CarrierError> {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                let _ = self.started.send(());
+                if let Ok(release) = self.release.lock() {
+                    let _ = release.recv();
+                }
+                self.finished
+                    .store(true, std::sync::atomic::Ordering::Release);
                 Err(umc_carrier::error::CarrierError::new(
                     umc_carrier::error::CarrierErrorKind::Unreachable,
                     "dial",
@@ -10090,7 +10100,14 @@ mod tests {
         }
 
         let (mut state, _tx) = test_state();
-        state.node.register_carrier(Box::new(SlowCarrier));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.node.register_carrier(Box::new(SlowCarrier {
+            started: started_tx,
+            release: std::sync::Arc::new(std::sync::Mutex::new(release_rx)),
+            finished: finished.clone(),
+        }));
         let create = api::CreateCarrierInstanceRequest {
             type_id: "ump.slow/1".into(),
             label: "slow".into(),
@@ -10132,18 +10149,30 @@ mod tests {
             }),
         );
         dial.deadline_unix_ms = i64::try_from(wall_now().0.saturating_add(10)).unwrap();
-        let started = std::time::Instant::now();
-        let bytes = tokio::task::spawn_blocking(move || {
+        let dispatch = tokio::task::spawn_blocking(move || {
             let mut conn = ConnectionState::new();
             dispatch_connection_request_with_cancellation(&mut conn, &mut state, &dial, None, None)
-        })
-        .await
-        .expect("dispatch worker");
-        assert!(started.elapsed() < std::time::Duration::from_millis(80));
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("carrier worker started");
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(1), dispatch)
+            .await
+            .expect("deadline response must not block on carrier")
+            .expect("dispatch worker");
         assert_eq!(
             decode_response(&bytes).status.unwrap().code,
             api::StatusCode::DeadlineExceeded as i32
         );
+        assert!(!finished.load(std::sync::atomic::Ordering::Acquire));
+        drop(release_tx);
+        for _ in 0..100 {
+            if finished.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("carrier worker must finish after release");
     }
 
     #[test]
