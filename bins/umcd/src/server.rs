@@ -2961,6 +2961,16 @@ fn node_config_message(config: &NodeConfig) -> api::NodeConfig {
             sensitive_present: config.mesh_secret.is_some(),
         },
         api::ConfigEntry {
+            key: "network_mode".into(),
+            value: config.network_mode.clone(),
+            sensitive_present: false,
+        },
+        api::ConfigEntry {
+            key: "network_id".into(),
+            value: config.network_id.clone().unwrap_or_default(),
+            sensitive_present: false,
+        },
+        api::ConfigEntry {
             key: "telemetry_enabled".into(),
             value: config.telemetry_enabled.to_string(),
             sensitive_present: false,
@@ -3062,6 +3072,19 @@ fn set_config(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<
             log::warn!("[config] set {}/{} rejected: {e}", change.key, value);
             return (api::StatusCode::InvalidArgument as i32, None);
         }
+    }
+    if let Err(e) = updated.validate_network_realm() {
+        log::warn!("[config] network realm rejected: {e}");
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    if updated.network_mode != state.config.network_mode
+        || updated.network_id != state.config.network_id
+        || updated.mesh_secret != state.config.mesh_secret
+    {
+        // The handshake and discovery services snapshot the realm at startup.
+        // Refuse a live mutation rather than leaving half the daemon in the
+        // old realm; operators can persist the desired file and restart.
+        return (api::StatusCode::FailedPrecondition as i32, None);
     }
     if let Err(e) = updated.persist() {
         log::error!("[config] persist failed: {e}");

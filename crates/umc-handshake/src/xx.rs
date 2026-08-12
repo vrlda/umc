@@ -23,6 +23,13 @@ pub const MAX_SUPPORTED_PRIVACY_PROFILE: &[u8] = b"p3";
 /// Secure-by-default privacy profile requested by a new client.
 pub const DEFAULT_MINIMUM_PRIVACY_PROFILE: &[u8] = b"p0";
 
+/// Realm marker extension offsets inside the transcript-bound hello padding.
+/// The legacy capability/privacy bytes remain unchanged; these bytes are
+/// ignored by pre-realm peers and therefore preserve public compatibility.
+pub const CLIENT_REALM_MARKER_OFFSET: usize = 32;
+pub const SERVER_REALM_MARKER_OFFSET: usize = 64;
+pub const REALM_MARKER_LEN: usize = 32;
+
 /// Returns the ordered numeric level for a wire privacy profile.
 #[must_use]
 pub fn privacy_profile_level(profile: &[u8]) -> Option<u8> {
@@ -239,6 +246,87 @@ impl ClientHello {
             invitation_authenticator,
             padding,
         })
+    }
+}
+
+/// Derives the public realm marker or a private realm commitment. The secret
+/// is hashed into the marker and is never placed on the wire.
+#[must_use]
+pub fn realm_marker(
+    network_mode: &str,
+    network_id: Option<&str>,
+    membership_secret: Option<&[u8]>,
+) -> [u8; REALM_MARKER_LEN] {
+    use blake2::Digest as _;
+    if network_mode.eq_ignore_ascii_case("public") {
+        return *blake2::Blake2s256::digest(b"UMP-PUBLIC-REALM-v1").as_ref();
+    }
+    let mut hasher = blake2::Blake2s256::new();
+    hasher.update(b"UMP-PRIVATE-REALM-v1");
+    hasher.update(network_id.unwrap_or_default().as_bytes());
+    hasher.update([0]);
+    hasher.update(membership_secret.unwrap_or_default());
+    *hasher.finalize().as_ref()
+}
+
+#[must_use]
+pub fn public_realm_marker() -> [u8; REALM_MARKER_LEN] {
+    realm_marker("public", None, None)
+}
+
+/// Writes the local realm commitment into the client hello extension area.
+pub fn set_client_realm_marker(hello: &mut ClientHello, marker: [u8; REALM_MARKER_LEN]) {
+    if hello.padding.len() < CLIENT_REALM_MARKER_OFFSET + REALM_MARKER_LEN {
+        hello
+            .padding
+            .resize(CLIENT_REALM_MARKER_OFFSET + REALM_MARKER_LEN, 0);
+    }
+    hello.padding[CLIENT_REALM_MARKER_OFFSET..CLIENT_REALM_MARKER_OFFSET + REALM_MARKER_LEN]
+        .copy_from_slice(&marker);
+}
+
+#[must_use]
+pub fn client_realm_marker(hello: &ClientHello) -> Option<[u8; REALM_MARKER_LEN]> {
+    let bytes = hello
+        .padding
+        .get(CLIENT_REALM_MARKER_OFFSET..CLIENT_REALM_MARKER_OFFSET + REALM_MARKER_LEN)?;
+    if bytes.iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    bytes.try_into().ok()
+}
+
+/// Writes the local realm commitment into the server hello extension area.
+pub fn set_server_realm_marker(hello: &mut ServerHello, marker: [u8; REALM_MARKER_LEN]) {
+    if hello.padding.len() < SERVER_REALM_MARKER_OFFSET + REALM_MARKER_LEN {
+        hello
+            .padding
+            .resize(SERVER_REALM_MARKER_OFFSET + REALM_MARKER_LEN, 0);
+    }
+    hello.padding[SERVER_REALM_MARKER_OFFSET..SERVER_REALM_MARKER_OFFSET + REALM_MARKER_LEN]
+        .copy_from_slice(&marker);
+}
+
+#[must_use]
+pub fn server_realm_marker(hello: &ServerHello) -> Option<[u8; REALM_MARKER_LEN]> {
+    let bytes = hello
+        .padding
+        .get(SERVER_REALM_MARKER_OFFSET..SERVER_REALM_MARKER_OFFSET + REALM_MARKER_LEN)?;
+    if bytes.iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    bytes.try_into().ok()
+}
+
+#[must_use]
+pub fn realm_marker_matches(
+    observed: Option<[u8; REALM_MARKER_LEN]>,
+    expected: [u8; REALM_MARKER_LEN],
+    private: bool,
+) -> bool {
+    match observed {
+        Some(marker) => marker == expected,
+        None => !private && expected == public_realm_marker(),
     }
 }
 
@@ -1538,6 +1626,39 @@ mod tests {
         let enc = sh.encode().unwrap();
         let dec = ServerHello::decode(&enc).unwrap();
         assert_eq!(dec, sh);
+    }
+
+    #[test]
+    fn realm_marker_round_trip_and_private_mismatch() {
+        let marker = realm_marker("private", Some("acme-prod"), Some(b"shared-secret"));
+        let mut client = ClientHello::new(&TestEntropy, &StaticHandshakeKeyPair::generate());
+        set_client_realm_marker(&mut client, marker);
+        assert_eq!(client_realm_marker(&client), Some(marker));
+        assert!(realm_marker_matches(
+            client_realm_marker(&client),
+            marker,
+            true
+        ));
+        assert!(!realm_marker_matches(
+            client_realm_marker(&client),
+            realm_marker("private", Some("other"), Some(b"shared-secret")),
+            true
+        ));
+    }
+
+    #[test]
+    fn legacy_public_hello_without_marker_remains_compatible() {
+        let client = ClientHello::new(&TestEntropy, &StaticHandshakeKeyPair::generate());
+        assert!(realm_marker_matches(
+            client_realm_marker(&client),
+            public_realm_marker(),
+            false
+        ));
+        assert!(!realm_marker_matches(
+            client_realm_marker(&client),
+            public_realm_marker(),
+            true
+        ));
     }
 
     #[test]

@@ -47,6 +47,8 @@ pub struct Node {
     carriers: HashMap<String, Arc<dyn Carrier + Send + Sync>>,
     sessions: Arc<Mutex<HashMap<u64, SessionEntry>>>,
     next_session: u64,
+    realm_marker: [u8; 32],
+    private_realm: bool,
 }
 
 impl std::fmt::Debug for Node {
@@ -95,7 +97,17 @@ impl Node {
             carriers: HashMap::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_session: 0,
+            realm_marker: umc_handshake::xx::public_realm_marker(),
+            private_realm: false,
         }
+    }
+
+    /// Configures the realm commitment used for outbound admission. Public
+    /// nodes retain legacy compatibility; private nodes fail closed when the
+    /// peer omits or changes the marker.
+    pub fn set_realm(&mut self, marker: [u8; 32], private: bool) {
+        self.realm_marker = marker;
+        self.private_realm = private;
     }
 
     pub fn register_carrier(&mut self, carrier: Box<dyn Carrier + Send + Sync>) {
@@ -319,6 +331,7 @@ impl Node {
         let client_ephemeral = StaticHandshakeKeyPair::generate();
         let mut hello =
             umc_handshake::xx::ClientHello::new(self.entropy.as_ref(), &client_ephemeral);
+        umc_handshake::xx::set_client_realm_marker(&mut hello, self.realm_marker);
         let mut hello_bytes = hello
             .encode()
             .map_err(|e| NodeError::Handshake(format!("{e:?}")))?;
@@ -424,6 +437,13 @@ impl Node {
         let server_hello_bytes = parse_initial_response(&server_packet, &keys.server)?;
         let server_hello = umc_handshake::xx::ServerHello::decode(&server_hello_bytes)
             .map_err(|e| NodeError::Handshake(format!("{e:?}")))?;
+        if !umc_handshake::xx::realm_marker_matches(
+            umc_handshake::xx::server_realm_marker(&server_hello),
+            self.realm_marker,
+            self.private_realm,
+        ) {
+            return Err(NodeError::Handshake("network realm mismatch".into()));
+        }
 
         // Derive session secrets using the verified client continuation.
         // The daemon's DH chain stands the client's ephemeral in for the
@@ -712,6 +732,7 @@ impl Node {
         let client_ephemeral = StaticHandshakeKeyPair::generate();
         let mut hello =
             umc_handshake::xx::ClientHello::new(self.entropy.as_ref(), &client_ephemeral);
+        umc_handshake::xx::set_client_realm_marker(&mut hello, self.realm_marker);
         hello.supported_handshake_modes = vec![umc_handshake::ik::MODE_IK.to_vec()];
         hello.retry_token = ticket.to_vec();
         let hello_bytes = hello
@@ -765,6 +786,13 @@ impl Node {
         let server_hello_bytes = parse_initial_response(&server_packet, &keys.server)?;
         let server_hello = umc_handshake::xx::ServerHello::decode(&server_hello_bytes)
             .map_err(|e| NodeError::Handshake(format!("{e:?}")))?;
+        if !umc_handshake::xx::realm_marker_matches(
+            umc_handshake::xx::server_realm_marker(&server_hello),
+            self.realm_marker,
+            self.private_realm,
+        ) {
+            return Err(NodeError::Handshake("network realm mismatch".into()));
+        }
         // The resume server hello must select IK: a mode-XX answer means
         // the daemon fell back to the full path (stale or invalid ticket)
         // and the caller must retry with a full connect.

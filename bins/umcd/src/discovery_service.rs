@@ -30,6 +30,8 @@ pub const DEFAULT_TABLE_CAP: usize = umc_discovery::table::DEFAULT_TABLE_CAP;
 /// `umc-discovery` `provider.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CandidateJson {
+    #[serde(default)]
+    realm_marker: Vec<u8>,
     candidate_id: u64,
     carrier_type: String,
     connection_hint: Vec<u8>,
@@ -79,8 +81,9 @@ impl DhtRecordJson {
 }
 
 impl CandidateJson {
-    fn from_candidate(c: &PeerCandidate) -> Self {
+    fn from_candidate(c: &PeerCandidate, realm_marker: [u8; 32]) -> Self {
         Self {
+            realm_marker: realm_marker.to_vec(),
             candidate_id: c.candidate_id,
             carrier_type: c.carrier_type.clone(),
             connection_hint: c.connection_hint.clone(),
@@ -181,8 +184,12 @@ fn candidate_key(id: u64) -> [u8; 8] {
     id.to_be_bytes()
 }
 
-fn save_candidate(store: &dyn Store, candidate: &PeerCandidate) -> Result<(), StoreError> {
-    let json = CandidateJson::from_candidate(candidate);
+fn save_candidate(
+    store: &dyn Store,
+    candidate: &PeerCandidate,
+    realm_marker: [u8; 32],
+) -> Result<(), StoreError> {
+    let json = CandidateJson::from_candidate(candidate, realm_marker);
     let value = serde_json::to_vec(&json).map_err(|_| StoreError::Serialization)?;
     store.put(
         Namespace::Peer,
@@ -191,21 +198,26 @@ fn save_candidate(store: &dyn Store, candidate: &PeerCandidate) -> Result<(), St
     )
 }
 
-fn dht_key(record: &DhtRecord) -> Vec<u8> {
+fn dht_key(record: &DhtRecord, realm_marker: [u8; 32]) -> Vec<u8> {
     let mut key = b"DHT".to_vec();
+    key.extend_from_slice(&realm_marker);
     key.extend_from_slice(&dht_candidate_id(record).to_be_bytes());
     key
 }
 
-fn save_dht_record(store: &dyn Store, record: &DhtRecord) -> Result<(), StoreError> {
+fn save_dht_record(
+    store: &dyn Store,
+    record: &DhtRecord,
+    realm_marker: [u8; 32],
+) -> Result<(), StoreError> {
     let value = serde_json::to_vec(&DhtRecordJson::from_record(record))
         .map_err(|_| StoreError::Serialization)?;
-    store.put(Namespace::Peer, &dht_key(record), &value)
+    store.put(Namespace::Peer, &dht_key(record, realm_marker), &value)
 }
 
 /// Loads every persisted candidate, skipping corrupt or unparsable records
 /// with a log line (never fatal).
-fn load_candidates(store: &dyn Store) -> Vec<PeerCandidate> {
+fn load_candidates(store: &dyn Store, realm_marker: [u8; 32]) -> Vec<PeerCandidate> {
     let mut out = Vec::new();
     let entries = match store.scan(Namespace::Peer) {
         Ok(entries) => entries,
@@ -219,26 +231,43 @@ fn load_candidates(store: &dyn Store) -> Vec<PeerCandidate> {
             continue;
         }
         match serde_json::from_slice::<CandidateJson>(&entry.value) {
-            Ok(json) => match json.into_candidate() {
-                Some(candidate) => out.push(candidate),
-                None => log::warn!(
-                    "[discovery] skipping candidate with unknown enum discriminant (key {})",
-                    u64::from_be_bytes(entry.key.try_into().unwrap_or([0; 8]))
-                ),
-            },
+            Ok(json) => {
+                if (json.realm_marker.is_empty()
+                    && realm_marker != umc_handshake::xx::public_realm_marker())
+                    || (!json.realm_marker.is_empty() && json.realm_marker != realm_marker)
+                {
+                    continue;
+                }
+                match json.into_candidate() {
+                    Some(candidate) => out.push(candidate),
+                    None => log::warn!(
+                        "[discovery] skipping candidate with unknown enum discriminant (key {})",
+                        u64::from_be_bytes(entry.key.try_into().unwrap_or([0; 8]))
+                    ),
+                }
+            }
             Err(e) => log::warn!("[discovery] skipping corrupt candidate record: {e}"),
         }
     }
     out
 }
 
-fn load_dht_records(store: &dyn Store) -> Vec<DhtRecord> {
+fn load_dht_records(store: &dyn Store, realm_marker: [u8; 32]) -> Vec<DhtRecord> {
     let Ok(entries) = store.scan(Namespace::Peer) else {
         return Vec::new();
     };
     entries
         .into_iter()
-        .filter(|entry| entry.key.starts_with(b"DHT"))
+        .filter(|entry| {
+            if !entry.key.starts_with(b"DHT") {
+                return false;
+            }
+            // Pre-realm public records used the short `DHT || id` key. Keep
+            // reading those only in the public realm; private realms accept
+            // exclusively their namespaced records.
+            (realm_marker == umc_handshake::xx::public_realm_marker() && entry.key.len() == 11)
+                || entry.key.get(3..35) == Some(realm_marker.as_slice())
+        })
         .filter_map(|entry| {
             serde_json::from_slice::<DhtRecordJson>(&entry.value)
                 .ok()
@@ -257,6 +286,7 @@ pub struct DiscoveryService {
     /// resources; failures and diversity are reported per refresh.
     pub providers: ProviderManager,
     store: Option<Arc<SqliteStore>>,
+    realm_marker: [u8; 32],
 }
 
 impl std::fmt::Debug for DiscoveryService {
@@ -266,6 +296,7 @@ impl std::fmt::Debug for DiscoveryService {
             .field("dht", &self.dht)
             .field("providers", &self.providers)
             .field("store_attached", &self.store.is_some())
+            .field("realm_marker", &"[redacted]")
             .finish()
     }
 }
@@ -274,11 +305,17 @@ impl std::fmt::Debug for DiscoveryService {
 impl DiscoveryService {
     #[must_use]
     pub fn new(cap: usize) -> Self {
+        Self::new_with_realm(cap, umc_handshake::xx::public_realm_marker())
+    }
+
+    #[must_use]
+    pub fn new_with_realm(cap: usize, realm_marker: [u8; 32]) -> Self {
         Self {
             candidates: CandidateTable::new(cap),
             dht: DhtTable::new(),
             providers: ProviderManager::new(cap),
             store: None,
+            realm_marker,
         }
     }
 
@@ -341,7 +378,7 @@ impl DiscoveryService {
                 .map_err(|_| BootstrapError::TableFull)?;
             if let Some(store) = &self.store {
                 if let Some(stored) = self.candidates.get(id) {
-                    if let Err(error) = save_candidate(store.as_ref(), stored) {
+                    if let Err(error) = save_candidate(store.as_ref(), stored, self.realm_marker) {
                         log::warn!(
                             "[discovery] failed to persist bootstrap candidate {id}: {error:?}"
                         );
@@ -357,7 +394,7 @@ impl DiscoveryService {
     /// hints survive restart; records already expired by load time are
     /// dropped, and the table's upsert merge preserves sharing policy.
     pub fn restore_candidates(&mut self, store: &dyn Store, now: Instant) {
-        for candidate in load_candidates(store) {
+        for candidate in load_candidates(store, self.realm_marker) {
             if candidate.is_expired(now) {
                 continue;
             }
@@ -366,7 +403,7 @@ impl DiscoveryService {
                 break;
             }
         }
-        for record in load_dht_records(store) {
+        for record in load_dht_records(store, self.realm_marker) {
             let _ = self.dht.insert(record, now);
         }
     }
@@ -387,7 +424,7 @@ impl DiscoveryService {
         self.candidates.upsert(candidate, now)?;
         if let Some(store) = &self.store {
             if let Some(stored) = self.candidates.get(id) {
-                if let Err(e) = save_candidate(store.as_ref(), stored) {
+                if let Err(e) = save_candidate(store.as_ref(), stored, self.realm_marker) {
                     log::error!("[discovery] failed to persist candidate {id}: {e:?}");
                 }
             }
@@ -443,7 +480,7 @@ impl DiscoveryService {
                     .into_iter()
                     .find(|record| record.connection_hint == endpoint.address.as_bytes())
                 {
-                    let _ = save_dht_record(store.as_ref(), &record);
+                    let _ = save_dht_record(store.as_ref(), &record, self.realm_marker);
                 }
             }
             if let Err(error) = self.record_candidate(candidate, now) {
@@ -501,7 +538,7 @@ impl DiscoveryService {
             if self.dht.insert(record.clone(), now) {
                 accepted += 1;
                 if let Some(store) = &self.store {
-                    let _ = save_dht_record(store.as_ref(), &record);
+                    let _ = save_dht_record(store.as_ref(), &record, self.realm_marker);
                 }
                 let candidate = PeerCandidate {
                     candidate_id: dht_candidate_id(&record),
@@ -587,7 +624,7 @@ impl DiscoveryService {
         if accepted > 0 {
             if let Some(store) = &self.store {
                 for candidate in self.candidates() {
-                    if let Err(error) = save_candidate(store.as_ref(), &candidate) {
+                    if let Err(error) = save_candidate(store.as_ref(), &candidate, self.realm_marker) {
                         log::warn!(
                             "[discovery] failed to persist hinted candidate {}: {error:?}",
                             candidate.candidate_id

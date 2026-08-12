@@ -460,6 +460,13 @@ pub fn respond_hello_with_retry_context_and_psk(
         ));
     }
     let hello = ClientHello::decode(hello_bytes).map_err(|e| format!("client hello: {e:?}"))?;
+    if !umc_handshake::xx::realm_marker_matches(
+        umc_handshake::xx::client_realm_marker(&hello),
+        state.config.realm_marker(),
+        state.config.is_private_network(),
+    ) {
+        return Err("network realm mismatch".into());
+    }
 
     // Version negotiation (compatibility.md §5.2, handshake.md §16): a
     // client offering no supported version gets a Version-Negotiation
@@ -596,7 +603,7 @@ pub fn respond_hello_with_retry_context_and_psk(
     )
     .map_err(|e| format!("server auth: {e:?}"))?;
 
-    let server_hello = ServerHello {
+    let mut server_hello = ServerHello {
         server_random,
         server_ephemeral_public_key: server_ephemeral.public().0,
         selected_protocol_version: selected_version,
@@ -610,13 +617,14 @@ pub fn respond_hello_with_retry_context_and_psk(
         // SERVER_HELLO, so the hash is transcript-bound like every other
         // hello field.
         padding: {
-            let mut padding = Vec::with_capacity(64);
+            let mut padding = Vec::with_capacity(96);
             padding.extend_from_slice(&capabilities_hash(&canonical_capabilities()));
             padding.push(selected_privacy);
             padding.extend_from_slice(&[0u8; 31]);
             padding
         },
     };
+    umc_handshake::xx::set_server_realm_marker(&mut server_hello, state.config.realm_marker());
     let server_hello_bytes = server_hello
         .encode()
         .map_err(|e| format!("server hello: {e:?}"))?;
@@ -1386,6 +1394,36 @@ mod tests {
             capabilities_hash(&canonical_capabilities())
         );
         assert_eq!(server_hello.selected_privacy_level(), Some(0));
+    }
+
+    #[test]
+    fn private_realm_rejects_public_hello_before_server_hello() {
+        let mut config = NodeConfig {
+            network_mode: "private".into(),
+            network_id: Some("acme-prod".into()),
+            mesh_secret: Some("shared-secret".into()),
+            ..NodeConfig::default()
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "umcd-private-responder-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        config.data_dir = dir;
+        let (tx, _rx) = mpsc::channel(1);
+        let state = RuntimeState::new(config, tx).expect("private state");
+        let (_identity, _static_key, client_ephemeral) = client_identity();
+        let hello = ClientHello::new(&TestEntropy, &client_ephemeral);
+        let error = respond_hello(
+            &state,
+            b"ump.tcp/1",
+            &hello.encode().expect("hello"),
+            &client_ephemeral.public(),
+            &[1u8; 8],
+            &[2u8; 8],
+        )
+        .expect_err("public hello must not enter private realm");
+        assert!(error.contains("realm"), "{error}");
     }
 
     #[test]

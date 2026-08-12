@@ -63,6 +63,11 @@ pub struct NodeConfig {
     /// Optional membership secret for authenticated local-mesh peer hints.
     /// The value is operator-provided and is never included in status output.
     pub mesh_secret: Option<String>,
+    /// Network realm admission mode. Public is the default open mesh;
+    /// private requires a matching network id and membership secret.
+    pub network_mode: String,
+    /// Operator-chosen namespace for a private corporate mesh.
+    pub network_id: Option<String>,
     /// Keystore directory; defaults to `<data_dir>/keystore`.
     pub keystore: Option<PathBuf>,
     pub public_relay: bool,
@@ -158,6 +163,8 @@ impl Default for NodeConfig {
             tls_server_name: "localhost".to_string(),
             mesh: false,
             mesh_secret: None,
+            network_mode: "public".to_string(),
+            network_id: None,
             keystore: None,
             public_relay: false,
             disabled_protocol_versions: Vec::new(),
@@ -200,6 +207,7 @@ impl NodeConfig {
         config.normalize_privacy_profiles()?;
         config.normalize_privacy_controls()?;
         config.validate_metrics_config()?;
+        config.validate_network_realm()?;
         // Safety invariants (resource-limits.md §51): conservative defaults.
         config.public_relay = false;
         config.telemetry_enabled = false;
@@ -323,6 +331,23 @@ impl NodeConfig {
                     Some(value.to_string())
                 };
             }
+            "network_mode" => {
+                let mode = value.trim().to_ascii_lowercase();
+                if mode != "public" && mode != "private" {
+                    return Err("network_mode must be public or private".into());
+                }
+                self.network_mode = mode;
+            }
+            "network_id" => {
+                if self.is_private_network() && value.trim().is_empty() {
+                    return Err("private network requires a non-empty network_id".into());
+                }
+                self.network_id = if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value.trim().to_string())
+                };
+            }
             "telemetry_enabled" | "telemetry" => {
                 self.telemetry_enabled = value
                     .parse::<bool>()
@@ -420,6 +445,37 @@ impl NodeConfig {
             other => return Err(format!("unsupported config key {other:?}")),
         }
         Ok(())
+    }
+
+    /// Validates the fail-closed private realm admission configuration.
+    pub fn validate_network_realm(&self) -> Result<(), String> {
+        if self.network_mode.eq_ignore_ascii_case("public") {
+            return Ok(());
+        }
+        if !self.network_mode.eq_ignore_ascii_case("private") {
+            return Err("network_mode must be public or private".into());
+        }
+        if self.network_id.as_deref().map_or(true, |value| value.trim().is_empty()) {
+            return Err("private network requires a non-empty network_id".into());
+        }
+        if self.mesh_secret.as_deref().map_or(true, |value| value.trim().is_empty()) {
+            return Err("private network requires mesh_secret membership key".into());
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn is_private_network(&self) -> bool {
+        self.network_mode.eq_ignore_ascii_case("private")
+    }
+
+    #[must_use]
+    pub fn realm_marker(&self) -> [u8; 32] {
+        umc_handshake::xx::realm_marker(
+            &self.network_mode,
+            self.network_id.as_deref(),
+            self.mesh_secret.as_deref().map(str::as_bytes),
+        )
     }
 
     /// Returns the configured privacy profile, falling back to P0 for an
@@ -838,6 +894,35 @@ mod tests {
         assert!(config.set_entry("no_such_key", "x").is_err());
         // A failed entry leaves the previous value intact.
         assert_eq!(config.profile, "relay");
+    }
+
+    #[test]
+    fn private_network_requires_realm_id_and_membership_secret() {
+        let mut config = NodeConfig {
+            network_mode: "private".into(),
+            ..NodeConfig::default()
+        };
+        assert!(config.validate_network_realm().is_err());
+
+        config.network_id = Some("acme-prod".into());
+        assert!(config.validate_network_realm().is_err());
+
+        config.mesh_secret = Some("correct horse battery staple".into());
+        config.validate_network_realm().expect("complete private realm");
+
+        config.mesh_secret = None;
+        assert!(config.validate_network_realm().is_err());
+    }
+
+    #[test]
+    fn network_realm_config_entries_are_validated() {
+        let mut config = NodeConfig::default();
+        config.set_entry("network_mode", "private").unwrap();
+        config.set_entry("network_id", "acme-prod").unwrap();
+        assert!(config.set_entry("network_mode", "sideways").is_err());
+        assert!(config.set_entry("network_id", " ").is_err());
+        config.set_entry("mesh_secret", "shared-secret").unwrap();
+        config.validate_network_realm().unwrap();
     }
 
     #[test]

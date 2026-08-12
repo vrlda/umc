@@ -104,6 +104,35 @@ for a lookup, replicate them across authenticated peers, and expire them from
 memory and disk. No node is authoritative and no complete peer table is sent;
 the original seed can disappear after the mesh has learned enough peers.
 
+### Private corporate meshes
+
+Nodes join the open public mesh by default. To create a separate corporate
+mesh, give every participating node the same private `network_id` and a
+high-entropy `mesh_secret`:
+
+```json
+{
+  "network_mode": "private",
+  "network_id": "acme-production",
+  "mesh_secret": "replace-with-a-long-random-membership-secret",
+  "bootstrap_peers": [
+    {"carrier": "ump.tcp/1", "address": "corp-seed.example:9001"}
+  ],
+  "advertised_endpoints": [
+    {"carrier": "ump.tcp/1", "address": "corp-node.example:9001"}
+  ]
+}
+```
+
+The secret is never sent on the wire. Both hellos carry only a
+transcript-bound commitment, and a node rejects a mismatched or missing
+private marker before doing public-key work. Public and private realms cannot
+handshake, exchange hints, or participate in one another's discovery overlay.
+Private discovery records are also namespaced in persistent storage. Keep the
+secret out of source control and distribute it through your normal corporate
+secret-management process. A daemon instance belongs to one realm; run a
+second instance with a separate data directory if a host must serve both.
+
 ### Optional Prometheus metrics
 
 Metrics are disabled unless explicitly configured. To expose the bounded

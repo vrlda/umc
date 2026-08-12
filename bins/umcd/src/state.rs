@@ -885,7 +885,9 @@ impl RuntimeState {
         let ticket_key = ticket_key_for(&state_identity);
         let retry_key = retry_key_for(&state_identity);
         let dcid = node_identity.endpoint_id()[..8].to_vec();
-        let node = Node::new(
+        let realm_marker = config.realm_marker();
+        let private_realm = config.is_private_network();
+        let mut node = Node::new(
             NodeRuntimeConfig {
                 identity: node_identity,
                 dcid,
@@ -893,6 +895,7 @@ impl RuntimeState {
             Arc::new(TokioAdaptor),
             Arc::new(TokioAdaptor),
         );
+        node.set_realm(realm_marker, private_realm);
         let mesh = if config.mesh {
             MeshConfig::local_mesh()
         } else {
@@ -937,7 +940,10 @@ impl RuntimeState {
         // startup: routes as candidates (storage.md §15.2), candidates as
         // operational hints (§16.4), bundle metadata (§6.3). Restore
         // failures are logged, never fatal.
-        let mut discovery = DiscoveryService::new(umc_discovery::table::DEFAULT_TABLE_CAP);
+        let mut discovery = DiscoveryService::new_with_realm(
+            umc_discovery::table::DEFAULT_TABLE_CAP,
+            realm_marker,
+        );
         discovery.attach_store(store.clone());
         discovery.restore_candidates(store.as_ref(), started_at);
         discovery.record_advertised_endpoints(
