@@ -28,6 +28,7 @@ interop/python/__pycache__/
 !/interop/python/test_live_runner.py
 !/interop/python/security_gate.py
 !/interop/python/fuzz_gate.py
+!/interop/python/release_baseline.py
 !/interop/vectors/
 !/interop/vectors/README.md
 !/interop/vectors/ump1-v0.1.json

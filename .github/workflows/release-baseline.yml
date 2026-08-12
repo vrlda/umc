@@ -1,0 +1,50 @@
+name: Release baseline
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-baseline:
+    name: Benchmarks and ten-minute soak
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "28.3"
+      - name: Install Linux keychain build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes pkg-config libdbus-1-dev
+      - name: Run release baseline
+        run: python3 interop/python/release_baseline.py --output artifacts/baseline --duration-ms 600000
+      - name: Verify clean baseline and artifact digests
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path("artifacts/baseline")
+          record = json.loads((root / "baseline.json").read_text(encoding="utf-8"))
+          assert record["schema"] == "umc-release-baseline-v1"
+          assert record["working_tree_dirty"] is False
+          assert record["soak"]["status"] == "pass"
+          assert record["soak"]["duration_ms"] >= 600000
+          trend = record["soak"]["resource_trend"]
+          assert trend["elapsed_ms"] >= record["soak"]["duration_ms"]
+          assert trend["iterations"] > 0
+          assert trend["peak_queued_packets"] <= trend["queue_capacity_packets"]
+          for artifact in record["artifacts"]:
+              path = root / artifact["name"]
+              assert path.is_file(), artifact["name"]
+              assert artifact["bytes"] == path.stat().st_size
+              assert artifact["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+          PY
+      - name: Upload release baseline
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-baseline
+          path: artifacts/baseline/
