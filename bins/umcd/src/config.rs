@@ -84,6 +84,11 @@ pub struct NodeConfig {
     /// Telemetry opt-in (core.md §61, privacy.md §38): off by default. The
     /// daemon dumps a bounded JSONL metrics file only when enabled.
     pub telemetry_enabled: bool,
+    /// Optional Prometheus-compatible metrics listener. Disabled by default.
+    /// Non-loopback listeners require `metrics_bearer_token`.
+    pub metrics_listen: Option<String>,
+    /// Bearer credential for a non-loopback metrics listener. Never logged.
+    pub metrics_bearer_token: Option<String>,
     /// Permits `IdentityService.ExportSecretIdentity` on the control socket.
     /// Off by default: without this flag the method answers
     /// `PermissionDenied`; when enabled, callers must still provide a
@@ -139,6 +144,8 @@ impl Default for NodeConfig {
             disable_public_relay: false,
             static_peers: Vec::new(),
             telemetry_enabled: false,
+            metrics_listen: None,
+            metrics_bearer_token: None,
             allow_secret_export: false,
             development_token: None,
             config_path: None,
@@ -167,6 +174,7 @@ impl NodeConfig {
         config.config_path = path.cloned();
         config.normalize_privacy_profiles()?;
         config.normalize_privacy_controls()?;
+        config.validate_metrics_config()?;
         // Safety invariants (resource-limits.md §51): conservative defaults.
         config.public_relay = false;
         config.telemetry_enabled = false;
@@ -294,6 +302,30 @@ impl NodeConfig {
                 self.telemetry_enabled = value
                     .parse::<bool>()
                     .map_err(|_| format!("telemetry_enabled must be a bool, got {value:?}"))?;
+            }
+            "metrics_listen" => {
+                let previous = self.metrics_listen.clone();
+                self.metrics_listen = if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value.trim().to_string())
+                };
+                if let Err(error) = self.validate_metrics_config() {
+                    self.metrics_listen = previous;
+                    return Err(error);
+                }
+            }
+            "metrics_bearer_token" => {
+                let previous = self.metrics_bearer_token.clone();
+                self.metrics_bearer_token = if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value.trim().to_string())
+                };
+                if let Err(error) = self.validate_metrics_config() {
+                    self.metrics_bearer_token = previous;
+                    return Err(error);
+                }
             }
             "allow_secret_export" => {
                 self.allow_secret_export = value
@@ -479,6 +511,34 @@ impl NodeConfig {
         expand_tilde(&self.data_dir)
     }
 
+    fn validate_metrics_config(&self) -> Result<(), String> {
+        let Some(bind) = self.metrics_listen.as_deref() else {
+            return Ok(());
+        };
+        let address = bind
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| format!("metrics_listen must be a socket address, got {bind:?}"))?;
+        let token_missing = match self.metrics_bearer_token.as_deref() {
+            None => true,
+            Some(token) => token.is_empty() || token.chars().any(char::is_whitespace),
+        };
+        if !address.ip().is_loopback() && token_missing {
+            return Err(
+                "non-loopback metrics_listen requires a non-empty metrics_bearer_token without whitespace"
+                    .into(),
+            );
+        }
+        if let Some(token) = self.metrics_bearer_token.as_deref() {
+            if token.is_empty() || token.len() > 256 || token.chars().any(char::is_whitespace) {
+                return Err(
+                    "metrics_bearer_token must be 1-256 non-whitespace bytes when configured"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn resolved_socket(&self) -> PathBuf {
         expand_tilde(&self.control_socket)
     }
@@ -551,6 +611,8 @@ mod tests {
         let config = NodeConfig::default();
         assert!(!config.public_relay);
         assert!(!config.telemetry_enabled);
+        assert!(config.metrics_listen.is_none());
+        assert!(config.metrics_bearer_token.is_none());
         assert!(!config.mesh);
         assert!(config.mesh_secret.is_none());
         assert_eq!(config.privacy_profile_value(), PrivacyProfile::P0);
@@ -620,6 +682,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn set_entry_validates_and_applies() {
         let mut config = NodeConfig::default();
         config.set_entry("profile", "relay").unwrap();
@@ -673,6 +736,22 @@ mod tests {
             !config.telemetry_enabled,
             "legacy `telemetry` key aliases the same field"
         );
+        config.set_entry("metrics_listen", "127.0.0.1:9464").unwrap();
+        assert_eq!(config.metrics_listen.as_deref(), Some("127.0.0.1:9464"));
+        config
+            .set_entry("metrics_bearer_token", "local-token")
+            .unwrap();
+        assert_eq!(config.metrics_bearer_token.as_deref(), Some("local-token"));
+        assert!(config
+            .set_entry("metrics_bearer_token", "bad token")
+            .is_err());
+        assert_eq!(config.metrics_bearer_token.as_deref(), Some("local-token"));
+        config.set_entry("metrics_listen", "0.0.0.0:9464").unwrap();
+        assert_eq!(config.metrics_listen.as_deref(), Some("0.0.0.0:9464"));
+        config.set_entry("metrics_listen", "127.0.0.1:9464").unwrap();
+        config.set_entry("metrics_bearer_token", "").unwrap();
+        assert!(config.set_entry("metrics_listen", "0.0.0.0:9464").is_err());
+        assert_eq!(config.metrics_listen.as_deref(), Some("127.0.0.1:9464"));
         config.set_entry("allow_secret_export", "true").unwrap();
         assert!(config.allow_secret_export);
         assert!(config.set_entry("allow_secret_export", "maybe").is_err());

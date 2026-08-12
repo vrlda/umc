@@ -72,6 +72,35 @@ umcd &
 umc status
 ```
 
+### Optional Prometheus metrics
+
+Metrics are disabled unless explicitly configured. To expose the bounded
+global counters on the loopback interface, add this to the node JSON:
+
+```json
+{
+  "metrics_listen": "127.0.0.1:9464"
+}
+```
+
+Prometheus can then scrape `http://127.0.0.1:9464/metrics`. The endpoint uses
+Prometheus text format and publishes only fixed, unlabeled daemon counters and
+gauges. It never exports peer identifiers, addresses, route data, secrets, or
+user-controlled labels. For a remote scrape, bind to an explicit non-loopback
+address and configure a non-whitespace bearer token:
+
+```json
+{
+  "metrics_listen": "0.0.0.0:9464",
+  "metrics_bearer_token": "replace-with-a-long-random-token"
+}
+```
+
+Send `Authorization: Bearer <token>` with the scrape. Prefer an SSH tunnel or
+TLS reverse proxy for remote access; the exporter itself is intentionally a
+small HTTP listener without TLS. Requests and responses are bounded and the
+daemon does not log the token.
+
 To build from a checkout instead:
 
 ```sh

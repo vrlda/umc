@@ -17,6 +17,7 @@ mod handshake_responder;
 mod handshake_timeout;
 mod initial;
 mod logging;
+mod metrics_exporter;
 mod relay_auth;
 mod relay_link;
 mod relay_service;
@@ -143,6 +144,7 @@ async fn run(config: NodeConfig) {
     } else {
         log::info!("[telemetry] disabled (default)");
     }
+    let metrics_task = spawn_metrics_task(&state.config, state.metrics.clone());
 
     carriers::wire_carriers(&mut state);
     let mut listeners: std::collections::VecDeque<Arc<dyn Listener + Send + Sync>> =
@@ -219,9 +221,21 @@ async fn run(config: NodeConfig) {
     // reader/writer coordinators own blocking carrier pumps, so merely
     // setting the shutdown flag is not enough to release their links.
     shutdown_sessions(&state);
+    if let Some(task) = metrics_task {
+        task.abort();
+    }
     log::info!("shutdown: complete");
     // Wait for the control socket to finish closing before exiting.
     let _ = server_task.await;
+}
+
+fn spawn_metrics_task(
+    config: &NodeConfig,
+    metrics: Arc<umc_metrics::Registry>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    config.metrics_listen.clone().map(|bind| {
+        metrics_exporter::spawn(metrics, bind, config.metrics_bearer_token.clone())
+    })
 }
 
 fn shutdown_sessions(state: &Arc<std::sync::Mutex<state::RuntimeState>>) {
