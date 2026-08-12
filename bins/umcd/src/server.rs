@@ -3079,7 +3079,7 @@ fn set_config(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<
     }
     if updated.network_mode != state.config.network_mode
         || updated.network_id != state.config.network_id
-        || updated.mesh_secret != state.config.mesh_secret
+        || (updated.is_private_network() && updated.mesh_secret != state.config.mesh_secret)
     {
         // The handshake and discovery services snapshot the realm at startup.
         // Refuse a live mutation rather than leaving half the daemon in the
