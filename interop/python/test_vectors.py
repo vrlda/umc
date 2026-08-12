@@ -85,6 +85,17 @@ class IndependentVectorTests(unittest.TestCase):
         self.assertIn("dependency_audit.py", workflow)
         self.assertIn("dependency-report.json", workflow)
 
+    def test_ci_exposes_operational_drill_workflow(self) -> None:
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github"
+            / "workflows"
+            / "operational-drill.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch", workflow)
+        self.assertIn("operational_drill.py", workflow)
+        self.assertIn("drill-report.json", workflow)
+
     def test_security_reporting_link_matches_published_repository(self) -> None:
         policy = (Path(__file__).resolve().parents[2] / "SECURITY.md").read_text(
             encoding="utf-8"

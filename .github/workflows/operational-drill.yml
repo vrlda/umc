@@ -1,0 +1,46 @@
+name: Security operations drill
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  operational-drill:
+    name: Solo-maintainer security operations drill
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "28.3"
+      - name: Install Linux keychain build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes pkg-config libdbus-1-dev openssl
+      - name: Run operational drill
+        run: python3 interop/python/operational_drill.py --output artifacts/drill
+      - name: Verify drill report
+        run: |
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          root = Path("artifacts/drill")
+          report = json.loads((root / "drill-report.json").read_text(encoding="utf-8"))
+          assert report["schema"] == "umc-security-operations-drill-v1"
+          assert report["status"] == "pass"
+          assert report["working_tree_dirty"] is False
+          assert len(report["drills"]) == 10
+          assert all(item["status"] == "pass" for item in report["drills"])
+          for artifact in report["artifacts"]:
+              path = root / artifact["name"]
+              assert path.is_file(), artifact["name"]
+              assert artifact["bytes"] == path.stat().st_size
+              assert artifact["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+          PY
+      - name: Upload drill evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-operations-drill
+          path: artifacts/drill/
