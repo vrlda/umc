@@ -58,6 +58,9 @@ pub fn run_migrations(store: &SqliteStore) -> Result<i64, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn failing_migration(conn: &Connection) -> Result<(), String> {
         conn.execute_batch("CREATE TABLE transient_migration (value INTEGER NOT NULL);")
@@ -69,11 +72,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("umc-migrate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!(
-            "m-{}.db",
+            "m-{}-{}.db",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         SqliteStore::open(&path).unwrap()
     }

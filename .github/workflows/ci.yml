@@ -97,3 +97,22 @@ jobs:
         with:
           name: carrier-interoperability
           path: artifacts/
+
+  security-evidence:
+    name: Security evidence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "28.3"
+      - name: Install Linux keychain build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes pkg-config libdbus-1-dev
+      - name: Run security evidence gate
+        run: python3 interop/python/security_gate.py --output artifacts/security-report.json
+      - name: Upload security evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-evidence
+          path: artifacts/security-report.json

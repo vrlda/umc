@@ -13,7 +13,7 @@ the repository's **Security** tab, choose **Advisories**, and select **Report a
 vulnerability**. This routes the report to the project owner without exposing
 it in the public issue tracker:
 
-- **Contact:** [GitHub private vulnerability report](https://github.com/varpn/openmesh/security/advisories/new)
+- **Contact:** [GitHub private vulnerability report](https://github.com/vrlda/umc/security/advisories/new)
 - **Signing:** reports containing sensitive detail MAY be signed with the published operator key
 - **Response target:** acknowledgment within 3 business days; severity assessment within 7 days; a fix, mitigation, or agreed disclosure plan within the 90-day SLA
 
@@ -67,3 +67,12 @@ Releases are published with:
 - SHA256SUMS and SBOM
 
 Verify artifacts before installation. Revocation data is distributed through multiple channels.
+
+## Repository evidence
+
+Every published change runs the `Security evidence` CI job. It executes the
+workspace regression suite, focused parser/handshake/storage checks, emergency
+disablement checks, and a bounded source scan for shell-command construction.
+The job uploads a machine-readable report with the commit and tree it checked.
+This is solo-maintainer implementation evidence; it is not a third-party audit
+or a formal protocol proof.

@@ -24,6 +24,23 @@ class IndependentVectorTests(unittest.TestCase):
         self.assertIn("live_runner.py --carrier udp", workflow)
         self.assertIn("live_runner.py --carrier tls", workflow)
 
+    def test_ci_exposes_security_evidence_gate(self) -> None:
+        workflow = (
+            Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("security-evidence:", workflow)
+        self.assertIn("security_gate.py", workflow)
+        self.assertIn("security-evidence", workflow)
+
+    def test_security_reporting_link_matches_published_repository(self) -> None:
+        policy = (Path(__file__).resolve().parents[2] / "SECURITY.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "https://github.com/vrlda/umc/security/advisories/new", policy
+        )
+        self.assertNotIn("github.com/varpn/openmesh", policy)
+
 
 if __name__ == "__main__":
     unittest.main()
