@@ -140,6 +140,8 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install Linux keychain build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes pkg-config libdbus-1-dev
       - name: Generate LCOV protocol coverage
         run: |
           mkdir -p artifacts
