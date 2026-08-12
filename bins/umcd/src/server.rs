@@ -939,6 +939,16 @@ fn dispatch_request(
     request: &api::Request,
     presented_token: Option<&[u8]>,
 ) -> Vec<u8> {
+    if let Some(code) = request_validation_status(request) {
+        return response_envelope(request, code, None);
+    }
+    let effective_deadline = match effective_request_deadline(state, request) {
+        Ok(deadline) => deadline,
+        Err(code) => return response_envelope(request, code, None),
+    };
+    if let Some(code) = request_abort_status(state, effective_deadline, None) {
+        return response_envelope(request, code, None);
+    }
     if let Some(configured) = &state.development_token {
         let matches = presented_token.is_some_and(|token| token == configured.as_slice());
         if !matches {
@@ -1148,7 +1158,8 @@ fn dispatch_request(
         }
         _ => (api::StatusCode::Unimplemented as i32, None),
     };
-    response_envelope(request, code, payload)
+    let response = response_envelope(request, code, payload);
+    finalize_control_dispatch(state, request, effective_deadline, None, response)
 }
 
 /// Frame one response envelope for `request`.
@@ -7143,6 +7154,25 @@ mod tests {
         assert_eq!(
             decode_response(&response).status.unwrap().code,
             api::StatusCode::InvalidArgument as i32
+        );
+    }
+
+    #[test]
+    fn direct_service_dispatch_cannot_bypass_deadline_validation() {
+        let (mut state, _tx) = test_state();
+        let mut expired = request("NodeAdmin", "GetStatus", vec![]);
+        expired.deadline_unix_ms = i64::try_from(wall_now().0.saturating_sub(1)).unwrap();
+        let response = dispatch_request(&mut state, &expired, None);
+        assert_eq!(
+            decode_response(&response).status.unwrap().code,
+            api::StatusCode::DeadlineExceeded as i32
+        );
+        assert_eq!(
+            state
+                .metrics
+                .get(crate::state::metric_names::CONTROL_REQUESTS_NODEADMIN),
+            None,
+            "an expired request must not enter the direct service dispatcher"
         );
     }
 
