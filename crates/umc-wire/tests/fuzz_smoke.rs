@@ -31,9 +31,11 @@ const SEEDS: [u64; 4] = [0xDEAD_BEEF, 0xCAFE_F00D, 42, u64::MAX];
 
 #[test]
 fn parser_never_panics_on_random_buffers() {
+    let mut cases = 0usize;
     for seed in SEEDS {
         let mut rng = XorShift(seed);
         for _ in 0..25_000 {
+            cases += 1;
             let len = (rng.next() % 300) as usize;
             let mut buf = vec![0u8; len];
             rng.fill(&mut buf);
@@ -45,6 +47,11 @@ fn parser_never_panics_on_random_buffers() {
             let _ = parse_payload(&PacketContext::Initial, &buf);
         }
     }
+    println!(
+        "FUZZ_EVIDENCE schema=umc-fuzz-evidence-v1 target=wire_parser seeds={} random_cases={} max_input_bytes=299",
+        SEEDS.len(),
+        cases
+    );
 }
 
 #[test]
@@ -70,6 +77,10 @@ fn parser_never_panics_on_corpus_edges() {
         );
         let _ = parse_payload(&PacketContext::Initial, buf);
     }
+    println!(
+        "FUZZ_EVIDENCE schema=umc-fuzz-evidence-v1 target=wire_parser corpus_edges={}",
+        corpus.len()
+    );
 }
 
 /// Hostile inputs aimed at length-driven slicing: a multi-byte type varint
@@ -118,6 +129,7 @@ fn hostile_length_inputs_return_errors_never_panic() {
         )
         .is_err());
     }
+    println!("FUZZ_EVIDENCE schema=umc-fuzz-evidence-v1 target=wire_parser hostile_inputs=7");
 }
 
 /// A packet that is pure padding is always acceptable, in any context

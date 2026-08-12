@@ -116,3 +116,17 @@ jobs:
         with:
           name: security-evidence
           path: artifacts/security-report.json
+
+  fuzz-evidence:
+    name: Fuzz evidence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run bounded parser campaign
+        run: python3 interop/python/fuzz_gate.py --output artifacts/fuzz-report.json
+      - name: Upload fuzz evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-evidence
+          path: artifacts/fuzz-report.json
