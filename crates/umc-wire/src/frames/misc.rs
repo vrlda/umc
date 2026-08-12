@@ -11,6 +11,9 @@ pub const MAX_PROTOCOL_ID: usize = 255;
 pub const MAX_ENDPOINT_HINT: usize = 512;
 pub const MAX_SERVICE_METADATA: usize = 4_096;
 pub const MAX_SIGNATURE: usize = 1_024;
+pub const MAX_DHT_RECORDS: usize = 16;
+pub const MAX_DHT_CARRIER: usize = 64;
+pub const MAX_DHT_HINT: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -144,6 +147,138 @@ pub struct ServiceHintFrame {
     pub signature: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DhtRecordWire {
+    pub endpoint_id: Vec<u8>,
+    pub identity_public_key: Vec<u8>,
+    pub carrier_type: Vec<u8>,
+    pub connection_hint: Vec<u8>,
+    pub expiration_time: u64,
+    pub sequence: u64,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DhtLookupFrame {
+    pub request_id: u64,
+    pub response: bool,
+    pub target_endpoint_id: Vec<u8>,
+    pub records: Vec<DhtRecordWire>,
+}
+
+impl DhtLookupFrame {
+    /// Encode a bounded DHT request or response.
+    ///
+    /// # Errors
+    ///
+    /// Returns a frame error when a field exceeds its wire limit.
+    pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
+        if self.target_endpoint_id.len() != 32 || self.records.len() > MAX_DHT_RECORDS {
+            return Err(FrameError::LengthExceedsLimit);
+        }
+        let mut body = Vec::new();
+        crate::varint::encode_into(&mut body, self.request_id).map_err(FrameError::VarintEncode)?;
+        crate::bytes::encode(&mut body, &self.target_endpoint_id, 32)
+            .map_err(|_| FrameError::LengthExceedsLimit)?;
+        body.push(u8::from(self.response));
+        crate::varint::encode_into(&mut body, self.records.len() as u64)
+            .map_err(FrameError::VarintEncode)?;
+        for record in &self.records {
+            crate::bytes::encode(&mut body, &record.endpoint_id, 32)
+                .map_err(|_| FrameError::LengthExceedsLimit)?;
+            crate::bytes::encode(&mut body, &record.identity_public_key, 32)
+                .map_err(|_| FrameError::LengthExceedsLimit)?;
+            crate::bytes::encode(&mut body, &record.carrier_type, MAX_DHT_CARRIER)
+                .map_err(|_| FrameError::LengthExceedsLimit)?;
+            crate::bytes::encode(&mut body, &record.connection_hint, MAX_DHT_HINT)
+                .map_err(|_| FrameError::LengthExceedsLimit)?;
+            crate::varint::encode_into(&mut body, record.expiration_time)
+                .map_err(FrameError::VarintEncode)?;
+            crate::varint::encode_into(&mut body, record.sequence)
+                .map_err(FrameError::VarintEncode)?;
+            crate::bytes::encode(&mut body, &record.signature, MAX_SIGNATURE)
+                .map_err(|_| FrameError::LengthExceedsLimit)?;
+        }
+        let mut out = Vec::with_capacity(body.len() + 8);
+        crate::varint::encode_into(&mut out, FrameType::DHT_LOOKUP.0)
+            .map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, body.len() as u64)
+            .map_err(FrameError::VarintEncode)?;
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// Decode a DHT request or response body.
+    ///
+    /// # Errors
+    ///
+    /// Returns a frame error when the body is truncated or violates a limit.
+    pub fn decode(body: &[u8]) -> Result<(Self, usize), FrameError> {
+        let mut pos = 0;
+        let read = |body: &[u8], pos: &mut usize| -> Result<Vec<u8>, FrameError> {
+            let (value, used) =
+                crate::bytes::decode(&body[*pos..], 1_024).map_err(|_| FrameError::Truncated)?;
+            *pos += used;
+            Ok(value.to_vec())
+        };
+        let (request_id, used) = crate::varint::decode(&body[pos..]).map_err(FrameError::Varint)?;
+        pos += used;
+        let target_endpoint_id = read(body, &mut pos)?;
+        if target_endpoint_id.len() != 32 {
+            return Err(FrameError::LengthExceedsLimit);
+        }
+        let response = *body.get(pos).ok_or(FrameError::Truncated)? != 0;
+        pos += 1;
+        let (count, used) = crate::varint::decode(&body[pos..]).map_err(FrameError::Varint)?;
+        pos += used;
+        if count > MAX_DHT_RECORDS as u64 {
+            return Err(FrameError::LengthExceedsLimit);
+        }
+        let mut records = Vec::new();
+        for _ in 0..count {
+            let endpoint_id = read(body, &mut pos)?;
+            let identity_public_key = read(body, &mut pos)?;
+            let carrier_type = read(body, &mut pos)?;
+            let connection_hint = read(body, &mut pos)?;
+            if endpoint_id.len() != 32
+                || identity_public_key.len() != 32
+                || carrier_type.len() > MAX_DHT_CARRIER
+                || connection_hint.len() > MAX_DHT_HINT
+            {
+                return Err(FrameError::LengthExceedsLimit);
+            }
+            let (expiration_time, used) =
+                crate::varint::decode(&body[pos..]).map_err(FrameError::Varint)?;
+            pos += used;
+            let (sequence, used) =
+                crate::varint::decode(&body[pos..]).map_err(FrameError::Varint)?;
+            pos += used;
+            let signature = read(body, &mut pos)?;
+            if signature.len() != 64 {
+                return Err(FrameError::LengthExceedsLimit);
+            }
+            records.push(DhtRecordWire {
+                endpoint_id,
+                identity_public_key,
+                carrier_type,
+                connection_hint,
+                expiration_time,
+                sequence,
+                signature,
+            });
+        }
+        Ok((
+            Self {
+                request_id,
+                response,
+                target_endpoint_id,
+                records,
+            },
+            pos,
+        ))
+    }
+}
+
 impl ServiceHintFrame {
     /// Encodes the frame including the type byte.
     ///
@@ -246,6 +381,36 @@ mod tests {
         let (dec, _) =
             ServiceHintFrame::decode(&enc[type_len(FrameType::SERVICE_HINT.0)..]).unwrap();
         assert_eq!(dec, f);
+    }
+
+    #[test]
+    fn dht_lookup_round_trip() {
+        let f = DhtLookupFrame {
+            request_id: 7,
+            response: true,
+            target_endpoint_id: vec![1; 32],
+            records: vec![DhtRecordWire {
+                endpoint_id: vec![2; 32],
+                identity_public_key: vec![3; 32],
+                carrier_type: b"ump.tcp/1".to_vec(),
+                connection_hint: b"node.example:9001".to_vec(),
+                expiration_time: 100,
+                sequence: 2,
+                signature: vec![4; 64],
+            }],
+        };
+        let enc = f.encode().unwrap();
+        let type_len = crate::varint::encode(FrameType::DHT_LOOKUP.0)
+            .unwrap()
+            .len();
+        let (_, length_len) = crate::varint::decode(&enc[type_len..]).unwrap();
+        let (dec, used) = DhtLookupFrame::decode(&enc[type_len + length_len..]).unwrap();
+        assert_eq!(used, enc.len() - type_len - length_len);
+        assert_eq!(dec, f);
+        assert!(matches!(
+            crate::frame::decode_frames(&enc).unwrap().as_slice(),
+            [crate::frame::Frame::DhtLookup(_)]
+        ));
     }
 
     #[test]

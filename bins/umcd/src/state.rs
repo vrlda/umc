@@ -873,6 +873,7 @@ impl RuntimeState {
 
         let (node_identity, primary_binding, secondaries) = load_identity_registry(&config)?;
         let node_endpoint_id = node_identity.endpoint_id();
+        let node_identity_key = node_identity.identity.clone();
         // The runtime node and the state share the same key material.
         let state_identity = NodeIdentity {
             identity: node_identity.identity.clone(),
@@ -940,6 +941,7 @@ impl RuntimeState {
         discovery.attach_store(store.clone());
         discovery.restore_candidates(store.as_ref(), started_at);
         discovery.record_advertised_endpoints(
+            &node_identity_key,
             &node_endpoint_id,
             &config.advertised_endpoints,
             started_at,

@@ -1,4 +1,5 @@
 pub mod bootstrap;
+pub mod dht;
 pub mod hints;
 pub mod invitation;
 pub mod limit;

@@ -67,7 +67,7 @@ pub fn context_allows(context: &PacketContext, ty: umc_types::frame::FrameType) 
         ) => true,
         (PacketContext::Protected(_), T::KEY_UPDATE) => true,
         (PacketContext::Protected(_), T::NEW_CONNECTION_ID | T::RETIRE_CONNECTION_ID) => true,
-        (PacketContext::Protected(_), T::PEER_HINT | T::SERVICE_HINT) => true,
+        (PacketContext::Protected(_), T::PEER_HINT | T::SERVICE_HINT | T::DHT_LOOKUP) => true,
         (PacketContext::Protected(_), T::MAX_DATA | T::MAX_STREAM_DATA | T::MAX_STREAMS) => true,
         (PacketContext::Protected(_), T::RESET_STREAM | T::STOP_SENDING) => true,
         (PacketContext::Protected(_), T::CONNECTION_CLOSE) => true,
@@ -124,6 +124,7 @@ pub fn frame_type_of(frame: &Frame) -> umc_types::frame::FrameType {
         Frame::HandshakeData(_) => T::HANDSHAKE_DATA,
         Frame::SessionTicket(_) => T::SESSION_TICKET,
         Frame::ServiceHint(_) => T::SERVICE_HINT,
+        Frame::DhtLookup(_) => T::DHT_LOOKUP,
     }
 }
 

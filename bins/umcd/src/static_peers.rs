@@ -208,6 +208,11 @@ pub fn candidate_dial_plan(
         .filter(|candidate| candidate.source != CandidateSource::Static)
         .cloned()
         .collect();
+    selected.sort_by(|left, right| {
+        left.carrier_type
+            .cmp(&right.carrier_type)
+            .then_with(|| left.connection_hint.cmp(&right.connection_hint))
+    });
     selected.dedup_by(|left, right| {
         left.carrier_type == right.carrier_type && left.connection_hint == right.connection_hint
     });

@@ -98,6 +98,12 @@ backoff, and each explicitly advertised node becomes another bootstrap point.
 behind NAT or a firewall must advertise a relay-reachable address or use a
 separate relay configuration; the core does not guess public addresses.
 
+The same exchange carries a bounded decentralized lookup overlay. Nodes share
+short-lived, endpoint-signed records, retain only the closest records needed
+for a lookup, replicate them across authenticated peers, and expire them from
+memory and disk. No node is authoritative and no complete peer table is sent;
+the original seed can disappear after the mesh has learned enough peers.
+
 ### Optional Prometheus metrics
 
 Metrics are disabled unless explicitly configured. To expose the bounded

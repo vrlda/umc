@@ -59,6 +59,7 @@ pub enum Frame {
     BundleAck(crate::frames::bundle::BundleAckFrame),
     PeerHint(crate::frames::misc::PeerHintFrame),
     ServiceHint(crate::frames::misc::ServiceHintFrame),
+    DhtLookup(crate::frames::misc::DhtLookupFrame),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,6 +419,15 @@ pub fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, FrameError> {
                 pos = pos.checked_add(len).ok_or(FrameError::LengthExceedsLimit)?;
                 if pos > payload.len() {
                     return Err(FrameError::Truncated);
+                }
+                if ty == FrameType::DHT_LOOKUP {
+                    let start = pos - len;
+                    let (frame, used) =
+                        crate::frames::misc::DhtLookupFrame::decode(&payload[start..pos])?;
+                    if used != len {
+                        return Err(FrameError::Truncated);
+                    }
+                    out.push(Frame::DhtLookup(frame));
                 }
             }
         }

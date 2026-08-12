@@ -7,6 +7,7 @@ use std::sync::Arc;
 use blake2::{Blake2s256, Digest};
 use umc_crypto::signatures::IdentityPublicKey;
 use umc_discovery::bootstrap::{BootstrapBundle, BootstrapError};
+use umc_discovery::dht::{DhtRecord, DhtTable, RECORD_LIFETIME_MS};
 use umc_discovery::hints::{
     apply_received_hints, apply_received_hints_with_mesh_secret, build_peer_hint,
     build_peer_hint_with_mesh_secret, select_for_share, HintError,
@@ -38,6 +39,43 @@ struct CandidateJson {
     sharing_policy: u8,
     authentication: u8,
     local: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DhtRecordJson {
+    endpoint_id: Vec<u8>,
+    identity_public_key: Vec<u8>,
+    carrier_type: String,
+    connection_hint: Vec<u8>,
+    expires_at_ms: u64,
+    sequence: u64,
+    signature: Vec<u8>,
+}
+
+impl DhtRecordJson {
+    fn from_record(record: &DhtRecord) -> Self {
+        Self {
+            endpoint_id: record.endpoint_id.to_vec(),
+            identity_public_key: record.identity_public_key.to_vec(),
+            carrier_type: record.carrier_type.clone(),
+            connection_hint: record.connection_hint.clone(),
+            expires_at_ms: record.expires_at.0,
+            sequence: record.sequence,
+            signature: record.signature.to_vec(),
+        }
+    }
+
+    fn into_record(self) -> Option<DhtRecord> {
+        Some(DhtRecord {
+            endpoint_id: self.endpoint_id.as_slice().try_into().ok()?,
+            identity_public_key: self.identity_public_key.as_slice().try_into().ok()?,
+            carrier_type: self.carrier_type,
+            connection_hint: self.connection_hint,
+            expires_at: Instant(self.expires_at_ms),
+            sequence: self.sequence,
+            signature: self.signature.as_slice().try_into().ok()?,
+        })
+    }
 }
 
 impl CandidateJson {
@@ -153,6 +191,18 @@ fn save_candidate(store: &dyn Store, candidate: &PeerCandidate) -> Result<(), St
     )
 }
 
+fn dht_key(record: &DhtRecord) -> Vec<u8> {
+    let mut key = b"DHT".to_vec();
+    key.extend_from_slice(&dht_candidate_id(record).to_be_bytes());
+    key
+}
+
+fn save_dht_record(store: &dyn Store, record: &DhtRecord) -> Result<(), StoreError> {
+    let value = serde_json::to_vec(&DhtRecordJson::from_record(record))
+        .map_err(|_| StoreError::Serialization)?;
+    store.put(Namespace::Peer, &dht_key(record), &value)
+}
+
 /// Loads every persisted candidate, skipping corrupt or unparsable records
 /// with a log line (never fatal).
 fn load_candidates(store: &dyn Store) -> Vec<PeerCandidate> {
@@ -165,6 +215,9 @@ fn load_candidates(store: &dyn Store) -> Vec<PeerCandidate> {
         }
     };
     for entry in entries {
+        if entry.key.starts_with(b"DHT") {
+            continue;
+        }
         match serde_json::from_slice::<CandidateJson>(&entry.value) {
             Ok(json) => match json.into_candidate() {
                 Some(candidate) => out.push(candidate),
@@ -179,10 +232,26 @@ fn load_candidates(store: &dyn Store) -> Vec<PeerCandidate> {
     out
 }
 
+fn load_dht_records(store: &dyn Store) -> Vec<DhtRecord> {
+    let Ok(entries) = store.scan(Namespace::Peer) else {
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .filter(|entry| entry.key.starts_with(b"DHT"))
+        .filter_map(|entry| {
+            serde_json::from_slice::<DhtRecordJson>(&entry.value)
+                .ok()
+                .and_then(DhtRecordJson::into_record)
+        })
+        .collect()
+}
+
 /// Process-local discovery state, optionally bound to the node database for
 /// candidate persistence.
 pub struct DiscoveryService {
     pub candidates: CandidateTable,
+    pub dht: DhtTable,
     /// Optional provider coordinator. The composition root can register
     /// providers without coupling candidate persistence to provider-owned
     /// resources; failures and diversity are reported per refresh.
@@ -194,6 +263,7 @@ impl std::fmt::Debug for DiscoveryService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiscoveryService")
             .field("candidates", &self.candidates)
+            .field("dht", &self.dht)
             .field("providers", &self.providers)
             .field("store_attached", &self.store.is_some())
             .finish()
@@ -206,6 +276,7 @@ impl DiscoveryService {
     pub fn new(cap: usize) -> Self {
         Self {
             candidates: CandidateTable::new(cap),
+            dht: DhtTable::new(),
             providers: ProviderManager::new(cap),
             store: None,
         }
@@ -295,6 +366,9 @@ impl DiscoveryService {
                 break;
             }
         }
+        for record in load_dht_records(store) {
+            let _ = self.dht.insert(record, now);
+        }
     }
 
     /// Record or refresh a candidate (discovery.md §8.1, §17.1). Successful
@@ -327,6 +401,7 @@ impl DiscoveryService {
     /// permanent authority.
     pub fn record_advertised_endpoints(
         &mut self,
+        identity: &umc_crypto::signatures::IdentityKeyPair,
         endpoint_id: &[u8; 32],
         endpoints: &[crate::config::AdvertisedEndpointConfig],
         now: Instant,
@@ -353,10 +428,96 @@ impl DiscoveryService {
                 authentication: CandidateAuth::CarrierAuthenticated,
                 local: true,
             };
+            let dht_record = DhtRecord::sign(
+                identity,
+                endpoint.carrier.clone(),
+                endpoint.address.as_bytes().to_vec(),
+                now + umc_types::runtime::Duration::from_millis(RECORD_LIFETIME_MS),
+                1,
+            );
+            let _ = self.dht.insert(dht_record, now);
+            if let Some(store) = &self.store {
+                if let Some(record) = self
+                    .dht
+                    .closest(endpoint_id, 1, now)
+                    .into_iter()
+                    .find(|record| record.connection_hint == endpoint.address.as_bytes())
+                {
+                    let _ = save_dht_record(store.as_ref(), &record);
+                }
+            }
             if let Err(error) = self.record_candidate(candidate, now) {
                 log::warn!("[discovery] advertised endpoint rejected: {error:?}");
             }
         }
+    }
+
+    #[must_use]
+    pub fn dht_exchange_frame(
+        &self,
+        target: &[u8; 32],
+        now: Instant,
+    ) -> Option<umc_wire::frames::misc::DhtLookupFrame> {
+        let records = self
+            .dht
+            .closest(target, umc_wire::frames::misc::MAX_DHT_RECORDS, now)
+            .into_iter()
+            .map(dht_record_to_wire)
+            .collect::<Vec<_>>();
+        (!records.is_empty()).then(|| umc_wire::frames::misc::DhtLookupFrame {
+            request_id: now.0,
+            response: false,
+            target_endpoint_id: target.to_vec(),
+            records,
+        })
+    }
+
+    pub fn apply_dht_frame(
+        &mut self,
+        frame: &umc_wire::frames::misc::DhtLookupFrame,
+        now: Instant,
+    ) -> usize {
+        let mut accepted = 0;
+        for wire in &frame.records {
+            if wire.endpoint_id.len() != 32 || wire.identity_public_key.len() != 32 {
+                continue;
+            }
+            let mut endpoint_id = [0u8; 32];
+            endpoint_id.copy_from_slice(&wire.endpoint_id);
+            let mut identity_public_key = [0u8; 32];
+            identity_public_key.copy_from_slice(&wire.identity_public_key);
+            let Ok(signature) = wire.signature.as_slice().try_into() else {
+                continue;
+            };
+            let record = DhtRecord {
+                endpoint_id,
+                identity_public_key,
+                carrier_type: String::from_utf8_lossy(&wire.carrier_type).to_string(),
+                connection_hint: wire.connection_hint.clone(),
+                expires_at: Instant(wire.expiration_time),
+                sequence: wire.sequence,
+                signature,
+            };
+            if self.dht.insert(record.clone(), now) {
+                accepted += 1;
+                if let Some(store) = &self.store {
+                    let _ = save_dht_record(store.as_ref(), &record);
+                }
+                let candidate = PeerCandidate {
+                    candidate_id: dht_candidate_id(&record),
+                    carrier_type: record.carrier_type,
+                    connection_hint: record.connection_hint,
+                    source: CandidateSource::CarrierNative,
+                    created_at: now,
+                    expires_at: record.expires_at,
+                    sharing_policy: SharingPolicy::ShareGeneral,
+                    authentication: CandidateAuth::CarrierAuthenticated,
+                    local: false,
+                };
+                let _ = self.record_candidate(candidate, now);
+            }
+        }
+        accepted
     }
 
     /// A snapshot of the live candidates.
@@ -439,6 +600,28 @@ impl DiscoveryService {
     }
 }
 
+fn dht_record_to_wire(record: DhtRecord) -> umc_wire::frames::misc::DhtRecordWire {
+    umc_wire::frames::misc::DhtRecordWire {
+        endpoint_id: record.endpoint_id.to_vec(),
+        identity_public_key: record.identity_public_key.to_vec(),
+        carrier_type: record.carrier_type.into_bytes(),
+        connection_hint: record.connection_hint,
+        expiration_time: record.expires_at.0,
+        sequence: record.sequence,
+        signature: record.signature.to_vec(),
+    }
+}
+
+fn dht_candidate_id(record: &DhtRecord) -> u64 {
+    let mut hasher = blake2::Blake2s256::new();
+    hasher.update(b"UMP-DHT-CANDIDATE-v1");
+    hasher.update(record.endpoint_id);
+    hasher.update(record.carrier_type.as_bytes());
+    hasher.update(&record.connection_hint);
+    let digest: [u8; 32] = hasher.finalize().into();
+    u64::from_be_bytes(digest[..8].try_into().unwrap_or([0; 8]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,15 +650,17 @@ mod tests {
             address: "node.example:9001".into(),
         }];
         let mut service = DiscoveryService::new(10);
-        service.record_advertised_endpoints(&[7u8; 32], &endpoints, Instant(100));
+        let identity = IdentityKeyPair::from_seed([7u8; 32]);
+        service.record_advertised_endpoints(&identity, &[7u8; 32], &endpoints, Instant(100));
         let first = service.candidates();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].source, CandidateSource::Application);
         assert_eq!(first[0].sharing_policy, SharingPolicy::ShareGeneral);
         assert_eq!(first[0].connection_hint, b"node.example:9001");
-        service.record_advertised_endpoints(&[7u8; 32], &endpoints, Instant(200));
+        service.record_advertised_endpoints(&identity, &[7u8; 32], &endpoints, Instant(200));
         assert_eq!(service.candidates().len(), 1);
         assert_ne!(first[0].candidate_id, 0);
+        assert_eq!(service.dht.len(), 1);
     }
 
     #[test]
@@ -644,5 +829,25 @@ mod tests {
             SharingPolicy::ShareGeneral,
             "sharing policy is preserved (storage.md §16.4)"
         );
+    }
+
+    #[test]
+    fn signed_dht_records_persist_and_restore_across_restart() {
+        let store = temp_store();
+        let identity = IdentityKeyPair::from_seed([9u8; 32]);
+        let endpoint = umc_handshake::identity::endpoint_id(&identity.public());
+        let endpoints = vec![crate::config::AdvertisedEndpointConfig {
+            carrier: "ump.tcp/1".into(),
+            address: "node.example:9001".into(),
+        }];
+        let mut service = DiscoveryService::new(10);
+        service.attach_store(store.clone());
+        service.record_advertised_endpoints(&identity, &endpoint, &endpoints, Instant(1));
+        assert_eq!(service.dht.len(), 1);
+        drop(service);
+        let mut restarted = DiscoveryService::new(10);
+        restarted.restore_candidates(store.as_ref(), Instant(2));
+        assert_eq!(restarted.dht.len(), 1);
+        assert_eq!(restarted.dht.closest(&endpoint, 1, Instant(2)).len(), 1);
     }
 }

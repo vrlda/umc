@@ -1265,6 +1265,12 @@ async fn process_inbound_packet_on_links(
                         combined.extend_from_slice(&payload);
                     }
                 }
+                let target = state.node_identity.endpoint_id();
+                if let Some(dht) = state.discovery.dht_exchange_frame(&target, now) {
+                    if let Ok(payload) = dht.encode() {
+                        combined.extend_from_slice(&payload);
+                    }
+                }
             }
             if rotation_due {
                 if let Some(started) = sweep.established {
@@ -2360,6 +2366,27 @@ fn handle_control_frames(
                         now,
                         format!("session {session_id}: {error:?}"),
                     ),
+                }
+            }
+            Frame::DhtLookup(lookup) => {
+                let accepted = state.discovery.apply_dht_frame(lookup, now);
+                push_event(
+                    state,
+                    "dht_records_received",
+                    now,
+                    format!("session {session_id}: {accepted} signed record(s)"),
+                );
+                if lookup.target_endpoint_id.len() == 32 {
+                    let mut target = [0u8; 32];
+                    target.copy_from_slice(&lookup.target_endpoint_id);
+                    if !lookup.response {
+                        if let Some(mut response) = state.discovery.dht_exchange_frame(&target, now) {
+                            response.response = true;
+                            if let Ok(payload) = response.encode() {
+                                return Some(payload);
+                            }
+                        }
+                    }
                 }
             }
             Frame::RouteRequest(request) => {

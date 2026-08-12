@@ -34,6 +34,8 @@ impl FrameType {
     pub const HANDSHAKE_DATA: Self = Self(0x74);
     pub const SESSION_TICKET: Self = Self(0x78);
     pub const SERVICE_HINT: Self = Self(0x7C);
+    /// Optional length-delimited decentralized discovery lookup.
+    pub const DHT_LOOKUP: Self = Self(0x7F);
     pub const RELAY_STATUS: Self = Self(0x82);
 }
 
@@ -118,6 +120,7 @@ mod tests {
             (FrameType::HANDSHAKE_DATA, 0x74),
             (FrameType::SESSION_TICKET, 0x78),
             (FrameType::SERVICE_HINT, 0x7C),
+            (FrameType::DHT_LOOKUP, 0x7F),
             (FrameType::RELAY_STATUS, 0x82),
         ];
         for (frame_type, expected) in table {

@@ -8,6 +8,7 @@ license.workspace = true
 umc-types = { path = "../umc-types" }
 umc-wire = { path = "../umc-wire" }
 umc-crypto = { path = "../umc-crypto" }
+umc-handshake = { path = "../umc-handshake" }
 
 [lints]
 workspace = true

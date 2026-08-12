@@ -2096,6 +2096,7 @@ name = "umc-discovery"
 version = "0.1.0"
 dependencies = [
  "umc-crypto",
+ "umc-handshake",
  "umc-types",
  "umc-wire",
 ]
