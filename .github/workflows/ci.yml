@@ -139,6 +139,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "28.3"
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Install Linux keychain build dependencies
         run: sudo apt-get update && sudo apt-get install --yes pkg-config libdbus-1-dev
