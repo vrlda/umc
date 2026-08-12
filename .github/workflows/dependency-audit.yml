@@ -1,0 +1,47 @@
+name: Dependency audit
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dependency-audit:
+    name: Locked dependency audit and SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Generate dependency evidence
+        run: python3 interop/python/dependency_audit.py --output artifacts/dependency
+      - name: Verify dependency evidence
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path("artifacts/dependency")
+          record = json.loads((root / "dependency-report.json").read_text(encoding="utf-8"))
+          assert record["schema"] == "umc-dependency-audit-v1"
+          assert record["working_tree_dirty"] is False
+          assert record["status"] == "pass"
+          assert record["vulnerabilities"] == 0
+          assert record["package_count"] > 0
+          assert hashlib.sha256((root / "Cargo.lock").read_bytes()).hexdigest() == record["lock_sha256"]
+          for artifact in record["artifacts"]:
+              path = root / artifact["name"]
+              assert path.is_file(), artifact["name"]
+              assert artifact["bytes"] == path.stat().st_size
+              assert artifact["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+          required = {"Cargo.lock", "sbom.json", "dependency-tree.txt", "cargo-audit.json"}
+          assert required.issubset({item["name"] for item in record["artifacts"]})
+          PY
+      - name: Upload dependency evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-audit
+          path: artifacts/dependency/

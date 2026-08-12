@@ -29,6 +29,7 @@ interop/python/__pycache__/
 !/interop/python/security_gate.py
 !/interop/python/fuzz_gate.py
 !/interop/python/release_baseline.py
+!/interop/python/dependency_audit.py
 !/interop/vectors/
 !/interop/vectors/README.md
 !/interop/vectors/ump1-v0.1.json
