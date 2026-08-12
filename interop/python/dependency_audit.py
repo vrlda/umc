@@ -16,7 +16,8 @@ def git_value(repo: Path, *args: str) -> str:
 
 def run_command(repo: Path, command: List[str], output: Path) -> None:
     with output.open("w", encoding="utf-8") as stream:
-        result = subprocess.run(command, cwd=repo, check=False, stdout=stream, stderr=subprocess.STDOUT)
+        result = subprocess.run(command, cwd=repo, check=False, stdout=stream, stderr=subprocess.PIPE, text=True)
+    output.with_name(output.name + ".stderr").write_text(result.stderr, encoding="utf-8")
     if result.returncode != 0:
         raise SystemExit(f"command failed ({result.returncode}): {' '.join(command)}")
 
