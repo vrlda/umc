@@ -669,9 +669,8 @@ mod tests {
         runtime.block_on(async {
             let carrier = TlsCarrier::new().expect("carrier");
             let listener = carrier.listen("127.0.0.1:0".into()).expect("listener");
-            let error = match listener.accept() {
-                Ok(_) => panic!("empty listener should not block"),
-                Err(error) => error,
+            let Err(error) = listener.accept() else {
+                panic!("empty listener should not block")
             };
             assert_eq!(error.kind, CarrierErrorKind::WouldBlock);
             listener.close().expect("close");
