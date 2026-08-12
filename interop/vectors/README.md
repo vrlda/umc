@@ -13,5 +13,6 @@ X25519, Initial/HKDF, binding, canonical XX transcript, protected short-packet,
 header-protection, AEAD, and tamper-rejection values independently of the Rust
 implementation. The JSON includes the canonical XX transcript sequence. The
 independent live peer at `interop/python/live_runner.py` consumes these same
-protocol primitives against the real daemon over TCP, UDP, and TLS-stream; CI
-archives one JSON result per carrier as cross-implementation release evidence.
+protocol primitives against the real daemon over TCP, UDP, and TLS-stream. The
+published CI workflow runs all three scenarios and archives one JSON result per
+carrier as cross-implementation release evidence.

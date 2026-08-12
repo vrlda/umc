@@ -292,25 +292,19 @@ impl Listener for TlsListener {
         }
         let rt = tokio::runtime::Handle::try_current()
             .map_err(|_| CarrierError::new(CarrierErrorKind::NotRunning, "accept"))?;
-        let (stream, _) = loop {
-            if self.closed.load(AtomicOrdering::Acquire) {
-                return Err(CarrierError::new(CarrierErrorKind::NotRunning, "accept"));
+        let (stream, _) = self.inner.accept().map_err(|error| {
+            let kind = if error.kind() == std::io::ErrorKind::WouldBlock {
+                CarrierErrorKind::WouldBlock
+            } else {
+                CarrierErrorKind::Internal
+            };
+            CarrierError {
+                kind,
+                operation: "accept",
+                retryable: true,
+                message: error.to_string(),
             }
-            match self.inner.accept() {
-                Ok(accepted) => break accepted,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(error) => {
-                    return Err(CarrierError {
-                        kind: CarrierErrorKind::Internal,
-                        operation: "accept",
-                        retryable: true,
-                        message: error.to_string(),
-                    });
-                }
-            }
-        };
+        })?;
         stream.set_nonblocking(true).map_err(|error| CarrierError {
             kind: CarrierErrorKind::Internal,
             operation: "accept",
@@ -587,7 +581,15 @@ mod tests {
         let carrier = TlsCarrier::new().unwrap();
         let listener = tokio::task::block_in_place(|| carrier.bind("127.0.0.1:0")).unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::task::spawn_blocking(move || listener.accept());
+        let server = tokio::task::spawn_blocking(move || loop {
+            match listener.accept() {
+                Ok(link) => break Ok(link),
+                Err(error) if error.kind == CarrierErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => break Err(error),
+            }
+        });
         let client = tokio::task::spawn_blocking({
             let carrier = carrier.clone();
             move || carrier.dial(address.to_string())
@@ -630,7 +632,15 @@ mod tests {
                 .unwrap();
         let listener = tokio::task::block_in_place(|| server.bind("127.0.0.1:0")).unwrap();
         let address = listener.local_addr().unwrap();
-        let server_task = tokio::task::spawn_blocking(move || listener.accept());
+        let server_task = tokio::task::spawn_blocking(move || loop {
+            match listener.accept() {
+                Ok(link) => break Ok(link),
+                Err(error) if error.kind == CarrierErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => break Err(error),
+            }
+        });
         let client_link = tokio::task::spawn_blocking(move || client.dial(address.to_string()))
             .await
             .unwrap()
@@ -648,5 +658,23 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(received.bytes, b"provisioned");
+    }
+
+    #[test]
+    fn listener_accept_returns_would_block_without_busy_waiting() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let carrier = TlsCarrier::new().expect("carrier");
+            let listener = carrier.listen("127.0.0.1:0".into()).expect("listener");
+            let error = match listener.accept() {
+                Ok(_) => panic!("empty listener should not block"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind, CarrierErrorKind::WouldBlock);
+            listener.close().expect("close");
+        });
     }
 }

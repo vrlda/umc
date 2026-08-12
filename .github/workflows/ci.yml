@@ -67,3 +67,33 @@ jobs:
         run: python -m pip install --disable-pip-version-check -r interop/python/requirements.txt
       - name: Verify published vectors
         run: python -m unittest discover -s interop/python -p 'test_*.py'
+
+  carrier-interoperability:
+    name: Independent carrier interoperability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "28.3"
+      - name: Install Linux keychain build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes pkg-config libdbus-1-dev
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install interoperability dependencies
+        run: python -m pip install --disable-pip-version-check -r interop/python/requirements.txt
+      - name: Build daemon
+        run: cargo build --locked -p umcd
+      - name: Exercise TCP carrier
+        run: python interop/python/live_runner.py --carrier tcp --binary target/debug/umcd --result artifacts/tcp.json
+      - name: Exercise UDP carrier
+        run: python interop/python/live_runner.py --carrier udp --binary target/debug/umcd --result artifacts/udp.json
+      - name: Exercise TLS stream carrier
+        run: python interop/python/live_runner.py --carrier tls --binary target/debug/umcd --result artifacts/tls.json
+      - name: Upload interoperability evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: carrier-interoperability
+          path: artifacts/
