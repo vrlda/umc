@@ -81,6 +81,13 @@ pub struct NodeConfig {
     /// Peers to dial at startup and on the bounded retry interval
     /// (discovery.md §15). Endpoint ids are lowercase/uppercase hex.
     pub static_peers: Vec<StaticPeerConfig>,
+    /// Initial rendezvous contacts. These are only a bootstrap seed: once a
+    /// session is established, learned and advertised candidates are dialed
+    /// automatically and the seed is no longer a central dependency.
+    pub bootstrap_peers: Vec<BootstrapPeerConfig>,
+    /// Publicly reachable addresses this node may introduce to other peers.
+    /// An empty list is intentional for nodes behind NAT or firewalls.
+    pub advertised_endpoints: Vec<AdvertisedEndpointConfig>,
     /// Telemetry opt-in (core.md §61, privacy.md §38): off by default. The
     /// daemon dumps a bounded JSONL metrics file only when enabled.
     pub telemetry_enabled: bool,
@@ -107,6 +114,22 @@ pub struct NodeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StaticPeerConfig {
     pub endpoint_id: String,
+    pub carrier: String,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapPeerConfig {
+    /// Optional expected endpoint id. Empty/omitted permits any authenticated
+    /// UMC endpoint at the rendezvous address.
+    #[serde(default)]
+    pub endpoint_id: Option<String>,
+    pub carrier: String,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvertisedEndpointConfig {
     pub carrier: String,
     pub address: String,
 }
@@ -143,6 +166,8 @@ impl Default for NodeConfig {
             require_retry: false,
             disable_public_relay: false,
             static_peers: Vec::new(),
+            bootstrap_peers: Vec::new(),
+            advertised_endpoints: Vec::new(),
             telemetry_enabled: false,
             metrics_listen: None,
             metrics_bearer_token: None,
@@ -383,6 +408,14 @@ impl NodeConfig {
             "static_peers" => {
                 self.static_peers = serde_json::from_str(value)
                     .map_err(|e| format!("static_peers must be a JSON array: {e}"))?;
+            }
+            "bootstrap_peers" => {
+                self.bootstrap_peers = serde_json::from_str(value)
+                    .map_err(|e| format!("bootstrap_peers must be a JSON array: {e}"))?;
+            }
+            "advertised_endpoints" => {
+                self.advertised_endpoints = serde_json::from_str(value)
+                    .map_err(|e| format!("advertised_endpoints must be a JSON array: {e}"))?;
             }
             other => return Err(format!("unsupported config key {other:?}")),
         }
@@ -637,6 +670,8 @@ mod tests {
         assert!(config.disabled_carriers.is_empty());
         assert!(!config.disable_public_relay);
         assert!(config.static_peers.is_empty());
+        assert!(config.bootstrap_peers.is_empty());
+        assert!(config.advertised_endpoints.is_empty());
     }
 
     #[test]
@@ -694,6 +729,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(config.static_peers.len(), 1);
+        config
+            .set_entry(
+                "bootstrap_peers",
+                r#"[{"carrier":"ump.tcp/1","address":"seed.example:9001"}]"#,
+            )
+            .unwrap();
+        assert_eq!(config.bootstrap_peers.len(), 1);
+        assert!(config.bootstrap_peers[0].endpoint_id.is_none());
+        config
+            .set_entry(
+                "advertised_endpoints",
+                r#"[{"carrier":"ump.tcp/1","address":"node.example:9001"}]"#,
+            )
+            .unwrap();
+        assert_eq!(config.advertised_endpoints.len(), 1);
         config.set_entry("mesh", "true").unwrap();
         assert!(config.mesh);
         config.set_entry("mesh_secret", "mesh-secret").unwrap();

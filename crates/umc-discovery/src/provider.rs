@@ -57,7 +57,10 @@ impl PeerCandidate {
     pub fn cap_lifetime(&mut self, now: Instant) {
         // Static/pinned configuration is an explicit local policy and may
         // outlive the provider's ordinary refresh window (discovery.md §8.1).
-        if self.source == CandidateSource::Static {
+        if matches!(
+            self.source,
+            CandidateSource::Static | CandidateSource::Bootstrap
+        ) {
             return;
         }
         let cap = now + umc_types::runtime::Duration::from_millis(MAX_CANDIDATE_LIFETIME_MS);
@@ -171,5 +174,23 @@ mod tests {
         };
         c.cap_lifetime(now);
         assert_eq!(c.expires_at.0, u64::MAX / 2);
+    }
+
+    #[test]
+    fn bootstrap_candidates_may_outlive_refresh_cap() {
+        let now = Instant(0);
+        let mut c = PeerCandidate {
+            candidate_id: 4,
+            carrier_type: "ump.tcp/1".into(),
+            connection_hint: vec![],
+            source: CandidateSource::Bootstrap,
+            created_at: now,
+            expires_at: Instant(u64::MAX),
+            sharing_policy: SharingPolicy::LocalUseOnly,
+            authentication: CandidateAuth::Unauthenticated,
+            local: true,
+        };
+        c.cap_lifetime(now);
+        assert_eq!(c.expires_at, Instant(u64::MAX));
     }
 }

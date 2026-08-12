@@ -72,7 +72,11 @@ pub fn build_peer_hint_with_mesh_secret(
             expiration_time: c.expires_at.0,
             public: c.sharing_policy == SharingPolicy::ShareGeneral,
             introduced: c.authentication == CandidateAuth::IntroductionAuthenticated,
-            local: c.local,
+            // `local` describes whether the candidate is local to the
+            // sender. Explicitly advertised application endpoints are meant
+            // to be dialed by receivers, so they must not inherit that local
+            // marker across the wire.
+            local: c.local && c.source != CandidateSource::Application,
             ephemeral: c.source == CandidateSource::LocalDiscovery,
             do_not_reshare: c.sharing_policy == SharingPolicy::DoNotReshare,
             authenticator: Vec::new(),
@@ -281,6 +285,23 @@ mod tests {
         assert_eq!(frame.entries.len(), 1);
         assert!(frame.entries[0].public);
         assert!(!frame.entries[0].do_not_reshare);
+    }
+
+    #[test]
+    fn advertised_local_candidate_is_dialable_after_exchange() {
+        let candidate = PeerCandidate {
+            source: CandidateSource::Application,
+            local: true,
+            connection_hint: b"node.example:9001".to_vec(),
+            ..candidate(8, SharingPolicy::ShareGeneral, u64::MAX)
+        };
+        let frame = build_peer_hint(&[candidate]).unwrap();
+        assert!(!frame.entries[0].local);
+        let mut table = CandidateTable::new(10);
+        apply_received_hints(&frame, b"seed", Instant(0), &mut table).unwrap();
+        let received = table.get(8).unwrap();
+        assert!(!received.local);
+        assert_eq!(received.source, CandidateSource::PeerHint);
     }
 
     #[test]

@@ -872,6 +872,7 @@ impl RuntimeState {
         let restore_warning = reconcile_restore_anchor(store.as_ref(), &data_dir)?;
 
         let (node_identity, primary_binding, secondaries) = load_identity_registry(&config)?;
+        let node_endpoint_id = node_identity.endpoint_id();
         // The runtime node and the state share the same key material.
         let state_identity = NodeIdentity {
             identity: node_identity.identity.clone(),
@@ -938,6 +939,30 @@ impl RuntimeState {
         let mut discovery = DiscoveryService::new(umc_discovery::table::DEFAULT_TABLE_CAP);
         discovery.attach_store(store.clone());
         discovery.restore_candidates(store.as_ref(), started_at);
+        discovery.record_advertised_endpoints(
+            &node_endpoint_id,
+            &config.advertised_endpoints,
+            started_at,
+        );
+        let bootstrap_provider = crate::static_peers::BootstrapPeerProvider::new(
+            &config.bootstrap_peers,
+            started_at,
+        );
+        if !bootstrap_provider.is_empty() {
+            discovery.register_provider(Box::new(bootstrap_provider));
+            let startup_reports = discovery.start_providers();
+            if startup_reports
+                .iter()
+                .any(|report| report.state != umc_discovery::manager::ProviderState::Running)
+            {
+                log::warn!("[discovery] bootstrap provider did not start cleanly");
+            }
+            let refresh = discovery.refresh_providers(started_at);
+            log::debug!(
+                "[discovery] bootstrap provider admitted {} candidate(s)",
+                refresh.admitted_candidates
+            );
+        }
         let static_provider =
             crate::static_peers::StaticPeerProvider::new(&config.static_peers, started_at);
         if !static_provider.is_empty() {

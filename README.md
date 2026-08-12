@@ -72,6 +72,32 @@ umcd &
 umc status
 ```
 
+### Automatic Internet discovery
+
+Internet discovery needs an initial rendezvous address, but it does not keep
+the rendezvous node in a privileged role. Configure one or more temporary seed
+contacts and advertise the addresses on which this node is reachable:
+
+```json
+{
+  "tcp_listen": "0.0.0.0:9001",
+  "bootstrap_peers": [
+    {"carrier": "ump.tcp/1", "address": "seed.example:9001"}
+  ],
+  "advertised_endpoints": [
+    {"carrier": "ump.tcp/1", "address": "node.example:9001"}
+  ]
+}
+```
+
+After the first authenticated session, nodes exchange bounded `PEER_HINT`
+frames. Learned and persisted candidates are dialed automatically with
+backoff, and each explicitly advertised node becomes another bootstrap point.
+`bootstrap_peers` is only a fallback for a node that has no live session;
+`static_peers` remains a private, endpoint-pinned operator override. A node
+behind NAT or a firewall must advertise a relay-reachable address or use a
+separate relay configuration; the core does not guess public addresses.
+
 ### Optional Prometheus metrics
 
 Metrics are disabled unless explicitly configured. To expose the bounded

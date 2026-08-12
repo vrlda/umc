@@ -3015,6 +3015,18 @@ fn node_config_message(config: &NodeConfig) -> api::NodeConfig {
             value: serde_json::to_string(&config.static_peers).unwrap_or_else(|_| "[]".into()),
             sensitive_present: false,
         },
+        api::ConfigEntry {
+            key: "bootstrap_peers".into(),
+            value: serde_json::to_string(&config.bootstrap_peers)
+                .unwrap_or_else(|_| "[]".into()),
+            sensitive_present: false,
+        },
+        api::ConfigEntry {
+            key: "advertised_endpoints".into(),
+            value: serde_json::to_string(&config.advertised_endpoints)
+                .unwrap_or_else(|_| "[]".into()),
+            sensitive_present: false,
+        },
     ];
     api::NodeConfig {
         resource_profile: config.profile.clone(),

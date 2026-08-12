@@ -37,6 +37,7 @@ use config::NodeConfig;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::collections::HashMap;
 use std::time::Duration;
 use umc_carrier::types::OutboundPacket;
 use umc_carrier::{BoxLink, Listener};
@@ -185,10 +186,14 @@ async fn run(config: NodeConfig) {
     let server_state = state.clone();
     let server_task = tokio::spawn(server::run(server_state));
 
-    let static_peers = state.lock().expect("state").config.static_peers.clone();
-    if !static_peers.is_empty() {
-        static_peers::dial_all(&state, &static_peers);
-    }
+    let (static_peers, bootstrap_peers) = start_discovery_dials(&state);
+    let mut discovered_attempts: HashMap<u64, static_peers::DialAttempt> = HashMap::new();
+    static_peers::dial_discovered(
+        &state,
+        &mut discovered_attempts,
+        state::wall_now(),
+        4,
+    );
 
     // Graceful shutdown: SIGINT sets the flag and releases the channel.
     let (shutdown_flag, shutdown_tx) = {
@@ -205,18 +210,14 @@ async fn run(config: NodeConfig) {
         let _ = shutdown_tx.send(()).await;
     });
 
-    // Retry static bootstrap contacts after a bounded interval. The first
-    // interval tick is consumed so startup dialing above is not duplicated.
-    let mut static_retry = tokio::time::interval(Duration::from_secs(30));
-    static_retry.tick().await;
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.recv() => break,
-            _ = static_retry.tick() => {
-                static_peers::dial_all(&state, &static_peers);
-            }
-        }
-    }
+    run_discovery_loop(
+        &state,
+        &mut shutdown_rx,
+        &static_peers,
+        &bootstrap_peers,
+        &mut discovered_attempts,
+    )
+    .await;
     // Stop live transport work before dropping the Tokio runtime. Session
     // reader/writer coordinators own blocking carrier pumps, so merely
     // setting the shutdown flag is not enough to release their links.
@@ -227,6 +228,52 @@ async fn run(config: NodeConfig) {
     log::info!("shutdown: complete");
     // Wait for the control socket to finish closing before exiting.
     let _ = server_task.await;
+}
+
+async fn run_discovery_loop(
+    state: &Arc<std::sync::Mutex<state::RuntimeState>>,
+    shutdown_rx: &mut tokio::sync::mpsc::Receiver<()>,
+    static_peers: &[config::StaticPeerConfig],
+    bootstrap_peers: &[config::BootstrapPeerConfig],
+    discovered_attempts: &mut std::collections::HashMap<u64, static_peers::DialAttempt>,
+) {
+    // Learned candidates are preferred; configured seeds remain a fallback.
+    let mut retry = tokio::time::interval(Duration::from_secs(30));
+    retry.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => break,
+            _ = retry.tick() => {
+                static_peers::dial_discovered(state, discovered_attempts, state::wall_now(), 4);
+                if state.lock().expect("state").sessions.count() == 0 {
+                    static_peers::dial_all(state, static_peers);
+                    static_peers::dial_bootstrap(state, bootstrap_peers);
+                }
+            }
+        }
+    }
+}
+
+fn start_discovery_dials(
+    state: &Arc<std::sync::Mutex<state::RuntimeState>>,
+) -> (
+    Vec<config::StaticPeerConfig>,
+    Vec<config::BootstrapPeerConfig>,
+) {
+    let (static_peers, bootstrap_peers) = {
+        let state = state.lock().expect("state");
+        (
+            state.config.static_peers.clone(),
+            state.config.bootstrap_peers.clone(),
+        )
+    };
+    if !static_peers.is_empty() {
+        static_peers::dial_all(state, &static_peers);
+    }
+    if !bootstrap_peers.is_empty() {
+        static_peers::dial_bootstrap(state, &bootstrap_peers);
+    }
+    (static_peers, bootstrap_peers)
 }
 
 fn spawn_metrics_task(

@@ -4,6 +4,7 @@
 //! after a restart the table is restored so operational hints survive.
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use blake2::{Blake2s256, Digest};
 use umc_crypto::signatures::IdentityPublicKey;
 use umc_discovery::bootstrap::{BootstrapBundle, BootstrapError};
 use umc_discovery::hints::{
@@ -320,6 +321,44 @@ impl DiscoveryService {
         Ok(())
     }
 
+    /// Advertise this node's explicitly configured public endpoints. These
+    /// candidates are shareable through `PEER_HINT`, so every connected node can
+    /// become a bootstrap contact without treating the original seed as a
+    /// permanent authority.
+    pub fn record_advertised_endpoints(
+        &mut self,
+        endpoint_id: &[u8; 32],
+        endpoints: &[crate::config::AdvertisedEndpointConfig],
+        now: Instant,
+    ) {
+        for endpoint in endpoints {
+            let mut hasher = Blake2s256::new();
+            hasher.update(b"UMP-ADVERTISED-CANDIDATE-v1");
+            hasher.update(endpoint_id);
+            hasher.update(endpoint.carrier.as_bytes());
+            hasher.update(endpoint.address.as_bytes());
+            let digest: [u8; 32] = hasher.finalize().into();
+            let mut id = [0u8; 8];
+            id.copy_from_slice(&digest[..8]);
+            let candidate = PeerCandidate {
+                candidate_id: u64::from_be_bytes(id),
+                carrier_type: endpoint.carrier.clone(),
+                connection_hint: endpoint.address.as_bytes().to_vec(),
+                source: CandidateSource::Application,
+                created_at: now,
+                expires_at: now + umc_types::runtime::Duration::from_millis(
+                    umc_discovery::provider::MAX_CANDIDATE_LIFETIME_MS,
+                ),
+                sharing_policy: SharingPolicy::ShareGeneral,
+                authentication: CandidateAuth::CarrierAuthenticated,
+                local: true,
+            };
+            if let Err(error) = self.record_candidate(candidate, now) {
+                log::warn!("[discovery] advertised endpoint rejected: {error:?}");
+            }
+        }
+    }
+
     /// A snapshot of the live candidates.
     #[must_use]
     pub fn candidates(&self) -> Vec<PeerCandidate> {
@@ -419,6 +458,24 @@ mod tests {
             authentication: CandidateAuth::Unauthenticated,
             local: false,
         }
+    }
+
+    #[test]
+    fn advertised_endpoints_are_shareable_and_stable() {
+        let endpoints = vec![crate::config::AdvertisedEndpointConfig {
+            carrier: "ump.tcp/1".into(),
+            address: "node.example:9001".into(),
+        }];
+        let mut service = DiscoveryService::new(10);
+        service.record_advertised_endpoints(&[7u8; 32], &endpoints, Instant(100));
+        let first = service.candidates();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].source, CandidateSource::Application);
+        assert_eq!(first[0].sharing_policy, SharingPolicy::ShareGeneral);
+        assert_eq!(first[0].connection_hint, b"node.example:9001");
+        service.record_advertised_endpoints(&[7u8; 32], &endpoints, Instant(200));
+        assert_eq!(service.candidates().len(), 1);
+        assert_ne!(first[0].candidate_id, 0);
     }
 
     #[test]
