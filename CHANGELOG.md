@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.1 — 2026-08-14
+
+### Fixed
+
+- Keep Windows clippy clean by compiling Unix sandbox helpers only on Unix.
+- Run protocol coverage against the standard edition instead of conflicting
+  compile-time edition features.
+- Install the Linux DBus development dependency in the edition matrix so the
+  native keychain adapter can be checked on Ubuntu.
+
+### Verified
+
+- Standard-edition LCOV generation completes locally with all workspace tests.
+
 ## 0.2.0 — 2026-08-14
 
 ### Added

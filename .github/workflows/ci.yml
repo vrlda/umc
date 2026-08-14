@@ -155,7 +155,10 @@ jobs:
       - name: Generate LCOV protocol coverage
         run: |
           mkdir -p artifacts
-          cargo llvm-cov --workspace --all-features --locked --lcov --output-path artifacts/lcov.info
+          # umcd's edition features are intentionally mutually exclusive;
+          # cover the standard artifact explicitly instead of enabling all
+          # three compile-time profiles at once.
+          cargo llvm-cov --workspace --no-default-features --features edition-standard --locked --lcov --output-path artifacts/lcov.info
       - name: Verify coverage artifact
         run: test -s artifacts/lcov.info && grep -q '^SF:' artifacts/lcov.info
       - name: Upload protocol coverage

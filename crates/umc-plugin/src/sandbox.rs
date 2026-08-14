@@ -70,6 +70,11 @@ impl SandboxPlan {
         private_root: &Path,
         strict: bool,
     ) -> Result<Self, SandboxError> {
+        // The platform-specific launchers below are unavailable on other
+        // targets, but the path is still part of the cross-platform API.
+        // Mark it as consumed so those targets remain warning-free under
+        // `-D warnings`.
+        let _ = private_root;
         #[cfg(target_os = "macos")]
         {
             if let Some(launcher) = find_program("sandbox-exec") {
@@ -153,6 +158,7 @@ fn platform_supported() -> bool {
     cfg!(any(target_os = "macos", target_os = "linux"))
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn find_program(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH")?
         .to_string_lossy()
