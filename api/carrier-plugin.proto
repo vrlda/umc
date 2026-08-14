@@ -1,0 +1,117 @@
+syntax = "proto3";
+
+package umc.plugin.v1;
+
+message ApiVersion { int32 major = 1; int32 minor = 2; }
+
+message PluginHello {
+  ApiVersion api_version = 1;
+  string plugin_name = 2;
+  repeated ApiVersion supported_versions = 3;
+  repeated string capabilities = 4;
+  bytes launch_token_proof = 5;
+}
+
+message DaemonHello {
+  ApiVersion selected_version = 1;
+  string daemon_identity = 2;
+  repeated string granted_capabilities = 3;
+  uint32 max_message_size = 4;
+}
+
+message SharedMemory { string path = 1; uint64 size = 2; bytes token = 3; }
+message PluginConfig { bytes config_blob = 1; uint32 maximum_packet_size = 2; SharedMemory shared_memory = 3; }
+message StartAck { bool started = 1; string effective_config = 2; }
+
+enum OpType {
+  OP_TYPE_UNSPECIFIED = 0;
+  LISTEN = 1;
+  DIAL = 2;
+  CLOSE_LISTENER = 3;
+  SEND = 4;
+  CLOSE_LINK = 5;
+  DISCOVER = 6;
+  CANCEL_OP = 7;
+}
+message OpReq {
+  uint64 operation_id = 1;
+  OpType op_type = 2;
+  uint64 handle = 3;
+  bytes arguments = 4;
+  uint64 deadline_ms = 5;
+  PayloadRef payload_ref = 6;
+}
+message PayloadRef { uint64 offset = 1; uint64 length = 2; bytes token = 3; }
+message DiscoveryRequest {
+  string scope = 1;
+  uint64 deadline_ms = 2;
+  uint32 maximum_candidates = 3;
+}
+message Candidate {
+  uint64 candidate_id = 1;
+  string carrier_type = 2;
+  bytes connection_hint = 3;
+  uint64 lifetime_ms = 4;
+  uint32 authentication = 5;
+  uint32 sharing_policy = 6;
+  bool local = 7;
+}
+enum OpStatus {
+  OP_STATUS_UNSPECIFIED = 0;
+  OK = 1;
+  WOULD_BLOCK = 2;
+  QUEUE_FULL = 3;
+  ERROR = 4;
+}
+message OpResp {
+  uint64 operation_id = 1;
+  OpStatus status = 2;
+  uint64 result_handle = 3;
+  bytes result = 4;
+  PayloadRef payload_ref = 5;
+}
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  LINK_ACCEPTED = 1;
+  LINK_ACTIVE = 2;
+  LINK_DEGRADED = 3;
+  WRITABLE = 4;
+  MTU_CHANGED = 5;
+  QUALITY_CHANGED = 6;
+  ADDRESS_REBOUND = 7;
+  CANDIDATE_FOUND = 8;
+  CANDIDATE_UPDATED = 9;
+  CANDIDATE_EXPIRED = 10;
+  CANDIDATE_REMOVED = 11;
+  DISCOVERY_COMPLETE = 12;
+  HEALTH = 13;
+  CLOSING = 14;
+  CLOSED = 15;
+  FAILED = 16;
+}
+message PluginEvent { EventType event_type = 1; uint64 handle = 2; bytes payload = 3; }
+message Heartbeat { uint64 sequence = 1; }
+message HeartbeatAck { uint64 sequence = 1; }
+message GoAway { string reason = 1; uint64 drain_deadline_ms = 2; }
+message Shutdown {}
+message PluginError { uint32 category = 1; string operation = 2; string message = 3; }
+
+message PluginEnvelope {
+  ApiVersion api_version = 1;
+  uint64 sequence = 2;
+  oneof body {
+    PluginHello plugin_hello = 3;
+    DaemonHello daemon_hello = 4;
+    PluginConfig config = 5;
+    StartAck start_ack = 6;
+    OpReq op_req = 7;
+    OpResp op_resp = 8;
+    PluginEvent event = 9;
+    Heartbeat heartbeat = 10;
+    HeartbeatAck heartbeat_ack = 11;
+    GoAway goaway = 12;
+    Shutdown shutdown = 13;
+    PluginError error = 14;
+  }
+}

@@ -7,6 +7,7 @@ pub enum Namespace {
     Peer,
     Route,
     Bundle,
+    Relay,
     Api,
     Abuse,
 }
@@ -21,6 +22,7 @@ impl Namespace {
             Namespace::Peer => "peer",
             Namespace::Route => "route",
             Namespace::Bundle => "bundle",
+            Namespace::Relay => "relay",
             Namespace::Api => "api",
             Namespace::Abuse => "abuse",
         }

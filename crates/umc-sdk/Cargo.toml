@@ -5,12 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blake2 = "0.10"
 umc-control = { path = "../umc-control" }
 umc-carrier = { path = "../umc-carrier" }
 umc-core = { path = "../umc-core" }
 umc-crypto = { path = "../umc-crypto" }
 umc-storage = { path = "../umc-storage" }
 umc-types = { path = "../umc-types" }
+umc-wire = { path = "../umc-wire" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time"] }
 prost = "0.13"

@@ -5,7 +5,7 @@ use crate::cancellation::CancellationRegistry;
 use crate::config::NodeConfig;
 use crate::control_application::{
     close_connection as close_application_connection, close_listener,
-    dispatch_request as dispatch_application_request, open_listener,
+    connect_route_probe_for_wait, dispatch_request as dispatch_application_request, open_listener,
     register as register_application, unregister as unregister_application,
 };
 use crate::control_authorization::{
@@ -48,7 +48,10 @@ use umc_control::pages::PageToken;
 use umc_control::proto::umc::api::v1 as api;
 use umc_core::block::BlockReason;
 use umc_core::rate_limiter::Rule;
-use umc_core::trust::TrustState;
+use umc_core::revocation::RevocationStore;
+use umc_core::trust::{decode_delegation_chain, encode_delegation_chain, DelegationStore, TrustState};
+use umc_core::trust_statement::SignedDelegation;
+use umc_crypto::signatures::IdentityPublicKey;
 use umc_discovery::invitation::InvitationError;
 use umc_discovery::provider::{CandidateAuth, CandidateSource, PeerCandidate, SharingPolicy};
 use umc_routing::paths::{decode_path_metadata, PATH_METADATA_MAGIC};
@@ -62,6 +65,7 @@ use umc_storage::secret_export::{self, SecretExportError};
 use umc_storage::sqlite::SqliteStore;
 use umc_storage::store::{Namespace, Store};
 use umc_types::runtime::{EntropySource, Instant};
+use umc_types::edition::CoreEdition;
 
 pub(crate) const DEFAULT_ENVELOPE_MAX: usize = 4 * 1024 * 1024;
 const MAX_ORDINARY_REQUEST_PAYLOAD: usize = 1024 * 1024;
@@ -121,15 +125,8 @@ struct CloseCircuitRequest {
     reason: u64,
 }
 
-/// Wire response for `PeerService.ListCandidates`: a bounded discovery
-/// snapshot (discovery.md §6). No proto message exists yet.
-#[derive(Clone, PartialEq, prost::Message)]
-struct ListCandidatesResponse {
-    #[prost(message, repeated, tag = "1")]
-    candidates: Vec<CandidateSummary>,
-    #[prost(uint32, tag = "2")]
-    total: u32,
-}
+/// Compatibility aliases for the canonical Control API discovery messages.
+type ListCandidatesResponse = api::ListCandidatesResponse;
 
 /// Wire body of the `PeerService.CreateInvitation` invitation document
 /// (discovery.md §14): the proto `InvitationScope` does not carry the
@@ -143,17 +140,8 @@ struct InvitationDocument {
     scope: Option<api::InvitationScope>,
 }
 
-#[derive(Clone, PartialEq, prost::Message)]
-struct CandidateSummary {
-    #[prost(uint64, tag = "1")]
-    candidate_id: u64,
-    #[prost(string, tag = "2")]
-    carrier_type: String,
-    #[prost(uint64, tag = "3")]
-    expires_at_ms: u64,
-    #[prost(bool, tag = "4")]
-    public: bool,
-}
+type CandidateSummary = api::CandidateSummary;
+type ServiceHintSummary = api::ServiceHintSummary;
 
 /// Wire request for `CarrierService.GetLinkProperties` (task F2): the
 /// capability report for one registered carrier type. No proto message
@@ -322,6 +310,10 @@ pub async fn run(state: Arc<Mutex<RuntimeState>>) {
 
         let mut options = ServerOptions::new();
         options.pipe_mode(PipeMode::Byte);
+        // Keep the control plane local-only even if Tokio's defaults change.
+        // The ordinary connection semaphore still bounds the number of live
+        // local clients without serializing otherwise independent operators.
+        options.reject_remote_clients(true);
         let pipe = match options.create(&pipe_name) {
             Ok(pipe) => pipe,
             Err(error) => {
@@ -438,7 +430,90 @@ where
                         let worker_tx = response_tx.clone();
                         let worker_registry = cancellation.clone();
                         workers.push(tokio::task::spawn_blocking(move || {
-                            let response = {
+                            let wait_request = match msg.body.as_ref() {
+                                Some(api::envelope::Body::Request(request))
+                                    if request.service == "RouteService"
+                                        && request.method == "ProbeRoute" =>
+                                {
+                                    api::ProbeRouteRequest::decode(request.payload.as_slice())
+                                        .ok()
+                                        .filter(|probe| probe.wait_for_usable)
+                                        .map(|_| request.clone())
+                                }
+                                _ => None,
+                            };
+                            let connect_wait_request = match msg.body.as_ref() {
+                                Some(api::envelope::Body::Request(request))
+                                    if request.service == "ApplicationService"
+                                        && request.method == "Connect" =>
+                                {
+                                    api::ConnectRequest::decode(request.payload.as_slice())
+                                        .ok()
+                                        .map(|_| request.clone())
+                                }
+                                _ => None,
+                            };
+                            let wait_deadline = wait_request.as_ref().and_then(|request| {
+                                let runtime = worker_state.lock().expect("runtime state");
+                                effective_request_deadline(&runtime, request).ok()
+                            });
+                            let connect_wait = connect_wait_request.as_ref().and_then(|request| {
+                                let deadline = {
+                                    let runtime = worker_state.lock().expect("runtime state");
+                                    effective_request_deadline(&runtime, request).ok()?
+                                };
+                                let pending = {
+                                    let mut runtime = worker_state.lock().expect("runtime state");
+                                    let connection = worker_conn.lock().expect("connection state");
+                                    if request_validation_status(request).is_some()
+                                        || request_abort_status(
+                                            &runtime,
+                                            deadline,
+                                            Some(&request_cancellation),
+                                        )
+                                        .is_some()
+                                        || authorize_live_request_with_peer(
+                                            &runtime,
+                                            request,
+                                            connection.presented_token.as_deref(),
+                                            connection.os_peer_authenticated,
+                                        )
+                                        .is_err()
+                                    {
+                                        false
+                                    } else {
+                                        matches!(
+                                            connect_route_probe_for_wait(&mut runtime, request, false),
+                                            Ok(Some(false))
+                                        )
+                                    }
+                                };
+                                pending.then(|| {
+                                    wait_for_connect_route(
+                                        &worker_state,
+                                        request,
+                                        &request_cancellation,
+                                        deadline,
+                                    )
+                                })
+                            });
+                            let response = if let Some(wait_result) = connect_wait {
+                                match wait_result {
+                                    Ok(()) => {
+                                        let mut runtime = worker_state.lock().expect("runtime state");
+                                        let mut connection = worker_conn.lock().expect("connection state");
+                                        handle_envelope_after_sequence_with_cancellation(
+                                            &mut connection,
+                                            &mut runtime,
+                                            msg,
+                                            Some(&request_cancellation),
+                                        )
+                                    }
+                                    Err(code) => connect_wait_request
+                                        .as_ref()
+                                        .map(|request| response_envelope(request, code, None)),
+                                }
+                            } else {
                                 let mut runtime = worker_state.lock().expect("runtime state");
                                 let mut connection = worker_conn.lock().expect("connection state");
                                 handle_envelope_after_sequence_with_cancellation(
@@ -447,6 +522,18 @@ where
                                     msg,
                                     Some(&request_cancellation),
                                 )
+                            };
+                            let response = match (wait_request, response, wait_deadline) {
+                                (Some(request), Some(response), Some(deadline)) => Some(
+                                    wait_for_route_probe(
+                                        &worker_state,
+                                        &request,
+                                        response,
+                                        &request_cancellation,
+                                        Some(deadline),
+                                    ),
+                                ),
+                                (_, response, _) => response,
                             };
                             worker_registry.remove(request_id);
                             if let Some(response) = response {
@@ -955,6 +1042,9 @@ fn dispatch_request(
             return response_envelope(request, api::StatusCode::Unauthenticated as i32, None);
         }
     }
+    if !edition_allows_service(state, request.service.as_str(), request.method.as_str()) {
+        return response_envelope(request, api::StatusCode::Unimplemented as i32, None);
+    }
     let principal_id = control_principal_id(state, presented_token).unwrap_or(0);
     // One request counter per service (core.md §42): the name is flat, the
     // service distinction is baked into it.
@@ -978,6 +1068,8 @@ fn dispatch_request(
         ("PeerService" | "DiscoveryService", "ListCandidates") => {
             list_candidates(state, presented_token)
         }
+        ("DiscoveryService", "PublishServiceHint") => publish_service_hint(state, request),
+        ("DiscoveryService", "DiscoverServices") => discover_services(state, request),
         ("PeerService", "ListPeers") => list_peers(state, request, principal_id),
         ("PeerService", "GetPeer") => get_peer(state, request),
         ("PeerService", "AddPeerHint") => add_peer_hint(state, request),
@@ -1034,6 +1126,10 @@ fn dispatch_request(
         ("IdentityService", "ExportSecretIdentity") => export_secret_identity(state, request),
         ("IdentityService", "ImportIdentity") => import_identity(state, request),
         ("IdentityService", "DeleteIdentity") => delete_identity(state, request, principal_id),
+        ("IdentityService", "CreateDelegation") => create_delegation(state, request),
+        ("IdentityService", "ImportDelegation") => import_delegation(state, request),
+        ("IdentityService", "ListDelegations") => list_delegations(state, request),
+        ("IdentityService", "RevokeDelegation") => revoke_delegation(state, request),
         // CarrierService instance lifecycle is owned by the modular
         // registry-backed control_carriers module. Raw Dial links are owned
         // here; CloseLink operates on either a raw link or a live session.
@@ -1193,6 +1289,10 @@ fn get_status(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
         metric_names::REVOCATION_STATE_STALE,
         u64::from(state.revocation_claim_warning(now.0).is_some()),
     );
+    let edition = state
+        .config
+        .core_edition()
+        .expect("runtime config edition is validated");
     let status = api::NodeStatus {
         state: api::NodeLifecycleState::Running as i32,
         software_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1208,6 +1308,12 @@ fn get_status(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
             .effective_privacy_profile()
             .as_str()
             .to_string(),
+        core_edition: edition.as_str().to_string(),
+        capabilities: edition
+            .capabilities()
+            .iter()
+            .map(|capability| (*capability).to_string())
+            .collect(),
         ..Default::default()
     };
     let response = api::GetStatusResponse {
@@ -1216,6 +1322,25 @@ fn get_status(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
     let mut payload = Vec::new();
     Message::encode(&response, &mut payload).expect("encode");
     (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// Edition-gate services whose implementations are not part of the Lite
+/// footprint. The gate is local only: it does not affect handshakes or realm
+/// admission, so all editions remain peers on the same UMP mesh.
+fn edition_allows_service(state: &RuntimeState, service: &str, method: &str) -> bool {
+    let capability_service = if matches!(
+        (service, method),
+        ("PeerService" | "DiscoveryService", "ListCandidates")
+    ) {
+        "DiscoveryService"
+    } else {
+        service
+    };
+    state
+        .config
+        .core_edition()
+        .unwrap_or(CoreEdition::Standard)
+        .supports_optional_service(capability_service)
 }
 
 /// `PeerService.ListCandidates`: discovery table snapshot.
@@ -1252,6 +1377,70 @@ fn list_candidates(
         candidates,
         total: u32::try_from(snapshot.len()).unwrap_or(u32::MAX),
     };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+fn service_hint_summary(hint: &crate::discovery_service::ServiceHintRecord) -> ServiceHintSummary {
+    ServiceHintSummary {
+        peer_endpoint_id: hint.peer_endpoint_id.to_vec(),
+        protocol_id: String::from_utf8_lossy(&hint.protocol_id).into_owned(),
+        endpoint_hint: hint.endpoint_hint.clone(),
+        metadata: hint.metadata.clone(),
+        expires_at_unix_ms: i64::try_from(hint.expiration_time).unwrap_or(i64::MAX),
+        signature: hint.signature.clone(),
+        public: hint.public,
+    }
+}
+
+/// `DiscoveryService.PublishServiceHint`: stores an opaque, locally signed
+/// application advertisement. The daemon never interprets its metadata.
+fn publish_service_hint(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(input) = api::PublishServiceHintRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok(expiration_time) = u64::try_from(input.expires_at_unix_ms) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let now = wall_now();
+    let hint = match state.discovery.publish_service_hint(
+        &state.node_identity.identity,
+        input.protocol_id.into_bytes(),
+        input.endpoint_hint,
+        input.metadata,
+        expiration_time,
+        input.public,
+        now,
+    ) {
+        Ok(hint) => hint,
+        Err(error) => {
+            log::debug!("[discovery] service hint rejected: {error}");
+            return (api::StatusCode::InvalidArgument as i32, None);
+        }
+    };
+    let response = api::PublishServiceHintResponse {
+        hint: Some(service_hint_summary(&hint)),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `DiscoveryService.DiscoverServices`: returns active public hints only.
+/// Results are candidates and do not imply endpoint trust.
+fn discover_services(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(input) = api::DiscoverServicesRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let protocol_id = (!input.protocol_id.is_empty()).then(|| input.protocol_id.into_bytes());
+    let hints = state
+        .discovery
+        .service_hints(protocol_id.as_deref(), wall_now())
+        .into_iter()
+        .map(|hint| service_hint_summary(&hint))
+        .collect();
+    let response = api::DiscoverServicesResponse { hints };
     let mut payload = Vec::new();
     Message::encode(&response, &mut payload).expect("encode");
     (api::StatusCode::Ok as i32, Some(payload))
@@ -1896,7 +2085,7 @@ fn get_session(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec
             active_path_count(state, session_id),
         )),
         paths: path_summaries(state, session_id),
-        privacy: Some(session_privacy_info(&state.config, &entry)),
+        privacy: Some(session_privacy_info(state, session_id, &entry)),
     };
     let mut payload = Vec::new();
     Message::encode(&response, &mut payload).expect("encode");
@@ -1973,22 +2162,50 @@ fn path_summaries(state: &RuntimeState, session_id: u64) -> Vec<api::PathSummary
 /// a private profile requires route wiring that the v1 daemon has not yet
 /// attached to the session registry (privacy.md §57).
 fn session_privacy_info(
-    config: &NodeConfig,
+    state: &RuntimeState,
+    session_id: u64,
     entry: &crate::session_manager::SessionEntry,
 ) -> api::SessionPrivacyInfo {
-    let requested = config.privacy_profile_value();
+    let requested = state.config.privacy_profile_value();
     let effective = match entry.privacy_profile.min(3) {
         0 => umc_core::privacy::PrivacyProfile::P0,
         1 => umc_core::privacy::PrivacyProfile::P1,
         2 => umc_core::privacy::PrivacyProfile::P2,
         _ => umc_core::privacy::PrivacyProfile::P3,
     };
+    let route = state.privacy_routes.get(&session_id);
+    let (min_hop_count, max_hop_count, anonymous_authorization_active, privacy_reason) =
+        route.map_or_else(
+            || {
+                if entry.direct_path_allowed {
+                    (1, 1, false, String::new())
+                } else {
+                    (0, 0, false, "private route metadata unavailable".into())
+                }
+            },
+            |route| {
+                (
+                    route.min_hops,
+                    route.max_hops,
+                    route.anonymous_authorization,
+                    route.reason.clone(),
+                )
+            },
+        );
     api::SessionPrivacyInfo {
         requested_profile: requested.as_str().to_string(),
         effective_profile: effective.as_str().to_string(),
         direct_path_allowed: entry.direct_path_allowed,
         traffic_padding_active: entry.traffic_padding_active,
-        hop_count: u32::from(entry.direct_path_allowed),
+        hop_count: if min_hop_count == max_hop_count {
+            min_hop_count
+        } else {
+            0
+        },
+        min_hop_count,
+        max_hop_count,
+        anonymous_authorization_active,
+        privacy_reason,
     }
 }
 
@@ -2120,7 +2337,7 @@ fn migrate_session(state: &mut RuntimeState, request: &api::Request) -> (i32, Op
             .map_err(|_| ())
             .expect("path challenge encoding");
         let Ok(Some(packet)) =
-            session.build_outbound_on_path(path_id, state.node.clock.as_ref(), now, &frame)
+            session.build_outbound_on_path_at(path_id, now, &frame)
         else {
             return (api::StatusCode::FailedPrecondition as i32, None);
         };
@@ -2284,9 +2501,12 @@ fn list_routes(
             destination_hint_hash: snapshot.key_hash,
             scope: route_scope_from_u8(snapshot.scope),
             state: "candidate".into(),
-            // The proto has no next-hop field; the hop label rides in
-            // `carrier_class` (the v1 snapshot's only other string field).
-            carrier_class: String::from_utf8_lossy(&snapshot.next_hop).into_owned(),
+            // Older snapshots only have the next-hop label. Fresh snapshots
+            // expose authenticated carrier evidence when available.
+            carrier_class: snapshot
+                .carrier_type
+                .clone()
+                .unwrap_or_else(|| String::from_utf8_lossy(&snapshot.next_hop).into_owned()),
             expires_at_unix_ms: i64::try_from(
                 snapshot.learned_at_ms.saturating_add(snapshot.lifetime_ms),
             )
@@ -2344,8 +2564,8 @@ fn route_state_str(state: RouteState) -> &'static str {
 }
 
 /// One `RouteSummary` from a cached route record (routing.md §24): the key
-/// hash doubles as the opaque handle, the next hop rides in
-/// `carrier_class` (the same field `ListRoutes` uses).
+/// hash doubles as the opaque handle; authenticated carrier evidence is
+/// exposed when present, with the legacy next-hop label as fallback.
 fn route_summary(record: &umc_routing::types::RouteRecord) -> api::RouteSummary {
     let (hop_count, relay_count) = decode_path_metadata(&record.metadata).map_or((1, 0), |hops| {
         (
@@ -2362,7 +2582,10 @@ fn route_summary(record: &umc_routing::types::RouteRecord) -> api::RouteSummary 
         state: route_state_str(record.state).into(),
         hop_count,
         relay_count,
-        carrier_class: record.next_hop.clone(),
+        carrier_class: record
+            .carrier_type
+            .clone()
+            .unwrap_or_else(|| record.next_hop.clone()),
         expires_at_unix_ms: i64::try_from(record.expires_at.0).unwrap_or(i64::MAX),
         last_success_unix_ms: record
             .last_success
@@ -2445,7 +2668,10 @@ fn get_route(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u
                 destination_hint_hash: snapshot.key_hash,
                 scope: route_scope_from_u8(snapshot.scope),
                 state: "candidate".into(),
-                carrier_class: String::from_utf8_lossy(&snapshot.next_hop).into_owned(),
+                carrier_class: snapshot
+                    .carrier_type
+                    .clone()
+                    .unwrap_or_else(|| String::from_utf8_lossy(&snapshot.next_hop).into_owned()),
                 expires_at_unix_ms: i64::try_from(
                     snapshot.learned_at_ms.saturating_add(snapshot.lifetime_ms),
                 )
@@ -2470,8 +2696,8 @@ fn get_route(state: &RuntimeState, request: &api::Request) -> (i32, Option<Vec<u
 /// bounded `ROUTE_REQUEST` over live, policy-eligible session-bus peers. The
 /// request gets local reverse state so downstream `ROUTE_RESPONSE` frames can
 /// be consumed and cached by the normal session-task path (routing.md
-/// §§9-18). `wait_for_usable` remains non-blocking: callers receive an
-/// operation handle and any candidates already available.
+/// §§9-18). Live control workers add the bounded wait requested by
+/// `wait_for_usable` after releasing the runtime-state mutex.
 fn probe_route(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
     let Ok(probe) = api::ProbeRouteRequest::decode(request.payload.as_slice()) else {
         return (api::StatusCode::InvalidArgument as i32, None);
@@ -2484,36 +2710,8 @@ fn probe_route(state: &mut RuntimeState, request: &api::Request) -> (i32, Option
         Ok(policy) => policy,
         Err(status) => return (status, None),
     };
-    let hash = crate::session_task::hash_destination(&probe.destination_hint);
-    let key = RouteKey {
-        destination_profile: 0,
-        destination_hash: hash,
-        scope,
-        policy_class: 0,
-    };
-    // Node-clock `now`: the cache is stamped with the monotonic node clock
-    // (see `get_route`).
     let now = state.node.clock.as_ref().now();
-    let candidates: Vec<api::RouteSummary> = state
-        .routing
-        .cache
-        .ranked_candidates(&key, now)
-        .into_iter()
-        .filter(|record| {
-            route_candidate_eligible(
-                state,
-                record,
-                &policy,
-                scope,
-                state
-                    .config
-                    .effective_privacy_profile()
-                    .includes(umc_core::privacy::PrivacyProfile::P2),
-            )
-        })
-        .take(3)
-        .map(|record| route_summary(&record))
-        .collect();
+    let candidates = collect_route_candidates(state, &probe, &policy, scope, now);
 
     if let Err(status) = fanout_route_probe(
         state,
@@ -2526,15 +2724,215 @@ fn probe_route(state: &mut RuntimeState, request: &api::Request) -> (i32, Option
     ) {
         return (status, None);
     }
-    let response = api::ProbeRouteResponse {
-        operation_handle: Some(api::OpaqueHandle {
-            value: hash.to_vec(),
-        }),
-        candidates,
-    };
+    let response = route_probe_response(&probe, candidates);
     let mut payload = Vec::new();
     Message::encode(&response, &mut payload).expect("encode");
     (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// Start a route probe from an in-process ApplicationService.Connect call.
+/// The Connect worker already owns the runtime-state mutex, so this helper
+/// deliberately performs only the bounded fanout/cache admission step; the
+/// caller must release the mutex before waiting for route responses.
+pub(crate) fn probe_route_for_connect(state: &mut RuntimeState, request: &api::Request) -> bool {
+    probe_route(state, request).0 == api::StatusCode::Ok as i32
+}
+
+pub(crate) fn collect_route_candidates(
+    state: &RuntimeState,
+    probe: &api::ProbeRouteRequest,
+    policy: &api::RoutePolicy,
+    scope: RouteScope,
+    now: Instant,
+) -> Vec<api::RouteSummary> {
+    let hash = crate::session_task::hash_destination(&probe.destination_hint);
+    let key = RouteKey {
+        destination_profile: 0,
+        destination_hash: hash,
+        scope,
+        policy_class: 0,
+    };
+    state
+        .routing
+        .cache
+        .ranked_candidates(&key, now)
+        .into_iter()
+        .filter(|record| {
+            route_candidate_eligible(
+                state,
+                record,
+                policy,
+                scope,
+                state
+                    .config
+                    .effective_privacy_profile()
+                    .includes(umc_core::privacy::PrivacyProfile::P2),
+            )
+        })
+        .take(3)
+        .map(|record| route_summary(&record))
+        .collect()
+}
+
+fn route_probe_response(
+    probe: &api::ProbeRouteRequest,
+    candidates: Vec<api::RouteSummary>,
+) -> api::ProbeRouteResponse {
+    api::ProbeRouteResponse {
+        operation_handle: Some(api::OpaqueHandle {
+            value: crate::session_task::hash_destination(&probe.destination_hint).to_vec(),
+        }),
+        candidates,
+    }
+}
+
+/// Poll helper kept independent from runtime state so deadline behavior is
+/// deterministic in unit tests and the live worker can release its mutex
+/// between checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteProbeWait {
+    Usable,
+    Cancelled,
+    Deadline,
+}
+
+fn wait_for_usable_until<Now, Check, Sleep>(
+    deadline: Instant,
+    mut now: Now,
+    mut check: Check,
+    mut sleep: Sleep,
+) -> RouteProbeWait
+where
+    Now: FnMut() -> Instant,
+    Check: FnMut() -> Result<bool, ()>,
+    Sleep: FnMut(u64),
+{
+    loop {
+        match check() {
+            Ok(true) => return RouteProbeWait::Usable,
+            Err(()) => return RouteProbeWait::Cancelled,
+            Ok(false) => {}
+        }
+        let current = now();
+        if current >= deadline {
+            return RouteProbeWait::Deadline;
+        }
+        sleep(deadline.duration_since(current).as_millis().clamp(1, 2));
+    }
+}
+
+/// Complete a live `wait_for_usable` probe after the initial fanout has
+/// returned. The control worker calls this outside the runtime-state mutex so
+/// session tasks can acquire the mutex and admit route responses meanwhile.
+pub(crate) fn wait_for_route_probe(
+    runtime: &std::sync::Arc<std::sync::Mutex<RuntimeState>>,
+    request: &api::Request,
+    initial_response: Vec<u8>,
+    cancellation: &CancellationHandle,
+    deadline: Option<Instant>,
+) -> Vec<u8> {
+    let Ok(probe) = api::ProbeRouteRequest::decode(request.payload.as_slice()) else {
+        return initial_response;
+    };
+    if !probe.wait_for_usable {
+        return initial_response;
+    }
+    let Some(deadline) = deadline else { return initial_response; };
+    let initial_has_candidate = api::Envelope::decode(initial_response.as_slice())
+        .ok()
+        .and_then(|envelope| match envelope.body {
+            Some(api::envelope::Body::Response(response)) => {
+                api::ProbeRouteResponse::decode(response.payload.as_slice()).ok()
+            }
+            _ => None,
+        })
+        .is_some_and(|response| !response.candidates.is_empty());
+    if initial_has_candidate {
+        return initial_response;
+    }
+    let wait_result = wait_for_usable_until(
+        deadline,
+        || runtime.lock().expect("runtime state").node.clock.as_ref().now(),
+        || {
+            if cancellation.is_cancelled() {
+                return Err(());
+            }
+            let state = runtime.lock().expect("runtime state");
+            let Ok(policy) = route_probe_policy(&probe.policy.clone().unwrap_or_default()) else {
+                return Ok(false);
+            };
+            let route_policy = probe.policy.clone().unwrap_or_default();
+            let candidates = collect_route_candidates(&state, &probe, &route_policy, policy.0, state.node.clock.as_ref().now());
+            if !candidates.is_empty() {
+                return Ok(true);
+            }
+            Ok(false)
+        },
+        |delay_ms| std::thread::sleep(std::time::Duration::from_millis(delay_ms)),
+    );
+    match wait_result {
+        RouteProbeWait::Cancelled => {
+            return response_envelope(request, api::StatusCode::Cancelled as i32, None);
+        }
+        RouteProbeWait::Deadline => {
+            return response_envelope(request, api::StatusCode::DeadlineExceeded as i32, None);
+        }
+        RouteProbeWait::Usable => {}
+    }
+    let state = runtime.lock().expect("runtime state");
+    let route_policy = probe.policy.clone().unwrap_or_default();
+    let Ok((scope, _, _)) = route_probe_policy(&route_policy) else {
+        return response_envelope(request, api::StatusCode::InvalidArgument as i32, None);
+    };
+    let candidates = collect_route_candidates(
+        &state,
+        &probe,
+        &route_policy,
+        scope,
+        state.node.clock.as_ref().now(),
+    );
+    let mut payload = Vec::new();
+    Message::encode(&route_probe_response(&probe, candidates), &mut payload).expect("encode");
+    response_envelope(request, api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// Wait for the relay leg required by a private ApplicationService.Connect.
+/// The worker deliberately drops the runtime-state mutex between every probe
+/// so inbound route responses and session-task progress can be admitted while
+/// the caller is waiting. A fresh fanout is sent at most every 100 ms; the
+/// intervening checks only inspect the live, policy-filtered route cache.
+pub(crate) fn wait_for_connect_route(
+    runtime: &std::sync::Arc<std::sync::Mutex<RuntimeState>>,
+    request: &api::Request,
+    cancellation: &CancellationHandle,
+    deadline: Instant,
+) -> Result<(), i32> {
+    let mut first_probe = true;
+    let mut last_probe = Instant(0);
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(api::StatusCode::Cancelled as i32);
+        }
+        let now = runtime.lock().expect("runtime state").node.clock.as_ref().now();
+        if now >= deadline {
+            return Err(api::StatusCode::DeadlineExceeded as i32);
+        }
+        let fanout = first_probe || now.duration_since(last_probe).as_millis() >= 100;
+        let status = {
+            let mut state = runtime.lock().expect("runtime state");
+            connect_route_probe_for_wait(&mut state, request, fanout)?
+        };
+        if fanout {
+            last_probe = now;
+            first_probe = false;
+        }
+        match status {
+            None | Some(true) => return Ok(()),
+            Some(false) => {}
+        }
+        let remaining = deadline.duration_since(now).as_millis().min(5);
+        std::thread::sleep(std::time::Duration::from_millis(remaining.max(1)));
+    }
 }
 
 /// Apply hard route constraints before a cached candidate reaches the control
@@ -2553,10 +2951,15 @@ pub(crate) fn route_candidate_eligible(
     ) {
         return false;
     }
-    // A caller-provided carrier allow-list is a hard constraint. The current
-    // canonical path metadata does not carry a carrier class, so claiming a
-    // match would be an unverifiable downgrade.
-    if !policy.allowed_carrier_types.is_empty() {
+    // Carrier evidence is copied from the authenticated adjacent session at
+    // response admission. Legacy/local records without that evidence fail
+    // closed rather than treating the next-hop endpoint id as a carrier.
+    if !policy.allowed_carrier_types.is_empty()
+        && !policy
+            .allowed_carrier_types
+            .iter()
+            .any(|allowed| record.carrier_type.as_deref() == Some(allowed.as_str()))
+    {
         return false;
     }
     let path = if record.metadata.starts_with(PATH_METADATA_MAGIC) {
@@ -2717,6 +3120,7 @@ fn fanout_route_probe(
         maximum_hops,
         max_relays,
         policy.allow_relay,
+        policy.allow_store_forward,
         now,
     );
     state
@@ -2896,6 +3300,11 @@ fn get_config(state: &RuntimeState) -> (i32, Option<Vec<u8>>) {
 fn node_config_message(config: &NodeConfig) -> api::NodeConfig {
     let entries = vec![
         api::ConfigEntry {
+            key: "edition".into(),
+            value: config.edition.clone(),
+            sensitive_present: false,
+        },
+        api::ConfigEntry {
             key: "profile".into(),
             value: config.profile.clone(),
             sensitive_present: false,
@@ -3040,6 +3449,17 @@ fn node_config_message(config: &NodeConfig) -> api::NodeConfig {
     ];
     api::NodeConfig {
         resource_profile: config.profile.clone(),
+        core_edition: config.edition.clone(),
+        capabilities: config
+            .core_edition()
+            .map(|edition| {
+                edition
+                    .capabilities()
+                    .iter()
+                    .map(|capability| (*capability).to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
         telemetry_enabled: config.telemetry_enabled,
         public_relay_enabled: config.public_relay && !config.disable_public_relay,
         entries,
@@ -3075,6 +3495,10 @@ fn set_config(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<
     }
     if let Err(e) = updated.validate_network_realm() {
         log::warn!("[config] network realm rejected: {e}");
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    if let Err(e) = updated.validate_edition_configuration() {
+        log::warn!("[config] edition rejected: {e}");
         return (api::StatusCode::InvalidArgument as i32, None);
     }
     if updated.network_mode != state.config.network_mode
@@ -3180,7 +3604,26 @@ fn create_bundle(state: &mut RuntimeState, request: &api::Request) -> (i32, Opti
         }
         Err(e) => {
             log::warn!("[bundle] create rejected: {e:?}");
-            (api::StatusCode::InvalidArgument as i32, None)
+            let code = match e {
+                umc_bundle::manager::BundleError::QuotaExceeded
+                | umc_bundle::manager::BundleError::TooLarge
+                | umc_bundle::manager::BundleError::ReplicationLimit => {
+                    api::StatusCode::ResourceExhausted as i32
+                }
+                umc_bundle::manager::BundleError::Duplicate => {
+                    api::StatusCode::AlreadyExists as i32
+                }
+                umc_bundle::manager::BundleError::Expired
+                | umc_bundle::manager::BundleError::Conflict
+                | umc_bundle::manager::BundleError::NotFound => {
+                    api::StatusCode::InvalidArgument as i32
+                }
+                umc_bundle::manager::BundleError::Persistence(_)
+                | umc_bundle::manager::BundleError::Storage(_) => {
+                    api::StatusCode::Unavailable as i32
+                }
+            };
+            (code, None)
         }
     }
 }
@@ -3339,6 +3782,7 @@ fn open_circuit(state: &mut RuntimeState, request: &api::Request) -> (i32, Optio
         flags: u8::try_from(open.flags).unwrap_or(u8::MAX),
         bidirectional: open.bidirectional,
         private_handling: open.private_handling,
+        multipath: false,
         // Control-opened circuits carry no wire destination hint; forwarding
         // targets come from `RELAY_OPEN.next_hop_hint` on session circuits.
         destination_hint: Vec::new(),
@@ -3912,11 +4356,6 @@ fn rotate_identity_key(state: &mut RuntimeState, request: &api::Request) -> (i32
     let Some(handle) = rotate.identity_handle else {
         return (api::StatusCode::InvalidArgument as i32, None);
     };
-    if rotate.require_old_key_signature {
-        // The request carries no old-signature material to verify against;
-        // the flag is unsupported (documented).
-        return (api::StatusCode::InvalidArgument as i32, None);
-    }
     let Some(resolved) = state.identity_by_handle(&handle.value) else {
         return (api::StatusCode::NotFound as i32, None);
     };
@@ -3930,14 +4369,14 @@ fn rotate_identity_key(state: &mut RuntimeState, request: &api::Request) -> (i32
         }
     }
     match state.rotate_identity_key(&handle.value) {
-        Ok(binding) => {
+        Ok((_binding, rotation_proof)) => {
             let summary = match state.identity_by_handle(&handle.value) {
                 Some(resolved) => summary_for(state, resolved),
                 None => return (api::StatusCode::NotFound as i32, None),
             };
             let response = api::RotateIdentityKeyResponse {
                 identity: Some(summary),
-                rotation_proof: binding.signature.to_vec(),
+                rotation_proof: rotation_proof.to_bytes().unwrap_or_default(),
             };
             let mut payload = Vec::new();
             Message::encode(&response, &mut payload).expect("encode");
@@ -3948,6 +4387,214 @@ fn rotate_identity_key(state: &mut RuntimeState, request: &api::Request) -> (i32
             (api::StatusCode::Internal as i32, None)
         }
     }
+}
+
+/// `IdentityService.CreateDelegation`: issue and persist a single leaf
+/// certificate from the selected local identity. The certificate is returned
+/// in the canonical handshake envelope so it can be imported by the new
+/// device without exposing any private key material.
+fn create_delegation(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(create) = api::CreateDelegationRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(handle) = create.identity_handle else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok(delegated_public_key) = <[u8; 32]>::try_from(create.delegated_public_key.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if create.expires_at_unix_ms <= 0 {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    let Some(resolved) = state.identity_by_handle(&handle.value) else {
+        return (api::StatusCode::NotFound as i32, None);
+    };
+    let (issuer, issuer_binding) = match resolved {
+        IdentityRef::Primary => (&state.node_identity.identity, &state.primary_binding),
+        IdentityRef::Secondary(entry) => (&entry.identity.identity, &entry.binding),
+    };
+    let expires_at = u64::try_from(create.expires_at_unix_ms).unwrap_or(0);
+    let certificate = match SignedDelegation::sign(
+        issuer,
+        delegated_public_key,
+        create.allowed_capabilities,
+        wall_now().0,
+        expires_at.min(issuer_binding.not_after),
+        1,
+    ) {
+        Ok(certificate) => certificate,
+        Err(error) => {
+            log::warn!("[identity] delegation creation rejected: {error:?}");
+            return (api::StatusCode::InvalidArgument as i32, None);
+        }
+    };
+    let chain = match encode_delegation_chain(std::slice::from_ref(&certificate)) {
+        Ok(chain) => chain,
+        Err(error) => {
+            log::warn!("[identity] delegation encoding failed: {error:?}");
+            return (api::StatusCode::InvalidArgument as i32, None);
+        }
+    };
+    if create.root_capabilities.is_empty() {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    let root_capabilities = create.root_capabilities;
+    if !certificate
+            .allowed_capabilities
+            .iter()
+            .all(|capability| root_capabilities.contains(capability))
+    {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    if let Err(error) = DelegationStore::new(state.store.as_ref()).accept_chain(
+        &issuer.public(),
+        &root_capabilities,
+        std::slice::from_ref(&certificate),
+        wall_now().0,
+    ) {
+        log::warn!("[identity] delegation persistence failed: {error:?}");
+        return (api::StatusCode::Internal as i32, None);
+    }
+    let response = api::CreateDelegationResponse {
+        certificate: certificate.to_bytes().unwrap_or_default(),
+        delegation_chain: chain,
+        root_public_key: issuer.public().0.to_vec(),
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `IdentityService.ImportDelegation`: verify and persist a delegation chain
+/// together with its root public key. No secret material is accepted.
+fn import_delegation(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(import) = api::ImportDelegationRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok(root_bytes) = <[u8; 32]>::try_from(import.root_public_key.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let chain = match decode_delegation_chain(&import.delegation_chain) {
+        Ok(chain) => chain,
+        Err(error) => {
+            log::warn!("[identity] delegation import framing failed: {error:?}");
+            return (api::StatusCode::InvalidArgument as i32, None);
+        }
+    };
+    let root = IdentityPublicKey(root_bytes);
+    let now = wall_now().0;
+    let authority = match DelegationStore::new(state.store.as_ref()).accept_chain(
+        &root,
+        &import.root_capabilities,
+        &chain,
+        now,
+    ) {
+        Ok(authority) => authority,
+        Err(error) => {
+            log::warn!("[identity] delegation import rejected: {error:?}");
+            return (api::StatusCode::InvalidArgument as i32, None);
+        }
+    };
+    let response = api::ImportDelegationResponse {
+        delegated_public_key: authority.public_key.0.to_vec(),
+        delegation_chain: import.delegation_chain,
+    };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `IdentityService.ListDelegations`: return only bounded public metadata.
+fn list_delegations(state: &RuntimeState, _request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let chains = match DelegationStore::new(state.store.as_ref()).valid_chains(wall_now().0) {
+        Ok(chains) => chains,
+        Err(error) => {
+            log::warn!("[identity] delegation listing failed: {error:?}");
+            return (api::StatusCode::Internal as i32, None);
+        }
+    };
+    let delegations = chains
+        .into_iter()
+        .filter_map(|chain| {
+            let leaf = chain.certificates.last()?;
+            Some(api::DelegationSummary {
+                root_public_key: chain.root_public_key.0.to_vec(),
+                delegated_public_key: leaf.delegated_public_key.to_vec(),
+                depth: u32::try_from(chain.certificates.len()).ok()?,
+                sequence: leaf.sequence,
+                expires_at_unix_ms: leaf.expires_at_ms,
+                capabilities: leaf.allowed_capabilities.clone(),
+            })
+        })
+        .collect();
+    let response = api::ListDelegationsResponse { delegations };
+    let mut payload = Vec::new();
+    Message::encode(&response, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
+}
+
+/// `IdentityService.RevokeDelegation`: a root identity signs a monotonic
+/// revocation for a delegated leaf. The certificate remains persisted for
+/// audit/listing, but no future handshake may use it.
+fn revoke_delegation(state: &mut RuntimeState, request: &api::Request) -> (i32, Option<Vec<u8>>) {
+    let Ok(revoke) = api::RevokeDelegationRequest::decode(request.payload.as_slice()) else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Some(handle) = revoke.identity_handle else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    let Ok(delegated_public_key) = <[u8; 32]>::try_from(revoke.delegated_public_key.as_slice())
+    else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if revoke.sequence == 0 || revoke.expires_at_unix_ms <= 0 {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    }
+    let Some(resolved) = state.identity_by_handle(&handle.value) else {
+        return (api::StatusCode::NotFound as i32, None);
+    };
+    let (issuer, binding) = match resolved {
+        IdentityRef::Primary => (&state.node_identity.identity, &state.primary_binding),
+        IdentityRef::Secondary(_) => return (api::StatusCode::PermissionDenied as i32, None),
+    };
+    let chain = match DelegationStore::new(state.store.as_ref())
+        .valid_chain_containing_public_key(&delegated_public_key, wall_now().0)
+        {
+        Ok(Some(chain)) if chain.root_public_key == issuer.public() => chain,
+        Ok(Some(_)) => return (api::StatusCode::PermissionDenied as i32, None),
+        Ok(None) => return (api::StatusCode::NotFound as i32, None),
+        Err(error) => {
+            log::warn!("[identity] delegation lookup failed: {error:?}");
+            return (api::StatusCode::Internal as i32, None);
+        }
+    };
+    let expires_at = u64::try_from(revoke.expires_at_unix_ms).unwrap_or(0);
+    let expires_at = expires_at.min(binding.not_after);
+    let statement = match umc_core::trust_statement::SignedRevocation::sign(
+        issuer,
+        umc_core::trust_statement::RevocationSubject::Delegation(delegated_public_key),
+        revoke.sequence,
+        wall_now().0,
+        expires_at,
+    ) {
+        Ok(statement) => statement,
+        Err(error) => {
+            log::warn!("[identity] delegation revocation rejected: {error:?}");
+            return (api::StatusCode::InvalidArgument as i32, None);
+        }
+    };
+    if let Err(error) = RevocationStore::new(state.store.as_ref()).accept_delegation_signed(
+        &statement,
+        &chain.root_public_key,
+        &delegated_public_key,
+        wall_now().0,
+    ) {
+        log::warn!("[identity] delegation revocation persistence failed: {error:?}");
+        return (api::StatusCode::Conflict as i32, None);
+    }
+    let mut payload = Vec::new();
+    Message::encode(&api::RevokeDelegationResponse {}, &mut payload).expect("encode");
+    (api::StatusCode::Ok as i32, Some(payload))
 }
 
 /// `IdentityService.ExportPublicIdentity`: the signed binding (public
@@ -4444,12 +5091,45 @@ fn carrier_type_info(carrier: &(dyn Carrier + Send + Sync)) -> api::CarrierTypeI
 /// registry is enumerated by resolving the configured ids against the
 /// runtime node. Configured-but-unregistered ids are skipped.
 fn registered_carriers(state: &RuntimeState) -> Vec<api::CarrierTypeInfo> {
-    state
+    let mut carriers: Vec<api::CarrierTypeInfo> = state
         .config
         .carriers
         .iter()
         .filter_map(|type_id| state.node.carrier(type_id).map(carrier_type_info))
-        .collect()
+        .collect();
+    for instance in state.carrier_instances.values() {
+        if !instance.external_plugin
+            || carriers.iter().any(|carrier| carrier.type_id == instance.type_id)
+        {
+            continue;
+        }
+        let supports_dial = instance.options.iter().any(|option| {
+            option.key == "supports_dial"
+                && !option.sensitive_present
+                && option.value.eq_ignore_ascii_case("true")
+        });
+        let supports_listen = instance.options.iter().any(|option| {
+            option.key == "supports_listen"
+                && !option.sensitive_present
+                && option.value.eq_ignore_ascii_case("true")
+        });
+        let supports_discovery = instance.options.iter().any(|option| {
+            option.key == "supports_discovery"
+                && !option.sensitive_present
+                && option.value.eq_ignore_ascii_case("true")
+        });
+        carriers.push(api::CarrierTypeInfo {
+            type_id: instance.type_id.clone(),
+            display_name: instance.label.clone(),
+            built_in: false,
+            supports_listen,
+            supports_dial,
+            supports_discovery,
+            minimum_packet_size: 1,
+            maximum_packet_size: 64 * 1024,
+        });
+    }
+    carriers
 }
 
 /// `CarrierService.ListCarrierTypes`: the registered carriers and their
@@ -4756,12 +5436,42 @@ fn get_link_properties(state: &RuntimeState, request: &api::Request) -> (i32, Op
     let Ok(get) = GetLinkPropertiesRequest::decode(request.payload.as_slice()) else {
         return (api::StatusCode::InvalidArgument as i32, None);
     };
-    let Some(carrier) = state.node.carrier(&get.carrier_type) else {
+    let info = state
+        .node
+        .carrier(&get.carrier_type)
+        .map(carrier_type_info)
+        .or_else(|| {
+            state
+                .carrier_instances
+                .values()
+                .find(|instance| instance.external_plugin && instance.type_id == get.carrier_type)
+                .map(|instance| api::CarrierTypeInfo {
+                    type_id: instance.type_id.clone(),
+                    display_name: instance.label.clone(),
+                    built_in: false,
+                    supports_listen: instance.options.iter().any(|option| {
+                        option.key == "supports_listen"
+                            && !option.sensitive_present
+                            && option.value.eq_ignore_ascii_case("true")
+                    }),
+                    supports_dial: instance.options.iter().any(|option| {
+                        option.key == "supports_dial"
+                            && !option.sensitive_present
+                            && option.value.eq_ignore_ascii_case("true")
+                    }),
+                    supports_discovery: instance.options.iter().any(|option| {
+                        option.key == "supports_discovery"
+                            && !option.sensitive_present
+                            && option.value.eq_ignore_ascii_case("true")
+                    }),
+                    minimum_packet_size: 1,
+                    maximum_packet_size: 64 * 1024,
+                })
+        });
+    let Some(info) = info else {
         return (api::StatusCode::NotFound as i32, None);
     };
-    let response = GetLinkPropertiesResponse {
-        info: Some(carrier_type_info(carrier)),
-    };
+    let response = GetLinkPropertiesResponse { info: Some(info) };
     let mut payload = Vec::new();
     Message::encode(&response, &mut payload).expect("encode");
     (api::StatusCode::Ok as i32, Some(payload))
@@ -4925,7 +5635,7 @@ pub fn load_node_state(store: &SqliteStore) -> Result<(String, Vec<String>), Str
     Ok((profile, carriers))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, not(feature = "edition-lite")))]
 mod tests {
     use super::*;
     use crate::control_transport::{IdempotencyCache, IDEMPOTENCY_CACHE_CAP, IDEMPOTENCY_TTL_MS};
@@ -4944,6 +5654,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let config = NodeConfig {
             data_dir: dir,
+            edition: "standard".into(),
             ..NodeConfig::default()
         };
         let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -4985,6 +5696,8 @@ mod tests {
         assert_eq!(status.active_sessions, 0);
         assert_eq!(status.active_relay_circuits, 0);
         assert_eq!(status.privacy_profile, "p0");
+        assert_eq!(status.core_edition, "standard");
+        assert!(status.capabilities.iter().any(|capability| capability == "core.identity-v1"));
         // Register a session; the count moves.
         state.sessions.register(
             state.sessions.next_id(),
@@ -5005,6 +5718,28 @@ mod tests {
             .status
             .expect("status");
         assert_eq!(status.active_sessions, 1);
+    }
+
+    #[test]
+    fn lite_gates_optional_services_without_gating_the_mesh() {
+        let (mut state, _tx) = test_state();
+        state.config.edition = "lite".into();
+        assert!(edition_allows_service(&state, "SessionService", "ListSessions"));
+        assert!(!edition_allows_service(&state, "RelayService", "GetRelayStatus"));
+        let response = decode_response(&dispatch_request(
+            &mut state,
+            &request("RelayService", "GetRelayStatus", vec![]),
+            None,
+        ));
+        assert_eq!(
+            response.status.expect("status").code,
+            api::StatusCode::Unimplemented as i32
+        );
+        assert!(!edition_allows_service(
+            &state,
+            "PeerService",
+            "ListCandidates"
+        ));
     }
 
     #[test]
@@ -5503,6 +6238,10 @@ mod tests {
         assert!(privacy.direct_path_allowed);
         assert!(!privacy.traffic_padding_active);
         assert_eq!(privacy.hop_count, 1);
+        assert_eq!(privacy.min_hop_count, 1);
+        assert_eq!(privacy.max_hop_count, 1);
+        assert!(!privacy.anonymous_authorization_active);
+        assert!(privacy.privacy_reason.is_empty());
 
         // An unknown handle is NotFound, not Ok.
         let get = api::GetSessionRequest {
@@ -6245,6 +6984,122 @@ mod tests {
     }
 
     #[test]
+    fn connect_route_wait_expires_without_a_usable_relay() {
+        let (mut state, _tx) = test_state();
+        state.config.privacy_profile = "p2".into();
+        let connect = api::ConnectRequest {
+            destination_hint: vec![7; 32],
+            policy: Some(api::ConnectionPolicy {
+                route: Some(api::RoutePolicy {
+                    scope: api::RouteScope::General as i32,
+                    allow_relay: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut payload = Vec::new();
+        Message::encode(&connect, &mut payload).expect("connect payload");
+        let request = request("ApplicationService", "Connect", payload);
+        let runtime = Arc::new(Mutex::new(state));
+        let cancellation = CancellationHandle::new();
+        let deadline = runtime
+            .lock()
+            .expect("runtime state")
+            .node
+            .clock
+            .as_ref()
+            .now()
+            + umc_types::runtime::Duration::from_millis(5);
+
+        assert_eq!(
+            wait_for_connect_route(&runtime, &request, &cancellation, deadline),
+            Err(api::StatusCode::DeadlineExceeded as i32)
+        );
+    }
+
+    #[test]
+    fn connect_route_wait_observes_a_relay_learned_after_dispatch() {
+        let (mut state, _tx) = test_state();
+        state.config.privacy_profile = "p2".into();
+        let destination = [7u8; 32];
+        let relay = [8u8; 32];
+        let connect = api::ConnectRequest {
+            destination_hint: destination.to_vec(),
+            policy: Some(api::ConnectionPolicy {
+                route: Some(api::RoutePolicy {
+                    scope: api::RouteScope::General as i32,
+                    allow_relay: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut payload = Vec::new();
+        Message::encode(&connect, &mut payload).expect("connect payload");
+        let request = request("ApplicationService", "Connect", payload);
+        let runtime = Arc::new(Mutex::new(state));
+        let route_runtime = runtime.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let mut state = route_runtime.lock().expect("runtime state");
+            let (in_tx, _in_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+            state
+                .bus
+                .lock()
+                .expect("session bus")
+                .register(relay.to_vec(), 1, in_tx, out_tx);
+            let metadata = umc_routing::paths::encode_path_metadata(&[
+                umc_routing::paths::PathHop {
+                    peer: relay.to_vec(),
+                    scope: RouteScope::General,
+                    failure_domain: Vec::new(),
+                    relay: true,
+                },
+                umc_routing::paths::PathHop {
+                    peer: destination.to_vec(),
+                    scope: RouteScope::General,
+                    failure_domain: Vec::new(),
+                    relay: false,
+                },
+            ])
+            .expect("path metadata");
+            let now = state.node.clock.as_ref().now();
+            let _ = state.routing.record_route_response_with_evidence(
+                RouteKey {
+                    destination_profile: 0,
+                    destination_hash: crate::session_task::hash_destination(&destination),
+                    scope: RouteScope::General,
+                    policy_class: 0,
+                },
+                "08".repeat(32),
+                60_000,
+                now,
+                None,
+                metadata,
+                Some("ump.relay/1".into()),
+            );
+        });
+        let cancellation = CancellationHandle::new();
+        let deadline = runtime
+            .lock()
+            .expect("runtime state")
+            .node
+            .clock
+            .as_ref()
+            .now()
+            + umc_types::runtime::Duration::from_millis(1_000);
+
+        assert_eq!(
+            wait_for_connect_route(&runtime, &request, &cancellation, deadline),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn get_route_finds_scoped_live_candidate() {
         let (mut state, _tx) = test_state();
         let now = state.node.clock.as_ref().now();
@@ -6330,6 +7185,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn probe_route_filters_hard_policy_before_return() {
         let (mut state, _tx) = test_state();
         let now = state.node.clock.as_ref().now();
@@ -6364,13 +7220,14 @@ mod tests {
             None,
             Vec::new(),
         );
-        let _ = state.routing.record_route_response_with_metadata(
+        let _ = state.routing.record_route_response_with_evidence(
             key,
             "relay".into(),
             600_000,
             now,
             None,
             relay_metadata,
+            Some("ump.relay/1".into()),
         );
 
         let probe = api::ProbeRouteRequest {
@@ -6392,7 +7249,52 @@ mod tests {
         let response = api::ProbeRouteResponse::decode(payload.as_deref().expect("payload"))
             .expect("probe response");
         assert_eq!(response.candidates.len(), 1);
-        assert_eq!(response.candidates[0].carrier_class, "relay");
+        assert_eq!(response.candidates[0].carrier_class, "ump.relay/1");
+
+        // Carrier allow-lists must match authenticated route evidence, not
+        // discard every candidate or trust an unrelated carrier label.
+        let probe = api::ProbeRouteRequest {
+            destination_hint: destination.to_vec(),
+            policy: Some(api::RoutePolicy {
+                scope: api::RouteScope::General as i32,
+                maximum_hops: 2,
+                maximum_relays: 1,
+                allow_relay: true,
+                allowed_carrier_types: vec!["ump.relay/1".into()],
+                ..Default::default()
+            }),
+            wait_for_usable: false,
+        };
+        let mut payload = Vec::new();
+        Message::encode(&probe, &mut payload).expect("probe payload");
+        let (code, payload) =
+            probe_route(&mut state, &request("RouteService", "ProbeRoute", payload));
+        assert_eq!(code, api::StatusCode::Ok as i32);
+        let response = api::ProbeRouteResponse::decode(payload.as_deref().expect("payload"))
+            .expect("probe response");
+        assert_eq!(response.candidates.len(), 1);
+        assert_eq!(response.candidates[0].carrier_class, "ump.relay/1");
+
+        let probe = api::ProbeRouteRequest {
+            destination_hint: destination.to_vec(),
+            policy: Some(api::RoutePolicy {
+                scope: api::RouteScope::General as i32,
+                maximum_hops: 2,
+                maximum_relays: 1,
+                allow_relay: true,
+                allowed_carrier_types: vec!["ump.udp/1".into()],
+                ..Default::default()
+            }),
+            wait_for_usable: false,
+        };
+        let mut payload = Vec::new();
+        Message::encode(&probe, &mut payload).expect("probe payload");
+        let (code, payload) =
+            probe_route(&mut state, &request("RouteService", "ProbeRoute", payload));
+        assert_eq!(code, api::StatusCode::Ok as i32);
+        let response = api::ProbeRouteResponse::decode(payload.as_deref().expect("payload"))
+            .expect("probe response");
+        assert!(response.candidates.is_empty());
 
         let probe = api::ProbeRouteRequest {
             destination_hint: destination.to_vec(),
@@ -6499,6 +7401,23 @@ mod tests {
         assert_eq!(code, api::StatusCode::InvalidArgument as i32);
         assert!(response_payload.is_none());
         assert!(state.routing.reverse.is_empty());
+    }
+
+    #[test]
+    fn wait_for_usable_honors_control_deadline() {
+        let mut now = 0;
+        let mut sleeps = Vec::new();
+        let usable = wait_for_usable_until(
+            Instant(5),
+            || {
+                now += 2;
+                Instant(now)
+            },
+            || Ok(false),
+            |delay| sleeps.push(delay),
+        );
+        assert_eq!(usable, RouteProbeWait::Deadline);
+        assert!(sleeps.iter().all(|delay| *delay <= 2));
     }
 
     #[test]
@@ -6804,6 +7723,11 @@ mod tests {
             .config
             .expect("config");
         assert_eq!(config.resource_profile, "relay");
+        assert_eq!(config.core_edition, "standard");
+        assert!(config
+            .capabilities
+            .iter()
+            .any(|capability| capability == "carrier.tls-v1"));
         assert!(config
             .entries
             .iter()
@@ -6872,6 +7796,10 @@ mod tests {
         assert!(!privacy.direct_path_allowed);
         assert!(privacy.traffic_padding_active);
         assert_eq!(privacy.hop_count, 0);
+        assert_eq!(privacy.min_hop_count, 0);
+        assert_eq!(privacy.max_hop_count, 0);
+        assert!(!privacy.anonymous_authorization_active);
+        assert_eq!(privacy.privacy_reason, "private route metadata unavailable");
     }
 
     #[test]
@@ -6971,6 +7899,94 @@ mod tests {
             .results;
         assert!(!results.is_empty());
         assert!(results.iter().any(|r| r.check_id == "database"));
+    }
+
+    #[test]
+    fn service_hint_publish_and_discover_round_trip() {
+        let (mut state, _tx) = test_state();
+        let protocol_id = "org.example.chat/1";
+        let expires_at_unix_ms = wall_now().0.saturating_add(60_000);
+        let publish = api::PublishServiceHintRequest {
+            protocol_id: protocol_id.into(),
+            endpoint_hint: b"chat.example.invalid".to_vec(),
+            metadata: br#"{"region":"test"}"#.to_vec(),
+            expires_at_unix_ms: i64::try_from(expires_at_unix_ms).expect("timestamp"),
+            public: true,
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "DiscoveryService",
+                "PublishServiceHint",
+                encode_request(&publish),
+            ),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let published = api::PublishServiceHintResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .hint
+            .expect("hint");
+        assert_eq!(published.protocol_id, protocol_id);
+        assert_eq!(published.endpoint_hint, b"chat.example.invalid");
+        assert_eq!(published.signature.len(), 64);
+        assert!(published.public);
+
+        let discover = api::DiscoverServicesRequest {
+            protocol_id: protocol_id.into(),
+        };
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "DiscoveryService",
+                "DiscoverServices",
+                encode_request(&discover),
+            ),
+            None,
+        );
+        let response = decode_response(&bytes);
+        assert_eq!(
+            response.status.as_ref().unwrap().code,
+            api::StatusCode::Ok as i32
+        );
+        let discovered = api::DiscoverServicesResponse::decode(response.payload.as_slice())
+            .expect("payload")
+            .hints;
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0], published);
+
+        // Private hints are accepted locally but are never returned by the
+        // public discovery listing or emitted to peers.
+        let mut private = publish;
+        private.endpoint_hint = b"private-only".to_vec();
+        private.public = false;
+        dispatch_request(
+            &mut state,
+            &request(
+                "DiscoveryService",
+                "PublishServiceHint",
+                encode_request(&private),
+            ),
+            None,
+        );
+        let bytes = dispatch_request(
+            &mut state,
+            &request(
+                "DiscoveryService",
+                "DiscoverServices",
+                encode_request(&discover),
+            ),
+            None,
+        );
+        let discovered = api::DiscoverServicesResponse::decode(decode_response(&bytes).payload.as_slice())
+            .expect("payload")
+            .hints;
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].endpoint_hint, b"chat.example.invalid");
     }
 
     #[test]
@@ -7503,6 +8519,34 @@ mod tests {
             api_version: Some(api::ApiVersion { major: 1, minor: 0 }),
             sequence,
             body: Some(body),
+        }
+    }
+
+    #[test]
+    fn unauthenticated_network_transport_cannot_reach_filesystem_controls() {
+        let (state, _tx) = test_state();
+        // These operations can mutate durable state, export key material, or
+        // launch a configured child process. They are all local Control API
+        // operations; an authenticated UMP peer must never be able to turn a
+        // network session into a filesystem/control-plane capability.
+        for (service, method) in [
+            ("NodeAdmin", "UpdateConfig"),
+            ("NodeAdmin", "Shutdown"),
+            ("IdentityService", "ExportSecretIdentity"),
+            ("CarrierService", "CreateCarrierInstance"),
+            ("BundleService", "CreateBundle"),
+            ("TokenService", "CreateToken"),
+        ] {
+            assert_eq!(
+                crate::control_authorization::authorize_live_request_with_peer(
+                    &state,
+                    &request(service, method, Vec::new()),
+                    Some(b"even-a-valid-bearer"),
+                    false,
+                ),
+                Err(api::StatusCode::Unauthenticated as i32),
+                "{service}.{method} must remain behind the local OS-peer gate"
+            );
         }
     }
 
@@ -9094,6 +10138,77 @@ mod tests {
     }
 
     #[test]
+    fn delegation_provision_list_and_revoke_round_trip() {
+        with_password("test-password", || {
+            let (mut state, _tx) = test_state();
+            let delegated = umc_crypto::signatures::IdentityKeyPair::from_seed([91u8; 32]);
+            let create = api::CreateDelegationRequest {
+                identity_handle: Some(identity_handle("node-identity")),
+                delegated_public_key: delegated.public().0.to_vec(),
+                allowed_capabilities: vec![b"identity".to_vec()],
+                expires_at_unix_ms: i64::try_from(wall_now().0.saturating_add(60_000))
+                    .expect("expiry fits"),
+                root_capabilities: vec![b"identity".to_vec()],
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "CreateDelegation", encode_request(&create)),
+                None,
+            );
+            let response = decode_response(&bytes);
+            assert_eq!(response.status.unwrap().code, api::StatusCode::Ok as i32);
+            let created = api::CreateDelegationResponse::decode(response.payload.as_slice())
+                .expect("delegation response");
+            assert_eq!(created.root_public_key, state.node_identity.identity.public().0);
+            assert!(!created.delegation_chain.is_empty());
+
+            let bytes = dispatch_request(
+                &mut state,
+                &request(
+                    "IdentityService",
+                    "ListDelegations",
+                    encode_request(&api::ListDelegationsRequest {}),
+                ),
+                None,
+            );
+            let listed = api::ListDelegationsResponse::decode(
+                decode_response(&bytes).payload.as_slice(),
+            )
+            .expect("delegation list");
+            assert_eq!(listed.delegations.len(), 1);
+            assert_eq!(listed.delegations[0].delegated_public_key, delegated.public().0);
+
+            let revoke = api::RevokeDelegationRequest {
+                identity_handle: Some(identity_handle("node-identity")),
+                delegated_public_key: delegated.public().0.to_vec(),
+                sequence: 1,
+                expires_at_unix_ms: i64::try_from(wall_now().0.saturating_add(60_000))
+                    .expect("expiry fits"),
+                reason: "device retired".into(),
+            };
+            let bytes = dispatch_request(
+                &mut state,
+                &request("IdentityService", "RevokeDelegation", encode_request(&revoke)),
+                None,
+            );
+            assert_eq!(
+                decode_response(&bytes).status.unwrap().code,
+                api::StatusCode::Ok as i32
+            );
+            let chain = umc_core::trust::DelegationStore::new(state.store.as_ref())
+                .valid_chain_for_public_key(&delegated.public().0, wall_now().0)
+                .expect("delegation store")
+                .expect("persisted delegation");
+            let revocation = umc_core::revocation::RevocationStore::new(state.store.as_ref())
+                .check_delegation(&chain, wall_now().0);
+            assert!(matches!(
+                revocation,
+                Err(umc_core::revocation::RevocationError::Revoked { .. })
+            ));
+        });
+    }
+
+    #[test]
     fn get_identity_resolves_by_endpoint_and_handle() {
         with_password("test-password", || {
             let (mut state, _tx) = test_state();
@@ -9296,10 +10411,9 @@ mod tests {
                 "a full identity change means a new endpoint id"
             );
             assert_eq!(summary.binding_sequence, 1);
-            assert_eq!(
-                rotated.rotation_proof.len(),
-                64,
-                "the new binding's signature"
+            assert!(
+                rotated.rotation_proof.len() > 64,
+                "rotation response carries a dual-signed proof"
             );
             assert_eq!(
                 state.node.config.dcid,
@@ -9365,7 +10479,8 @@ mod tests {
                 decode_response(&bytes).status.unwrap().code,
                 api::StatusCode::NotFound as i32
             );
-            // require_old_key_signature is unsupported → InvalidArgument.
+            // A dual-signed proof is now always produced; the request flag is
+            // retained as an explicit caller preference for that guarantee.
             let rotate = api::RotateIdentityKeyRequest {
                 identity_handle: Some(identity_handle("node-identity")),
                 expected_revision: None,
@@ -9380,10 +10495,14 @@ mod tests {
                 ),
                 None,
             );
+            let response = decode_response(&bytes);
             assert_eq!(
-                decode_response(&bytes).status.unwrap().code,
-                api::StatusCode::InvalidArgument as i32
+                response.status.unwrap().code,
+                api::StatusCode::Ok as i32
             );
+            let rotated = api::RotateIdentityKeyResponse::decode(response.payload.as_slice())
+                .expect("rotation payload");
+            assert!(rotated.rotation_proof.len() > 64);
         });
     }
 
@@ -11620,6 +12739,7 @@ mod tests {
                     flags: 0,
                     bidirectional: true,
                     private_handling: false,
+                    multipath: false,
                     destination_hint: b"dest-peer".to_vec(),
                 },
                 peer.to_vec(),

@@ -10,13 +10,60 @@ use umc_carrier::types::{
 };
 use umc_carrier::{BoxLink, Carrier};
 use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
+use umc_handshake::identity::IdentityBinding;
 use umc_handshake::traffic::SessionSecrets;
 use umc_types::runtime::{Clock, EntropySource};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NodeIdentity {
     pub identity: IdentityKeyPair,
     pub static_handshake: StaticHandshakeKeyPair,
+}
+
+/// An endpoint identity that authenticates through a locally-authorized
+/// delegation chain. The delegated key and binding are sent in `CLIENT_AUTH`;
+/// the responder independently verifies the canonical chain against its
+/// persisted trust state before activating the session.
+#[derive(Debug, Clone)]
+pub struct DelegatedIdentity {
+    pub identity: NodeIdentity,
+    pub binding: IdentityBinding,
+    /// Canonical envelope: `[count || u16 length || certificate bytes] *`.
+    /// Use `umc_core::trust::encode_delegation_chain` to construct it.
+    pub delegation_chain: Vec<u8>,
+}
+
+impl DelegatedIdentity {
+    /// Validates the local key/binding relationship and the envelope bounds.
+    /// Chain authority is deliberately checked by the remote responder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Handshake`] if the binding does not match the key
+    /// material, has an invalid signature, or the chain is outside bounds.
+    pub fn validate(&self) -> Result<(), NodeError> {
+        if self.binding.identity_public_key != self.identity.identity.public()
+            || self.binding.static_handshake_public_key != self.identity.static_handshake.public()
+            || self.binding.endpoint_id
+                != umc_handshake::identity::endpoint_id(&self.identity.identity.public())
+        {
+            return Err(NodeError::Handshake(
+                "delegated identity binding does not match key material".into(),
+            ));
+        }
+        if !self
+            .binding
+            .identity_public_key
+            .verify(&self.binding.signed_message(), &self.binding.signature)
+        {
+            return Err(NodeError::Handshake(
+                "delegated identity binding signature is invalid".into(),
+            ));
+        }
+        crate::trust::decode_delegation_chain(&self.delegation_chain)
+            .map_err(|error| NodeError::Handshake(format!("delegation chain: {error:?}")))?;
+        Ok(())
+    }
 }
 
 impl NodeIdentity {
@@ -49,6 +96,7 @@ pub struct Node {
     next_session: u64,
     realm_marker: [u8; 32],
     private_realm: bool,
+    delegated_identity: Option<DelegatedIdentity>,
 }
 
 impl std::fmt::Debug for Node {
@@ -76,6 +124,15 @@ pub struct ConnectedTransport {
     pub dcid: Vec<u8>,
     pub secrets: SessionSecrets,
     pub peer_endpoint_id: [u8; 32],
+    /// Static handshake key authenticated by the full XX exchange. Resumed
+    /// sessions leave this unset because v1 tickets carry endpoint identity,
+    /// not a fresh binding.
+    pub peer_static_handshake_public_key: Option<[u8; 32]>,
+    /// Identity signing key authenticated by a full handshake. Resumed
+    /// sessions leave this unset and reuse daemon-persisted peer state.
+    pub peer_identity_public_key: Option<[u8; 32]>,
+    /// Whether this transport used the single-hop IK resumption path.
+    pub resumed: bool,
 }
 
 impl std::fmt::Debug for ConnectedTransport {
@@ -84,6 +141,11 @@ impl std::fmt::Debug for ConnectedTransport {
             .field("session_id", &self.session_id)
             .field("dcid", &self.dcid)
             .field("peer_endpoint_id", &self.peer_endpoint_id)
+            .field(
+                "peer_static_handshake_public_key",
+                &self.peer_static_handshake_public_key,
+            )
+            .field("peer_identity_public_key", &self.peer_identity_public_key)
             .finish_non_exhaustive()
     }
 }
@@ -99,6 +161,7 @@ impl Node {
             next_session: 0,
             realm_marker: umc_handshake::xx::public_realm_marker(),
             private_realm: false,
+            delegated_identity: None,
         }
     }
 
@@ -110,9 +173,32 @@ impl Node {
         self.private_realm = private;
     }
 
+    /// Selects a delegated endpoint for future outbound sessions. Passing
+    /// `None` restores the node's primary identity. The chain is copied so
+    /// callers may safely release their provisioning buffers after this call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Handshake`] when the supplied delegated identity
+    /// fails local binding or envelope validation.
+    pub fn set_delegated_identity(
+        &mut self,
+        delegated: Option<DelegatedIdentity>,
+    ) -> Result<(), NodeError> {
+        if let Some(identity) = delegated.as_ref() {
+            identity.validate()?;
+        }
+        self.delegated_identity = delegated;
+        Ok(())
+    }
+
     pub fn register_carrier(&mut self, carrier: Box<dyn Carrier + Send + Sync>) {
         self.carriers
             .insert(carrier.type_id().0.clone(), Arc::from(carrier));
+    }
+
+    pub fn unregister_carrier(&mut self, carrier_type: &str) {
+        self.carriers.remove(carrier_type);
     }
 
     #[must_use]
@@ -156,7 +242,7 @@ impl Node {
         remote: String,
         _server_identity_public: &NodeIdentity,
     ) -> Result<u64, NodeError> {
-        self.connect_with_endpoint_check(carrier_type, remote, None, None)
+        self.connect_with_endpoint_check(carrier_type, remote, None, None, None)
             .await
             .map(|connection| connection.session_id)
     }
@@ -175,9 +261,15 @@ impl Node {
         remote: String,
         expected_endpoint_id: [u8; 32],
     ) -> Result<u64, NodeError> {
-        self.connect_with_endpoint_check(carrier_type, remote, Some(expected_endpoint_id), None)
-            .await
-            .map(|connection| connection.session_id)
+        self.connect_with_endpoint_check(
+            carrier_type,
+            remote,
+            Some(expected_endpoint_id),
+            None,
+            None,
+        )
+        .await
+        .map(|connection| connection.session_id)
     }
 
     /// Complete an outbound XX handshake and retain the authenticated link
@@ -195,8 +287,59 @@ impl Node {
         remote: String,
         expected_endpoint_id: Option<[u8; 32]>,
     ) -> Result<ConnectedTransport, NodeError> {
-        self.connect_with_endpoint_check(carrier_type, remote, expected_endpoint_id, None)
+        self.connect_with_endpoint_check(carrier_type, remote, expected_endpoint_id, None, None)
             .await
+    }
+
+    /// Complete an outbound XX handshake using a locally-authorized delegated
+    /// endpoint. The delegated key is used only for this operation; the node's
+    /// primary identity selection is not mutated, so concurrent control calls
+    /// cannot cross-contaminate authentication.
+    ///
+    /// # Errors
+    /// Returns carrier, deadline, or handshake errors from the delegated
+    /// transport exchange.
+    pub async fn connect_transport_with_delegated_identity(
+        &mut self,
+        carrier_type: &str,
+        remote: String,
+        expected_endpoint_id: Option<[u8; 32]>,
+        delegated: DelegatedIdentity,
+    ) -> Result<ConnectedTransport, NodeError> {
+        delegated.validate()?;
+        self.connect_with_endpoint_check(
+            carrier_type,
+            remote,
+            expected_endpoint_id,
+            None,
+            Some(delegated),
+        )
+        .await
+    }
+
+    /// Deadline-bounded delegated-identity variant of
+    /// [`Node::connect_transport`].
+    ///
+    /// # Errors
+    /// Returns carrier, deadline, or handshake errors from the delegated
+    /// transport exchange.
+    pub async fn connect_transport_with_delegated_identity_and_deadline(
+        &mut self,
+        carrier_type: &str,
+        remote: String,
+        expected_endpoint_id: Option<[u8; 32]>,
+        deadline: std::time::Instant,
+        delegated: DelegatedIdentity,
+    ) -> Result<ConnectedTransport, NodeError> {
+        delegated.validate()?;
+        self.connect_with_endpoint_check(
+            carrier_type,
+            remote,
+            expected_endpoint_id,
+            Some(deadline),
+            Some(delegated),
+        )
+        .await
     }
 
     /// Complete an outbound handshake with a monotonic operation deadline.
@@ -215,8 +358,14 @@ impl Node {
         expected_endpoint_id: Option<[u8; 32]>,
         deadline: std::time::Instant,
     ) -> Result<ConnectedTransport, NodeError> {
-        self.connect_with_endpoint_check(carrier_type, remote, expected_endpoint_id, Some(deadline))
-            .await
+        self.connect_with_endpoint_check(
+            carrier_type,
+            remote,
+            expected_endpoint_id,
+            Some(deadline),
+            None,
+        )
+        .await
     }
 
     /// Complete an outbound XX handshake over a caller-owned link.
@@ -265,12 +414,78 @@ impl Node {
         .await
     }
 
+    /// Relay-backed delegated-identity variant of
+    /// [`Node::connect_transport_over_link`].
+    ///
+    /// # Errors
+    /// Returns carrier, deadline, or handshake errors from the delegated
+    /// transport exchange.
+    pub async fn connect_transport_over_link_with_delegated_identity(
+        &mut self,
+        carrier_type: &str,
+        link: BoxLink,
+        expected_endpoint_id: Option<[u8; 32]>,
+        delegated: DelegatedIdentity,
+    ) -> Result<ConnectedTransport, NodeError> {
+        delegated.validate()?;
+        self.connect_transport_over_link_inner_with_identity(
+            carrier_type,
+            link,
+            expected_endpoint_id,
+            None,
+            Some(delegated),
+        )
+        .await
+    }
+
+    /// Deadline-bounded delegated-identity variant for relay-backed links.
+    ///
+    /// # Errors
+    /// Returns carrier, deadline, or handshake errors from the delegated
+    /// transport exchange.
+    pub async fn connect_transport_over_link_with_delegated_identity_and_deadline(
+        &mut self,
+        carrier_type: &str,
+        link: BoxLink,
+        expected_endpoint_id: Option<[u8; 32]>,
+        deadline: std::time::Instant,
+        delegated: DelegatedIdentity,
+    ) -> Result<ConnectedTransport, NodeError> {
+        delegated.validate()?;
+        self.connect_transport_over_link_inner_with_identity(
+            carrier_type,
+            link,
+            expected_endpoint_id,
+            Some(deadline),
+            Some(delegated),
+        )
+        .await
+    }
+
     async fn connect_transport_over_link_inner(
         &mut self,
         carrier_type: &str,
         link: BoxLink,
         expected_endpoint_id: Option<[u8; 32]>,
         deadline: Option<std::time::Instant>,
+    ) -> Result<ConnectedTransport, NodeError> {
+        self.connect_transport_over_link_inner_with_identity(
+            carrier_type,
+            link,
+            expected_endpoint_id,
+            deadline,
+            None,
+        )
+        .await
+    }
+
+    async fn connect_transport_over_link_inner_with_identity(
+        &mut self,
+        carrier_type: &str,
+        link: BoxLink,
+        expected_endpoint_id: Option<[u8; 32]>,
+        deadline: Option<std::time::Instant>,
+        delegated: Option<DelegatedIdentity>,
     ) -> Result<ConnectedTransport, NodeError> {
         if self.carriers.contains_key(carrier_type) {
             return Err(NodeError::Handshake(format!(
@@ -287,6 +502,7 @@ impl Node {
                 String::new(),
                 expected_endpoint_id,
                 deadline,
+                delegated,
             )
             .await;
         self.carriers.remove(carrier_type);
@@ -299,11 +515,18 @@ impl Node {
         remote: String,
         expected_endpoint_id: Option<[u8; 32]>,
         deadline: Option<std::time::Instant>,
+        delegated: Option<DelegatedIdentity>,
     ) -> Result<ConnectedTransport, NodeError> {
         let mut retried = false;
         loop {
             match self
-                .connect_attempt(carrier_type, remote.clone(), expected_endpoint_id, deadline)
+                .connect_attempt(
+                    carrier_type,
+                    remote.clone(),
+                    expected_endpoint_id,
+                    deadline,
+                    delegated.as_ref(),
+                )
                 .await
             {
                 Err(NodeError::VersionNegotiation) if !retried => {
@@ -324,10 +547,36 @@ impl Node {
         remote: String,
         expected_endpoint_id: Option<[u8; 32]>,
         deadline: Option<std::time::Instant>,
+        delegated: Option<&DelegatedIdentity>,
     ) -> Result<ConnectedTransport, NodeError> {
         let carrier = self
             .carrier_handle(carrier_type)
             .ok_or(NodeError::CarrierUnknown)?;
+        let (client_identity, client_static, client_binding, delegation_chain) =
+            if let Some(delegated) = delegated.or(self.delegated_identity.as_ref()) {
+                (
+                    delegated.identity.identity.clone(),
+                    delegated.identity.static_handshake.clone(),
+                    delegated.binding.clone(),
+                    (!delegated.delegation_chain.is_empty())
+                        .then(|| delegated.delegation_chain.clone()),
+                )
+            } else {
+                let binding = umc_handshake::identity::IdentityBinding::sign(
+                    &self.config.identity.identity,
+                    &self.config.identity.static_handshake.public(),
+                    0,
+                    u64::MAX,
+                    0,
+                    [0u8; 32],
+                );
+                (
+                    self.config.identity.identity.clone(),
+                    self.config.identity.static_handshake.clone(),
+                    binding,
+                    None,
+                )
+            };
         let client_ephemeral = StaticHandshakeKeyPair::generate();
         let mut hello =
             umc_handshake::xx::ClientHello::new(self.entropy.as_ref(), &client_ephemeral);
@@ -453,7 +702,7 @@ impl Node {
         // sides. The CLIENT_AUTH payload itself carries the REAL static,
         // binding, and signature.
         let handshake_out = umc_handshake::xx::complete_client_side_with_retry_context(
-            &self.config.identity.identity,
+            &client_identity,
             &client_ephemeral,
             &client_ephemeral,
             &hello,
@@ -475,28 +724,20 @@ impl Node {
         // both endpoint ids, sealed with the provisional-chain client-auth
         // key. The message rides in an encrypted Handshake packet using the
         // directional traffic secret derived from the frozen transcript.
-        let binding = umc_handshake::identity::IdentityBinding::sign(
-            &self.config.identity.identity,
-            &self.config.identity.static_handshake.public(),
-            0,
-            u64::MAX,
-            0,
-            [0u8; 32],
-        );
-        let client_eid =
-            umc_handshake::identity::endpoint_id(&self.config.identity.identity.public());
+        let client_eid = umc_handshake::identity::endpoint_id(&client_identity.public());
         let sig_input = umc_handshake::xx::client_signature_input(
             &handshake_out.transcript_hash,
             &client_eid,
             &handshake_out.server_endpoint_id,
-            &self.config.identity.static_handshake.public().0,
+            &client_static.public().0,
             &handshake_out.server_static_public_key,
         );
-        let client_signature = self.config.identity.identity.sign(&sig_input);
-        let plaintext = umc_handshake::xx::build_client_auth_plaintext(
-            &self.config.identity.static_handshake.public().0,
-            &binding,
+        let client_signature = client_identity.sign(&sig_input);
+        let plaintext = umc_handshake::xx::build_client_auth_plaintext_with_delegation(
+            &client_static.public().0,
+            &client_binding,
             &client_signature,
+            delegation_chain.as_deref().unwrap_or_default(),
         );
         let ciphertext = umc_handshake::xx::encrypt_client_auth(
             &handshake_out.client_auth_key,
@@ -617,7 +858,7 @@ impl Node {
             &handshake_out.server_endpoint_id,
             &client_eid,
             &handshake_out.server_static_public_key,
-            &self.config.identity.static_handshake.public().0,
+            &client_static.public().0,
             &auth_body,
             &finished_message.body,
         )
@@ -662,6 +903,9 @@ impl Node {
             dcid: session_dcid,
             secrets,
             peer_endpoint_id,
+            peer_static_handshake_public_key: Some(handshake_out.server_static_public_key),
+            peer_identity_public_key: Some(handshake_out.server_identity_public_key.0),
+            resumed: false,
         })
     }
 
@@ -696,6 +940,24 @@ impl Node {
         ticket: &[u8],
         resumption_secret: &[u8; 32],
     ) -> Result<u64, NodeError> {
+        self.connect_resumed_transport(carrier_type, remote, ticket, resumption_secret)
+            .await
+            .map(|connection| connection.session_id)
+    }
+
+    /// Complete an outbound IK resumption and retain the carrier plus the
+    /// derived traffic secrets for a daemon-owned session loop.
+    ///
+    /// # Errors
+    /// Returns the same carrier, handshake, and version-negotiation errors as
+    /// [`Node::connect_resumed`].
+    pub async fn connect_resumed_transport(
+        &mut self,
+        carrier_type: &str,
+        remote: String,
+        ticket: &[u8],
+        resumption_secret: &[u8; 32],
+    ) -> Result<ConnectedTransport, NodeError> {
         let mut retried = false;
         loop {
             match self
@@ -721,9 +983,9 @@ impl Node {
         remote: String,
         ticket: &[u8],
         resumption_secret: &[u8; 32],
-    ) -> Result<u64, NodeError> {
+    ) -> Result<ConnectedTransport, NodeError> {
         let carrier = self
-            .carrier(carrier_type)
+            .carrier_handle(carrier_type)
             .ok_or(NodeError::CarrierUnknown)?;
         let link = carrier.dial(remote).map_err(NodeError::Carrier)?;
 
@@ -853,22 +1115,32 @@ impl Node {
         // documented as not derived). The peer identity is not re-established
         // by the resume (no identity exchange): it is unknown until a full
         // handshake.
+        let secrets = SessionSecrets {
+            client: resume.client,
+            server: resume.server,
+            exporter: [0u8; 32],
+            resumption: [0u8; 32],
+            path_validation: [0u8; 32],
+            connection_id: [0u8; 32],
+            stateless_reset: [0u8; 32],
+        };
         self.sessions.lock().await.insert(
             id,
             SessionEntry {
-                secrets: SessionSecrets {
-                    client: resume.client,
-                    server: resume.server,
-                    exporter: [0u8; 32],
-                    resumption: [0u8; 32],
-                    path_validation: [0u8; 32],
-                    connection_id: [0u8; 32],
-                    stateless_reset: [0u8; 32],
-                },
+                secrets: secrets.clone(),
                 peer_endpoint_id: [0u8; 32],
             },
         );
-        Ok(id)
+        Ok(ConnectedTransport {
+            session_id: id,
+            link,
+            dcid: transport_session_dcid(&dcid),
+            secrets,
+            peer_endpoint_id: [0u8; 32],
+            peer_static_handshake_public_key: None,
+            peer_identity_public_key: None,
+            resumed: true,
+        })
     }
 }
 
@@ -1452,6 +1724,58 @@ mod tests {
         let a = NodeIdentity::generate(&TestEntropy);
         let b = NodeIdentity::generate(&TestEntropy);
         assert_ne!(a.endpoint_id(), b.endpoint_id());
+    }
+
+    #[test]
+    fn delegated_identity_selection_requires_matching_signed_binding() {
+        let identity = NodeIdentity::generate(&TestEntropy);
+        let binding = umc_handshake::identity::IdentityBinding::sign(
+            &identity.identity,
+            &identity.static_handshake.public(),
+            0,
+            u64::MAX,
+            0,
+            [7u8; 32],
+        );
+        let root = IdentityKeyPair::generate();
+        let certificate = crate::trust_statement::SignedDelegation::sign(
+            &root,
+            identity.identity.public().0,
+            vec![b"chat".to_vec()],
+            0,
+            u64::MAX,
+            1,
+        )
+        .expect("certificate");
+        let chain = crate::trust::encode_delegation_chain(&[certificate]).expect("chain");
+        let mut node = Node::new(
+            NodeConfig {
+                identity: NodeIdentity::generate(&TestEntropy),
+                dcid: vec![1u8; 8],
+            },
+            Arc::new(TestClock),
+            Arc::new(TestEntropy),
+        );
+        node.set_delegated_identity(Some(DelegatedIdentity {
+            identity,
+            binding,
+            delegation_chain: chain,
+        }))
+        .expect("matching delegated identity");
+        assert!(node
+            .set_delegated_identity(Some(DelegatedIdentity {
+                identity: NodeIdentity::generate(&TestEntropy),
+                binding: umc_handshake::identity::IdentityBinding::sign(
+                    &IdentityKeyPair::generate(),
+                    &StaticHandshakeKeyPair::generate().public(),
+                    0,
+                    u64::MAX,
+                    0,
+                    [0u8; 32],
+                ),
+                delegation_chain: vec![1],
+            }))
+            .is_err());
     }
 
     #[test]

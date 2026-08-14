@@ -5,10 +5,11 @@
 use crate::state::RuntimeState;
 use umc_carrier::registry::CarrierRegistry;
 use umc_carrier::Carrier;
-use umc_carrier_lan::{LanDiscoveryCarrier, LanDiscoveryConfig};
+use umc_carrier_lan::{LanDiscovery, LanDiscoveryCarrier, LanDiscoveryConfig};
 use umc_carrier_tcp::TcpCarrier;
 use umc_carrier_tls::TlsCarrier;
 use umc_carrier_udp::UdpCarrier;
+use umc_types::edition::CoreEdition;
 
 /// Default TCP bind address when `tcp_listen` is unset.
 pub const DEFAULT_TCP_LISTEN: &str = "127.0.0.1:9001";
@@ -19,8 +20,16 @@ pub const DEFAULT_UDP_LISTEN: &str = "127.0.0.1:9002";
 /// data-carrier listeners, holding the binders in the runtime state.
 pub fn wire_carriers(state: &mut RuntimeState) {
     let config = state.config.clone();
+    let edition = config.core_edition().unwrap_or(CoreEdition::Standard);
     let registry = CarrierRegistry::default();
     for carrier_type in &config.carriers {
+        if !edition.supports_carrier(carrier_type) {
+            log::warn!(
+                "[carrier] {carrier_type} is not available in {} edition; skipped",
+                edition.as_str()
+            );
+            continue;
+        }
         if !registry.contains(carrier_type) {
             log::error!("[carrier] unknown carrier type {carrier_type}; skipped");
             continue;
@@ -154,7 +163,63 @@ fn register_lan(state: &mut RuntimeState) {
         },
     };
     state.node.register_carrier(Box::new(carrier));
-    log::info!("[carrier] ump.lan-discovery/1 registered (discovery loop in Task 15+)");
+    let advertised_tcp_port = configured_data_port(
+        &state.config,
+        "ump.tcp/1",
+        state.config.tcp_listen.as_deref(),
+        DEFAULT_TCP_LISTEN,
+    );
+    let advertised_udp_port = configured_data_port(
+        &state.config,
+        "ump.udp/1",
+        state.config.udp_listen.as_deref(),
+        DEFAULT_UDP_LISTEN,
+    );
+    match LanDiscovery::bind(LanDiscoveryConfig {
+        node_hint: state.node.config.identity.endpoint_id().to_vec(),
+        ..LanDiscoveryConfig::default()
+    }) {
+        Ok(discovery) => {
+            state.discovery.register_provider(Box::new(
+                crate::lan_discovery::LanDiscoveryProvider::new(
+                    discovery,
+                    state.node.config.identity.endpoint_id().to_vec(),
+                    advertised_tcp_port,
+                    advertised_udp_port,
+                ),
+            ));
+            let reports = state.discovery.start_providers();
+            if reports
+                .iter()
+                .any(|report| report.state != umc_discovery::manager::ProviderState::Running)
+            {
+                log::warn!("[discovery] LAN provider did not start cleanly");
+            }
+            let refresh = state.discovery.refresh_providers(crate::state::wall_now());
+            log::debug!(
+                "[discovery] LAN provider admitted {} candidate(s)",
+                refresh.admitted_candidates
+            );
+            log::info!("[carrier] ump.lan-discovery/1 registered");
+        }
+        Err(error) => log::warn!("[carrier] LAN discovery unavailable: {error:?}"),
+    }
+}
+
+fn configured_data_port(
+    config: &crate::config::NodeConfig,
+    carrier: &str,
+    listen: Option<&str>,
+    default: &str,
+) -> Option<u16> {
+    if !config.carriers.iter().any(|value| value == carrier) || config.carrier_disabled(carrier) {
+        return None;
+    }
+    listen
+        .or(Some(default))
+        .and_then(|address| address.rsplit_once(':'))
+        .and_then(|(_, port)| port.parse().ok())
+        .filter(|port| *port != 0)
 }
 
 #[cfg(test)]

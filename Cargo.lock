@@ -1800,6 +1800,16 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "socket2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
@@ -1947,7 +1957,7 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2",
+ "socket2 0.6.5",
  "tokio-macros",
  "windows-sys 0.61.2",
 ]
@@ -1981,7 +1991,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "umc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "prost",
@@ -1992,12 +2002,13 @@ dependencies = [
 
 [[package]]
 name = "umc-bundle"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake2",
  "serde",
  "serde_json",
  "umc-crypto",
+ "umc-handshake",
  "umc-storage",
  "umc-types",
  "umc-wire",
@@ -2005,15 +2016,16 @@ dependencies = [
 
 [[package]]
 name = "umc-carrier"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "umc-types",
 ]
 
 [[package]]
 name = "umc-carrier-lan"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "socket2 0.5.10",
  "tokio",
  "umc-carrier",
  "umc-types",
@@ -2021,7 +2033,7 @@ dependencies = [
 
 [[package]]
 name = "umc-carrier-tcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tokio",
  "umc-carrier",
@@ -2030,7 +2042,7 @@ dependencies = [
 
 [[package]]
 name = "umc-carrier-tls"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rcgen",
  "rustls",
@@ -2042,7 +2054,7 @@ dependencies = [
 
 [[package]]
 name = "umc-carrier-udp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tokio",
  "umc-carrier",
@@ -2050,8 +2062,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "umc-chat"
+version = "0.2.0"
+dependencies = [
+ "tokio",
+ "umc-sdk",
+]
+
+[[package]]
 name = "umc-control"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake2",
  "prost",
@@ -2062,7 +2082,7 @@ dependencies = [
 
 [[package]]
 name = "umc-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake2",
  "tokio",
@@ -2078,7 +2098,7 @@ dependencies = [
 
 [[package]]
 name = "umc-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake2",
  "chacha20",
@@ -2093,7 +2113,7 @@ dependencies = [
 
 [[package]]
 name = "umc-discovery"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "umc-crypto",
  "umc-handshake",
@@ -2103,7 +2123,7 @@ dependencies = [
 
 [[package]]
 name = "umc-echo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rand_core 0.6.4",
  "tokio",
@@ -2115,8 +2135,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "umc-file-transfer"
+version = "0.2.0"
+dependencies = [
+ "blake2",
+ "tokio",
+ "umc-sdk",
+]
+
+[[package]]
 name = "umc-handshake"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake2",
  "proptest",
@@ -2127,19 +2156,28 @@ dependencies = [
 
 [[package]]
 name = "umc-metrics"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "umc-plugin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "blake2",
+ "prost",
+ "prost-build",
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
+ "tokio",
+ "umc-carrier",
+ "umc-crypto",
+ "umc-discovery",
+ "umc-types",
 ]
 
 [[package]]
 name = "umc-relay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "umc-crypto",
@@ -2149,7 +2187,7 @@ dependencies = [
 
 [[package]]
 name = "umc-routing"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "umc-types",
@@ -2158,8 +2196,9 @@ dependencies = [
 
 [[package]]
 name = "umc-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "blake2",
  "prost",
  "rand_core 0.6.4",
  "tokio",
@@ -2169,11 +2208,12 @@ dependencies = [
  "umc-crypto",
  "umc-storage",
  "umc-types",
+ "umc-wire",
 ]
 
 [[package]]
 name = "umc-sdk-c"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tokio",
  "umc-sdk",
@@ -2181,7 +2221,7 @@ dependencies = [
 
 [[package]]
 name = "umc-session"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -2193,7 +2233,7 @@ dependencies = [
 
 [[package]]
 name = "umc-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "blake2",
@@ -2209,11 +2249,11 @@ dependencies = [
 
 [[package]]
 name = "umc-types"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "umc-wire"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -2222,7 +2262,7 @@ dependencies = [
 
 [[package]]
 name = "umcd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake2",
  "clap",
@@ -2246,6 +2286,7 @@ dependencies = [
  "umc-discovery",
  "umc-handshake",
  "umc-metrics",
+ "umc-plugin",
  "umc-relay",
  "umc-routing",
  "umc-session",

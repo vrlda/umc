@@ -35,6 +35,8 @@ use umc_handshake::xx::{
     MODE_XX, SUPPORTED_PROTOCOL_VERSION,
 };
 use umc_types::runtime::EntropySource;
+use umc_core::revocation::RevocationStore;
+use umc_core::trust::{decode_delegation_chain, DelegationStore};
 
 #[cfg(test)]
 use umc_handshake::xx::parse_version_negotiation;
@@ -60,6 +62,7 @@ pub const BINDING_SIGNATURE_LEN: usize = 64;
 
 /// Full on-wire length of an [`IdentityBinding`].
 pub const BINDING_WIRE_LEN: usize = BINDING_SIGNED_LEN + BINDING_SIGNATURE_LEN;
+const MAX_DELEGATION_CHAIN_BYTES: usize = 8 * 1024;
 
 /// The server-side handshake captured by [`respond_hello`], carried until
 /// the client's `CLIENT_AUTH` arrives (handshake.md §18).
@@ -81,6 +84,8 @@ pub struct HandshakePending {
 pub struct PeerIdentity {
     pub client_static_public_key: StaticHandshakePublicKey,
     pub binding: IdentityBinding,
+    #[allow(dead_code)]
+    pub delegation_depth: Option<u8>,
 }
 
 /// The responder's answer to a `CLIENT_HELLO` (handshake.md §16): either a
@@ -167,6 +172,7 @@ impl HandshakePending {
     /// is refused), or the client's transcript-bound signature does not
     /// verify.
     #[allow(clippy::similar_names)]
+    #[allow(clippy::too_many_lines)]
     pub fn complete(
         &mut self,
         state: &RuntimeState,
@@ -206,6 +212,35 @@ impl HandshakePending {
                 .get(32..32 + BINDING_WIRE_LEN)
                 .ok_or("client auth truncated")?,
         )?;
+        let base_len = 32 + BINDING_WIRE_LEN + 64;
+        let delegation_chain = if plaintext.len() == base_len {
+            None
+        } else {
+            let tail = plaintext.get(base_len..).ok_or("client auth truncated")?;
+            let (encoded, consumed) = umc_wire::bytes::decode(tail, MAX_DELEGATION_CHAIN_BYTES)
+                .map_err(|_| "delegation chain framing")?;
+            if consumed != tail.len() {
+                return Err("delegation chain trailing bytes".into());
+            }
+            let chain = decode_delegation_chain(encoded)
+                .map_err(|error| format!("delegation chain: {error:?}"))?;
+            let persisted = DelegationStore::new(state.store.as_ref())
+                .valid_chain_for_public_key(&binding.identity_public_key.0, now_ms)
+                .map_err(|error| format!("delegation store unavailable: {error:?}"))?;
+            let accepted = persisted.is_some_and(|record| record.certificates == chain);
+            if !accepted {
+                return Err("delegation chain is not locally authorized".into());
+            }
+            if let Some(record) = DelegationStore::new(state.store.as_ref())
+                .valid_chain_for_public_key(&binding.identity_public_key.0, now_ms)
+                .map_err(|error| format!("delegation store unavailable: {error:?}"))?
+            {
+                RevocationStore::new(state.store.as_ref())
+                    .check_delegation(&record, now_ms)
+                    .map_err(|error| format!("delegation revoked: {error:?}"))?;
+            }
+            Some(chain)
+        };
         // The identity binding must be self-consistent and signed by the
         // claimed identity key; a binding signed by a different key is
         // refused before the session is accepted (handshake.md §4.3).
@@ -231,6 +266,9 @@ impl HandshakePending {
         let peer = PeerIdentity {
             client_static_public_key: recovered_static,
             binding,
+            delegation_depth: delegation_chain.map(|chain| {
+                u8::try_from(chain.len()).expect("delegation chain length is bounded")
+            }),
         };
 
         // Append CLIENT_AUTH; the finished keys and the server signature
@@ -579,14 +617,10 @@ pub fn respond_hello_with_retry_context_and_psk(
     } else {
         umc_crypto::hkdf::extract(&[0u8; 32], &dh_ee)
     };
-    let binding = IdentityBinding::sign(
-        &state.node_identity.identity,
-        &state.node_identity.static_handshake.public(),
-        0,
-        u64::MAX,
-        0,
-        [0u8; 32],
-    );
+    // The live server authentication must carry the same persisted binding
+    // advertised by the identity service. Re-signing a zero-hash placeholder
+    // here would make the wire claim diverge from the keystore record.
+    let binding = state.primary_binding.clone();
     // The auth-block AAD binds the transcript hash BEFORE the SERVER_HELLO
     // message is appended (handshake.md §16.1).
     let server_auth_transcript = transcript.hash;
@@ -595,7 +629,12 @@ pub fn respond_hello_with_retry_context_and_psk(
         &server_auth_transcript,
         &ServerAuthBlock {
             server_static_public_key: state.node_identity.static_handshake.public().0,
-            server_identity_binding: binding.signed_bytes(),
+            server_identity_binding: {
+                let mut bytes = binding.signed_bytes();
+                bytes.extend_from_slice(&binding.signature);
+                bytes
+            },
+            server_delegation_chain: Vec::new(),
         },
         &server_ephemeral.public().0,
         &server_random,
@@ -742,6 +781,31 @@ mod tests {
         carrier_binding: &[u8],
         client_binding: &IdentityBinding,
     ) -> Vec<u8> {
+        build_client_auth_with_chain(
+            claimed_identity,
+            client_static,
+            client_ephemeral,
+            hello,
+            server_hello,
+            server_binding,
+            carrier_binding,
+            client_binding,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::similar_names)]
+    fn build_client_auth_with_chain(
+        claimed_identity: &IdentityKeyPair,
+        client_static: &StaticHandshakeKeyPair,
+        client_ephemeral: &StaticHandshakeKeyPair,
+        hello: &ClientHello,
+        server_hello: &ServerHello,
+        server_binding: &IdentityBinding,
+        carrier_binding: &[u8],
+        client_binding: &IdentityBinding,
+        delegation_chain: &[u8],
+    ) -> Vec<u8> {
         let mut transcript = Transcript::new(MODE_XX, CRYPTO_PROFILE, carrier_binding);
         transcript
             .update_message(CLIENT_HELLO, &hello.encode().expect("hello"))
@@ -781,11 +845,12 @@ mod tests {
             &server_static_pub.0,
         );
         let signature = claimed_identity.sign(&sig_input);
-        let mut plaintext = Vec::new();
-        plaintext.extend_from_slice(&client_static.public().0);
-        plaintext.extend_from_slice(&client_binding.signed_bytes());
-        plaintext.extend_from_slice(&client_binding.signature);
-        plaintext.extend_from_slice(&signature);
+        let plaintext = umc_handshake::xx::build_client_auth_plaintext_with_delegation(
+            &client_static.public().0,
+            client_binding,
+            &signature,
+            delegation_chain,
+        );
         let encrypted = umc_crypto::aead::PacketKeys::from_traffic_secret(&auth_key)
             .expect("keys")
             .seal(0, &transcript.hash, &plaintext)
@@ -955,6 +1020,91 @@ mod tests {
             Some(&wrong_key),
         )
         .is_err());
+    }
+
+    #[test]
+    fn responder_accepts_only_persisted_delegation_chain() {
+        let state = test_state();
+        let root = IdentityKeyPair::generate();
+        let client_identity = IdentityKeyPair::generate();
+        let client_static = StaticHandshakeKeyPair::generate();
+        let client_ephemeral = StaticHandshakeKeyPair::generate();
+        let certificate = umc_core::trust_statement::SignedDelegation::sign(
+            &root,
+            client_identity.public().0,
+            vec![b"chat".to_vec()],
+            0,
+            1_800_000_000_000,
+            1,
+        )
+        .expect("certificate");
+        let chain = umc_core::trust::encode_delegation_chain(std::slice::from_ref(&certificate))
+            .expect("chain");
+        umc_core::trust::DelegationStore::new(state.store.as_ref())
+            .accept_chain(&root.public(), &[b"chat".to_vec()], &[certificate], 1_000)
+            .expect("persist chain");
+        let hello = ClientHello::new(&TestEntropy, &client_ephemeral);
+        let hello_bytes = hello.encode().expect("hello");
+        let (server_hello_bytes, mut pending) = expect_server_hello(
+            respond_hello(
+                &state,
+                b"ump.tcp/1",
+                &hello_bytes,
+                &client_static.public(),
+                &[1u8; 8],
+                &[2u8; 8],
+            )
+            .expect("responder"),
+        );
+        let server_hello = ServerHello::decode(&server_hello_bytes).expect("server hello");
+        let server_binding = IdentityBinding::sign(
+            &state.node_identity.identity,
+            &state.node_identity.static_handshake.public(),
+            0,
+            1_800_000_000_000,
+            0,
+            [0u8; 32],
+        );
+        let auth = build_client_auth_with_chain(
+            &client_identity,
+            &client_static,
+            &client_ephemeral,
+            &hello,
+            &server_hello,
+            &server_binding,
+            b"ump.tcp/1",
+            &client_binding(&client_identity, &client_static),
+            &chain,
+        );
+        let (_finished, _secrets, peer) = pending.complete(&state, &auth, 1_000).expect("delegated auth");
+        assert_eq!(peer.delegation_depth, Some(1));
+
+        let (rejected_hello_bytes, mut rejected_pending) = expect_server_hello(
+            respond_hello(
+                &state,
+                b"ump.tcp/1",
+                &hello_bytes,
+                &client_static.public(),
+                &[3u8; 8],
+                &[4u8; 8],
+            )
+            .expect("responder"),
+        );
+        let rejected_server_hello = ServerHello::decode(&rejected_hello_bytes).expect("server hello");
+        let mut tampered = chain.clone();
+        *tampered.last_mut().expect("chain byte") ^= 1;
+        let bad_auth = build_client_auth_with_chain(
+            &client_identity,
+            &client_static,
+            &client_ephemeral,
+            &hello,
+            &rejected_server_hello,
+            &server_binding,
+            b"ump.tcp/1",
+            &client_binding(&client_identity, &client_static),
+            &tampered,
+        );
+        assert!(rejected_pending.complete(&state, &bad_auth, 1_000).is_err());
     }
 
     #[test]
@@ -1453,5 +1603,13 @@ mod tests {
             Some(0),
             "negotiation must not raise p0 to the implementation maximum"
         );
+    }
+
+    #[test]
+    fn delegation_chain_parser_is_strictly_bounded() {
+        assert!(decode_delegation_chain(&[]).is_err());
+        assert!(decode_delegation_chain(&[0]).is_err());
+        assert!(decode_delegation_chain(&[5]).is_err());
+        assert!(decode_delegation_chain(&[1, 0, 0]).is_err());
     }
 }

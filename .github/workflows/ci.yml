@@ -40,6 +40,13 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Build daemon for Windows control smoke
+        if: runner.os == 'Windows'
+        run: cargo build --locked -p umcd
+      - name: Windows Python named-pipe Control API smoke
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python interop/python/windows_control_smoke.py target/debug/umcd.exe
 
   sbom:
     name: SBOM

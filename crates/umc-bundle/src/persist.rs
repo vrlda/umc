@@ -55,6 +55,12 @@ pub struct BundleMeta {
     pub destination_hint: Vec<u8>,
     pub priority: u64,
     pub replication_limit: u64,
+    #[serde(default)]
+    pub replication_count: u64,
+    #[serde(default)]
+    pub do_not_replicate: bool,
+    #[serde(default)]
+    pub local_scope_only: bool,
     pub custody: bool,
     /// Added after the initial metadata format; absent means the ordinary
     /// expiration is also the custody deadline.
@@ -82,6 +88,9 @@ impl BundleMeta {
             destination_hint: record.destination_hint.clone(),
             priority: record.priority,
             replication_limit: record.replication_limit,
+            replication_count: record.replication_count,
+            do_not_replicate: record.do_not_replicate,
+            local_scope_only: record.local_scope_only,
             custody: record.custody,
             custody_deadline_ms: record.custody_deadline.map(|deadline| deadline.0),
             transfer_chunk_index: record.transfer_chunk_index,
@@ -103,8 +112,10 @@ impl BundleMeta {
             priority: self.priority,
             created_at: Instant(self.created_at_ms),
             expires_at: Instant(self.expires_at_ms),
-            replication_count: 0,
+            replication_count: self.replication_count,
             replication_limit: self.replication_limit,
+            do_not_replicate: self.do_not_replicate,
+            local_scope_only: self.local_scope_only,
             custody: self.custody,
             custody_deadline: self.custody_deadline_ms.map(Instant),
             transfer_chunk_index: self.transfer_chunk_index,

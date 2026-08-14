@@ -31,6 +31,10 @@ pub struct AdmissionLimits {
     pub max_lifetime_ms: u64,
     pub max_byte_quota: u64,
     pub max_payload: usize,
+    /// Whether this relay may negotiate more than one downstream path.
+    pub allow_multipath: bool,
+    /// Maximum simultaneously admitted downstream paths per circuit.
+    pub max_multipath_paths: usize,
 }
 
 impl Default for AdmissionLimits {
@@ -39,9 +43,11 @@ impl Default for AdmissionLimits {
             policy: RelayPolicy::Disabled,
             max_circuits_per_peer: 4,
             active_circuits: 0,
-            max_lifetime_ms: 30 * 60 * 1000,
+            max_lifetime_ms: 10 * 60 * 1000,
             max_byte_quota: 256 * 1024 * 1024,
             max_payload: 64 * 1024,
+            allow_multipath: true,
+            max_multipath_paths: 4,
         }
     }
 }
@@ -59,6 +65,9 @@ pub fn evaluate_open(
         return AdmissionDecision::Refused;
     }
     if flags & 0xF0 != 0 {
+        return AdmissionDecision::UnsupportedFlags;
+    }
+    if flags & 0x08 != 0 && (!limits.allow_multipath || limits.max_multipath_paths < 2) {
         return AdmissionDecision::UnsupportedFlags;
     }
     if peer_circuits >= limits.max_circuits_per_peer {
@@ -99,6 +108,14 @@ mod tests {
             evaluate_open(&limits, 0, 600_000, 1_048_576, 0),
             AdmissionDecision::Refused
         );
+    }
+
+    #[test]
+    fn default_admission_matches_v01_standard_limits() {
+        let limits = AdmissionLimits::default();
+        assert_eq!(limits.max_lifetime_ms, 10 * 60 * 1000);
+        assert_eq!(limits.max_byte_quota, 256 * 1024 * 1024);
+        assert_eq!(limits.max_payload, 64 * 1024);
     }
 
     #[test]
@@ -168,6 +185,28 @@ mod tests {
         };
         assert_eq!(
             evaluate_open(&limits, 0, 600_000, 0, 0x10),
+            AdmissionDecision::UnsupportedFlags
+        );
+    }
+
+    #[test]
+    fn multipath_requires_policy_and_two_paths() {
+        let limits = AdmissionLimits {
+            policy: RelayPolicy::Public,
+            allow_multipath: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_open(&limits, 0, 600_000, 0, 0x08),
+            AdmissionDecision::UnsupportedFlags
+        );
+        let limits = AdmissionLimits {
+            policy: RelayPolicy::Public,
+            max_multipath_paths: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_open(&limits, 0, 600_000, 0, 0x08),
             AdmissionDecision::UnsupportedFlags
         );
     }

@@ -37,6 +37,8 @@ impl FrameType {
     /// Optional length-delimited decentralized discovery lookup.
     pub const DHT_LOOKUP: Self = Self(0x7F);
     pub const RELAY_STATUS: Self = Self(0x82);
+    /// Optional length-delimited authenticated revocation exchange.
+    pub const REVOCATION_BATCH: Self = Self(0x83);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +124,7 @@ mod tests {
             (FrameType::SERVICE_HINT, 0x7C),
             (FrameType::DHT_LOOKUP, 0x7F),
             (FrameType::RELAY_STATUS, 0x82),
+            (FrameType::REVOCATION_BATCH, 0x83),
         ];
         for (frame_type, expected) in table {
             assert_eq!(frame_type.0, *expected, "{frame_type:?}");

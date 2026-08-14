@@ -460,6 +460,14 @@ impl ApplicationDataPlane {
             .get(&(session_id, stream_id))
             .cloned()
         {
+            let existing_protocol = self
+                .streams
+                .get(&handle)
+                .map(|stream| stream.protocol_id.as_slice())
+                .ok_or(ApplicationDataError::NotFound)?;
+            if existing_protocol != protocol_id {
+                return Err(ApplicationDataError::PermissionDenied);
+            }
             self.push_stream_data(&handle, data, eof)?;
             return Ok(true);
         }

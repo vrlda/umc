@@ -31,7 +31,7 @@ pub enum AppError {
 }
 
 /// The daemon's application registry: one handle per registered protocol ID.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct AppRegistry {
     apps: HashMap<Vec<u8>, AppHandle>,
 }

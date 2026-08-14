@@ -340,6 +340,88 @@ pub struct StoredDelegationChain {
     pub certificates: Vec<SignedDelegation>,
 }
 
+/// Encodes the bounded delegation envelope carried in `CLIENT_AUTH` and
+/// `SERVER_AUTH`. The returned bytes are intentionally independent of the
+/// persistence record: they contain only the certificate count and canonical
+/// signed certificates, while the responder obtains the root authority from
+/// its local trust store.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Corrupt`] for an empty/oversized chain or malformed
+/// certificates, and [`StoreError::QuotaExceeded`] for profile bounds.
+pub fn encode_delegation_chain(certificates: &[SignedDelegation]) -> Result<Vec<u8>, StoreError> {
+    if certificates.is_empty()
+        || certificates.len() > crate::trust_statement::MAX_DELEGATION_CHAIN_LENGTH
+    {
+        return Err(StoreError::QuotaExceeded);
+    }
+    let mut out = Vec::with_capacity(1 + certificates.len() * 2);
+    out.push(u8::try_from(certificates.len()).map_err(|_| StoreError::QuotaExceeded)?);
+    for certificate in certificates {
+        let encoded = certificate
+            .to_bytes()
+            .map_err(|error| StoreError::Corrupt(format!("invalid delegation: {error:?}")))?;
+        let length = u16::try_from(encoded.len()).map_err(|_| StoreError::QuotaExceeded)?;
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(&encoded);
+    }
+    if out.len() > MAX_DELEGATION_CHAIN_BYTES {
+        return Err(StoreError::QuotaExceeded);
+    }
+    Ok(out)
+}
+
+/// Decodes the bounded handshake delegation envelope. This validates framing
+/// and each certificate's canonical structure; authority and validity are
+/// checked separately by [`DelegationStore`].
+///
+/// # Errors
+///
+/// Returns [`StoreError::Corrupt`] for malformed framing/certificates and
+/// [`StoreError::QuotaExceeded`] when profile bounds are exceeded.
+pub fn decode_delegation_chain(bytes: &[u8]) -> Result<Vec<SignedDelegation>, StoreError> {
+    if bytes.is_empty() || bytes.len() > MAX_DELEGATION_CHAIN_BYTES {
+        return Err(StoreError::QuotaExceeded);
+    }
+    let count = usize::from(bytes[0]);
+    if count == 0 || count > crate::trust_statement::MAX_DELEGATION_CHAIN_LENGTH {
+        return Err(StoreError::QuotaExceeded);
+    }
+    let mut offset = 1usize;
+    let mut certificates = Vec::with_capacity(count);
+    for _ in 0..count {
+        let length_end = offset
+            .checked_add(2)
+            .ok_or_else(|| StoreError::Corrupt("delegation envelope overflow".into()))?;
+        let length = usize::from(u16::from_be_bytes(
+            bytes
+                .get(offset..length_end)
+                .ok_or_else(|| StoreError::Corrupt("delegation envelope truncated".into()))?
+                .try_into()
+                .map_err(|_| StoreError::Corrupt("delegation certificate length".into()))?,
+        ));
+        offset = length_end;
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| StoreError::Corrupt("delegation envelope overflow".into()))?;
+        let certificate = SignedDelegation::from_bytes(
+            bytes
+                .get(offset..end)
+                .ok_or_else(|| StoreError::Corrupt("delegation certificate truncated".into()))?,
+        )
+        .map_err(|error| StoreError::Corrupt(format!("delegation certificate: {error:?}")))?;
+        offset = end;
+        certificates.push(certificate);
+    }
+    if offset != bytes.len() {
+        return Err(StoreError::Corrupt(
+            "delegation envelope trailing bytes".into(),
+        ));
+    }
+    Ok(certificates)
+}
+
 /// Bounded delegation persistence over the trust namespace. Certificates are
 /// accepted only after full chain verification; restart reads verify every
 /// signature again before exposing an authority to callers.
@@ -447,6 +529,86 @@ impl<'a> DelegationStore<'a> {
             }
         }
         Ok(chains)
+    }
+
+    /// Loads and re-verifies the chain for one delegated public key without
+    /// scanning the entire trust namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Corrupt`] for malformed or cryptographically
+    /// invalid persisted evidence, and the backend error for storage failure.
+    pub fn valid_chain_for_public_key(
+        &self,
+        delegated_public_key: &[u8; 32],
+        now_ms: u64,
+    ) -> Result<Option<StoredDelegationChain>, StoreError> {
+        let key = delegation_key(delegated_public_key);
+        let Some(value) = self.store.get(Namespace::Trust, &key)? else {
+            return Ok(None);
+        };
+        let record = decode_delegation(&key, &value)?;
+        match DelegationChain::verify(
+            &record.root_public_key,
+            &record.root_capabilities,
+            &record.certificates,
+            now_ms,
+        ) {
+            Ok(_) => Ok(Some(record)),
+            Err(crate::trust_statement::DelegationError::Expired) => Ok(None),
+            Err(error) => Err(StoreError::Corrupt(format!(
+                "invalid persisted delegation: {error:?}"
+            ))),
+        }
+    }
+
+    /// Finds a valid chain containing a delegated certificate link. This is
+    /// used by root-authorized revocation so an operator can revoke either a
+    /// leaf device or an intermediate delegating device.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or persisted-chain validation errors from the trust
+    /// namespace.
+    pub fn valid_chain_containing_public_key(
+        &self,
+        delegated_public_key: &[u8; 32],
+        now_ms: u64,
+    ) -> Result<Option<StoredDelegationChain>, StoreError> {
+        for chain in self.valid_chains(now_ms)? {
+            if chain
+                .certificates
+                .iter()
+                .any(|certificate| &certificate.delegated_public_key == delegated_public_key)
+            {
+                return Ok(Some(chain));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Finds a valid delegated chain by its derived endpoint id. This is used
+    /// by ticket resumption, whose compact credential carries the endpoint id
+    /// but not the delegated public key or certificate envelope.
+    ///
+    /// # Errors
+    /// Returns storage/corruption errors from the trust namespace.
+    pub fn valid_chain_for_endpoint_id(
+        &self,
+        endpoint_id: &[u8; 32],
+        now_ms: u64,
+    ) -> Result<Option<StoredDelegationChain>, StoreError> {
+        for chain in self.valid_chains(now_ms)? {
+            if let Some(leaf) = chain.certificates.last() {
+                if umc_handshake::identity::endpoint_id(&IdentityPublicKey(
+                    leaf.delegated_public_key,
+                )) == *endpoint_id
+                {
+                    return Ok(Some(chain));
+                }
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -1388,6 +1550,15 @@ mod tests {
         let restored = DelegationStore::new(&store).valid_chains(300).unwrap();
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].certificates, vec![certificate.clone()]);
+        let by_leaf = DelegationStore::new(&store)
+            .valid_chain_for_public_key(&delegated.public().0, 300)
+            .unwrap()
+            .expect("leaf lookup");
+        assert_eq!(by_leaf.certificates, vec![certificate.clone()]);
+        assert!(DelegationStore::new(&store)
+            .valid_chain_for_public_key(&[9u8; 32], 300)
+            .unwrap()
+            .is_none());
 
         let newer = SignedDelegation::sign(
             &root,

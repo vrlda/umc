@@ -294,7 +294,39 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> Result<(), KeystoreErro
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, data).map_err(|e| KeystoreError::Io(e.to_string()))
+        use std::io::Write;
+        // Keep the same crash-safety contract on Windows and other supported
+        // targets: write a complete private temporary file, flush it, then
+        // replace the keystore. The OS owns ACL inheritance; we never expose
+        // a partially written or plaintext keystore at the final path.
+        let tmp = path.with_extension("tmp");
+        let mut file = std::fs::OpenOptions::new();
+        file.create(true).write(true).truncate(true);
+        let mut file = file
+            .open(&tmp)
+            .map_err(|e| KeystoreError::Io(e.to_string()))?;
+        file.write_all(data)
+            .map_err(|e| KeystoreError::Io(e.to_string()))?;
+        file.sync_all()
+            .map_err(|e| KeystoreError::Io(e.to_string()))?;
+        drop(file);
+        #[cfg(windows)]
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+        }
+        std::fs::rename(&tmp, path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            // Directory fsync is not available on every non-Unix target;
+            // best effort is preferable to reverting to an unsynchronised
+            // final write.
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -528,6 +560,17 @@ mod tests {
             Keystore::open(path.clone(), b"password-b"),
             Err(KeystoreError::InvalidPassword)
         ));
+    }
+
+    #[test]
+    fn write_private_replaces_without_leaving_temp_file() {
+        let path = temp_path();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("tmp"));
+        write_private(&path, b"first").unwrap();
+        write_private(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert!(!path.with_extension("tmp").exists());
     }
 
     #[test]

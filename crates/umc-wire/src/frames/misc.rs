@@ -14,6 +14,7 @@ pub const MAX_SIGNATURE: usize = 1_024;
 pub const MAX_DHT_RECORDS: usize = 16;
 pub const MAX_DHT_CARRIER: usize = 64;
 pub const MAX_DHT_HINT: usize = 1_024;
+pub const MAX_REVOCATION_BATCH: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -164,6 +165,54 @@ pub struct DhtLookupFrame {
     pub response: bool,
     pub target_endpoint_id: Vec<u8>,
     pub records: Vec<DhtRecordWire>,
+}
+
+/// Optional authenticated revocation exchange carried inside a protected
+/// session. The payload is the canonical signed-batch envelope; transport
+/// authentication is supplementary and each statement is independently
+/// verified by the receiver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevocationBatchFrame {
+    pub payload: Vec<u8>,
+}
+
+impl RevocationBatchFrame {
+    /// Encodes the optional length-delimited frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError::LengthExceedsLimit`] when the signed batch is
+    /// larger than the protected exchange bound.
+    pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
+        if self.payload.len() > MAX_REVOCATION_BATCH {
+            return Err(FrameError::LengthExceedsLimit);
+        }
+        let mut out = Vec::new();
+        crate::varint::encode_into(&mut out, FrameType::REVOCATION_BATCH.0)
+            .map_err(FrameError::VarintEncode)?;
+        crate::varint::encode_into(&mut out, self.payload.len() as u64)
+            .map_err(FrameError::VarintEncode)?;
+        out.extend_from_slice(&self.payload);
+        Ok(out)
+    }
+
+    /// Decodes the body after the outer length delimiter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError::LengthExceedsLimit`] when the declared body is
+    /// larger than the protected exchange bound.
+    pub fn decode(body: &[u8]) -> Result<(Self, usize), FrameError> {
+        if body.len() > MAX_REVOCATION_BATCH {
+            return Err(FrameError::LengthExceedsLimit);
+        }
+        Ok((
+            Self {
+                payload: body.to_vec(),
+            },
+            body.len(),
+        ))
+    }
 }
 
 impl DhtLookupFrame {
@@ -438,5 +487,23 @@ mod tests {
         crate::varint::encode_into(&mut frame, 1_700_000_000_000).unwrap();
         crate::bytes::encode(&mut frame, b"sig", MAX_SIGNATURE).unwrap();
         assert!(crate::frame::decode_frames(&frame).is_ok());
+    }
+
+    #[test]
+    fn revocation_batch_frame_round_trips_and_is_bounded() {
+        let frame = RevocationBatchFrame {
+            payload: b"RS\x01\x00\x00".to_vec(),
+        };
+        let encoded = frame.encode().expect("encode");
+        let (_, length_bytes) = crate::varint::decode(&encoded[2..]).expect("length");
+        let body_start = 2 + length_bytes;
+        let (decoded, used) = RevocationBatchFrame::decode(&encoded[body_start..]).expect("decode");
+        assert_eq!(decoded, frame);
+        assert_eq!(used, encoded.len() - body_start);
+        assert!(RevocationBatchFrame {
+            payload: vec![0; MAX_REVOCATION_BATCH + 1],
+        }
+        .encode()
+        .is_err());
     }
 }

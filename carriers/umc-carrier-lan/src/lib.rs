@@ -6,10 +6,10 @@
 //! a varint payload length, followed by the opaque node hint. The varint is
 //! width-tagged in the top two bits of the first byte (1/2/4/8-byte payload
 //! widths), mirroring umc-wire framing without depending on it.
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
 use umc_carrier::error::{CarrierError, CarrierErrorKind};
 use umc_carrier::types::{
     CarrierCapabilities, CarrierTypeId, ConnectionModel, Ordering, PacketMode, Reliability,
@@ -29,6 +29,183 @@ pub struct LanDiscoveryConfig {
     pub interface: Option<String>,
     pub announce_interval_ms: u64,
     pub node_hint: Vec<u8>,
+}
+
+/// A bounded announcement observed on the local multicast channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanAnnouncement {
+    pub source: SocketAddr,
+    pub node_hint: Vec<u8>,
+}
+
+/// Shared LAN discovery socket. It carries announcements only; UMP data
+/// sessions continue over TCP or UDP (lan-discovery.md §3).
+#[derive(Debug)]
+pub struct LanDiscovery {
+    socket: Arc<UdpSocket>,
+    config: LanDiscoveryConfig,
+    closed: AtomicBool,
+}
+
+impl LanDiscovery {
+    /// Binds the multicast discovery socket and joins its group.
+    ///
+    /// # Errors
+    /// Returns a carrier error when the socket cannot be configured or bound.
+    pub fn bind(config: LanDiscoveryConfig) -> Result<Arc<Self>, CarrierError> {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .map_err(|e| CarrierError {
+            kind: CarrierErrorKind::Internal,
+            operation: "listen",
+            retryable: false,
+            message: e.to_string(),
+        })?;
+        socket.set_reuse_address(true).map_err(|e| CarrierError {
+            kind: CarrierErrorKind::Internal,
+            operation: "listen",
+            retryable: false,
+            message: e.to_string(),
+        })?;
+        #[cfg(unix)]
+        socket.set_reuse_port(true).map_err(|e| CarrierError {
+            kind: CarrierErrorKind::Internal,
+            operation: "listen",
+            retryable: false,
+            message: e.to_string(),
+        })?;
+        socket
+            .bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.group.port()).into())
+            .map_err(|e| CarrierError {
+                kind: CarrierErrorKind::AddressInUse,
+                operation: "listen",
+                retryable: false,
+                message: e.to_string(),
+            })?;
+        socket.set_nonblocking(true).map_err(|e| CarrierError {
+            kind: CarrierErrorKind::Internal,
+            operation: "listen",
+            retryable: false,
+            message: e.to_string(),
+        })?;
+        let socket: std::net::UdpSocket = socket.into();
+        let socket = Arc::new(UdpSocket::from_std(socket).map_err(|e| CarrierError {
+            kind: CarrierErrorKind::Internal,
+            operation: "listen",
+            retryable: false,
+            message: e.to_string(),
+        })?);
+        if let IpAddr::V4(multicast) = config.group.ip() {
+            let interface = config
+                .interface
+                .as_deref()
+                .and_then(|value| value.parse::<Ipv4Addr>().ok())
+                .unwrap_or(Ipv4Addr::UNSPECIFIED);
+            socket
+                .join_multicast_v4(multicast, interface)
+                .map_err(|e| CarrierError {
+                    kind: CarrierErrorKind::Internal,
+                    operation: "listen",
+                    retryable: false,
+                    message: e.to_string(),
+                })?;
+        }
+        Ok(Arc::new(Self {
+            socket,
+            config,
+            closed: AtomicBool::new(false),
+        }))
+    }
+
+    #[must_use]
+    pub fn config(&self) -> &LanDiscoveryConfig {
+        &self.config
+    }
+
+    #[must_use]
+    pub fn socket(&self) -> Arc<UdpSocket> {
+        self.socket.clone()
+    }
+
+    /// Receives one bounded announcement without turning it into a data link.
+    ///
+    /// # Errors
+    /// Returns `WouldBlock`, `LinkClosed`, or a malformed-packet/backend error.
+    pub fn receive(&self) -> Result<LanAnnouncement, CarrierError> {
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return Err(CarrierError::new(CarrierErrorKind::LinkClosed, "receive"));
+        }
+        let mut bytes = [0u8; MAX_ANNOUNCEMENT];
+        match self.socket.try_recv_from(&mut bytes) {
+            Ok((length, source)) => Ok(LanAnnouncement {
+                source,
+                node_hint: parse_announcement(&bytes[..length])?,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(CarrierError::new(CarrierErrorKind::WouldBlock, "receive"))
+            }
+            Err(error) => Err(CarrierError {
+                kind: CarrierErrorKind::Internal,
+                operation: "receive",
+                retryable: true,
+                message: error.to_string(),
+            }),
+        }
+    }
+
+    /// Async receive used by the daemon discovery task.
+    ///
+    /// # Errors
+    /// Returns `LinkClosed`, malformed-packet, or socket backend errors.
+    pub async fn receive_async(&self) -> Result<LanAnnouncement, CarrierError> {
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return Err(CarrierError::new(CarrierErrorKind::LinkClosed, "receive"));
+        }
+        let mut bytes = [0u8; MAX_ANNOUNCEMENT];
+        let (length, source) =
+            self.socket
+                .recv_from(&mut bytes)
+                .await
+                .map_err(|error| CarrierError {
+                    kind: CarrierErrorKind::Internal,
+                    operation: "receive",
+                    retryable: true,
+                    message: error.to_string(),
+                })?;
+        Ok(LanAnnouncement {
+            source,
+            node_hint: parse_announcement(&bytes[..length])?,
+        })
+    }
+
+    /// Sends this node's bounded presence announcement.
+    ///
+    /// # Errors
+    /// Returns `WouldBlock` or a socket backend error when the announcement
+    /// cannot be sent.
+    pub fn announce(&self) -> Result<(), CarrierError> {
+        let packet = build_announcement(&self.config)?;
+        self.socket
+            .try_send_to(&packet, self.config.group)
+            .map(|_| ())
+            .map_err(|error| CarrierError {
+                kind: if error.kind() == std::io::ErrorKind::WouldBlock {
+                    CarrierErrorKind::WouldBlock
+                } else {
+                    CarrierErrorKind::Internal
+                },
+                operation: "announce",
+                retryable: true,
+                message: error.to_string(),
+            })
+    }
+
+    pub fn close(&self) {
+        self.closed.store(true, AtomicOrdering::Release);
+    }
 }
 
 impl Default for LanDiscoveryConfig {
@@ -61,7 +238,7 @@ impl Carrier for LanDiscoveryCarrier {
             ordering: Ordering::Unordered,
             connection_model: ConnectionModel::SharedChannel,
             supports_listen: true,
-            supports_dial: true,
+            supports_dial: false,
             supports_discovery: true,
             minimum_packet_size: 1,
             maximum_packet_size: MAX_ANNOUNCEMENT,
@@ -70,29 +247,8 @@ impl Carrier for LanDiscoveryCarrier {
     }
 
     fn listen(&self, _bind: String) -> Result<Box<dyn Listener + Send + Sync>, CarrierError> {
-        let rt = tokio::runtime::Handle::try_current()
-            .map_err(|_| CarrierError::new(CarrierErrorKind::NotRunning, "listen"))?;
-        let socket = Arc::new(
-            rt.block_on(UdpSocket::bind(format!(
-                "0.0.0.0:{}",
-                self.config.group.port()
-            )))
-            .map_err(|e| CarrierError {
-                kind: CarrierErrorKind::AddressInUse,
-                operation: "listen",
-                retryable: false,
-                message: e.to_string(),
-            })?,
-        );
-        if let std::net::IpAddr::V4(multicast) = self.config.group.ip() {
-            socket
-                .join_multicast_v4(multicast, Ipv4Addr::UNSPECIFIED)
-                .ok();
-        }
-        Ok(Box::new(LanListenerAdapter {
-            socket,
-            responses_per_minute: Arc::new(Mutex::new(0u32)),
-        }))
+        let discovery = LanDiscovery::bind(self.config.clone())?;
+        Ok(Box::new(LanListenerAdapter { discovery }))
     }
 
     fn dial(&self, _remote: String) -> Result<BoxLink, CarrierError> {
@@ -104,18 +260,53 @@ impl Carrier for LanDiscoveryCarrier {
 #[derive(Debug)]
 #[allow(dead_code)] // fields reserved for the Phase 6 discovery loop wiring
 pub struct LanListenerAdapter {
-    socket: Arc<UdpSocket>,
-    responses_per_minute: Arc<Mutex<u32>>,
+    discovery: Arc<LanDiscovery>,
 }
 
 impl Listener for LanListenerAdapter {
     fn accept(&self) -> Result<BoxLink, CarrierError> {
-        // Phase 5: the listener is a discovery sink, not a link source.
+        // The carrier is discovery-only; callers use `receive` below rather
+        // than treating announcements as UMP data links.
         Err(CarrierError::new(CarrierErrorKind::Unsupported, "accept"))
     }
 
     fn close(&self) -> Result<(), CarrierError> {
+        self.discovery.close();
         Ok(())
+    }
+}
+
+impl LanListenerAdapter {
+    /// Receives one bounded LAN announcement without turning it into a data
+    /// link. `WouldBlock` is returned when no datagram is ready.
+    ///
+    /// # Errors
+    /// Returns `WouldBlock`, `LinkClosed`, malformed-packet, or backend errors.
+    pub fn receive(&self) -> Result<LanAnnouncement, CarrierError> {
+        self.discovery.receive()
+    }
+
+    /// Sends this node's bounded presence announcement to the configured
+    /// multicast group.
+    ///
+    /// # Errors
+    /// Returns a framing, `WouldBlock`, or socket backend error.
+    pub fn announce(&self, config: &LanDiscoveryConfig) -> Result<(), CarrierError> {
+        let packet = build_announcement(config)?;
+        self.discovery
+            .socket()
+            .try_send_to(&packet, config.group)
+            .map(|_| ())
+            .map_err(|error| CarrierError {
+                kind: if error.kind() == std::io::ErrorKind::WouldBlock {
+                    CarrierErrorKind::WouldBlock
+                } else {
+                    CarrierErrorKind::Internal
+                },
+                operation: "announce",
+                retryable: true,
+                message: error.to_string(),
+            })
     }
 }
 

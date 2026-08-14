@@ -3,10 +3,26 @@ name = "umc-plugin"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "umc-plugin-loopback"
+path = "src/bin/loopback.rs"
 
 [dependencies]
+prost = "0.13"
+blake2 = "0.10"
+umc-crypto = { path = "../umc-crypto" }
+tokio = { version = "1", features = ["io-util", "net", "process", "rt", "macros", "time"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+umc-carrier = { path = "../umc-carrier" }
+umc-types = { path = "../umc-types" }
+umc-discovery = { path = "../umc-discovery" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[build-dependencies]
+prost-build = "0.13"
 
 [lints]
 workspace = true

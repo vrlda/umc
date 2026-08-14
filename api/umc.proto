@@ -188,6 +188,7 @@ enum Capability {
   CAPABILITY_IDENTITY_EXPORT_PUBLIC = 13;
   CAPABILITY_IDENTITY_EXPORT_SECRET = 14;
   CAPABILITY_IDENTITY_DELETE = 15;
+  CAPABILITY_IDENTITY_DELEGATE = 16;
   CAPABILITY_CARRIER_READ = 20;
   CAPABILITY_CARRIER_ADMIN = 21;
   CAPABILITY_PEER_READ = 30;
@@ -276,6 +277,8 @@ message NodeStatus {
   uint32 active_relay_circuits = 10;
   uint32 pending_handshakes = 11;
   string privacy_profile = 12;
+  string core_edition = 13;
+  repeated string capabilities = 14;
 }
 
 enum ResourcePressure {
@@ -296,6 +299,8 @@ message NodeConfig {
   bool telemetry_enabled = 3;
   bool public_relay_enabled = 4;
   repeated ConfigEntry entries = 5;
+  string core_edition = 6;
+  repeated string capabilities = 7;
 }
 
 message ConfigEntry {
@@ -452,6 +457,46 @@ message DeleteIdentityRequest {
   bytes deletion_plan_token = 3;
   bool plan_only = 4;
 }
+
+message CreateDelegationRequest {
+  OpaqueHandle identity_handle = 1;
+  bytes delegated_public_key = 2;
+  repeated bytes allowed_capabilities = 3;
+  int64 expires_at_unix_ms = 4;
+  repeated bytes root_capabilities = 5;
+}
+message CreateDelegationResponse {
+  bytes certificate = 1;
+  bytes delegation_chain = 2;
+  bytes root_public_key = 3;
+}
+message ImportDelegationRequest {
+  bytes root_public_key = 1;
+  repeated bytes root_capabilities = 2;
+  bytes delegation_chain = 3;
+}
+message ImportDelegationResponse {
+  bytes delegated_public_key = 1;
+  bytes delegation_chain = 2;
+}
+message DelegationSummary {
+  bytes root_public_key = 1;
+  bytes delegated_public_key = 2;
+  uint32 depth = 3;
+  uint64 sequence = 4;
+  uint64 expires_at_unix_ms = 5;
+  repeated bytes capabilities = 6;
+}
+message ListDelegationsRequest {}
+message ListDelegationsResponse { repeated DelegationSummary delegations = 1; }
+message RevokeDelegationRequest {
+  OpaqueHandle identity_handle = 1;
+  bytes delegated_public_key = 2;
+  uint64 sequence = 3;
+  int64 expires_at_unix_ms = 4;
+  string reason = 5;
+}
+message RevokeDelegationResponse {}
 message DeleteIdentityResponse {
   bool deleted = 1;
   bytes deletion_plan_token = 2;
@@ -579,6 +624,43 @@ message PeerHint {
   bool do_not_reshare = 5;
 }
 
+// Bounded discovery-provider snapshot exposed to SDK clients. Candidate
+// metadata never contains private keys or application payloads.
+message CandidateSummary {
+  uint64 candidate_id = 1;
+  string carrier_type = 2;
+  uint64 expires_at_ms = 3;
+  bool public = 4;
+}
+message ListCandidatesRequest {}
+message ListCandidatesResponse {
+  repeated CandidateSummary candidates = 1;
+  uint32 total = 2;
+}
+
+// Opaque, protocol-scoped application service advertisement. The daemon does
+// not interpret metadata; endpoint authentication happens during Connect.
+message ServiceHintSummary {
+  bytes peer_endpoint_id = 1;
+  string protocol_id = 2;
+  bytes endpoint_hint = 3;
+  bytes metadata = 4;
+  int64 expires_at_unix_ms = 5;
+  bytes signature = 6;
+  bool public = 7;
+}
+message PublishServiceHintRequest {
+  string protocol_id = 1;
+  bytes endpoint_hint = 2;
+  bytes metadata = 3;
+  int64 expires_at_unix_ms = 4;
+  bool public = 5;
+}
+message PublishServiceHintResponse { ServiceHintSummary hint = 1; }
+message DiscoverServicesRequest { string protocol_id = 1; }
+message DiscoverServicesResponse { repeated ServiceHintSummary hints = 1; }
+
+
 message AddPeerHintRequest { bytes endpoint_id = 1; PeerHint hint = 2; }
 message AddPeerHintResponse { PeerSummary peer = 1; }
 message RemovePeerRequest { bytes endpoint_id = 1; ResourceRevision expected_revision = 2; }
@@ -679,6 +761,10 @@ message SessionPrivacyInfo {
   bool direct_path_allowed = 3;
   bool traffic_padding_active = 4;
   uint32 hop_count = 5;
+  uint32 min_hop_count = 6;
+  uint32 max_hop_count = 7;
+  bool anonymous_authorization_active = 8;
+  string privacy_reason = 9;
 }
 message GetSessionResponse {
   SessionSummary session = 1;
@@ -1035,6 +1121,10 @@ service IdentityService {
   rpc ExportSecretIdentity(ExportSecretIdentityRequest) returns (ExportSecretIdentityResponse);
   rpc ImportIdentity(ImportIdentityRequest) returns (ImportIdentityResponse);
   rpc DeleteIdentity(DeleteIdentityRequest) returns (DeleteIdentityResponse);
+  rpc CreateDelegation(CreateDelegationRequest) returns (CreateDelegationResponse);
+  rpc ImportDelegation(ImportDelegationRequest) returns (ImportDelegationResponse);
+  rpc ListDelegations(ListDelegationsRequest) returns (ListDelegationsResponse);
+  rpc RevokeDelegation(RevokeDelegationRequest) returns (RevokeDelegationResponse);
 }
 
 service CarrierService {
@@ -1062,6 +1152,12 @@ service PeerService {
   rpc CreateInvitation(CreateInvitationRequest) returns (CreateInvitationResponse);
   rpc ImportInvitation(ImportInvitationRequest) returns (ImportInvitationResponse);
   rpc RevokeInvitation(RevokeInvitationRequest) returns (RevokeInvitationResponse);
+}
+
+service DiscoveryService {
+  rpc ListCandidates(ListCandidatesRequest) returns (ListCandidatesResponse);
+  rpc PublishServiceHint(PublishServiceHintRequest) returns (PublishServiceHintResponse);
+  rpc DiscoverServices(DiscoverServicesRequest) returns (DiscoverServicesResponse);
 }
 
 service RouteService {

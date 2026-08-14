@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use umc_bundle::manager::BundleStatus;
 use umc_bundle::manager::{BundleError, BundleManager, BundleRecord};
+use umc_bundle::forward::{select_for_contact, Contact};
 use umc_bundle::transfer::{BundleChunk, BundleReassembler, TransferError};
 use umc_storage::objects::ObjectStore;
 use umc_storage::quota::QuotaAccount;
@@ -108,7 +109,8 @@ impl BundleService {
         let lifetime = frame.expiration_time.saturating_sub(frame.creation_time);
         if frame.chunk_index == 0 && frame.chunk_final {
             return self
-                .admit(
+                .manager
+                .admit_with_policy(
                     &frame.payload,
                     sender,
                     &frame.destination_hint,
@@ -116,6 +118,8 @@ impl BundleService {
                     lifetime.max(1_000),
                     frame.replication_limit,
                     frame.custody_requested,
+                    frame.do_not_replicate,
+                    frame.local_scope_only,
                     now,
                 )
                 .map(Some);
@@ -141,7 +145,7 @@ impl BundleService {
             Ok(None) => Ok(None),
             Ok(Some(payload)) => {
                 self.reassembly.remove(&bundle_id);
-                self.admit(
+                self.manager.admit_with_policy(
                     &payload,
                     sender,
                     &frame.destination_hint,
@@ -149,6 +153,8 @@ impl BundleService {
                     lifetime.max(1_000),
                     frame.replication_limit,
                     frame.custody_requested,
+                    frame.do_not_replicate,
+                    frame.local_scope_only,
                     now,
                 )
                 .map(Some)
@@ -188,11 +194,18 @@ impl BundleService {
     /// Returns the evicted ids.
     #[must_use]
     pub fn expire_old(&mut self, now: Instant) -> Vec<[u8; 32]> {
-        let ids = self.manager.evict_expired(now);
+        let mut ids = self.manager.evict_expired(now);
+        let pressure_ids = self.manager.evict_under_pressure(now);
+        ids.extend(pressure_ids.iter().copied());
         let mut events = self.events.lock().expect("event log");
         for id in &ids {
             events.push(DaemonEvent {
-                kind: "bundle_expired".into(),
+                kind: if pressure_ids.contains(id) {
+                    "bundle_evicted_pressure"
+                } else {
+                    "bundle_expired"
+                }
+                .into(),
                 at_ms: now.0,
                 detail: format!("bundle {id:02x?}"),
             });
@@ -214,13 +227,60 @@ impl BundleService {
     /// Ids of bundles awaiting delivery (status `Received`, not yet
     /// expired): the session loop wraps each stored ciphertext in a `BUNDLE`
     /// frame over active sessions (bundles.md §10.1).
+    #[allow(dead_code)] // retained for control/tests; live sweeps use contact selection
     #[must_use]
     pub fn pending_delivery(&self, now: Instant) -> Vec<[u8; 32]> {
         self.manager
             .records_iter()
-            .filter(|r| matches!(r.status, BundleStatus::Received) && now < r.expires_at)
+            .filter(|r| {
+                matches!(r.status, BundleStatus::Received | BundleStatus::CustodyAccepted)
+                    && now < r.expires_at
+                    && !r.do_not_replicate
+                    && r.replication_count < r.replication_limit
+            })
             .map(|r| r.id)
             .collect()
+    }
+
+    /// Select pending bundles for one authenticated delayed-delivery contact.
+    /// Destination, capability, contact expiry, bundle expiry, replication,
+    /// and local-scope policy are all enforced by the bundle forwarder.
+    #[allow(dead_code)] // direct one-contact helper complements multi-hint sweeps
+    #[must_use]
+    pub fn pending_delivery_for_contact(
+        &self,
+        contact: &Contact,
+        now: Instant,
+    ) -> Vec<[u8; 32]> {
+        self.pending_delivery_for_contact_hints(std::slice::from_ref(contact), now)
+    }
+
+    /// Select pending bundles for a contact that has more than one accepted
+    /// destination representation (for example endpoint id and static key).
+    #[must_use]
+    pub fn pending_delivery_for_contact_hints(
+        &self,
+        contacts: &[Contact],
+        now: Instant,
+    ) -> Vec<[u8; 32]> {
+        let mut selected = Vec::new();
+        for contact in contacts {
+            for record in select_for_contact(&self.manager, contact, now)
+                .expect("contact selection is infallible")
+            {
+                if !selected.contains(&record.id) {
+                    selected.push(record.id);
+                }
+            }
+        }
+        selected
+    }
+
+    /// Whether this node has storage capacity for delayed bundle delivery.
+    /// Constrained profiles deliberately advertise no store-forward support.
+    #[must_use]
+    pub fn store_forward_available(&self) -> bool {
+        self.manager.quota().hard_limit > 0
     }
 
     /// The stored ciphertext for a bundle id, when it exists.
@@ -239,10 +299,19 @@ impl BundleService {
         self.manager.next_transfer_chunk(id, chunk_size)
     }
 
+    /// Rewind a delivery cursor when the carrier rejected the packet. The
+    /// cursor advances while a frame is built so concurrent sweeps cannot
+    /// select the same chunk; a non-accepted send must put it back.
+    pub fn rewind_delivery_chunk(&mut self, id: &[u8; 32], chunk_index: u64) -> bool {
+        self.manager
+            .rewind_transfer_chunk(id, chunk_index)
+            .is_ok()
+    }
+
     /// Record a bundle that has been wrapped into a `BUNDLE` frame as
     /// `Forwarded` (bundles.md §10.2).
-    pub fn mark_forwarded(&mut self, id: &[u8; 32]) {
-        let _ = self.manager.set_status(id, BundleStatus::Forwarded);
+    pub fn mark_forwarded(&mut self, id: &[u8; 32]) -> bool {
+        self.manager.mark_forwarded(id).is_ok()
     }
 
     /// Apply a peer-reported `BUNDLE_ACK` status to a locally held bundle
@@ -456,6 +525,59 @@ mod tests {
         assert_eq!(pending.len(), 2);
         assert!(!pending.contains(&forwarded_id));
     }
+
+    #[test]
+    fn pending_delivery_for_contact_is_destination_and_capability_scoped() {
+        let mut service = service();
+        let matching = service
+            .admit(
+                b"matching",
+                b"sender",
+                b"peer-a",
+                1,
+                10_000,
+                3,
+                false,
+                Instant(0),
+            )
+            .unwrap();
+        let other = service
+            .admit(
+                b"other",
+                b"sender",
+                b"peer-b",
+                1,
+                10_000,
+                3,
+                false,
+                Instant(0),
+            )
+            .unwrap();
+        let contact = umc_bundle::forward::Contact {
+            destination_hint: b"peer-a".to_vec(),
+            peer: b"peer-a".to_vec(),
+            expires_at: Instant(10_000),
+            authenticated: true,
+            store_forward_allowed: true,
+            local_scope_only: false,
+        };
+        assert_eq!(
+            service.pending_delivery_for_contact(&contact, Instant(1)),
+            vec![matching]
+        );
+        let mut disallowed = contact.clone();
+        disallowed.store_forward_allowed = false;
+        assert!(service
+            .pending_delivery_for_contact(&disallowed, Instant(1))
+            .is_empty());
+        let mut expired = contact;
+        expired.expires_at = Instant(1);
+        assert!(service
+            .pending_delivery_for_contact(&expired, Instant(1))
+            .is_empty());
+        assert!(service.find(&other).is_some());
+    }
+
 
     #[test]
     fn payload_and_record_expose_the_stored_bundle() {

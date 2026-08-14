@@ -256,6 +256,944 @@ class CapabilityGrant(Message):
         return result
 
 
+class OpaqueHandle(Message):
+    def __init__(self, value: bytes = b""):
+        self.value = bytes(value)
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_bytes(out, 1, self.value)
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.value = value
+        return result
+
+
+class ListIdentitiesRequest(Message):
+    def _encode(self) -> bytes:
+        return b""
+
+
+class IdentitySummary(Message):
+    def __init__(self):
+        self.identity_handle = None
+        self.endpoint_id = b""
+        self.kind = 0
+        self.label = ""
+        self.binding_sequence = 0
+        self.binding_not_after_unix_ms = 0
+        self.secret_available = False
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.identity_handle)
+        _put_bytes(out, 2, self.endpoint_id)
+        _put_varint(out, 3, self.kind)
+        _put_string(out, 4, self.label)
+        _put_varint(out, 5, self.binding_sequence)
+        _put_varint(out, 6, self.binding_not_after_unix_ms)
+        _put_varint(out, 7, int(self.secret_available))
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.identity_handle = OpaqueHandle.FromString(value)
+            elif number == 2 and wire == 2:
+                result.endpoint_id = value
+            elif number == 3 and wire == 0:
+                result.kind = value
+            elif number == 4 and wire == 2:
+                result.label = value.decode("utf-8")
+            elif number == 5 and wire == 0:
+                result.binding_sequence = value
+            elif number == 6 and wire == 0:
+                result.binding_not_after_unix_ms = _signed64(value)
+            elif number == 7 and wire == 0:
+                result.secret_available = bool(value)
+        return result
+
+
+class ListIdentitiesResponse(Message):
+    def __init__(self):
+        self.identities = []
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        for identity in self.identities:
+            _put_message(out, 1, identity)
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.identities.append(IdentitySummary.FromString(value))
+        return result
+
+
+class CreateDelegationRequest(Message):
+    def __init__(self, identity_handle=None, delegated_public_key: bytes = b"", allowed_capabilities=None, expires_at_unix_ms: int = 0, root_capabilities=None):
+        self.identity_handle = identity_handle
+        self.delegated_public_key = bytes(delegated_public_key)
+        self.allowed_capabilities = list(allowed_capabilities or [])
+        self.expires_at_unix_ms = expires_at_unix_ms
+        self.root_capabilities = list(root_capabilities or [])
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.identity_handle)
+        _put_bytes(out, 2, self.delegated_public_key)
+        for capability in self.allowed_capabilities:
+            _put_bytes(out, 3, capability)
+        _put_varint(out, 4, self.expires_at_unix_ms)
+        for capability in self.root_capabilities:
+            _put_bytes(out, 5, capability)
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.identity_handle = OpaqueHandle.FromString(value)
+            elif number == 2 and wire == 2:
+                result.delegated_public_key = value
+            elif number == 3 and wire == 2:
+                result.allowed_capabilities.append(value)
+            elif number == 4 and wire == 0:
+                result.expires_at_unix_ms = _signed64(value)
+            elif number == 5 and wire == 2:
+                result.root_capabilities.append(value)
+        return result
+
+
+class CreateDelegationResponse(Message):
+    def __init__(self):
+        self.certificate = b""
+        self.delegation_chain = b""
+        self.root_public_key = b""
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.certificate = value
+            elif number == 2 and wire == 2:
+                result.delegation_chain = value
+            elif number == 3 and wire == 2:
+                result.root_public_key = value
+        return result
+
+
+class ImportDelegationRequest(Message):
+    def __init__(self, root_public_key: bytes = b"", root_capabilities=None, delegation_chain: bytes = b""):
+        self.root_public_key = bytes(root_public_key)
+        self.root_capabilities = list(root_capabilities or [])
+        self.delegation_chain = bytes(delegation_chain)
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_bytes(out, 1, self.root_public_key)
+        for capability in self.root_capabilities:
+            _put_bytes(out, 2, capability)
+        _put_bytes(out, 3, self.delegation_chain)
+        return bytes(out)
+
+
+class ImportDelegationResponse(Message):
+    def __init__(self):
+        self.delegated_public_key = b""
+        self.delegation_chain = b""
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.delegated_public_key = value
+            elif number == 2 and wire == 2:
+                result.delegation_chain = value
+        return result
+
+
+class ListDelegationsRequest(Message):
+    def _encode(self) -> bytes:
+        return b""
+
+
+class DelegationSummary(Message):
+    def __init__(self):
+        self.root_public_key = b""
+        self.delegated_public_key = b""
+        self.depth = 0
+        self.sequence = 0
+        self.expires_at_unix_ms = 0
+        self.capabilities = []
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_bytes(out, 1, self.root_public_key)
+        _put_bytes(out, 2, self.delegated_public_key)
+        _put_varint(out, 3, self.depth)
+        _put_varint(out, 4, self.sequence)
+        _put_varint(out, 5, self.expires_at_unix_ms)
+        for capability in self.capabilities:
+            _put_bytes(out, 6, capability)
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.root_public_key = value
+            elif number == 2 and wire == 2:
+                result.delegated_public_key = value
+            elif number == 3 and wire == 0:
+                result.depth = value
+            elif number == 4 and wire == 0:
+                result.sequence = value
+            elif number == 5 and wire == 0:
+                result.expires_at_unix_ms = value
+            elif number == 6 and wire == 2:
+                result.capabilities.append(value)
+        return result
+
+
+class ListDelegationsResponse(Message):
+    def __init__(self):
+        self.delegations = []
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        for delegation in self.delegations:
+            _put_message(out, 1, delegation)
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.delegations.append(DelegationSummary.FromString(value))
+        return result
+
+
+class RevokeDelegationRequest(Message):
+    def __init__(self, identity_handle=None, delegated_public_key: bytes = b"", sequence: int = 0, expires_at_unix_ms: int = 0, reason: str = ""):
+        self.identity_handle = identity_handle
+        self.delegated_public_key = bytes(delegated_public_key)
+        self.sequence = sequence
+        self.expires_at_unix_ms = expires_at_unix_ms
+        self.reason = reason
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.identity_handle)
+        _put_bytes(out, 2, self.delegated_public_key)
+        _put_varint(out, 3, self.sequence)
+        _put_varint(out, 4, self.expires_at_unix_ms)
+        _put_string(out, 5, self.reason)
+        return bytes(out)
+
+
+class RevokeDelegationResponse(Message):
+    def _encode(self) -> bytes:
+        return b""
+
+
+class RegisterApplicationRequest(Message):
+    def __init__(self, application_name: str = "", application_instance_id: bytes = b"", requested_protocol_ids: list[str] | None = None, resumable: bool = False):
+        self.application_name = application_name
+        self.application_instance_id = bytes(application_instance_id)
+        self.requested_protocol_ids = list(requested_protocol_ids or [])
+        self.resumable = resumable
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_string(out, 1, self.application_name)
+        _put_bytes(out, 2, self.application_instance_id)
+        for protocol in self.requested_protocol_ids:
+            _put_string(out, 4, protocol)
+        _put_varint(out, 6, int(self.resumable))
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.application_name = value.decode("utf-8")
+            elif number == 2 and wire == 2:
+                result.application_instance_id = value
+            elif number == 4 and wire == 2:
+                result.requested_protocol_ids.append(value.decode("utf-8"))
+            elif number == 6 and wire == 0:
+                result.resumable = bool(value)
+        return result
+
+
+class RegisterApplicationResponse(Message):
+    def __init__(self):
+        self.application_handle = None
+        self.effective_grants = []
+        self.resume_token = b""
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.application_handle)
+        for grant in self.effective_grants:
+            _put_message(out, 2, grant)
+        _put_bytes(out, 3, self.resume_token)
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.application_handle = OpaqueHandle.FromString(value)
+            elif number == 2 and wire == 2:
+                result.effective_grants.append(CapabilityGrant.FromString(value))
+            elif number == 3 and wire == 2:
+                result.resume_token = value
+        return result
+
+
+class UnregisterApplicationRequest(Message):
+    def __init__(self, application_handle=None, close_owned_sessions: bool = False):
+        self.application_handle = application_handle
+        self.close_owned_sessions = close_owned_sessions
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.application_handle)
+        _put_varint(out, 2, int(self.close_owned_sessions))
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.application_handle = OpaqueHandle.FromString(value)
+            elif number == 2 and wire == 0:
+                result.close_owned_sessions = bool(value)
+        return result
+
+
+class ConnectRequest(Message):
+    def __init__(self, application_handle=None, local_endpoint_id: bytes = b"", destination_hint: bytes = b"", protocol_id: str = "", return_operation: bool = False):
+        self.application_handle = application_handle
+        self.local_endpoint_id = bytes(local_endpoint_id)
+        self.destination_hint = bytes(destination_hint)
+        self.protocol_id = protocol_id
+        self.return_operation = return_operation
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.application_handle)
+        _put_bytes(out, 2, self.local_endpoint_id)
+        _put_bytes(out, 3, self.destination_hint)
+        _put_string(out, 4, self.protocol_id)
+        _put_varint(out, 6, int(self.return_operation))
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.application_handle = OpaqueHandle.FromString(value)
+            elif number == 2 and wire == 2:
+                result.local_endpoint_id = value
+            elif number == 3 and wire == 2:
+                result.destination_hint = value
+            elif number == 4 and wire == 2:
+                result.protocol_id = value.decode("utf-8")
+            elif number == 6 and wire == 0:
+                result.return_operation = bool(value)
+        return result
+
+
+class ConnectResponse(Message):
+    def __init__(self):
+        self.session_handle = None
+        self.operation_handle = None
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.session_handle)
+        _put_message(out, 2, self.operation_handle)
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.session_handle = OpaqueHandle.FromString(value)
+            elif number == 2 and wire == 2:
+                result.operation_handle = OpaqueHandle.FromString(value)
+        return result
+
+
+class AcceptIncomingSessionRequest(Message):
+    def __init__(self, application_handle=None, pending_session_handle=None):
+        self.application_handle = application_handle
+        self.pending_session_handle = pending_session_handle
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.application_handle)
+        _put_message(out, 2, self.pending_session_handle)
+        return bytes(out)
+
+
+class RejectIncomingSessionRequest(Message):
+    def __init__(self, application_handle=None, pending_session_handle=None, application_error_code: int = 0, reason: str = ""):
+        self.application_handle = application_handle
+        self.pending_session_handle = pending_session_handle
+        self.application_error_code = application_error_code
+        self.reason = reason
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.application_handle)
+        _put_message(out, 2, self.pending_session_handle)
+        _put_varint(out, 3, self.application_error_code)
+        _put_string(out, 4, self.reason)
+        return bytes(out)
+
+
+class AcceptIncomingSessionResponse(Message):
+    def __init__(self):
+        self.session_handle = None
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.session_handle = OpaqueHandle.FromString(value)
+        return result
+
+
+class OpenListenerRequest(Message):
+    def __init__(self, application_handle=None, endpoint_id: bytes = b"", protocol_id: str = ""):
+        self.application_handle = application_handle
+        self.endpoint_id = bytes(endpoint_id)
+        self.protocol_id = protocol_id
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.application_handle)
+        _put_bytes(out, 2, self.endpoint_id)
+        _put_string(out, 3, self.protocol_id)
+        return bytes(out)
+
+
+class ListCandidatesRequest(Message):
+    def __init__(self):
+        pass
+
+    def _encode(self) -> bytes:
+        return b""
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        return cls()
+
+
+class CandidateSummary(Message):
+    def __init__(self, candidate_id: int = 0, carrier_type: str = "", expires_at_ms: int = 0, public: bool = False):
+        self.candidate_id = candidate_id
+        self.carrier_type = carrier_type
+        self.expires_at_ms = expires_at_ms
+        self.public = public
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_varint(out, 1, self.candidate_id)
+        _put_string(out, 2, self.carrier_type)
+        _put_varint(out, 3, self.expires_at_ms)
+        _put_varint(out, 4, int(self.public))
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 0:
+                result.candidate_id = value
+            elif number == 2 and wire == 2:
+                result.carrier_type = value.decode("utf-8")
+            elif number == 3 and wire == 0:
+                result.expires_at_ms = value
+            elif number == 4 and wire == 0:
+                result.public = bool(value)
+        return result
+
+
+class ListCandidatesResponse(Message):
+    def __init__(self):
+        self.candidates = []
+        self.total = 0
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        for candidate in self.candidates:
+            _put_message(out, 1, candidate)
+        _put_varint(out, 2, self.total)
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.candidates.append(CandidateSummary.FromString(value))
+            elif number == 2 and wire == 0:
+                result.total = value
+        return result
+
+
+class ServiceHintSummary(Message):
+    def __init__(self, peer_endpoint_id: bytes = b"", protocol_id: str = "", endpoint_hint: bytes = b"", metadata: bytes = b"", expires_at_unix_ms: int = 0, signature: bytes = b"", public: bool = False):
+        self.peer_endpoint_id = bytes(peer_endpoint_id)
+        self.protocol_id = protocol_id
+        self.endpoint_hint = bytes(endpoint_hint)
+        self.metadata = bytes(metadata)
+        self.expires_at_unix_ms = expires_at_unix_ms
+        self.signature = bytes(signature)
+        self.public = public
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_bytes(out, 1, self.peer_endpoint_id)
+        _put_string(out, 2, self.protocol_id)
+        _put_bytes(out, 3, self.endpoint_hint)
+        _put_bytes(out, 4, self.metadata)
+        _put_varint(out, 5, self.expires_at_unix_ms)
+        _put_bytes(out, 6, self.signature)
+        _put_varint(out, 7, int(self.public))
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.peer_endpoint_id = value
+            elif number == 2 and wire == 2:
+                result.protocol_id = value.decode("utf-8")
+            elif number == 3 and wire == 2:
+                result.endpoint_hint = value
+            elif number == 4 and wire == 2:
+                result.metadata = value
+            elif number == 5 and wire == 0:
+                result.expires_at_unix_ms = _signed64(value)
+            elif number == 6 and wire == 2:
+                result.signature = value
+            elif number == 7 and wire == 0:
+                result.public = bool(value)
+        return result
+
+
+class PublishServiceHintRequest(Message):
+    def __init__(self, protocol_id: str = "", endpoint_hint: bytes = b"", metadata: bytes = b"", expires_at_unix_ms: int = 0, public: bool = False):
+        self.protocol_id = protocol_id
+        self.endpoint_hint = bytes(endpoint_hint)
+        self.metadata = bytes(metadata)
+        self.expires_at_unix_ms = expires_at_unix_ms
+        self.public = public
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_string(out, 1, self.protocol_id)
+        _put_bytes(out, 2, self.endpoint_hint)
+        _put_bytes(out, 3, self.metadata)
+        _put_varint(out, 4, self.expires_at_unix_ms)
+        _put_varint(out, 5, int(self.public))
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.protocol_id = value.decode("utf-8")
+            elif number == 2 and wire == 2:
+                result.endpoint_hint = value
+            elif number == 3 and wire == 2:
+                result.metadata = value
+            elif number == 4 and wire == 0:
+                result.expires_at_unix_ms = _signed64(value)
+            elif number == 5 and wire == 0:
+                result.public = bool(value)
+        return result
+
+
+class PublishServiceHintResponse(Message):
+    def __init__(self, hint=None):
+        self.hint = hint
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.hint)
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.hint = ServiceHintSummary.FromString(value)
+        return result
+
+
+class DiscoverServicesRequest(Message):
+    def __init__(self, protocol_id: str = ""):
+        self.protocol_id = protocol_id
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_string(out, 1, self.protocol_id)
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.protocol_id = value.decode("utf-8")
+        return result
+
+
+class DiscoverServicesResponse(Message):
+    def __init__(self, hints=None):
+        self.hints = list(hints or [])
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        for hint in self.hints:
+            _put_message(out, 1, hint)
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.hints.append(ServiceHintSummary.FromString(value))
+        return result
+
+
+class OpenListenerResponse(Message):
+    def __init__(self):
+        self.listener_handle = None
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.listener_handle = OpaqueHandle.FromString(value)
+        return result
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.listener_handle)
+        return bytes(out)
+
+
+class CloseListenerRequest(Message):
+    def __init__(self, listener_handle=None, close_owned_sessions: bool = False):
+        self.listener_handle = listener_handle
+        self.close_owned_sessions = close_owned_sessions
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.listener_handle)
+        _put_varint(out, 2, int(self.close_owned_sessions))
+        return bytes(out)
+
+
+class OpenStreamRequest(Message):
+    def __init__(self, application_handle=None, session_handle=None, unidirectional: bool = False, initial_metadata: bytes = b""):
+        self.application_handle = application_handle
+        self.session_handle = session_handle
+        self.unidirectional = unidirectional
+        self.initial_metadata = bytes(initial_metadata)
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.application_handle)
+        _put_message(out, 2, self.session_handle)
+        _put_varint(out, 3, int(self.unidirectional))
+        _put_bytes(out, 4, self.initial_metadata)
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.application_handle = OpaqueHandle.FromString(value)
+            elif number == 2 and wire == 2:
+                result.session_handle = OpaqueHandle.FromString(value)
+            elif number == 3 and wire == 0:
+                result.unidirectional = bool(value)
+            elif number == 4 and wire == 2:
+                result.initial_metadata = value
+        return result
+
+
+class OpenStreamResponse(Message):
+    def __init__(self):
+        self.stream_handle = None
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.stream_handle)
+        return bytes(out)
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.stream_handle = OpaqueHandle.FromString(value)
+        return result
+
+
+class AcceptStreamRequest(Message):
+    def __init__(self, application_handle=None, pending_stream_handle=None):
+        self.application_handle = application_handle
+        self.pending_stream_handle = pending_stream_handle
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.application_handle)
+        _put_message(out, 2, self.pending_stream_handle)
+        return bytes(out)
+
+
+class RejectStreamRequest(Message):
+    def __init__(self, pending_stream_handle=None, application_error_code: int = 0):
+        self.pending_stream_handle = pending_stream_handle
+        self.application_error_code = application_error_code
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.pending_stream_handle)
+        _put_varint(out, 2, self.application_error_code)
+        return bytes(out)
+
+
+class AcceptStreamResponse(Message):
+    def __init__(self):
+        self.stream_handle = None
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.stream_handle = OpaqueHandle.FromString(value)
+        return result
+
+
+class WriteStreamRequest(Message):
+    def __init__(self, stream_handle=None, data: bytes = b"", fin: bool = False):
+        self.stream_handle = stream_handle
+        self.data = bytes(data)
+        self.fin = fin
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.stream_handle)
+        _put_bytes(out, 2, self.data)
+        _put_varint(out, 3, int(self.fin))
+        return bytes(out)
+
+
+class WriteStreamResponse(Message):
+    def __init__(self):
+        self.accepted_bytes = 0
+        self.fin_accepted = False
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 0:
+                result.accepted_bytes = value
+            elif number == 2 and wire == 0:
+                result.fin_accepted = bool(value)
+        return result
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_varint(out, 1, self.accepted_bytes)
+        _put_varint(out, 2, int(self.fin_accepted))
+        return bytes(out)
+
+
+class CloseStreamSendRequest(Message):
+    def __init__(self, stream_handle=None):
+        self.stream_handle = stream_handle
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.stream_handle)
+        return bytes(out)
+
+
+class ResetStreamRequest(Message):
+    def __init__(self, stream_handle=None, application_error_code: int = 0):
+        self.stream_handle = stream_handle
+        self.application_error_code = application_error_code
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.stream_handle)
+        _put_varint(out, 2, self.application_error_code)
+        return bytes(out)
+
+
+class StopStreamRequest(ResetStreamRequest):
+    pass
+
+
+class SendDatagramRequest(Message):
+    def __init__(self, session_handle=None, context_id: int = 0, data: bytes = b"", lifetime_ms: int = 0, request_ack: bool = False):
+        self.session_handle = session_handle
+        self.context_id = context_id
+        self.data = bytes(data)
+        self.lifetime_ms = lifetime_ms
+        self.request_ack = request_ack
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.session_handle)
+        _put_varint(out, 2, self.context_id)
+        _put_bytes(out, 3, self.data)
+        _put_varint(out, 4, self.lifetime_ms)
+        _put_varint(out, 5, int(self.request_ack))
+        return bytes(out)
+
+
+class SendDatagramResponse(Message):
+    def __init__(self):
+        self.local_datagram_id = 0
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 0:
+                result.local_datagram_id = value
+        return result
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_varint(out, 1, self.local_datagram_id)
+        return bytes(out)
+
+
+class ReceiveDatagramRequest(Message):
+    def __init__(self, application_handle=None, session_handle=None, maximum_bytes: int = 0, wait_for_data: bool = False):
+        self.application_handle = application_handle
+        self.session_handle = session_handle
+        self.maximum_bytes = maximum_bytes
+        self.wait_for_data = wait_for_data
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.application_handle)
+        _put_message(out, 2, self.session_handle)
+        _put_varint(out, 3, self.maximum_bytes)
+        _put_varint(out, 4, int(self.wait_for_data))
+        return bytes(out)
+
+
+class ReceiveDatagramResponse(Message):
+    def __init__(self):
+        self.session_handle = None
+        self.context_id = 0
+        self.data = b""
+        self.expired = False
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.session_handle = OpaqueHandle.FromString(value)
+            elif number == 2 and wire == 0:
+                result.context_id = value
+            elif number == 3 and wire == 2:
+                result.data = value
+            elif number == 4 and wire == 0:
+                result.expired = bool(value)
+        return result
+
+
+class ReadStreamRequest(Message):
+    def __init__(self, stream_handle=None, maximum_bytes: int = 0, wait_for_data: bool = False):
+        self.stream_handle = stream_handle
+        self.maximum_bytes = maximum_bytes
+        self.wait_for_data = wait_for_data
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_message(out, 1, self.stream_handle)
+        _put_varint(out, 2, self.maximum_bytes)
+        _put_varint(out, 3, int(self.wait_for_data))
+        return bytes(out)
+
+
+class ReadStreamResponse(Message):
+    def __init__(self):
+        self.data = b""
+        self.eof = False
+        self.reset = False
+        self.application_error_code = 0
+
+    @classmethod
+    def _decode(cls, data: bytes):
+        result = cls()
+        for number, wire, value in _fields(data):
+            if number == 1 and wire == 2:
+                result.data = value
+            elif number == 2 and wire == 0:
+                result.eof = bool(value)
+            elif number == 3 and wire == 0:
+                result.reset = bool(value)
+            elif number == 4 and wire == 0:
+                result.application_error_code = value
+        return result
+
+    def _encode(self) -> bytes:
+        out = bytearray()
+        _put_bytes(out, 1, self.data)
+        _put_varint(out, 2, int(self.eof))
+        _put_varint(out, 3, int(self.reset))
+        _put_varint(out, 4, self.application_error_code)
+        return bytes(out)
+
+
 class ConnectionLimits(Message):
     def __init__(self, **kwargs: int):
         names = (
@@ -556,17 +1494,62 @@ class StatusCode:
 
 
 __all__ = [
+    "AcceptIncomingSessionRequest",
+    "AcceptIncomingSessionResponse",
+    "AcceptStreamRequest",
+    "AcceptStreamResponse",
     "ApiVersion",
     "CapabilityGrant",
+    "CandidateSummary",
+    "CloseStreamSendRequest",
     "ClientAuthentication",
     "ClientHello",
     "ConnectionLimits",
     "Envelope",
     "Message",
+    "ConnectRequest",
+    "ConnectResponse",
+    "CreateDelegationRequest",
+    "CreateDelegationResponse",
+    "DelegationSummary",
+    "ImportDelegationRequest",
+    "ImportDelegationResponse",
+    "ListDelegationsRequest",
+    "ListDelegationsResponse",
+    "ListCandidatesRequest",
+    "ListCandidatesResponse",
+    "ServiceHintSummary",
+    "PublishServiceHintRequest",
+    "PublishServiceHintResponse",
+    "DiscoverServicesRequest",
+    "DiscoverServicesResponse",
+    "ListIdentitiesRequest",
+    "ListIdentitiesResponse",
+    "IdentitySummary",
     "Request",
+    "OpaqueHandle",
+    "OpenStreamRequest",
+    "OpenStreamResponse",
+    "ReadStreamRequest",
+    "ReadStreamResponse",
+    "ReceiveDatagramRequest",
+    "ReceiveDatagramResponse",
+    "RegisterApplicationRequest",
+    "RegisterApplicationResponse",
+    "RejectIncomingSessionRequest",
+    "RejectStreamRequest",
+    "ResetStreamRequest",
+    "RevokeDelegationRequest",
+    "RevokeDelegationResponse",
     "Response",
+    "SendDatagramRequest",
+    "SendDatagramResponse",
     "ServerHello",
     "Status",
     "StatusCode",
     "StatusDetail",
+    "StopStreamRequest",
+    "UnregisterApplicationRequest",
+    "WriteStreamRequest",
+    "WriteStreamResponse",
 ]

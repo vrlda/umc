@@ -67,7 +67,10 @@ pub fn context_allows(context: &PacketContext, ty: umc_types::frame::FrameType) 
         ) => true,
         (PacketContext::Protected(_), T::KEY_UPDATE) => true,
         (PacketContext::Protected(_), T::NEW_CONNECTION_ID | T::RETIRE_CONNECTION_ID) => true,
-        (PacketContext::Protected(_), T::PEER_HINT | T::SERVICE_HINT | T::DHT_LOOKUP) => true,
+        (
+            PacketContext::Protected(_),
+            T::PEER_HINT | T::SERVICE_HINT | T::DHT_LOOKUP | T::REVOCATION_BATCH,
+        ) => true,
         (PacketContext::Protected(_), T::MAX_DATA | T::MAX_STREAM_DATA | T::MAX_STREAMS) => true,
         (PacketContext::Protected(_), T::RESET_STREAM | T::STOP_SENDING) => true,
         (PacketContext::Protected(_), T::CONNECTION_CLOSE) => true,
@@ -125,6 +128,7 @@ pub fn frame_type_of(frame: &Frame) -> umc_types::frame::FrameType {
         Frame::SessionTicket(_) => T::SESSION_TICKET,
         Frame::ServiceHint(_) => T::SERVICE_HINT,
         Frame::DhtLookup(_) => T::DHT_LOOKUP,
+        Frame::RevocationBatch(_) => T::REVOCATION_BATCH,
     }
 }
 
@@ -195,6 +199,24 @@ mod tests {
         assert_eq!(
             parse_payload(&PacketContext::Handshake, &payload).unwrap_err(),
             PacketError::ContextViolation(T::ROUTE_REQUEST)
+        );
+    }
+
+    #[test]
+    fn revocation_batch_only_in_protected() {
+        let encoded = crate::frames::misc::RevocationBatchFrame {
+            payload: b"RS\x01\x00\x00".to_vec(),
+        }
+        .encode()
+        .unwrap();
+        assert!(parse_payload(
+            &PacketContext::Protected(ShortPacketSpace::SessionData),
+            &encoded
+        )
+        .is_ok());
+        assert_eq!(
+            parse_payload(&PacketContext::Initial, &encoded).unwrap_err(),
+            PacketError::ContextViolation(T::REVOCATION_BATCH)
         );
     }
 

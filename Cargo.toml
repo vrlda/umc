@@ -25,10 +25,12 @@ members = [
     "carriers/umc-carrier-udp",
     "carriers/umc-carrier-lan",
     "examples/echo",
+    "examples/chat",
+    "examples/file-transfer",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.80"

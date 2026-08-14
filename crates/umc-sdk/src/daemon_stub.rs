@@ -1,8 +1,9 @@
-//! Compile-only daemon backend for platforms without Unix domain sockets.
+//! Compile-only daemon backend for platforms without Unix domain sockets or
+//! Windows named pipes.
 //!
-//! Windows named-pipe transport is intentionally deferred; the public SDK
-//! surface remains available so cross-platform builds can include the crate,
-//! while daemon-backed operations return [`ClientError::Unsupported`].
+//! Unix and Windows have real daemon transports. This module keeps the public
+//! SDK surface available on other targets, while daemon-backed operations
+//! return [`ClientError::Unsupported`].
 
 #[cfg(test)]
 use prost::Message;
@@ -12,15 +13,15 @@ use umc_control::proto::umc::api::v1 as api;
 use crate::client::ClientError;
 use crate::events::Event;
 
-const UNSUPPORTED: &str =
-    "daemon control transport is unavailable on this platform; Windows named-pipe support is deferred";
+const UNSUPPORTED: &str = "daemon control transport is unavailable on this platform";
 
 /// Placeholder daemon client for non-Unix targets.
 #[derive(Debug)]
 pub struct DaemonClient;
 
 impl DaemonClient {
-    /// Returns an explicit unsupported error until named-pipe transport is implemented.
+    /// Returns an explicit unsupported error on platforms without a daemon
+    /// transport.
     ///
     /// # Errors
     ///
@@ -30,7 +31,8 @@ impl DaemonClient {
         std::future::ready(Err(ClientError::Unsupported(UNSUPPORTED.into()))).await
     }
 
-    /// Returns an explicit unsupported error until named-pipe transport is implemented.
+    /// Returns an explicit unsupported error on platforms without a daemon
+    /// transport.
     ///
     /// # Errors
     ///
@@ -45,7 +47,8 @@ impl DaemonClient {
         std::future::ready(Err(ClientError::Unsupported(UNSUPPORTED.into()))).await
     }
 
-    /// Returns an explicit unsupported error until named-pipe transport is implemented.
+    /// Returns an explicit unsupported error on platforms without a daemon
+    /// transport.
     ///
     /// # Errors
     ///

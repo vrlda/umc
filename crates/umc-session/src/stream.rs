@@ -27,6 +27,10 @@ pub enum RecvState {
 pub struct Stream {
     pub stream_id: u64,
     pub protocol_id: Vec<u8>,
+    /// Opening-frame metadata, retained to validate duplicate OPEN frames.
+    pub metadata: Vec<u8>,
+    /// Whether peer receive direction has observed its opening frame.
+    pub recv_opened: bool,
     pub unidirectional: bool,
     pub send_state: SendState,
     pub recv_state: RecvState,
@@ -60,6 +64,8 @@ impl Stream {
         Self {
             stream_id,
             protocol_id,
+            metadata: Vec::new(),
+            recv_opened: false,
             unidirectional: false,
             send_state: SendState::Ready,
             recv_state: RecvState::Recv,

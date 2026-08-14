@@ -31,6 +31,41 @@ pub struct Endpoint {
     secret_available: bool,
 }
 
+/// Public material returned when a root endpoint provisions another device.
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delegation {
+    certificate: Vec<u8>,
+    delegation_chain: Vec<u8>,
+    root_public_key: Vec<u8>,
+}
+
+impl Delegation {
+    #[must_use]
+    pub fn certificate(&self) -> &[u8] {
+        &self.certificate
+    }
+    #[must_use]
+    pub fn delegation_chain(&self) -> &[u8] {
+        &self.delegation_chain
+    }
+    #[must_use]
+    pub fn root_public_key(&self) -> &[u8] {
+        &self.root_public_key
+    }
+}
+
+/// Public summary of one persisted delegated leaf.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegationSummary {
+    pub root_public_key: Vec<u8>,
+    pub delegated_public_key: Vec<u8>,
+    pub depth: u32,
+    pub sequence: u64,
+    pub expires_at_unix_ms: u64,
+    pub capabilities: Vec<Vec<u8>>,
+}
+
 /// Result of an application registration. The daemon may narrow requested
 /// capabilities to the authenticated principal's effective grants and may
 /// issue a resumable registration token.
@@ -373,6 +408,131 @@ impl Client {
         )
     }
 
+    /// Creates and persists a bounded signed delegation for a device key.
+    pub async fn create_delegation(
+        &mut self,
+        identity: &EndpointHandle,
+        delegated_public_key: [u8; 32],
+        allowed_capabilities: &[Vec<u8>],
+        root_capabilities: &[Vec<u8>],
+        expires_at_unix_ms: i64,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<Delegation, ClientError> {
+        self.validate_handle(identity)?;
+        let request = v1::CreateDelegationRequest {
+            identity_handle: Some(identity.to_proto()),
+            delegated_public_key: delegated_public_key.to_vec(),
+            allowed_capabilities: allowed_capabilities.to_vec(),
+            expires_at_unix_ms,
+            root_capabilities: root_capabilities.to_vec(),
+        };
+        let response = self
+            .request_with_deadline(
+                "IdentityService",
+                "CreateDelegation",
+                encode(&request)?,
+                deadline_unix_ms,
+            )
+            .await?;
+        require_ok(&response, "IdentityService.CreateDelegation")?;
+        let created = v1::CreateDelegationResponse::decode(response.payload.as_slice())
+            .map_err(|error| ClientError::Proto(error.to_string()))?;
+        Ok(Delegation {
+            certificate: created.certificate,
+            delegation_chain: created.delegation_chain,
+            root_public_key: created.root_public_key,
+        })
+    }
+
+    /// Imports a public delegation chain into the local trust store.
+    pub async fn import_delegation(
+        &mut self,
+        root_public_key: [u8; 32],
+        root_capabilities: &[Vec<u8>],
+        delegation_chain: &[u8],
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<Vec<u8>, ClientError> {
+        let request = v1::ImportDelegationRequest {
+            root_public_key: root_public_key.to_vec(),
+            root_capabilities: root_capabilities.to_vec(),
+            delegation_chain: delegation_chain.to_vec(),
+        };
+        let response = self
+            .request_with_deadline(
+                "IdentityService",
+                "ImportDelegation",
+                encode(&request)?,
+                deadline_unix_ms,
+            )
+            .await?;
+        require_ok(&response, "IdentityService.ImportDelegation")?;
+        Ok(
+            v1::ImportDelegationResponse::decode(response.payload.as_slice())
+                .map_err(|error| ClientError::Proto(error.to_string()))?
+                .delegated_public_key,
+        )
+    }
+
+    /// Lists only public metadata for locally persisted delegated devices.
+    pub async fn list_delegations(
+        &mut self,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<Vec<DelegationSummary>, ClientError> {
+        let response = self
+            .request_with_deadline(
+                "IdentityService",
+                "ListDelegations",
+                encode(&v1::ListDelegationsRequest {})?,
+                deadline_unix_ms,
+            )
+            .await?;
+        require_ok(&response, "IdentityService.ListDelegations")?;
+        Ok(
+            v1::ListDelegationsResponse::decode(response.payload.as_slice())
+                .map_err(|error| ClientError::Proto(error.to_string()))?
+                .delegations
+                .into_iter()
+                .map(|summary| DelegationSummary {
+                    root_public_key: summary.root_public_key,
+                    delegated_public_key: summary.delegated_public_key,
+                    depth: summary.depth,
+                    sequence: summary.sequence,
+                    expires_at_unix_ms: summary.expires_at_unix_ms,
+                    capabilities: summary.capabilities,
+                })
+                .collect(),
+        )
+    }
+
+    /// Revokes a delegated leaf using the selected root endpoint.
+    pub async fn revoke_delegation(
+        &mut self,
+        identity: &EndpointHandle,
+        delegated_public_key: [u8; 32],
+        sequence: u64,
+        expires_at_unix_ms: i64,
+        reason: &str,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<(), ClientError> {
+        self.validate_handle(identity)?;
+        let request = v1::RevokeDelegationRequest {
+            identity_handle: Some(identity.to_proto()),
+            delegated_public_key: delegated_public_key.to_vec(),
+            sequence,
+            expires_at_unix_ms,
+            reason: reason.to_string(),
+        };
+        let response = self
+            .request_with_deadline(
+                "IdentityService",
+                "RevokeDelegation",
+                encode(&request)?,
+                deadline_unix_ms,
+            )
+            .await?;
+        require_ok(&response, "IdentityService.RevokeDelegation")
+    }
+
     /// Registers application protocols and returns an application-scoped
     /// handle. The daemon enforces capability grants and ownership.
     pub async fn register_application(
@@ -633,6 +793,45 @@ impl Client {
         validate_protocol_id(protocol_id)?;
         let request = v1::ConnectRequest {
             application_handle: Some(application.to_proto()),
+            destination_hint: destination_hint.to_vec(),
+            protocol_id: protocol_id.to_string(),
+            policy: Some(policy.to_connection_policy()),
+            ..Default::default()
+        };
+        let response = self
+            .request_with_deadline(
+                "ApplicationService",
+                "Connect",
+                encode(&request)?,
+                deadline_unix_ms,
+            )
+            .await?;
+        require_ok(&response, "ApplicationService.Connect")?;
+        let connected = v1::ConnectResponse::decode(response.payload.as_slice())
+            .map_err(|error| ClientError::Proto(error.to_string()))?;
+        connected
+            .session_handle
+            .as_ref()
+            .map(|handle| SessionHandle::from_proto_with_generation(handle, self.generation()))
+            .ok_or_else(|| ClientError::Proto("connect response has no session handle".into()))
+    }
+
+    /// Connects using a specific local endpoint selected at registration.
+    pub async fn connect_session_from_endpoint(
+        &mut self,
+        application: &AppHandle,
+        local_endpoint: &EndpointHandle,
+        destination_hint: &[u8],
+        protocol_id: &str,
+        policy: &Policy,
+        deadline_unix_ms: Option<i64>,
+    ) -> Result<SessionHandle, ClientError> {
+        self.validate_handle(application)?;
+        self.validate_handle(local_endpoint)?;
+        validate_protocol_id(protocol_id)?;
+        let request = v1::ConnectRequest {
+            application_handle: Some(application.to_proto()),
+            local_endpoint_id: local_endpoint.to_proto().value,
             destination_hint: destination_hint.to_vec(),
             protocol_id: protocol_id.to_string(),
             policy: Some(policy.to_connection_policy()),

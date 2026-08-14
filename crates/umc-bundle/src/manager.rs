@@ -44,6 +44,8 @@ pub struct BundleRecord {
     pub expires_at: Instant,
     pub replication_count: u64,
     pub replication_limit: u64,
+    pub do_not_replicate: bool,
+    pub local_scope_only: bool,
     pub custody: bool,
     /// A custody commitment may outlive the payload's ordinary expiry. The
     /// node retains the record until this deadline or explicit release.
@@ -70,6 +72,7 @@ pub enum BundleError {
     ReplicationLimit,
     NotFound,
     Storage(StoreError),
+    Persistence(StoreError),
 }
 
 pub struct BundleManager {
@@ -211,6 +214,39 @@ impl BundleManager {
         custody: bool,
         now: Instant,
     ) -> Result<[u8; BUNDLE_ID_LEN], BundleError> {
+        self.admit_with_policy(
+            payload,
+            sender,
+            destination_hint,
+            priority,
+            lifetime_ms,
+            replication_limit,
+            custody,
+            false,
+            false,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    ///
+    /// # Errors
+    ///
+    /// Returns the same policy, duplicate, quota, storage, and persistence
+    /// errors as [`Self::admit`].
+    pub fn admit_with_policy(
+        &mut self,
+        payload: &[u8],
+        sender: &[u8],
+        destination_hint: &[u8],
+        priority: u64,
+        lifetime_ms: u64,
+        replication_limit: u64,
+        custody: bool,
+        do_not_replicate: bool,
+        local_scope_only: bool,
+        now: Instant,
+    ) -> Result<[u8; BUNDLE_ID_LEN], BundleError> {
         self.last_now = now;
         self.prune_duplicate_cache(now);
         if payload.len() > DEFAULT_MAX_BUNDLE_BYTES {
@@ -240,6 +276,29 @@ impl BundleManager {
         if self.duplicate_cache.contains_key(&id) {
             return Err(BundleError::Duplicate);
         }
+        // At the pressure threshold, reclaim eligible delivered/low-value
+        // records before evaluating the new admission. Live custody records
+        // are excluded by `evict_under_pressure`, so a node never breaks an
+        // accepted retention promise to make room for a new bundle.
+        let hard_limit = self.quota.hard_limit;
+        if hard_limit > 0 {
+            let critical_limit = hard_limit.saturating_mul(98) / 100;
+            let soft_limit = hard_limit.saturating_mul(80) / 100;
+            // Critical pressure is fail-closed: cleanup must not turn a
+            // saturated node into one that silently accepts more network
+            // storage in the same admission attempt.
+            if self.quota.used() >= critical_limit {
+                return Err(BundleError::QuotaExceeded);
+            }
+            if self.quota.used() >= hard_limit.saturating_mul(90) / 100 {
+                let _ = self.evict_under_pressure(now);
+            }
+            if self.quota.used() >= critical_limit
+                || (self.quota.used() >= soft_limit && priority == 0)
+            {
+                return Err(BundleError::QuotaExceeded);
+            }
+        }
         // Reserve quota BEFORE allocation (resource-limits.md §32).
         self.quota
             .reserve(payload.len() as u64)
@@ -262,6 +321,8 @@ impl BundleManager {
                 expires_at: now + Duration::from_millis(lifetime),
                 replication_count: 0,
                 replication_limit,
+                do_not_replicate,
+                local_scope_only,
                 custody,
                 custody_deadline: custody.then_some(now + Duration::from_millis(lifetime)),
                 transfer_chunk_index: 0,
@@ -273,13 +334,25 @@ impl BundleManager {
             },
         );
         *self.bundles_per_sender.entry(sender.to_vec()).or_insert(0) += 1;
-        // Persistence is best-effort: a failed meta write never fails the
-        // admission; the record lives on in memory and the next restart
-        // simply loses it (storage.md §6.3).
+        // Durable store-and-forward requires the metadata commit before the
+        // admission is acknowledged. A failed commit rolls back the in-memory
+        // record, quota, sender accounting, and content-addressed object.
         if let Some(store) = &self.store {
             if let Some(record) = self.records.get(&id) {
                 if let Err(e) = save_meta(store.as_ref(), &BundleMeta::from_record(record)) {
-                    println!("[bundle] admit: meta persist failed: {e:?}");
+                    self.records.remove(&id);
+                    self.quota.release(payload.len() as u64);
+                    if let Some(count) = self.bundles_per_sender.get_mut(sender) {
+                        *count = count.saturating_sub(1);
+                    }
+                    let still_referenced = self
+                        .records_iter()
+                        .any(|other| other.object_id == object_id);
+                    if !still_referenced {
+                        let _ = self.objects.delete(&object_id);
+                    }
+                    let _ = delete_meta(store.as_ref(), &id);
+                    return Err(BundleError::Persistence(e));
                 }
             }
         }
@@ -343,6 +416,28 @@ impl BundleManager {
         )))
     }
 
+    /// Rewinds a previously reserved transfer chunk after its carrier send
+    /// was not accepted. The cursor changes only when it still points at the
+    /// chunk immediately after `chunk_index`, preventing an old send failure
+    /// from undoing a later accepted transfer.
+    ///
+    /// # Errors
+    /// Returns [`BundleError::NotFound`] for an unknown bundle and
+    /// [`BundleError::Conflict`] when the cursor has advanced independently.
+    pub fn rewind_transfer_chunk(
+        &mut self,
+        id: &[u8; BUNDLE_ID_LEN],
+        chunk_index: u64,
+    ) -> Result<(), BundleError> {
+        let record = self.records.get_mut(id).ok_or(BundleError::NotFound)?;
+        if record.transfer_chunk_index != chunk_index.saturating_add(1) {
+            return Err(BundleError::Conflict);
+        }
+        record.transfer_chunk_index = chunk_index;
+        self.persist_record(id);
+        Ok(())
+    }
+
     #[must_use]
     pub fn record(&self, id: &[u8; BUNDLE_ID_LEN]) -> Option<&BundleRecord> {
         self.records.get(id)
@@ -374,6 +469,25 @@ impl BundleManager {
         Ok(())
     }
 
+    /// Records one authenticated handoff attempt and consumes one replication
+    /// slot. The caller must only invoke this after the complete final chunk
+    /// has been accepted for transmission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::NotFound`] for an unknown bundle or
+    /// [`BundleError::ReplicationLimit`] when no slot remains.
+    pub fn mark_forwarded(&mut self, id: &[u8; BUNDLE_ID_LEN]) -> Result<(), BundleError> {
+        let record = self.records.get_mut(id).ok_or(BundleError::NotFound)?;
+        if record.replication_count >= record.replication_limit {
+            return Err(BundleError::ReplicationLimit);
+        }
+        record.replication_count = record.replication_count.saturating_add(1);
+        record.status = BundleStatus::Forwarded;
+        self.persist_record(id);
+        Ok(())
+    }
+
     /// Extends or shortens the deadline of an accepted custody commitment.
     /// The deadline is explicit so a node cannot accidentally promise
     /// unbounded retention.
@@ -388,7 +502,12 @@ impl BundleManager {
         deadline: Instant,
     ) -> Result<(), BundleError> {
         let record = self.records.get_mut(id).ok_or(BundleError::NotFound)?;
-        if !record.custody || record.status != BundleStatus::CustodyAccepted {
+        if !record.custody
+            || matches!(
+                record.status,
+                BundleStatus::Delivered | BundleStatus::Expired
+            )
+        {
             return Err(BundleError::Conflict);
         }
         record.custody_deadline = Some(deadline);
@@ -411,6 +530,48 @@ impl BundleManager {
         record.custody_deadline = None;
         record.status = BundleStatus::Delivered;
         self.persist_record(id);
+        Ok(())
+    }
+
+    /// Completes a custody handoff after the next node's authenticated
+    /// `CustodyAccepted` receipt. The local copy remains available for normal
+    /// expiry, but the local retention promise is no longer active.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::NotFound`] for an unknown bundle.
+    pub fn complete_custody_transfer(
+        &mut self,
+        id: &[u8; BUNDLE_ID_LEN],
+    ) -> Result<(), BundleError> {
+        let record = self.records.get_mut(id).ok_or(BundleError::NotFound)?;
+        if !record.custody {
+            return Ok(());
+        }
+        record.custody = false;
+        record.custody_deadline = None;
+        if record.status != BundleStatus::Delivered {
+            record.status = BundleStatus::Forwarded;
+        }
+        self.persist_record(id);
+        Ok(())
+    }
+
+    /// Refuses a custody handoff after an authenticated peer rejection. The
+    /// local copy remains eligible for a later contact, but the node no
+    /// longer promises retention on behalf of the rejecting peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::NotFound`] for an unknown bundle.
+    pub fn reject_custody_transfer(&mut self, id: &[u8; BUNDLE_ID_LEN]) -> Result<(), BundleError> {
+        let record = self.records.get_mut(id).ok_or(BundleError::NotFound)?;
+        if record.custody {
+            record.custody = false;
+            record.custody_deadline = None;
+            record.status = BundleStatus::Received;
+            self.persist_record(id);
+        }
         Ok(())
     }
 
@@ -496,6 +657,48 @@ impl BundleManager {
         ids
     }
 
+    /// Evicts eligible records under storage pressure until usage falls below
+    /// the 90% recovery threshold. Live custody commitments are never
+    /// selected; if only custody records remain, the node fails closed rather
+    /// than silently breaking a retention promise (bundles.md §19.1).
+    #[must_use]
+    pub fn evict_under_pressure(&mut self, now: Instant) -> Vec<[u8; BUNDLE_ID_LEN]> {
+        let recovery_limit = self.quota.hard_limit.saturating_mul(90) / 100;
+        if self.quota.used() <= recovery_limit {
+            return Vec::new();
+        }
+        let mut eligible: Vec<BundleRecord> = self
+            .records_iter()
+            .filter(|record| !record.custody_holds(now))
+            .cloned()
+            .collect();
+        eligible.sort_by(|left, right| {
+            let left_delivered = left.status == BundleStatus::Delivered;
+            let right_delivered = right.status == BundleStatus::Delivered;
+            right_delivered
+                .cmp(&left_delivered)
+                .then_with(|| left.priority.cmp(&right.priority))
+                .then_with(|| right.replication_count.cmp(&left.replication_count))
+                .then_with(|| right.size.cmp(&left.size))
+                .then_with(|| left.created_at.0.cmp(&right.created_at.0))
+        });
+        let mut evicted = Vec::new();
+        for record in eligible {
+            if self.quota.used() <= recovery_limit {
+                break;
+            }
+            let still_referenced = self
+                .records_iter()
+                .any(|other| other.id != record.id && other.object_id == record.object_id);
+            if !still_referenced {
+                let _ = self.objects.delete(&record.object_id);
+            }
+            self.remove_at(&record.id, now);
+            evicted.push(record.id);
+        }
+        evicted
+    }
+
     fn prune_duplicate_cache(&mut self, now: Instant) {
         self.duplicate_cache
             .retain(|_, entry| entry.expires_at > now);
@@ -527,7 +730,8 @@ impl BundleRecord {
     #[must_use]
     pub fn custody_holds(&self, now: Instant) -> bool {
         self.custody
-            && self.status == BundleStatus::CustodyAccepted
+            && self.status != BundleStatus::Delivered
+            && self.status != BundleStatus::Expired
             && self.custody_deadline.is_some_and(|deadline| now < deadline)
     }
 }
@@ -668,6 +872,177 @@ mod tests {
     }
 
     #[test]
+    fn soft_pressure_rejects_new_low_priority_bundles() {
+        let objects = ObjectStore::open(temp_dir()).unwrap();
+        let quota = QuotaAccount::new(umc_storage::quota::Profile::Standard, 0, 100);
+        let mut m = BundleManager::new(objects, quota);
+        m.admit(
+            b"0123456789abcdefghij",
+            b"sender",
+            b"one",
+            1,
+            10_000,
+            3,
+            false,
+            Instant(0),
+        )
+        .unwrap();
+        m.admit(
+            b"0123456789abcdefghij",
+            b"sender",
+            b"two",
+            1,
+            10_000,
+            3,
+            false,
+            Instant(0),
+        )
+        .unwrap();
+        m.admit(
+            b"0123456789abcdefghij",
+            b"sender",
+            b"three",
+            1,
+            10_000,
+            3,
+            false,
+            Instant(0),
+        )
+        .unwrap();
+        m.admit(
+            b"0123456789abcdefghij",
+            b"sender",
+            b"four",
+            1,
+            10_000,
+            3,
+            false,
+            Instant(0),
+        )
+        .unwrap();
+        assert_eq!(m.quota().used(), 80);
+        assert_eq!(
+            m.admit(b"low", b"sender", b"low", 0, 10_000, 3, false, Instant(0)),
+            Err(BundleError::QuotaExceeded)
+        );
+    }
+
+    #[test]
+    fn high_pressure_evicts_non_custody_records_before_new_admission() {
+        let objects = ObjectStore::open(temp_dir()).unwrap();
+        let quota = QuotaAccount::new(umc_storage::quota::Profile::Standard, 0, 100);
+        let mut m = BundleManager::new(objects, quota);
+        let retained = m
+            .admit(
+                b"0123456789abcdefghij",
+                b"sender",
+                b"retained",
+                1,
+                10_000,
+                3,
+                false,
+                Instant(0),
+            )
+            .unwrap();
+        let delivered = m
+            .admit(
+                b"0123456789abcdefghij",
+                b"sender",
+                b"delivered",
+                1,
+                10_000,
+                3,
+                false,
+                Instant(0),
+            )
+            .unwrap();
+        let custody = m
+            .admit(
+                b"0123456789abcdefghij",
+                b"sender",
+                b"custody",
+                1,
+                10_000,
+                3,
+                true,
+                Instant(0),
+            )
+            .unwrap();
+        m.set_status(&delivered, BundleStatus::Delivered).unwrap();
+        assert_eq!(m.quota().used(), 60);
+        m.admit(
+            b"0123456789abcdefghij",
+            b"sender",
+            b"fourth",
+            1,
+            10_000,
+            3,
+            false,
+            Instant(0),
+        )
+        .unwrap();
+        m.admit(
+            b"0123456789abcdefghij",
+            b"sender",
+            b"fifth",
+            1,
+            10_000,
+            3,
+            false,
+            Instant(0),
+        )
+        .unwrap();
+        assert_eq!(m.quota().used(), 100);
+        let evicted = m.evict_under_pressure(Instant(1));
+        assert_eq!(evicted, vec![delivered]);
+        assert!(m.record(&retained).is_some());
+        assert!(m.record(&custody).is_some());
+        assert!(m.record(&delivered).is_none());
+    }
+
+    #[test]
+    fn pressure_eviction_never_breaks_live_custody() {
+        let objects = ObjectStore::open(temp_dir()).unwrap();
+        let quota = QuotaAccount::new(umc_storage::quota::Profile::Standard, 0, 100);
+        let mut m = BundleManager::new(objects, quota);
+        let custody = m
+            .admit(
+                b"0123456789abcdefghij",
+                b"sender",
+                b"custody",
+                1,
+                10_000,
+                3,
+                true,
+                Instant(0),
+            )
+            .unwrap();
+        for hint in [
+            b"a".as_slice(),
+            b"b".as_slice(),
+            b"c".as_slice(),
+            b"d".as_slice(),
+        ] {
+            m.admit(
+                b"0123456789abcdefghij",
+                b"sender",
+                hint,
+                1,
+                10_000,
+                3,
+                false,
+                Instant(0),
+            )
+            .unwrap();
+        }
+        assert_eq!(m.quota().used(), 100);
+        let evicted = m.evict_under_pressure(Instant(1));
+        assert_eq!(evicted.len(), 1);
+        assert!(m.record(&custody).is_some());
+        assert!(m.record(&custody).unwrap().custody);
+    }
+
+    #[test]
     fn custody_sets_status() {
         let mut m = manager();
         let id = m
@@ -701,6 +1076,66 @@ mod tests {
     }
 
     #[test]
+    fn forwarding_does_not_drop_custody_hold() {
+        let mut m = manager();
+        let id = m
+            .admit(
+                b"custody-forward",
+                b"s",
+                b"d",
+                1,
+                1_000,
+                3,
+                true,
+                Instant(0),
+            )
+            .unwrap();
+        m.set_status(&id, BundleStatus::Forwarded).unwrap();
+        assert!(m.record(&id).unwrap().custody_holds(Instant(999)));
+        assert!(m.evict_expired(Instant(999)).is_empty());
+    }
+
+    #[test]
+    fn custody_transfer_releases_only_local_commitment() {
+        let mut m = manager();
+        let id = m
+            .admit(b"handoff", b"s", b"d", 1, 1_000, 3, true, Instant(0))
+            .unwrap();
+        m.complete_custody_transfer(&id).unwrap();
+        let record = m.record(&id).unwrap();
+        assert!(!record.custody);
+        assert_eq!(record.status, BundleStatus::Forwarded);
+    }
+
+    #[test]
+    fn transfer_cursor_can_rewind_only_latest_reservation() {
+        let mut m = manager();
+        let id = m
+            .admit(
+                b"rewind",
+                b"s",
+                b"d",
+                1,
+                DEFAULT_LIFETIME_MS,
+                3,
+                false,
+                Instant(0),
+            )
+            .unwrap();
+        let (_, _, index, _) = m.next_transfer_chunk(&id, 2).unwrap().unwrap();
+        m.rewind_transfer_chunk(&id, index).unwrap();
+        assert_eq!(m.record(&id).unwrap().transfer_chunk_index, index);
+        let (_, _, next, _) = m.next_transfer_chunk(&id, 2).unwrap().unwrap();
+        assert_eq!(next, index);
+        let (_, _, later, _) = m.next_transfer_chunk(&id, 2).unwrap().unwrap();
+        assert_eq!(later, index + 1);
+        assert!(matches!(
+            m.rewind_transfer_chunk(&id, index),
+            Err(BundleError::Conflict)
+        ));
+    }
+
+    #[test]
     fn removed_bundle_ids_are_suppressed_by_bounded_cache() {
         let mut m = manager();
         let id = m
@@ -725,6 +1160,50 @@ mod tests {
                 Instant(10 + DUPLICATE_CACHE_TTL_MS + 1),
             )
             .is_ok());
+    }
+
+    #[test]
+    fn persistence_failure_rolls_back_admission() {
+        use umc_storage::store::{Entry, Namespace, Store};
+
+        #[derive(Debug)]
+        struct FailingStore;
+
+        impl Store for FailingStore {
+            fn get(&self, _: Namespace, _: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+                Ok(None)
+            }
+            fn put(&self, _: Namespace, _: &[u8], _: &[u8]) -> Result<(), StoreError> {
+                Err(StoreError::Transaction)
+            }
+            fn delete(&self, _: Namespace, _: &[u8]) -> Result<(), StoreError> {
+                Ok(())
+            }
+            fn scan(&self, _: Namespace) -> Result<Vec<Entry>, StoreError> {
+                Ok(Vec::new())
+            }
+            fn put_batch(&self, _: Namespace, _: &[(Vec<u8>, Vec<u8>)]) -> Result<(), StoreError> {
+                Err(StoreError::Transaction)
+            }
+        }
+
+        let mut manager = manager();
+        manager.set_persistence(Some(Arc::new(FailingStore)));
+        assert!(matches!(
+            manager.admit(
+                b"durable",
+                b"sender",
+                b"destination",
+                1,
+                DEFAULT_LIFETIME_MS,
+                1,
+                true,
+                Instant(0),
+            ),
+            Err(BundleError::Persistence(StoreError::Transaction))
+        ));
+        assert!(manager.is_empty());
+        assert_eq!(manager.quota().used(), 0);
     }
 
     #[test]

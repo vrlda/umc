@@ -6,6 +6,10 @@
 .DS_Store
 fuzz/target
 interop/python/__pycache__/
+bindings/python/**/__pycache__/
+bindings/typescript/dist/
+bindings/typescript/node_modules/
+bindings/swift/.build/
 
 # Development material retained locally but not shipped in the product tree.
 /docs/

@@ -17,13 +17,13 @@ pub fn decide_replication(
     do_not_replicate: bool,
     storage_pressure_high: bool,
 ) -> ReplicationDecision {
-    if do_not_replicate {
+    if do_not_replicate || record_do_not_replicate(manager, id) {
         return ReplicationDecision::DoNotReplicate;
     }
     let Some(record) = manager.record(id) else {
         return ReplicationDecision::Skip;
     };
-    if record.replication_count >= record.replication_limit {
+    if record.replication_count >= record.replication_limit || record.do_not_replicate {
         return ReplicationDecision::DoNotReplicate;
     }
     if record.status == BundleStatus::Delivered {
@@ -33,6 +33,12 @@ pub fn decide_replication(
         return ReplicationDecision::Skip;
     }
     ReplicationDecision::Replicate
+}
+
+fn record_do_not_replicate(manager: &BundleManager, id: &[u8; 32]) -> bool {
+    manager
+        .record(id)
+        .is_some_and(|record| record.do_not_replicate)
 }
 
 #[cfg(test)]

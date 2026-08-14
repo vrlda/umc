@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::task::JoinHandle;
 use umc_carrier::error::CarrierErrorKind;
-use umc_carrier::types::OutboundPacket;
+use umc_carrier::types::{OutboundPacket, SendResult};
 use umc_carrier::BoxLink;
 use umc_core::app_io::{AppRx, AppTx};
 use umc_crypto::aead::PacketKeys;
@@ -38,7 +38,17 @@ use umc_wire::frames::relay::{RelayCloseFrame, RelayOpenFrame, RelayStatusFrame}
 /// this token through its locally learned route table; it never needs the
 /// destination endpoint id that originated the request (privacy.md §§9-12).
 const PRIVATE_ROUTE_TOKEN_PREFIX: &[u8] = b"UMP-P2-ROUTE\0";
+const PRIVATE_ROUTE_TOKEN_POLICY_PREFIX: &[u8] = b"UMP-P2-ROUTE\x01";
 const PRIVATE_ROUTE_TOKEN_NONCE_LEN: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrivateRouteToken {
+    destination_hash: [u8; 32],
+    nonce: [u8; PRIVATE_ROUTE_TOKEN_NONCE_LEN],
+    remaining_hops: usize,
+    remaining_relays: usize,
+    carries_policy: bool,
+}
 
 /// Build the stable, non-reversible destination token used by private relay
 /// construction.  The route cache is keyed by the same hash, so each relay
@@ -65,13 +75,80 @@ pub fn privacy_route_token_with_nonce(
     token
 }
 
-fn decode_privacy_route_token(token: &[u8]) -> Option<[u8; 32]> {
-    let hash = token.strip_prefix(PRIVATE_ROUTE_TOKEN_PREFIX)?;
-    let hash = hash.get(..32)?;
-    if token.len() != PRIVATE_ROUTE_TOKEN_PREFIX.len() + 32 + PRIVATE_ROUTE_TOKEN_NONCE_LEN {
+/// Build a private-route token carrying the caller's bounded route envelope.
+/// The legacy token remains available for old relay fixtures; new Connect
+/// calls use this policy-bearing form so every relay can enforce the same
+/// negotiated hop and relay budget.
+#[must_use]
+pub fn privacy_route_token_with_policy(
+    destination: &[u8],
+    nonce: [u8; PRIVATE_ROUTE_TOKEN_NONCE_LEN],
+    maximum_hops: usize,
+    maximum_relays: usize,
+) -> Vec<u8> {
+    let mut token = Vec::with_capacity(
+        PRIVATE_ROUTE_TOKEN_POLICY_PREFIX.len() + 32 + PRIVATE_ROUTE_TOKEN_NONCE_LEN + 2,
+    );
+    token.extend_from_slice(PRIVATE_ROUTE_TOKEN_POLICY_PREFIX);
+    token.extend_from_slice(&hash_destination(destination));
+    token.extend_from_slice(&nonce);
+    token.push(u8::try_from(maximum_hops.min(usize::from(u8::MAX))).unwrap_or(u8::MAX));
+    token.push(u8::try_from(maximum_relays.min(usize::from(u8::MAX))).unwrap_or(u8::MAX));
+    token
+}
+
+fn decode_privacy_route_token(token: &[u8]) -> Option<PrivateRouteToken> {
+    if let Some(body) = token.strip_prefix(PRIVATE_ROUTE_TOKEN_POLICY_PREFIX) {
+        if body.len() != 32 + PRIVATE_ROUTE_TOKEN_NONCE_LEN + 2 {
+            return None;
+        }
+        let destination_hash = body[..32].try_into().ok()?;
+        let nonce_offset = 32;
+        let nonce = body[nonce_offset..nonce_offset + PRIVATE_ROUTE_TOKEN_NONCE_LEN]
+            .try_into()
+            .ok()?;
+        return Some(PrivateRouteToken {
+            destination_hash,
+            nonce,
+            remaining_hops: usize::from(body[nonce_offset + PRIVATE_ROUTE_TOKEN_NONCE_LEN]),
+            remaining_relays: usize::from(body[nonce_offset + PRIVATE_ROUTE_TOKEN_NONCE_LEN + 1]),
+            carries_policy: true,
+        });
+    }
+    let body = token.strip_prefix(PRIVATE_ROUTE_TOKEN_PREFIX)?;
+    if body.len() != 32 + PRIVATE_ROUTE_TOKEN_NONCE_LEN {
         return None;
     }
-    hash.try_into().ok()
+    Some(PrivateRouteToken {
+        destination_hash: body[..32].try_into().ok()?,
+        nonce: body[32..].try_into().ok()?,
+        remaining_hops: usize::try_from(umc_routing::types::MAX_HOP_LIMIT)
+            .expect("protocol hop limit fits"),
+        remaining_relays: umc_routing::paths::DEFAULT_MAX_RELAYS,
+        carries_policy: false,
+    })
+}
+
+fn advance_privacy_route_token(token: &[u8], consumes_relay: bool) -> Option<Vec<u8>> {
+    let decoded = decode_privacy_route_token(token)?;
+    if !decoded.carries_policy {
+        return Some(token.to_vec());
+    }
+    let remaining_hops = decoded.remaining_hops.checked_sub(1)?;
+    let remaining_relays = if consumes_relay {
+        decoded.remaining_relays.checked_sub(1)?
+    } else {
+        decoded.remaining_relays
+    };
+    let mut next = Vec::with_capacity(
+        PRIVATE_ROUTE_TOKEN_POLICY_PREFIX.len() + 32 + PRIVATE_ROUTE_TOKEN_NONCE_LEN + 2,
+    );
+    next.extend_from_slice(PRIVATE_ROUTE_TOKEN_POLICY_PREFIX);
+    next.extend_from_slice(&decoded.destination_hash);
+    next.extend_from_slice(&decoded.nonce);
+    next.push(u8::try_from(remaining_hops).ok()?);
+    next.push(u8::try_from(remaining_relays).ok()?);
+    Some(next)
 }
 use umc_wire::frames::routing::RouteResponseFrame;
 use umc_wire::header::ShortPacketSpace;
@@ -171,6 +248,32 @@ pub struct TicketMaterial {
     pub peer_endpoint_id: [u8; 32],
     /// This node's endpoint id, bound into the ticket.
     pub server_endpoint_id: [u8; 32],
+}
+
+fn session_ticket_record(
+    peer_endpoint_id: [u8; 32],
+    carrier_type: &str,
+    ticket: &umc_wire::frames::handshake::SessionTicketFrame,
+    resumption_secret: &[u8; 32],
+    received_at_ms: u64,
+) -> Option<umc_storage::records::SessionTicketRecord> {
+    if ticket.ticket.is_empty() || ticket.lifetime == 0 {
+        return None;
+    }
+    // The peer supplies the lifetime, but the opaque ticket remains the
+    // authority for cryptographic validity. Bound storage to the protocol's
+    // maximum lifetime so a malicious frame cannot pin a record forever.
+    let lifetime = ticket
+        .lifetime
+        .min(umc_handshake::ticket::MAX_TICKET_LIFETIME_MS);
+    Some(umc_storage::records::SessionTicketRecord {
+        peer_endpoint_id: peer_endpoint_id.to_vec(),
+        carrier_type: carrier_type.to_owned(),
+        ticket: ticket.ticket.clone(),
+        resumption_secret: resumption_secret.to_vec(),
+        expires_at_ms: received_at_ms.saturating_add(lifetime),
+        received_at_ms,
+    })
 }
 
 /// Runtime traffic-defense policy derived once from local config and the
@@ -362,7 +465,7 @@ fn pto_deadline_after(
 /// closed, not kept alive.
 fn handle_idle_timers(
     session: &mut Session,
-    clock: &dyn Clock,
+    _clock: &dyn Clock,
     now: Instant,
     ticket_material: Option<&TicketMaterial>,
 ) -> (Option<Vec<u8>>, Option<Vec<u8>>, bool) {
@@ -381,7 +484,7 @@ fn handle_idle_timers(
             }
         }
         let built = close_payload
-            .and_then(|payload| session.build_outbound(clock, now, &payload).ok().flatten());
+            .and_then(|payload| session.build_outbound_at(now, &payload).ok().flatten());
         session.close(now);
         return (built, None, false);
     }
@@ -396,7 +499,7 @@ fn handle_idle_timers(
         if idle_since.is_some_and(|idle| idle >= half_idle) {
             let ping =
                 umc_wire::varint::encode(umc_types::frame::FrameType::PING.0).unwrap_or_default();
-            let built = session.build_outbound(clock, now, &ping).ok().flatten();
+            let built = session.build_outbound_at(now, &ping).ok().flatten();
             if built.is_some() {
                 session.touch(now);
             }
@@ -447,6 +550,7 @@ pub fn spawn_session_task(
     remote_keys: PacketKeys,
     remote_hp_key: [u8; 32],
     ticket_material: Option<TicketMaterial>,
+    local_resumption_secret: Option<[u8; 32]>,
     bus_inbound_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     bus_outbound_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 ) -> SpawnedSession {
@@ -538,6 +642,7 @@ pub fn spawn_session_task(
             &remote_keys,
             &remote_hp_key,
             ticket_material,
+            local_resumption_secret,
             session_id,
             packet_rx,
             bus_inbound_rx,
@@ -593,6 +698,7 @@ struct SweepState {
     last_key_update: Option<Instant>,
     last_dcid_rotation: Option<Instant>,
     last_bundle_flush: Option<Instant>,
+    service_hint_cursor: usize,
     route_rotation_interval_ms: u64,
 }
 
@@ -603,6 +709,7 @@ impl Default for SweepState {
             last_key_update: None,
             last_dcid_rotation: None,
             last_bundle_flush: None,
+            service_hint_cursor: 0,
             route_rotation_interval_ms: DCID_ROTATION_INTERVAL_MS,
         }
     }
@@ -691,6 +798,7 @@ async fn reader_loop(
     remote_keys: &PacketKeys,
     remote_hp_key: &[u8; 32],
     ticket_material: Option<TicketMaterial>,
+    local_resumption_secret: Option<[u8; 32]>,
     session_id: u64,
     mut packet_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Vec<u8>)>,
     mut bus_inbound_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
@@ -728,6 +836,7 @@ async fn reader_loop(
                             runtime,
                             remote_keys,
                             remote_hp_key,
+                            local_resumption_secret,
                             session_id,
                             path_id,
                             &bytes,
@@ -752,6 +861,7 @@ async fn reader_loop(
                             runtime,
                             remote_keys,
                             remote_hp_key,
+                            local_resumption_secret,
                             session_id,
                             links.active_path(),
                             &bytes,
@@ -775,7 +885,7 @@ async fn reader_loop(
                         // routing, and bundle forwarding all use this path).
                         let packet = {
                             let mut session = session.lock().await;
-                            match session.build_outbound(clock.as_ref(), now, &bytes) {
+                            match session.build_outbound_at(now, &bytes) {
                                 Ok(Some(packet)) => {
                                     session.touch(now);
                                     Some(packet)
@@ -823,7 +933,7 @@ async fn reader_loop(
                 }
                 let packet = {
                     let mut session = session.lock().await;
-                    match session.build_outbound(clock.as_ref(), now, &cover_payload()) {
+                    match session.build_outbound_at(now, &cover_payload()) {
                         Ok(Some(packet)) => Some(packet),
                         Ok(None) | Err(_) => None,
                     }
@@ -901,7 +1011,7 @@ async fn reader_loop(
                     });
                     if due {
                         if let Some(payload) = maybe_rotate_dcid(&mut session, &OsEntropy) {
-                            match session.build_outbound(clock.as_ref(), now, &payload) {
+                            match session.build_outbound_at(now, &payload) {
                                 Ok(packet) => {
                                     if packet.is_some() {
                                         sweep.last_dcid_rotation = Some(now);
@@ -946,7 +1056,7 @@ async fn reader_loop(
                     if in_flight {
                         let ping = umc_wire::varint::encode(umc_types::frame::FrameType::PING.0)
                             .unwrap_or_default();
-                        match session.build_outbound(clock.as_ref(), now, &ping) {
+                        match session.build_outbound_at(now, &ping) {
                             Ok(Some(bytes)) => Some(bytes),
                             _ => None,
                         }
@@ -1024,6 +1134,7 @@ async fn process_inbound_packet(
         runtime,
         remote_keys,
         remote_hp_key,
+        None,
         session_id,
         umc_session::packet::DEFAULT_PATH_ID,
         bytes,
@@ -1041,6 +1152,7 @@ async fn process_inbound_packet_on_links(
     runtime: &Arc<Mutex<RuntimeState>>,
     remote_keys: &PacketKeys,
     remote_hp_key: &[u8; 32],
+    local_resumption_secret: Option<[u8; 32]>,
     session_id: u64,
     ingress_path_id: u64,
     bytes: &[u8],
@@ -1058,6 +1170,7 @@ async fn process_inbound_packet_on_links(
         .expected_pn(umc_session::spaces::PacketSpace::SessionData);
     let frames = parse_control_frames(remote_keys, remote_hp_key, expected, bytes);
     let mut outbound = None;
+    let mut bundle_reservation = None;
     let mut retransmits: Vec<Vec<u8>> = Vec::new();
     let mut pending: Vec<(Vec<u8>, u64, Vec<u8>, bool)> = Vec::new();
     let mut pending_resets: Vec<(u64, u64)> = Vec::new();
@@ -1244,13 +1357,36 @@ async fn process_inbound_packet_on_links(
             let mut state = runtime.lock().expect("runtime state");
             if let Some((_space, _path_id, control_frames)) = &frames {
                 if let Some(payload) =
-                    handle_control_frames(&mut state, session_id, &mut session, control_frames, now)
+                    handle_control_frames_with_resumption(
+                        &mut state,
+                        session_id,
+                        &mut session,
+                        control_frames,
+                        now,
+                        local_resumption_secret,
+                    )
                 {
                     combined.extend_from_slice(&payload);
                 }
             }
             if sweep_due {
-                let payload = flush_pending_bundles(&mut state, crate::state::wall_now());
+                let peer_endpoint_id = state
+                    .sessions
+                    .lookup(session_id)
+                    .map_or([0u8; 32], |entry| entry.peer_endpoint_id);
+                let peer_static_handshake_public_key = state
+                    .peer_static_handshake_keys
+                    .get(&peer_endpoint_id)
+                    .copied();
+                let store_forward_allowed = state.store_forward_sessions.contains(&session_id);
+                let payload = flush_pending_bundles(
+                    &mut state,
+                    &peer_endpoint_id,
+                    peer_static_handshake_public_key.as_ref(),
+                    crate::state::wall_now(),
+                    store_forward_allowed,
+                    &mut bundle_reservation,
+                );
                 combined.extend_from_slice(&payload);
                 sweep.last_bundle_flush = Some(now);
             }
@@ -1269,6 +1405,50 @@ async fn process_inbound_packet_on_links(
                 if let Some(dht) = state.discovery.dht_exchange_frame(&target, now) {
                     if let Ok(payload) = dht.encode() {
                         combined.extend_from_slice(&payload);
+                    }
+                }
+                // Revocations are exchanged only inside an already
+                // authenticated protected session. The signed batch remains
+                // independently verified at the receiver, and the empty
+                // batch is omitted to avoid creating a periodic fingerprint
+                // for nodes with no revocation state.
+                if let Ok(batch) = umc_core::revocation::RevocationStore::new(
+                    state.store.as_ref(),
+                )
+                .export_signed_batch_at(crate::state::wall_now().0)
+                {
+                    if batch.len() > 5 {
+                        if let Ok(payload) = (umc_wire::frames::misc::RevocationBatchFrame {
+                            payload: batch,
+                        })
+                        .encode()
+                        {
+                            combined.extend_from_slice(&payload);
+                        }
+                    }
+                }
+                let hints = state
+                    .discovery
+                    .service_hint_frames(crate::state::wall_now());
+                if !hints.is_empty() {
+                    let start = sweep.service_hint_cursor % hints.len();
+                    let mut sent = 0usize;
+                    for offset in 0..hints.len() {
+                        let hint = &hints[(start + offset) % hints.len()];
+                        let Ok(payload) = hint.encode() else {
+                            continue;
+                        };
+                        if combined.len().saturating_add(payload.len())
+                            > umc_types::version::MAX_PACKET_SIZE
+                                .saturating_sub(BUNDLE_PACKET_HEADROOM)
+                        {
+                            break;
+                        }
+                        combined.extend_from_slice(&payload);
+                        sent += 1;
+                    }
+                    if sent > 0 {
+                        sweep.service_hint_cursor = (start + sent) % hints.len();
                     }
                 }
             }
@@ -1293,7 +1473,7 @@ async fn process_inbound_packet_on_links(
                 .as_ref()
                 .map_or(ingress_path_id, |(_, path_id, _)| *path_id);
             let built =
-                session.build_outbound_on_path(egress_path_id, clock.as_ref(), now, &combined);
+                session.build_outbound_on_path_at(egress_path_id, now, &combined);
             outbound = match built {
                 Ok(outbound) => {
                     if outbound.is_some() {
@@ -1309,6 +1489,10 @@ async fn process_inbound_packet_on_links(
                     None
                 }
             };
+        }
+        if outbound.is_none() {
+            let mut state = runtime.lock().expect("runtime state");
+            settle_bundle_reservation(&mut state, bundle_reservation.take(), false, now);
         }
         // Forward contiguous data of streams whose protocol ID has an
         // application channel; reading drains the session buffer, which
@@ -1349,7 +1533,7 @@ async fn process_inbound_packet_on_links(
             let old_path_id = session.primary_path_id();
             if let Ok(payload) = session.build_migrate_payload(new_path_id, keep_old_path, true) {
                 if let Ok(Some(packet)) =
-                    session.build_outbound_on_path(old_path_id, clock.as_ref(), now, &payload)
+                    session.build_outbound_on_path_at(old_path_id, now, &payload)
                 {
                     if session.migrate_to(new_path_id, keep_old_path, now).is_ok() {
                         automatic_migration =
@@ -1400,6 +1584,7 @@ async fn process_inbound_packet_on_links(
     if !pending_resets.is_empty() {
         let mut state = runtime.lock().expect("runtime state");
         for (stream_id, error_code) in pending_resets {
+            state.stream_dispatcher.forget_stream(session_id, stream_id);
             if let Err(error) = state
                 .application_data
                 .mark_stream_reset_for_session(session_id, stream_id, error_code)
@@ -1411,11 +1596,26 @@ async fn process_inbound_packet_on_links(
         }
     }
     for (protocol_id, stream_id, data, eof) in pending {
-        let routed = runtime
-            .lock()
-            .expect("runtime state")
-            .application_data
-            .route_stream_data(session_id, stream_id, &protocol_id, data.clone(), eof);
+        let routed = {
+            let mut state = runtime.lock().expect("runtime state");
+            let opening = !state.stream_dispatcher.contains(session_id, stream_id);
+            let apps = state.apps.clone();
+            if let Err(error) = state.stream_dispatcher.dispatch_for_session(
+                &apps,
+                session_id,
+                stream_id,
+                &protocol_id,
+                opening,
+            ) {
+                log::debug!(
+                    "[session {session_id}] stream {stream_id} dispatch rejected: {error:?}"
+                );
+                continue;
+            }
+            state
+                .application_data
+                .route_stream_data(session_id, stream_id, &protocol_id, data.clone(), eof)
+        };
         match routed {
             Ok(true) => continue,
             Err(error) => {
@@ -1473,6 +1673,8 @@ async fn process_inbound_packet_on_links(
             log::debug!(
                 "[session {session_id}] combined outbound backpressured (carrier queue >80%)"
             );
+            let mut state = runtime.lock().expect("runtime state");
+            settle_bundle_reservation(&mut state, bundle_reservation.take(), false, now);
         } else {
             let sent = tokio::task::block_in_place(|| {
                 links.send_on(
@@ -1484,8 +1686,15 @@ async fn process_inbound_packet_on_links(
                     },
                 )
             });
-            if let Err(e) = sent {
-                log::debug!("[session {session_id}] send error: {e:?}");
+            match sent {
+                Ok(SendResult::Accepted { .. }) => {
+                    let mut state = runtime.lock().expect("runtime state");
+                    settle_bundle_reservation(&mut state, bundle_reservation.take(), true, now);
+                }
+                Ok(SendResult::WouldBlock | SendResult::QueueFull) | Err(_) => {
+                    let mut state = runtime.lock().expect("runtime state");
+                    settle_bundle_reservation(&mut state, bundle_reservation.take(), false, now);
+                }
             }
         }
     }
@@ -1563,12 +1772,25 @@ fn relay_profile_capacity_available(state: &RuntimeState) -> bool {
 /// frame payload to send back, if any (e.g. a `RELAY_STATUS` answer to a
 /// `RELAY_OPEN`).
 #[allow(clippy::too_many_lines)]
+#[cfg(test)]
 fn handle_control_frames(
     state: &mut RuntimeState,
     session_id: u64,
     session: &mut Session,
     frames: &[Frame],
     now: Instant,
+) -> Option<Vec<u8>> {
+    handle_control_frames_with_resumption(state, session_id, session, frames, now, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_control_frames_with_resumption(
+    state: &mut RuntimeState,
+    session_id: u64,
+    session: &mut Session,
+    frames: &[Frame],
+    now: Instant,
+    local_resumption_secret: Option<[u8; 32]>,
 ) -> Option<Vec<u8>> {
     let peer_endpoint_id = state
         .sessions
@@ -1650,9 +1872,10 @@ fn handle_control_frames(
                     flags: relay_request_flags(open),
                     bidirectional: open.bidirectional,
                     private_handling: open.private_circuit,
+                    multipath: open.multipath_allowed,
                     destination_hint: open.next_hop_hint.clone(),
                 };
-                let admission_status = state.relay.admission_status(&circuit_request);
+                                let admission_status = state.relay.admission_status(&circuit_request);
                 let (code, retryable, granted) = match (authorization_valid, public_relay_disabled)
                 {
                     (false, _) => {
@@ -1724,6 +1947,8 @@ fn handle_control_frames(
                                         })
                                         .flatten();
                                 let mut downstream_ready = !open.private_circuit;
+                                let mut multipath_paths = 0usize;
+                                let mut alternate_hops = Vec::new();
                                 if let Some(destination_session) =
                                     destination_session.filter(|candidate| {
                                         *candidate != session_id && open.private_circuit
@@ -1745,6 +1970,7 @@ fn handle_control_frames(
                                         );
                                     } else {
                                         downstream_ready = true;
+                                        multipath_paths = 1;
                                     }
                                 }
                                 if open.private_circuit && !downstream_ready {
@@ -1753,13 +1979,15 @@ fn handle_control_frames(
                                     // consulted only after direct delivery
                                     // fails, so a local destination always
                                     // wins over a broader route.
-                                    let next_hop = relay_next_hop_for_destination(
+                                    let next_hops = relay_next_hops_for_destination(
                                         state,
                                         &open.next_hop_hint,
                                         &peer_endpoint_id,
                                         now,
+                                        state.relay.limits.max_multipath_paths,
                                     );
-                                    if let Some(next_hop) = next_hop {
+                                    alternate_hops = next_hops.iter().skip(1).cloned().collect();
+                                    if let Some(next_hop) = next_hops.into_iter().next() {
                                         let next_hop_session = state
                                             .bus
                                             .lock()
@@ -1785,8 +2013,11 @@ fn handle_control_frames(
                                                     );
                                                 } else {
                                                     downstream_ready = true;
+                                                    multipath_paths = 1;
                                                 }
-                                            } else {
+                                            } else if let Some(next_hop_hint) =
+                                                advance_privacy_route_token(&open.next_hop_hint, true)
+                                            {
                                                 let downstream_wire_id =
                                                     fresh_relay_wire_id(state, next_hop_session);
                                                 let downstream_request = CircuitOpenRequest {
@@ -1798,7 +2029,8 @@ fn handle_control_frames(
                                                     flags: relay_request_flags(open),
                                                     bidirectional: open.bidirectional,
                                                     private_handling: true,
-                                                    destination_hint: open.next_hop_hint.clone(),
+                                                    multipath: open.multipath_allowed,
+                                                    destination_hint: next_hop_hint.clone(),
                                                 };
                                                 let downstream =
                                                     if relay_profile_capacity_available(state) {
@@ -1845,9 +2077,7 @@ fn handle_control_frames(
                                                                     .requested_lifetime,
                                                                 requested_byte_quota: open
                                                                     .requested_byte_quota,
-                                                                next_hop_hint: open
-                                                                    .next_hop_hint
-                                                                    .clone(),
+                                                                next_hop_hint,
                                                                 authorization: Vec::new(),
                                                             };
                                                             let nested_result = nested
@@ -1873,7 +2103,10 @@ fn handle_control_frames(
                                                                         })
                                                                 });
                                                             match nested_result {
-                                                                Ok(()) => downstream_ready = true,
+                                                                Ok(()) => {
+                                                                    downstream_ready = true;
+                                                                    multipath_paths = 1;
+                                                                }
                                                                 Err(error) => push_event(
                                                                     state,
                                                                     "relay_downstream_open_failed",
@@ -1906,6 +2139,15 @@ fn handle_control_frames(
                                                         ),
                                                     ),
                                                 }
+                                            } else {
+                                                push_event(
+                                                    state,
+                                                    "relay_route_budget_exhausted",
+                                                    now,
+                                                    format!(
+                                                        "circuit {circuit_id}: no remaining private relay budget"
+                                                    ),
+                                                );
                                             }
                                         }
                                     }
@@ -1918,6 +2160,77 @@ fn handle_control_frames(
                                     );
                                     (RELAY_STATUS_NO_ROUTE, false, None)
                                 } else {
+                                    if open.multipath_allowed && multipath_paths == 1 {
+                                        for (path_offset, alternate) in alternate_hops.into_iter().enumerate() {
+                                            if !alternate.terminal {
+                                                continue;
+                                            }
+                                            let Some(destination_session) = state
+                                                .bus
+                                                .lock()
+                                                .expect("session bus")
+                                                .lookup(&alternate.peer)
+                                            else {
+                                                continue;
+                                            };
+                                            let alternate_wire_id =
+                                                fresh_relay_wire_id(state, destination_session);
+                                            let alternate_request = CircuitOpenRequest {
+                                                peer_circuits: state
+                                                    .relay
+                                                    .circuits_for_peer(destination_session),
+                                                requested_lifetime_ms: open.requested_lifetime,
+                                                requested_byte_quota: open.requested_byte_quota,
+                                                flags: relay_request_flags(open),
+                                                bidirectional: open.bidirectional,
+                                                private_handling: open.private_circuit,
+                                                multipath: true,
+                                                destination_hint: open.next_hop_hint.clone(),
+                                            };
+                                            let Ok(alternate_circuit) = state.relay.open_circuit(
+                                                &alternate_request,
+                                                alternate.peer.clone(),
+                                                now,
+                                            ) else {
+                                                continue;
+                                            };
+                                            if state
+                                                .relay
+                                                .attach_additional_downstream_leg(
+                                                    circuit_id,
+                                                    alternate_circuit.circuit_id,
+                                                    destination_session,
+                                                    alternate_wire_id,
+                                                    &peer_endpoint_id,
+                                                    &alternate.peer,
+                                                    u64::try_from(path_offset + 1).unwrap_or(1),
+                                                    1,
+                                                    now,
+                                                )
+                                                .is_err()
+                                            {
+                                                continue;
+                                            }
+                                            let nested = RelayOpenFrame {
+                                                circuit_id: alternate_wire_id,
+                                                bidirectional: open.bidirectional,
+                                                store_forward_allowed: open.store_forward_allowed,
+                                                private_circuit: open.private_circuit,
+                                                multipath_allowed: false,
+                                                requested_lifetime: open.requested_lifetime,
+                                                requested_byte_quota: open.requested_byte_quota,
+                                                next_hop_hint: open.next_hop_hint.clone(),
+                                                authorization: Vec::new(),
+                                            };
+                                            if let Ok(bytes) = nested.encode() {
+                                                let _ = state
+                                                    .bus
+                                                    .lock()
+                                                    .expect("session bus")
+                                                    .inject_outbound(&alternate.peer, bytes);
+                                            }
+                                        }
+                                    }
                                     state.metrics.incr(metric_names::RELAY_CIRCUITS_OPENED, 1);
                                     (RELAY_STATUS_ACCEPTED, false, Some(accepted))
                                 }
@@ -1936,7 +2249,16 @@ fn handle_control_frames(
                     status_code: code,
                     bidirectional_granted: open.bidirectional && code == RELAY_STATUS_ACCEPTED,
                     private_handling_granted: open.private_circuit && code == RELAY_STATUS_ACCEPTED,
-                    multipath_granted: open.multipath_allowed && code == RELAY_STATUS_ACCEPTED,
+                    multipath_granted: open.multipath_allowed
+                        && code == RELAY_STATUS_ACCEPTED
+                        && state.relay.limits.allow_multipath
+                        && state.relay.limits.max_multipath_paths >= 2
+                        && state.relay.circuit_multipath_granted(
+                            state
+                                .relay
+                                .resolve_wire_circuit(session_id, open.circuit_id)
+                                .unwrap_or_default(),
+                        ),
                     downstream_authenticated: false,
                     retryable,
                     granted_lifetime: granted.as_ref().map_or(0, |g| g.granted_lifetime_ms),
@@ -1964,6 +2286,32 @@ fn handle_control_frames(
                         } else {
                             Vec::new()
                         };
+                        if status.status_code == RELAY_STATUS_ACCEPTED {
+                            if let Some(internal) = state
+                                .relay
+                                .resolve_wire_circuit(session_id, status.circuit_id)
+                            {
+                                let _ = state.relay.activate_multipath_path(internal, 0);
+                                if let Some((upstream_session, grant)) =
+                                    state.relay.multipath_grant_status(internal, now)
+                                {
+                                    if let Some(upstream_peer) = state
+                                        .bus
+                                        .lock()
+                                        .expect("session bus")
+                                        .peer_for_session(upstream_session)
+                                    {
+                                        if let Ok(encoded) = grant.encode() {
+                                            let _ = state
+                                                .bus
+                                                .lock()
+                                                .expect("session bus")
+                                                .inject_outbound(&upstream_peer, encoded);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         push_event(
                             state,
                             "relay_status_received",
@@ -2117,18 +2465,17 @@ fn handle_control_frames(
                     );
                     continue;
                 }
-                let internal_data = umc_wire::frames::relay::RelayDataFrame {
-                    circuit_id: internal_circuit_id,
-                    ..data.clone()
-                };
-                match state.relay.accept_upstream(
+                match state.relay.accept_upstream_frames(
                     internal_circuit_id,
                     data.relay_sequence,
                     data.fin,
+                    data.ack_requested,
+                    data.high_priority,
                     &data.data,
                     now,
                 ) {
-                    Ok(()) => {
+                    Ok(accepted_frames) => {
+                        for internal_data in accepted_frames {
                         if !state.relay.downstream_ready(internal_circuit_id) {
                             if !state.relay.has_paired_circuit(internal_circuit_id) {
                                 append_downstream_failed_close(
@@ -2173,6 +2520,27 @@ fn handle_control_frames(
                                     .expect("session bus")
                                     .inject_outbound(&dest_peer, frame_bytes);
                                 if let Err(e) = injected {
+                                    let retried = state
+                                        .relay
+                                        .fail_multipath_destination(internal_circuit_id, &dest_peer)
+                                        .then(|| state.relay.forward_data_frame(&internal_data, now));
+                                    if let Some(Ok((retry_peer, retry_bytes))) = retried {
+                                        if state
+                                            .bus
+                                            .lock()
+                                            .expect("session bus")
+                                            .inject_outbound(&retry_peer, retry_bytes)
+                                            .is_ok()
+                                        {
+                                            push_event(
+                                                state,
+                                                "relay_path_failover",
+                                                now,
+                                                format!("circuit {}: path replaced", data.circuit_id),
+                                            );
+                                            continue;
+                                        }
+                                    }
                                     push_event(
                                         state,
                                         "relay_forward_dropped",
@@ -2205,6 +2573,7 @@ fn handle_control_frames(
                                     now,
                                 );
                             }
+                        }
                         }
                     }
                     Err(e) => push_event(
@@ -2291,6 +2660,7 @@ fn handle_control_frames(
                 match admitted {
                     Ok(Some(id)) => {
                         state.metrics.incr(metric_names::BUNDLES_ADMITTED, 1);
+                        let record = state.bundle.record(&id).cloned();
                         push_event(
                             state,
                             "bundle_admitted",
@@ -2302,6 +2672,52 @@ fn handle_control_frames(
                                 bundle.payload.len()
                             ),
                         );
+                        if bundle.custody_requested || bundle.delivery_ack_requested {
+                            if let Some(record) = record {
+                                let destination_authenticated = bundle_is_destination_authenticated(state, &id);
+                                let status = if destination_authenticated {
+                                    umc_bundle::manager::BundleStatus::Delivered
+                                } else if bundle.custody_requested {
+                                    umc_bundle::manager::BundleStatus::CustodyAccepted
+                                } else {
+                                    umc_bundle::manager::BundleStatus::Received
+                                };
+                                let stored_until = record
+                                    .custody_deadline
+                                    .unwrap_or(record.expires_at)
+                                    .0;
+                                let status_code = umc_bundle::ack::status_code(&status);
+                                let authentication = umc_bundle::ack::sign_auth(
+                                    &state.node_identity.identity,
+                                    &id,
+                                    status_code,
+                                    stored_until,
+                                    &peer_endpoint_id,
+                                );
+                                let ack = umc_wire::frames::bundle::BundleAckFrame {
+                                    bundle_id: id.to_vec(),
+                                    status: status_code,
+                                    stored_until,
+                                    authentication,
+                                };
+                                if let Ok(encoded) = ack.encode() {
+                                    outbound.extend_from_slice(&encoded);
+                                }
+                                if destination_authenticated {
+                                    state.bundle.mark_status(
+                                        &id,
+                                        umc_bundle::manager::BundleStatus::Delivered,
+                                    );
+                                    let _ = state.bundle.manager.release_custody(&id);
+                                    push_event(
+                                        state,
+                                        "bundle_delivered",
+                                        now,
+                                        format!("bundle {} authenticated locally", hex_id(&id)),
+                                    );
+                                }
+                            }
+                        }
                     }
                     Ok(None) => push_event(
                         state,
@@ -2313,37 +2729,110 @@ fn handle_control_frames(
                             bundle.chunk_index
                         ),
                     ),
-                    Err(e) => push_event(
-                        state,
-                        "bundle_rejected",
-                        now,
-                        format!(
-                            "frame id {}: {e:?}",
-                            String::from_utf8_lossy(&bundle.bundle_id)
-                        ),
-                    ),
+                    Err(error) => {
+                        if bundle.bundle_id.len() == 32
+                            && (bundle.custody_requested || bundle.delivery_ack_requested)
+                        {
+                        let authentication = umc_bundle::ack::sign_auth(
+                            &state.node_identity.identity,
+                            &bundle.bundle_id,
+                            umc_bundle::ack::status_code(
+                                &umc_bundle::manager::BundleStatus::Rejected,
+                            ),
+                            0,
+                            &peer_endpoint_id,
+                        );
+                        let ack = umc_wire::frames::bundle::BundleAckFrame {
+                            bundle_id: bundle.bundle_id.clone(),
+                            status: umc_bundle::ack::status_code(
+                                &umc_bundle::manager::BundleStatus::Rejected,
+                            ),
+                            stored_until: 0,
+                            authentication,
+                        };
+                        if let Ok(encoded) = ack.encode() {
+                            outbound.extend_from_slice(&encoded);
+                        }
+                        }
+                        push_event(
+                            state,
+                            "bundle_rejected",
+                            now,
+                            format!(
+                                "frame id {}: {error:?}",
+                                String::from_utf8_lossy(&bundle.bundle_id)
+                            ),
+                        );
+                    }
                 }
             }
             Frame::BundleAck(ack) => {
-                let status = match ack.status {
-                    0 => umc_bundle::manager::BundleStatus::Received,
-                    1 => umc_bundle::manager::BundleStatus::CustodyAccepted,
-                    2 => umc_bundle::manager::BundleStatus::Forwarded,
-                    3 => umc_bundle::manager::BundleStatus::Delivered,
-                    4 => umc_bundle::manager::BundleStatus::Rejected,
-                    5 => umc_bundle::manager::BundleStatus::Expired,
-                    _ => umc_bundle::manager::BundleStatus::Evicted,
+                let Some(status) = umc_bundle::ack::status_from_code(ack.status) else {
+                    push_event(
+                        state,
+                        "bundle_ack_rejected",
+                        now,
+                        format!("session {session_id}: unknown status {}", ack.status),
+                    );
+                    continue;
                 };
-                if ack.bundle_id.len() == 32 {
+                if ack.bundle_id.len() == 32
+                    && umc_bundle::ack::verify_auth(
+                        &ack.authentication,
+                        &ack.bundle_id,
+                        ack.status,
+                        ack.stored_until,
+                        &peer_endpoint_id,
+                        &state.node_identity.endpoint_id(),
+                    )
+                {
                     let mut id = [0u8; 32];
                     id.copy_from_slice(&ack.bundle_id);
                     if state.bundle.record(&id).is_some() {
                         if status == umc_bundle::manager::BundleStatus::Delivered {
+                            state
+                                .bundle
+                                .mark_status(&id, umc_bundle::manager::BundleStatus::Delivered);
                             let _ = state.bundle.manager.release_custody(&id);
+                        } else if status == umc_bundle::manager::BundleStatus::CustodyAccepted {
+                            if ack.stored_until > now.0 {
+                                let _ = state.bundle.manager.complete_custody_transfer(&id);
+                            } else {
+                                push_event(
+                                    state,
+                                    "bundle_ack_rejected",
+                                    now,
+                                    format!("session {session_id}: expired custody deadline"),
+                                );
+                                continue;
+                            }
+                        } else if status == umc_bundle::manager::BundleStatus::Rejected {
+                            let has_custody = state
+                                .bundle
+                                .record(&id)
+                                .is_some_and(|record| record.custody);
+                            if has_custody {
+                                let _ = state.bundle.manager.reject_custody_transfer(&id);
+                            } else {
+                                state.bundle.mark_status(&id, status);
+                            }
                         } else {
                             state.bundle.mark_status(&id, status);
                         }
+                        push_event(
+                            state,
+                            "bundle_ack_accepted",
+                            now,
+                            format!("session {session_id}: bundle {} status {}", hex_id(&id), ack.status),
+                        );
                     }
+                } else {
+                    push_event(
+                        state,
+                        "bundle_ack_rejected",
+                        now,
+                        format!("session {session_id}: invalid authentication"),
+                    );
                 }
             }
             Frame::PeerHint(hint) => {
@@ -2387,6 +2876,28 @@ fn handle_control_frames(
                             }
                         }
                     }
+                }
+            }
+            Frame::ServiceHint(hint) => {
+                let peer_identity_key = state.peer_identity_public_keys.get(&peer_endpoint_id);
+                match state.discovery.accept_service_hint(
+                    peer_endpoint_id,
+                    peer_identity_key,
+                    hint,
+                    crate::state::wall_now(),
+                ) {
+                    Ok(()) => push_event(
+                        state,
+                        "service_hint_received",
+                        now,
+                        format!("session {session_id}: {}", String::from_utf8_lossy(&hint.protocol_id)),
+                    ),
+                    Err(error) => push_event(
+                        state,
+                        "service_hint_rejected",
+                        now,
+                        format!("session {session_id}: {error}"),
+                    ),
                 }
             }
             Frame::RouteRequest(request) => {
@@ -2453,6 +2964,7 @@ fn handle_control_frames(
                             0
                         },
                         request.allow_relay,
+                        request.allow_store_forward,
                         now,
                     );
                 }
@@ -2574,7 +3086,8 @@ fn handle_control_frames(
                             response_sequence: 0,
                             direct: !private_relay,
                             relay_required: private_relay,
-                            store_forward_available: request.allow_store_forward,
+                            store_forward_available: request.allow_store_forward
+                                && state.bundle.store_forward_available(),
                             local_path: true,
                             gateway_path: false,
                             route_lifetime: remaining_lifetime_ms,
@@ -2668,6 +3181,7 @@ fn handle_control_frames(
                     max_hops,
                     max_relays,
                     allow_relay,
+                    allow_store_forward,
                 ) = context.clone().map_or(
                     (
                         hash_destination(&response.next_hop_hint),
@@ -2676,6 +3190,7 @@ fn handle_control_frames(
                         umc_routing::types::DEFAULT_HOP_LIMIT,
                         umc_routing::paths::DEFAULT_MAX_RELAYS,
                         true,
+                        false,
                     ),
                     |context| {
                         (
@@ -2685,9 +3200,15 @@ fn handle_control_frames(
                             context.max_hops,
                             context.max_relays,
                             context.allow_relay,
+                            context.allow_store_forward,
                         )
                     },
                 );
+                if response.store_forward_available && allow_store_forward {
+                    state.store_forward_sessions.insert(session_id);
+                } else {
+                    state.store_forward_sessions.remove(&session_id);
+                }
                 if require_private_response && response.direct {
                     push_event(
                         state,
@@ -2842,12 +3363,16 @@ fn handle_control_frames(
                     || peer_endpoint_id.to_vec(),
                     |entry| entry.peer_endpoint_id.to_vec(),
                 );
+                let carrier_type = state
+                    .sessions
+                    .lookup(session_id)
+                    .map(|entry| entry.carrier_type.clone());
                 let cache_metadata = private_cache_path_metadata(
                     state,
                     &forwarded_response.route_metadata,
                     require_private_response,
                 );
-                let record = state.routing.record_route_response_with_metadata(
+                let record = state.routing.record_route_response_with_evidence(
                     key,
                     // The response arrived over the authenticated adjacent
                     // session. That peer is the next leg this node can
@@ -2864,6 +3389,7 @@ fn handle_control_frames(
                     } else {
                         Vec::new()
                     },
+                    carrier_type,
                 );
                 push_event(
                     state,
@@ -2907,20 +3433,75 @@ fn handle_control_frames(
                 }
             }
             Frame::SessionTicket(ticket) => {
-                // A ticket from the peer's daemon (handshake.md §35): the
-                // credential for resuming THIS daemon as a client. The v1
-                // daemon has no dial path, so the ticket is recorded — a
-                // future resume attempt consumes it.
-                push_event(
-                    state,
-                    "session_ticket_received",
-                    now,
-                    format!(
-                        "lifetime {} ms, {} ticket bytes",
-                        ticket.lifetime,
-                        ticket.ticket.len()
+                let peer = state
+                    .sessions
+                    .lookup(session_id)
+                    .map(|entry| entry.peer_endpoint_id)
+                    .unwrap_or_default();
+                let Some(secret) = local_resumption_secret else {
+                    push_event(
+                        state,
+                        "session_ticket_rejected",
+                        now,
+                        "session has no resumption secret".into(),
+                    );
+                    continue;
+                };
+                let Some(record) = session_ticket_record(
+                    peer,
+                    &state
+                        .sessions
+                        .lookup(session_id)
+                        .map(|entry| entry.carrier_type.clone())
+                        .unwrap_or_default(),
+                    ticket,
+                    &secret,
+                    now.0,
+                ) else {
+                    push_event(
+                        state,
+                        "session_ticket_rejected",
+                        now,
+                        "malformed or zero-lifetime ticket".into(),
+                    );
+                    continue;
+                };
+                match umc_storage::records::save_session_ticket(state.store.as_ref(), &record) {
+                    Ok(()) => push_event(
+                        state,
+                        "session_ticket_received",
+                        now,
+                        format!("lifetime {} ms, {} ticket bytes", ticket.lifetime, ticket.ticket.len()),
                     ),
-                );
+                    Err(error) => push_event(
+                        state,
+                        "session_ticket_rejected",
+                        now,
+                        format!("storage: {error:?}"),
+                    ),
+                }
+            }
+            Frame::RevocationBatch(batch) => {
+                match umc_core::revocation::RevocationStore::new(state.store.as_ref())
+                    .accept_signed_batch(&batch.payload, crate::state::wall_now().0)
+                {
+                    Ok(accepted) => {
+                        push_event(
+                            state,
+                            "revocations_received",
+                            now,
+                            format!("session {session_id}: {accepted} signed record(s)"),
+                        );
+                    }
+                    Err(error) => {
+                        push_event(
+                            state,
+                            "revocations_rejected",
+                            now,
+                            format!("session {session_id}: {error:?}"),
+                        );
+                    }
+                }
             }
             _ => {}
         }
@@ -2936,7 +3517,21 @@ fn handle_control_frames(
 /// wrap the stored ciphertext of the next undelivered bundle in a `BUNDLE`
 /// frame (bundles.md §10.1). One frame per sweep: bundle payloads can
 /// approach the packet-size cap.
-fn flush_pending_bundles(state: &mut RuntimeState, now: Instant) -> Vec<u8> {
+#[derive(Debug, Clone, Copy)]
+struct BundleDeliveryReservation {
+    id: [u8; 32],
+    chunk_index: u64,
+    chunk_final: bool,
+}
+
+fn flush_pending_bundles(
+    state: &mut RuntimeState,
+    peer_endpoint_id: &[u8],
+    peer_static_handshake_public_key: Option<&[u8; 32]>,
+    now: Instant,
+    store_forward_allowed: bool,
+    reservation: &mut Option<BundleDeliveryReservation>,
+) -> Vec<u8> {
     let mut outbound = Vec::new();
     // Evict expired bundles FIRST (bundles.md §11): they are removed (records
     // + object store) and never selected for delivery.
@@ -2944,7 +3539,28 @@ fn flush_pending_bundles(state: &mut RuntimeState, now: Instant) -> Vec<u8> {
     state
         .metrics
         .incr(metric_names::BUNDLES_EXPIRED, expired.len() as u64);
-    let pending = state.bundle.pending_delivery(now);
+    let contact_expires_at = Instant(now.0.saturating_add(BUNDLE_FLUSH_INTERVAL_MS));
+    let mut contacts = vec![umc_bundle::forward::Contact {
+        destination_hint: peer_endpoint_id.to_vec(),
+        peer: peer_endpoint_id.to_vec(),
+        expires_at: contact_expires_at,
+        authenticated: true,
+        store_forward_allowed,
+        local_scope_only: false,
+    }];
+    if let Some(static_key) = peer_static_handshake_public_key {
+        contacts.push(umc_bundle::forward::Contact {
+            destination_hint: static_key.to_vec(),
+            peer: peer_endpoint_id.to_vec(),
+            expires_at: contact_expires_at,
+            authenticated: true,
+            store_forward_allowed,
+            local_scope_only: false,
+        });
+    }
+    let pending = state
+        .bundle
+        .pending_delivery_for_contact_hints(&contacts, now);
     for id in pending.into_iter().take(BUNDLES_PER_FLUSH) {
         let Ok(Some((record, payload, chunk_index, chunk_final))) = state
             .bundle
@@ -2956,8 +3572,8 @@ fn flush_pending_bundles(state: &mut RuntimeState, now: Instant) -> Vec<u8> {
             bundle_id: id.to_vec(),
             custody_requested: record.custody,
             delivery_ack_requested: true,
-            do_not_replicate: false,
-            local_scope_only: false,
+            do_not_replicate: record.do_not_replicate,
+            local_scope_only: record.local_scope_only,
             high_sensitivity: false,
             priority: record.priority,
             creation_time: record.created_at.0,
@@ -2970,26 +3586,54 @@ fn flush_pending_bundles(state: &mut RuntimeState, now: Instant) -> Vec<u8> {
             chunk_final,
         };
         let Ok(encoded) = frame.encode() else {
+            let _ = state.bundle.rewind_delivery_chunk(&id, chunk_index);
             continue;
         };
         // One bundle per protected packet: a frame that cannot fit with
         // headers and AEAD tags is left for a later sweep.
         if encoded.len() + BUNDLE_PACKET_HEADROOM > umc_types::version::MAX_PACKET_SIZE {
+            let _ = state.bundle.rewind_delivery_chunk(&id, chunk_index);
             continue;
         }
-        if chunk_final {
-            state.bundle.mark_forwarded(&id);
-        }
-        push_event(
-            state,
-            "bundle_forwarded",
-            now,
-            format!("bundle {} chunk {} over session", hex_id(&id), chunk_index),
-        );
+        *reservation = Some(BundleDeliveryReservation {
+            id,
+            chunk_index,
+            chunk_final,
+        });
         outbound.extend_from_slice(&encoded);
         break;
     }
     outbound
+}
+
+fn settle_bundle_reservation(
+    state: &mut RuntimeState,
+    reservation: Option<BundleDeliveryReservation>,
+    accepted: bool,
+    now: Instant,
+) {
+    let Some(reservation) = reservation else {
+        return;
+    };
+    if !accepted {
+        let _ = state
+            .bundle
+            .rewind_delivery_chunk(&reservation.id, reservation.chunk_index);
+        return;
+    }
+    if reservation.chunk_final && !state.bundle.mark_forwarded(&reservation.id) {
+        return;
+    }
+    push_event(
+        state,
+        "bundle_forwarded",
+        now,
+        format!(
+            "bundle {} chunk {} over session",
+            hex_id(&reservation.id),
+            reservation.chunk_index
+        ),
+    );
 }
 
 /// The 30-second pending-bundle sweep is due (bundles.md §10.1): at session
@@ -2998,6 +3642,27 @@ fn bundle_flush_due(now: Instant, last: Option<Instant>) -> bool {
     last.map_or(true, |last| {
         now.0.saturating_sub(last.0) >= BUNDLE_FLUSH_INTERVAL_MS
     })
+}
+
+/// Returns true only when this node is the envelope's intended destination
+/// and can authenticate/open the stored ciphertext. A matching route hint or
+/// endpoint id alone is insufficient for a final delivery receipt.
+#[must_use]
+fn bundle_is_destination_authenticated(state: &RuntimeState, id: &[u8; 32]) -> bool {
+    let Some(record) = state.bundle.record(id) else {
+        return false;
+    };
+    let destination_static = state.node_identity.static_handshake.public();
+    if record.destination_hint.as_slice() != destination_static.0 {
+        return false;
+    }
+    let Some(payload) = state.bundle.payload(id) else {
+        return false;
+    };
+    let Ok(envelope) = umc_bundle::envelope::BundleEnvelope::decode(&payload) else {
+        return false;
+    };
+    umc_bundle::envelope::open_bundle(&state.node_identity.static_handshake, &envelope).is_ok()
 }
 
 /// A key update is due: every [`KEY_UPDATE_INTERVAL_MS`] of session
@@ -3354,19 +4019,37 @@ struct RelayRouteHop {
     terminal: bool,
 }
 
-fn relay_next_hop_for_destination(
+#[allow(clippy::too_many_lines)]
+fn relay_next_hops_for_destination(
     state: &RuntimeState,
     destination: &[u8],
     incoming_peer: &[u8],
     now: Instant,
-) -> Option<RelayRouteHop> {
+    maximum: usize,
+) -> Vec<RelayRouteHop> {
     use umc_routing::paths::{decode_path_metadata, PathPolicy, PATH_METADATA_MAGIC};
-    use umc_routing::types::{RouteKey, RouteScope, RouteState, DEFAULT_HOP_LIMIT};
+    use umc_routing::types::{RouteKey, RouteScope, RouteState};
 
-    let destination_hash =
-        decode_privacy_route_token(destination).unwrap_or_else(|| hash_destination(destination));
-    // Prefer the narrowest valid scope. If a local route disappears, a
-    // broader authenticated route can still service the private circuit.
+    let token = decode_privacy_route_token(destination);
+    let (destination_hash, maximum_hops, maximum_relays) = match token {
+        Some(token) => (
+            token.destination_hash,
+            token.remaining_hops,
+            token.remaining_relays,
+        ),
+        None => (
+            hash_destination(destination),
+            usize::try_from(umc_routing::types::DEFAULT_HOP_LIMIT)
+                .expect("default hop limit fits"),
+            umc_routing::paths::DEFAULT_MAX_RELAYS,
+        ),
+    };
+    if maximum_hops == 0 {
+        return Vec::new();
+    }
+    let mut hops: Vec<RelayRouteHop> = Vec::new();
+    // Prefer the narrowest valid scope. If a local route disappears, broader
+    // authenticated routes can still service private-circuit failover.
     for scope in [
         RouteScope::LinkLocal,
         RouteScope::LocalMesh,
@@ -3379,82 +4062,82 @@ fn relay_next_hop_for_destination(
             scope,
             policy_class: 0,
         };
-        let Some(record) = state
+        for record in state
             .routing
-            .diverse_route_candidates(&key, now, umc_routing::cache::DEFAULT_CACHE_TARGET)
-            .into_iter()
-            .next()
-        else {
-            continue;
-        };
-        if record.state != RouteState::Usable || record.is_expired(now) {
-            continue;
-        }
-        // Private relay extension requires canonical path evidence. This
-        // prevents an old direct-route snapshot from silently becoming a
-        // multi-hop relay route.
-        if !record.metadata.starts_with(PATH_METADATA_MAGIC) {
-            continue;
-        }
-        let Ok(path) = decode_path_metadata(&record.metadata) else {
-            continue;
-        };
-        let policy = PathPolicy {
-            max_hops: usize::try_from(DEFAULT_HOP_LIMIT).unwrap_or(usize::MAX),
-            max_relays: umc_routing::paths::DEFAULT_MAX_RELAYS,
-            allow_direct: false,
-            ..PathPolicy::default()
-        };
-        if state
-            .routing
-            .construct_path(scope, &[], &path, policy)
-            .is_err()
+            .diverse_route_candidates(&key, now, maximum.max(1))
         {
-            continue;
-        }
-        let Some(next_hop) = decode_route_next_hop(&record.next_hop) else {
-            continue;
-        };
-        let next_hop = if state
-            .bus
-            .lock()
-            .expect("session bus")
-            .lookup(&next_hop)
-            .is_some()
-        {
-            next_hop
-        } else {
-            let Some(endpoint) = state
-                .config
-                .static_peers
-                .iter()
-                .find(|peer| peer.address == record.next_hop)
-                .and_then(|peer| crate::static_peers::parse_endpoint_id(&peer.endpoint_id).ok())
-            else {
+            if record.state != RouteState::Usable || record.is_expired(now) {
+                continue;
+            }
+            // Private relay extension requires canonical path evidence. This
+            // prevents an old direct-route snapshot from silently becoming a
+            // multi-hop relay route.
+            if !record.metadata.starts_with(PATH_METADATA_MAGIC) {
+                continue;
+            }
+            let Ok(path) = decode_path_metadata(&record.metadata) else {
                 continue;
             };
-            endpoint.to_vec()
-        };
-        if next_hop == incoming_peer {
-            continue;
-        }
-        let live = state
-            .bus
-            .lock()
-            .expect("session bus")
-            .lookup(&next_hop)
-            .is_some();
-        if live {
-            let terminal = path
-                .last()
-                .is_some_and(|last| !last.relay && last.peer == next_hop);
-            return Some(RelayRouteHop {
-                peer: next_hop,
-                terminal,
-            });
+            let policy = PathPolicy {
+                max_hops: maximum_hops,
+                max_relays: maximum_relays,
+                allow_direct: false,
+                ..PathPolicy::default()
+            };
+            if state
+                .routing
+                .construct_path(scope, &[], &path, policy)
+                .is_err()
+            {
+                continue;
+            }
+            let Some(next_hop) = decode_route_next_hop(&record.next_hop) else {
+                continue;
+            };
+            let next_hop = if state
+                .bus
+                .lock()
+                .expect("session bus")
+                .lookup(&next_hop)
+                .is_some()
+            {
+                next_hop
+            } else {
+                let Some(endpoint) = state
+                    .config
+                    .static_peers
+                    .iter()
+                    .find(|peer| peer.address == record.next_hop)
+                    .and_then(|peer| crate::static_peers::parse_endpoint_id(&peer.endpoint_id).ok())
+                else {
+                    continue;
+                };
+                endpoint.to_vec()
+            };
+            if next_hop == incoming_peer || hops.iter().any(|hop| hop.peer == next_hop) {
+                continue;
+            }
+            let live = state
+                .bus
+                .lock()
+                .expect("session bus")
+                .lookup(&next_hop)
+                .is_some();
+            if live {
+                let terminal = path
+                    .last()
+                    .is_some_and(|last| !last.relay && last.peer == next_hop);
+                hops.push(RelayRouteHop {
+                    peer: next_hop,
+                    terminal,
+                });
+                if hops.len() >= maximum.max(1) {
+                    return hops;
+                }
+            }
         }
     }
-    None
+    hops
 }
 
 /// Allocate a peer-scoped wire id for a relay extension. The process-local
@@ -3585,7 +4268,7 @@ async fn writer_loop(
         };
         let (outbound, pace_wait) = {
             let mut session = session.lock().await;
-            match session.build_outbound(clock.as_ref(), now, &payload) {
+            match session.build_outbound_at(now, &payload) {
                 Ok(Some(outbound)) => {
                     // App-originated echo traffic: resets the idle timer
                     // (session.md §22).
@@ -3661,6 +4344,10 @@ mod tests {
         IDLE_TIMEOUT_MS, MIN_DRAIN_MS,
     };
     use umc_session::spaces::PacketSpace;
+    use umc_core::revocation::RevocationStore;
+    use umc_core::trust_statement::{RevocationSubject, SignedRevocation};
+    use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
+    use umc_storage::sqlite::SqliteStore;
     use umc_wire::frame::Frame as WireFrame;
     use umc_wire::frames::path::KeyUpdateFrame;
     use umc_wire::frames::relay::{RelayDataFrame, RelayOpenFrame, RelayStatusFrame};
@@ -3736,6 +4423,16 @@ mod tests {
             privacy_route_token_with_nonce(&destination, [2u8; 16]),
             "route tokens must be scoped per private connection"
         );
+        let policy_token = privacy_route_token_with_policy(&destination, [3u8; 16], 6, 2);
+        let decoded = decode_privacy_route_token(&policy_token).expect("policy token");
+        assert_eq!(decoded.destination_hash, hash_destination(&destination));
+        assert_eq!(decoded.remaining_hops, 6);
+        assert_eq!(decoded.remaining_relays, 2);
+        let advanced = advance_privacy_route_token(&policy_token, true).expect("next hop token");
+        let advanced = decode_privacy_route_token(&advanced).expect("advanced token");
+        assert_eq!(advanced.remaining_hops, 5);
+        assert_eq!(advanced.remaining_relays, 1);
+        assert!(advance_privacy_route_token(&privacy_route_token_with_policy(&destination, [4u8; 16], 1, 0), true).is_none());
     }
 
     fn test_session() -> Session {
@@ -4694,7 +5391,23 @@ mod tests {
             &[WireFrame::Bundle(bundle)],
             Instant(0),
         );
-        assert!(outbound.is_none(), "bundle admission sends nothing back");
+        let outbound = outbound.expect("delivery acknowledgement");
+        let ack = decode_outbound(&outbound)
+            .into_iter()
+            .find_map(|frame| match frame {
+                WireFrame::BundleAck(ack) => Some(ack),
+                _ => None,
+            })
+            .expect("bundle admission emits an acknowledgement");
+        assert_eq!(ack.status, 0);
+        assert!(umc_bundle::ack::verify_auth(
+            &ack.authentication,
+            &ack.bundle_id,
+            ack.status,
+            ack.stored_until,
+            &state.node_identity.endpoint_id(),
+            &[7u8; 32]
+        ));
         assert_eq!(state.bundle.count(), 1);
         let id = state.bundle.list()[0].0.clone();
         let id32: [u8; 32] = id.as_slice().try_into().unwrap();
@@ -4702,16 +5415,278 @@ mod tests {
 
         // The delivery sweep wraps the stored ciphertext into a BUNDLE frame
         // and marks it forwarded.
-        let swept = flush_pending_bundles(&mut state, Instant(5_000));
+        let mut disallowed_reservation = None;
+        assert!(flush_pending_bundles(
+            &mut state,
+            b"dest",
+            None,
+            Instant(5_000),
+            false,
+            &mut disallowed_reservation,
+        )
+        .is_empty());
+        assert!(disallowed_reservation.is_none());
+        let mut reservation = None;
+        let swept = flush_pending_bundles(
+            &mut state,
+            b"dest",
+            None,
+            Instant(5_000),
+            true,
+            &mut reservation,
+        );
         assert!(!swept.is_empty());
         let frames = decode_outbound(&swept);
         assert!(matches!(&frames[0], WireFrame::Bundle(f) if f.payload == b"ciphertext"));
+        settle_bundle_reservation(&mut state, reservation, true, Instant(5_000));
         assert!(matches!(
             state.bundle.record(&id32).map(|r| r.status.clone()),
             Some(umc_bundle::manager::BundleStatus::Forwarded)
         ));
         // Nothing left to deliver.
-        assert!(flush_pending_bundles(&mut state, Instant(5_000)).is_empty());
+        let mut retry = None;
+        assert!(flush_pending_bundles(
+            &mut state,
+            b"dest",
+            None,
+            Instant(5_000),
+            true,
+            &mut retry,
+        )
+        .is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn destination_authentication_requires_local_static_key_and_openable_envelope() {
+        let (mut state, _tx) = test_state();
+        let sender = umc_crypto::signatures::StaticHandshakeKeyPair::generate();
+        let destination = state.node_identity.static_handshake.public();
+        let envelope = umc_bundle::envelope::seal_bundle(&sender, &destination, b"destination");
+        let id = state
+            .bundle
+            .admit(
+                &envelope.encode(),
+                b"sender",
+                &destination.0,
+                1,
+                10_000,
+                3,
+                true,
+                Instant(0),
+            )
+            .expect("bundle");
+        assert!(bundle_is_destination_authenticated(&state, &id));
+
+        let other = umc_crypto::signatures::StaticHandshakeKeyPair::generate();
+        let wrong_envelope = umc_bundle::envelope::seal_bundle(&sender, &other.public(), b"wrong");
+        let wrong_id = state
+            .bundle
+            .admit(
+                &wrong_envelope.encode(),
+                b"sender",
+                &destination.0,
+                1,
+                10_000,
+                3,
+                true,
+                Instant(0),
+            )
+            .expect("wrong bundle");
+        assert!(!bundle_is_destination_authenticated(&state, &wrong_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_destination_emits_authenticated_delivered_receipt() {
+        let (mut state, _tx) = test_state();
+        let sender = umc_crypto::signatures::StaticHandshakeKeyPair::generate();
+        let destination = state.node_identity.static_handshake.public();
+        let envelope = umc_bundle::envelope::seal_bundle(&sender, &destination, b"delivered");
+        let bundle = BundleFrame {
+            bundle_id: vec![1; 32],
+            custody_requested: true,
+            delivery_ack_requested: true,
+            do_not_replicate: false,
+            local_scope_only: false,
+            high_sensitivity: false,
+            priority: 1,
+            creation_time: 0,
+            expiration_time: 10_000,
+            replication_limit: 3,
+            destination_hint: destination.0.to_vec(),
+            payload: envelope.encode(),
+            bundle_auth: Vec::new(),
+            chunk_index: 0,
+            chunk_final: true,
+        };
+        let mut session = test_session();
+        let outbound = handle_control_frames(
+            &mut state,
+            1,
+            &mut session,
+            &[WireFrame::Bundle(bundle)],
+            Instant(1),
+        )
+        .expect("delivery receipt");
+        let ack = decode_outbound(&outbound)
+            .into_iter()
+            .find_map(|frame| match frame {
+                WireFrame::BundleAck(ack) => Some(ack),
+                _ => None,
+            })
+            .expect("bundle ack");
+        assert_eq!(ack.status, 3);
+        let id: [u8; 32] = ack.bundle_id.as_slice().try_into().expect("id");
+        assert_eq!(
+            state.bundle.record(&id).map(|record| record.status.clone()),
+            Some(umc_bundle::manager::BundleStatus::Delivered)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refused_custody_emits_authenticated_rejected_receipt() {
+        let (mut state, _tx) = test_state();
+        let bundle = BundleFrame {
+            bundle_id: vec![3; 32],
+            custody_requested: true,
+            delivery_ack_requested: true,
+            do_not_replicate: false,
+            local_scope_only: false,
+            high_sensitivity: false,
+            priority: 1,
+            creation_time: 1,
+            expiration_time: 10_001,
+            replication_limit: umc_bundle::manager::DEFAULT_MAX_REPLICATION + 1,
+            destination_hint: b"dest".to_vec(),
+            payload: b"ciphertext".to_vec(),
+            bundle_auth: Vec::new(),
+            chunk_index: 0,
+            chunk_final: true,
+        };
+        let mut session = test_session();
+        let outbound = handle_control_frames(
+            &mut state,
+            1,
+            &mut session,
+            &[WireFrame::Bundle(bundle)],
+            Instant(2),
+        )
+        .expect("custody refusal receipt");
+        let ack = decode_outbound(&outbound)
+            .into_iter()
+            .find_map(|frame| match frame {
+                WireFrame::BundleAck(ack) => Some(ack),
+                _ => None,
+            })
+            .expect("custody refusal ack");
+        assert_eq!(ack.status, 4);
+        assert!(umc_bundle::ack::verify_auth(
+            &ack.authentication,
+            &ack.bundle_id,
+            ack.status,
+            ack.stored_until,
+            &state.node_identity.endpoint_id(),
+            &[7; 32]
+        ));
+        assert_eq!(state.bundle.count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejected_custody_receipt_releases_local_commitment_for_retry() {
+        let (mut state, _tx) = test_state();
+        let id = state
+            .bundle
+            .admit(
+                b"payload",
+                b"sender",
+                b"dest",
+                1,
+                10_000,
+                3,
+                true,
+                Instant(0),
+            )
+            .expect("bundle");
+        let peer_identity = umc_crypto::signatures::IdentityKeyPair::from_seed([8; 32]);
+        let peer_endpoint = umc_handshake::identity::endpoint_id(&peer_identity.public());
+        state.sessions.remove(1);
+        state.sessions.register(
+            1,
+            SessionEntry {
+                peer_endpoint_id: peer_endpoint,
+                carrier_type: "ump.tcp/1".into(),
+                task: tokio::spawn(async {}).abort_handle(),
+                established_at_ms: 0,
+                privacy_profile: 0,
+                direct_path_allowed: true,
+                traffic_padding_active: false,
+            },
+        );
+        let forged = WireFrame::BundleAck(umc_wire::frames::bundle::BundleAckFrame {
+            bundle_id: id.to_vec(),
+            status: 4,
+            stored_until: 10_000,
+            authentication: umc_bundle::ack::sign_auth(
+                &peer_identity,
+                &id,
+                4,
+                10_000,
+                &state.node_identity.endpoint_id(),
+            ),
+        });
+        let mut session = test_session();
+        let _ = handle_control_frames(
+            &mut state,
+            1,
+            &mut session,
+            &[forged],
+            Instant(1),
+        );
+        let record = state.bundle.record(&id).expect("bundle retained");
+        assert!(!record.custody);
+        assert_eq!(record.status, umc_bundle::manager::BundleStatus::Received);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forged_bundle_ack_cannot_change_local_status() {
+        let (mut state, _tx) = test_state();
+        let id = state
+            .bundle
+            .admit(
+                b"payload",
+                b"sender",
+                b"dest",
+                1,
+                10_000,
+                3,
+                true,
+                Instant(0),
+            )
+            .expect("bundle");
+        let forged_identity = umc_crypto::signatures::IdentityKeyPair::from_seed([99; 32]);
+        let forged = WireFrame::BundleAck(umc_wire::frames::bundle::BundleAckFrame {
+            bundle_id: id.to_vec(),
+            status: 3,
+            stored_until: 10_000,
+            authentication: umc_bundle::ack::sign_auth(
+                &forged_identity,
+                &id,
+                3,
+                10_000,
+                &state.node_identity.endpoint_id(),
+            ),
+        });
+        let mut session = test_session();
+        let _ = handle_control_frames(
+            &mut state,
+            1,
+            &mut session,
+            &[forged],
+            Instant(1),
+        );
+        assert_eq!(
+            state.bundle.record(&id).map(|record| record.status.clone()),
+            Some(umc_bundle::manager::BundleStatus::CustodyAccepted)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4748,7 +5723,16 @@ mod tests {
         // The sweep evicts expired bundles BEFORE delivery selection
         // (bundles.md §11): the expired bundle is removed (records + object
         // store) and never wrapped; the live bundle survives.
-        let swept = flush_pending_bundles(&mut state, Instant(1_001));
+        let mut reservation = None;
+        let swept = flush_pending_bundles(
+            &mut state,
+            b"dest",
+            None,
+            Instant(1_001),
+            true,
+            &mut reservation,
+        );
+        settle_bundle_reservation(&mut state, reservation, true, Instant(1_001));
         assert!(!swept.is_empty(), "live bundle still swept");
         assert!(state.bundle.find(&expired_id).is_none());
         assert!(state.bundle.payload(&expired_id).is_none());
@@ -4952,6 +5936,7 @@ mod tests {
                     flags: 0,
                     bidirectional: true,
                     private_handling: false,
+                    multipath: false,
                     destination_hint: b"missing-downstream".to_vec(),
                 },
                 vec![7u8; 32],
@@ -5303,6 +6288,7 @@ mod tests {
             8,
             0,
             false,
+            false,
             Instant(0),
         );
         let mut session = test_session();
@@ -5341,6 +6327,7 @@ mod tests {
             8,
             1,
             true,
+            false,
             Instant(0),
         );
         assert!(handle_control_frames(
@@ -5499,6 +6486,65 @@ mod tests {
             candidates[0].source,
             umc_discovery::provider::CandidateSource::PeerHint
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn authenticated_revocation_batch_is_applied_by_control_dispatch() {
+        let source_path = std::env::temp_dir().join(format!(
+            "umcd-revocation-source-{}-{}.db",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source_store = SqliteStore::open(&source_path).expect("source store");
+        let source_identity = IdentityKeyPair::from_seed([121u8; 32]);
+        let endpoint_id = umc_handshake::identity::endpoint_id(&source_identity.public());
+        let statement = SignedRevocation::sign(
+            &source_identity,
+            RevocationSubject::Identity(endpoint_id),
+            1,
+            0,
+            0,
+        )
+        .expect("signed revocation");
+        let source_revocations = RevocationStore::new(&source_store);
+        source_revocations
+            .accept_signed(&statement, &source_identity.public(), 1)
+            .expect("persist source statement");
+        let batch = source_revocations
+            .export_signed_batch_at(1)
+            .expect("export batch");
+
+        let (mut state, _tx) = test_state();
+        let mut session = test_session();
+        let outbound = handle_control_frames(
+            &mut state,
+            1,
+            &mut session,
+            &[WireFrame::RevocationBatch(
+                umc_wire::frames::misc::RevocationBatchFrame { payload: batch },
+            )],
+            Instant(5),
+        );
+        assert!(outbound.is_none());
+        let binding = umc_handshake::identity::IdentityBinding::sign(
+            &source_identity,
+            &StaticHandshakeKeyPair::from_seed([122u8; 32]).public(),
+            0,
+            u64::MAX,
+            0,
+            [0u8; 32],
+        );
+        assert!(matches!(
+            RevocationStore::new(state.store.as_ref()).check(&binding, 5),
+            Err(umc_core::revocation::RevocationError::Revoked { .. })
+        ));
+        assert!(state
+            .events
+            .lock()
+            .unwrap()
+            .recent(10)
+            .iter()
+            .any(|event| event.kind == "revocations_received"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5800,6 +6846,12 @@ mod tests {
         // numbers lower is packet-threshold lost (session.md §14.1); the
         // elapsed time stays below the 9/8 RTT time threshold.
         let mut peer = peer_session();
+        // The newest packet may be a later STREAM frame. Feed the opening
+        // frame first so the peer has the stream binding before exercising
+        // packet-threshold loss on the newest packet.
+        peer.on_inbound(t0, &packets[0]).unwrap_or_else(|e| {
+            panic!("peer opening stream: {e:?}, packet_len={}", packets[0].len())
+        });
         let ack_payload = peer.on_inbound(t0 + ms(10), newest).expect("peer recv");
         let ack_pkt = peer
             .build_outbound(clock.as_ref(), t0 + ms(10), &ack_payload)
@@ -5856,9 +6908,14 @@ mod tests {
                     t0 + ms(20),
                 )
                 .expect("recovery ack");
+            let retry = (0..=largest).find_map(|packet_number| {
+                session
+                    .retransmit(packet_number, t0)
+                    .expect("retransmit")
+            });
             assert!(
-                session.retransmit(2, t0).expect("retransmit").is_some(),
-                "gated retransmit keeps the payload for a later attempt"
+                retry.is_some(),
+                "a gated lost payload survives for a later attempt"
             );
         }
     }
@@ -6294,6 +7351,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn received_session_ticket_builds_persisted_peer_record() {
+        let frame = umc_wire::frames::handshake::SessionTicketFrame {
+            lifetime: 60_000,
+            age_add: 0,
+            nonce: Vec::new(),
+            ticket: vec![9, 8, 7],
+        };
+        let record = session_ticket_record(
+            [4u8; 32],
+            "ump.tcp/1",
+            &frame,
+            &[6u8; 32],
+            1_000,
+        )
+        .expect("valid ticket record");
+        assert_eq!(record.peer_endpoint_id, vec![4; 32]);
+        assert_eq!(record.resumption_secret, vec![6; 32]);
+        assert_eq!(record.expires_at_ms, 61_000);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn draining_not_extended_by_idle_sweep() {
         let t0 = Instant(1_000_000);
@@ -6555,6 +7633,7 @@ mod tests {
             ),
             &remote_keys,
             &remote_hp_key,
+            None,
             None,
             1,
             packet_rx,

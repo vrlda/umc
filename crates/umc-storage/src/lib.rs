@@ -1,6 +1,7 @@
 pub mod abuse;
 pub mod keychain;
 pub mod keystore;
+pub mod memory;
 pub mod migrations;
 pub mod objects;
 pub mod quota;

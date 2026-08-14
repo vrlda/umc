@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use umc_core::privacy::PrivacyProfile;
 use umc_storage::quota::Profile;
+use umc_types::edition::CoreEdition;
+
+use crate::build_profile;
 
 #[cfg(unix)]
 const DEFAULT_CONTROL_SOCKET: &str = "~/.local/run/umc.sock";
@@ -21,6 +24,9 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
     pub control_socket: PathBuf,
     pub profile: String,
+    /// Product edition. Unlike `profile`, this controls the advertised
+    /// capability family; all editions remain on the same UMP mesh.
+    pub edition: String,
     /// Requested privacy profile. P0 is the secure-by-default baseline.
     pub privacy_profile: String,
     /// Optional local policy floor. It can raise, but never lower, the
@@ -145,6 +151,7 @@ impl Default for NodeConfig {
             data_dir: PathBuf::from("~/.local/share/umc"),
             control_socket: PathBuf::from(DEFAULT_CONTROL_SOCKET),
             profile: "standard".to_string(),
+            edition: build_profile::compiled_edition().as_str().to_string(),
             privacy_profile: PrivacyProfile::P0.as_str().to_string(),
             privacy_policy_override: None,
             traffic_padding: false,
@@ -187,6 +194,7 @@ impl Default for NodeConfig {
 
 /// Profiles accepted by `SetConfig` (resource-limits.md §7).
 pub const SUPPORTED_PROFILES: &[&str] = &["constrained", "standard", "relay"];
+pub const SUPPORTED_EDITIONS: &[&str] = &["lite", "standard", "extended"];
 
 impl NodeConfig {
     pub fn load(path: Option<&PathBuf>) -> Result<Self, String> {
@@ -203,9 +211,23 @@ impl NodeConfig {
                 config.profile
             ));
         }
+        if config.core_edition().is_err() {
+            return Err(format!(
+                "config edition must be one of {SUPPORTED_EDITIONS:?}, got {:?}",
+                config.edition
+            ));
+        }
+        let edition = config.core_edition()?;
+        if !build_profile::supports_runtime_edition(edition) {
+            return Err(format!(
+                "config edition {edition:?} is not available in {} artifact",
+                build_profile::artifact_name()
+            ));
+        }
         config.config_path = path.cloned();
         config.normalize_privacy_profiles()?;
         config.normalize_privacy_controls()?;
+        config.validate_edition_configuration()?;
         config.validate_metrics_config()?;
         config.validate_network_realm()?;
         // Safety invariants (resource-limits.md §51): conservative defaults.
@@ -233,6 +255,12 @@ impl NodeConfig {
     #[allow(clippy::too_many_lines)]
     pub fn set_entry(&mut self, key: &str, value: &str) -> Result<(), String> {
         match key {
+            "edition" => {
+                value
+                    .parse::<CoreEdition>()
+                    .map_err(|_| format!("edition must be one of {SUPPORTED_EDITIONS:?}, got {value:?}"))?;
+                self.edition = value.trim().to_ascii_lowercase();
+            }
             "profile" => {
                 if !SUPPORTED_PROFILES.contains(&value) {
                     return Err(format!(
@@ -502,6 +530,45 @@ impl NodeConfig {
         Profile::from_name(&self.profile).unwrap_or(Profile::Standard)
     }
 
+    /// Returns the validated product edition.
+    pub fn core_edition(&self) -> Result<CoreEdition, String> {
+        self.edition
+            .parse()
+            .map_err(|_| format!("unsupported core edition {:?}", self.edition))
+    }
+
+    /// Reject known built-in modules that the selected edition cannot run.
+    /// Unknown carrier identifiers remain valid for future supervised modules.
+    pub fn validate_edition_configuration(&self) -> Result<(), String> {
+        let edition = self.core_edition()?;
+        if !build_profile::supports_runtime_edition(edition) {
+            return Err(format!(
+                "config edition {edition:?} is not available in {} artifact",
+                build_profile::artifact_name()
+            ));
+        }
+        if edition == CoreEdition::Lite
+            && self.effective_privacy_profile() > PrivacyProfile::P0
+        {
+            return Err(format!(
+                "privacy profile {} is unavailable in {} edition",
+                self.effective_privacy_profile().as_str(),
+                edition.as_str()
+            ));
+        }
+        if let Some(carrier) = self
+            .carriers
+            .iter()
+            .find(|carrier| !edition.supports_carrier(carrier))
+        {
+            return Err(format!(
+                "carrier {carrier:?} is unavailable in {} edition",
+                edition.as_str()
+            ));
+        }
+        Ok(())
+    }
+
     fn normalize_privacy_profiles(&mut self) -> Result<(), String> {
         let requested =
             PrivacyProfile::from_str(&self.privacy_profile).map_err(|e| format!("config: {e}"))?;
@@ -698,6 +765,10 @@ mod tests {
     #[test]
     fn defaults_are_conservative() {
         let config = NodeConfig::default();
+        assert_eq!(
+            config.core_edition().unwrap(),
+            crate::build_profile::compiled_edition()
+        );
         assert!(!config.public_relay);
         assert!(!config.telemetry_enabled);
         assert!(config.metrics_listen.is_none());
@@ -943,6 +1014,43 @@ mod tests {
     }
 
     #[test]
+    fn edition_is_separate_from_resource_profile_and_interoperable() {
+        let mut config = NodeConfig::default();
+        config.set_entry("edition", "lite").unwrap();
+        config.set_entry("profile", "constrained").unwrap();
+        assert_eq!(config.core_edition().unwrap(), CoreEdition::Lite);
+        assert_eq!(config.resource_profile(), Profile::Constrained);
+        assert!(CoreEdition::Lite.interoperates_with(CoreEdition::Extended));
+        assert!(config.set_entry("edition", "relay").is_err());
+    }
+
+    #[test]
+    fn lite_rejects_optional_builtin_carriers() {
+        let mut config = NodeConfig {
+            edition: "lite".into(),
+            ..NodeConfig::default()
+        };
+        config.carriers.push("ump.tls-stream/1".into());
+        let error = config
+            .validate_edition_configuration()
+            .expect_err("Lite must not configure TLS");
+        assert!(error.contains("ump.tls-stream/1"));
+    }
+
+    #[test]
+    fn lite_rejects_advanced_privacy_profile() {
+        let config = NodeConfig {
+            edition: "lite".into(),
+            privacy_profile: "p3".into(),
+            ..NodeConfig::default()
+        };
+        let error = config
+            .validate_edition_configuration()
+            .expect_err("Lite must not configure advanced privacy");
+        assert!(error.contains("privacy profile"));
+    }
+
+    #[test]
     fn emergency_disablement_entries_round_trip() {
         let mut config = NodeConfig::default();
         config
@@ -988,15 +1096,38 @@ mod tests {
         assert!(reloaded.mesh);
 
         let privacy_path = dir.join("privacy-node.json");
+        let privacy_edition = if cfg!(feature = "edition-lite") {
+            "lite"
+        } else {
+            "standard"
+        };
+        let privacy_requested = if cfg!(feature = "edition-lite") {
+            "P0"
+        } else {
+            "P1"
+        };
+        let privacy_policy = if cfg!(feature = "edition-lite") {
+            "P0"
+        } else {
+            "P2"
+        };
         std::fs::write(
             &privacy_path,
-            r#"{"privacy_profile":"P1","privacy_policy_override":"P2"}"#,
+            format!(
+                r#"{{"edition":"{privacy_edition}","privacy_profile":"{privacy_requested}","privacy_policy_override":"{privacy_policy}"}}"#
+            ),
         )
         .unwrap();
         let privacy = NodeConfig::load(Some(&privacy_path)).unwrap();
-        assert_eq!(privacy.privacy_profile, "p1");
-        assert_eq!(privacy.privacy_policy_override.as_deref(), Some("p2"));
-        assert_eq!(privacy.effective_privacy_profile(), PrivacyProfile::P2);
+        if cfg!(feature = "edition-lite") {
+            assert_eq!(privacy.privacy_profile, "p0");
+            assert_eq!(privacy.privacy_policy_override.as_deref(), Some("p0"));
+            assert_eq!(privacy.effective_privacy_profile(), PrivacyProfile::P0);
+        } else {
+            assert_eq!(privacy.privacy_profile, "p1");
+            assert_eq!(privacy.privacy_policy_override.as_deref(), Some("p2"));
+            assert_eq!(privacy.effective_privacy_profile(), PrivacyProfile::P2);
+        }
 
         let invalid_path = dir.join("invalid-privacy-node.json");
         std::fs::write(&invalid_path, r#"{"privacy_profile":"p9"}"#).unwrap();

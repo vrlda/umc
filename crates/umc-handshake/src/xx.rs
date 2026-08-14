@@ -20,8 +20,14 @@ pub const MAX_SUPPORTED_PARAMETERS: usize = 16;
 /// P3 is negotiated only when both peers advertise it; local policy still
 /// decides whether the node may accept or initiate that profile.
 pub const MAX_SUPPORTED_PRIVACY_PROFILE: &[u8] = b"p3";
+pub const MAX_DELEGATION_CHAIN_BYTES: usize = 8 * 1024;
 /// Secure-by-default privacy profile requested by a new client.
 pub const DEFAULT_MINIMUM_PRIVACY_PROFILE: &[u8] = b"p0";
+
+/// Capability-set version used by all three UMC editions. The edition is
+/// carried in the authenticated capability hash, while the wire protocol and
+/// mesh realm remain shared.
+pub const EDITION_CAPABILITY_PREFIX: &[u8] = b"edition=";
 
 /// Realm marker extension offsets inside the transcript-bound hello padding.
 /// The legacy capability/privacy bytes remain unchanged; these bytes are
@@ -525,6 +531,17 @@ pub fn capabilities_hash_for_minimum_privacy(minimum_privacy: &[u8]) -> [u8; 32]
     capabilities_hash(&canonical_capabilities_for_minimum_privacy(minimum_privacy))
 }
 
+/// Hashes the canonical v1 capabilities plus an edition label. This helper is
+/// for future edition-aware handshakes; existing v1 peers continue using the
+/// legacy minimum-privacy hash until the versioned negotiation is enabled.
+#[must_use]
+pub fn capabilities_hash_for_edition(edition: &str, minimum_privacy: &[u8]) -> [u8; 32] {
+    let mut caps = canonical_capabilities_for_minimum_privacy(minimum_privacy);
+    caps.extend_from_slice(EDITION_CAPABILITY_PREFIX);
+    caps.extend_from_slice(edition.as_bytes());
+    capabilities_hash(&caps)
+}
+
 /// Build a minimal Version-Negotiation packet (wire-format §25): the long
 /// header form with the `VersionNegotiation` type, version 0 (the VN
 /// convention — no version is being negotiated), the connection-id echo
@@ -597,6 +614,7 @@ use blake2::{Blake2s256, Digest};
 pub struct ServerAuthBlock {
     pub server_static_public_key: [u8; 32],
     pub server_identity_binding: Vec<u8>,
+    pub server_delegation_chain: Vec<u8>,
 }
 
 /// Encrypts the server authentication block.
@@ -618,6 +636,14 @@ pub fn encrypt_server_auth(
     let mut plaintext = Vec::new();
     plaintext.extend_from_slice(&block.server_static_public_key);
     plaintext.extend_from_slice(&block.server_identity_binding);
+    if !block.server_delegation_chain.is_empty() {
+        umc_wire::bytes::encode(
+            &mut plaintext,
+            &block.server_delegation_chain,
+            MAX_DELEGATION_CHAIN_BYTES,
+        )
+        .map_err(|_| EncodeError::Bytes)?;
+    }
     let mut aad = Vec::new();
     aad.extend_from_slice(transcript_before); // §16.1: transcript hash + preceding fields
     aad.extend_from_slice(server_random);
@@ -654,9 +680,38 @@ pub fn decrypt_server_auth(
         .map_err(|_| EncodeError::Bytes)?;
     let mut server_static_public_key = [0u8; 32];
     server_static_public_key.copy_from_slice(plaintext.get(..32).ok_or(EncodeError::Truncated)?);
+    // v0.1 peers sent only the binding's signed bytes (153 bytes). New
+    // peers send the canonical binding including its signature (217 bytes)
+    // before the optional delegation envelope. Keep both forms decodable;
+    // delegation is accepted only on the signed form at the trust boundary.
+    let legacy_binding_end = 32 + 153;
+    let signed_binding_end = 32 + crate::identity::IDENTITY_BINDING_WIRE_LEN;
+    let binding_end = if plaintext.len() >= signed_binding_end {
+        signed_binding_end
+    } else if plaintext.len() == legacy_binding_end {
+        legacy_binding_end
+    } else {
+        return Err(EncodeError::Truncated);
+    };
+    let server_delegation_chain = if plaintext.len() == binding_end {
+        Vec::new()
+    } else if binding_end == signed_binding_end {
+        let (chain, consumed) = umc_wire::bytes::decode(
+            plaintext.get(binding_end..).ok_or(EncodeError::Truncated)?,
+            MAX_DELEGATION_CHAIN_BYTES,
+        )
+        .map_err(|_| EncodeError::Bytes)?;
+        if binding_end + consumed != plaintext.len() {
+            return Err(EncodeError::Bytes);
+        }
+        chain.to_vec()
+    } else {
+        return Err(EncodeError::Bytes);
+    };
     Ok(ServerAuthBlock {
         server_static_public_key,
-        server_identity_binding: plaintext[32..].to_vec(),
+        server_identity_binding: plaintext[32..binding_end].to_vec(),
+        server_delegation_chain,
     })
 }
 
@@ -725,11 +780,40 @@ pub fn build_client_auth_plaintext(
     binding: &crate::identity::IdentityBinding,
     client_signature: &[u8; 64],
 ) -> Vec<u8> {
-    let mut plaintext = Vec::with_capacity(32 + binding.signed_bytes().len() + 64 + 64);
+    build_client_auth_plaintext_with_delegation(
+        client_static_public_key,
+        binding,
+        client_signature,
+        &[],
+    )
+}
+
+/// Assembles `CLIENT_AUTH` with an optional canonical, locally-authorized
+/// delegation-chain envelope appended after the identity signature.
+///
+/// # Panics
+///
+/// Panics only if `delegation_chain` exceeds the fixed wire bound. Callers
+/// should use a bounded trust-layer encoder or validate the length before
+/// constructing the envelope.
+#[must_use]
+pub fn build_client_auth_plaintext_with_delegation(
+    client_static_public_key: &[u8; 32],
+    binding: &crate::identity::IdentityBinding,
+    client_signature: &[u8; 64],
+    delegation_chain: &[u8],
+) -> Vec<u8> {
+    let mut plaintext = Vec::with_capacity(
+        32 + binding.signed_bytes().len() + 64 + 64 + delegation_chain.len() + 3,
+    );
     plaintext.extend_from_slice(client_static_public_key);
     plaintext.extend_from_slice(&binding.signed_bytes());
     plaintext.extend_from_slice(&binding.signature);
     plaintext.extend_from_slice(client_signature);
+    if !delegation_chain.is_empty() {
+        umc_wire::bytes::encode(&mut plaintext, delegation_chain, MAX_DELEGATION_CHAIN_BYTES)
+            .expect("bounded delegation chain");
+    }
     plaintext
 }
 
@@ -940,7 +1024,12 @@ pub fn run_xx_handshake(
         &server_auth_transcript,
         &ServerAuthBlock {
             server_static_public_key: server_static.public().0,
-            server_identity_binding: binding.signed_bytes(),
+            server_identity_binding: {
+                let mut bytes = binding.signed_bytes();
+                bytes.extend_from_slice(&binding.signature);
+                bytes
+            },
+            server_delegation_chain: Vec::new(),
         },
         &server_ephemeral.public().0,
         &server_random,
@@ -1679,7 +1768,8 @@ mod tests {
         let tr = [2u8; 32];
         let block = ServerAuthBlock {
             server_static_public_key: [3u8; 32],
-            server_identity_binding: vec![4u8; 100],
+            server_identity_binding: vec![4u8; crate::identity::IDENTITY_BINDING_WIRE_LEN],
+            server_delegation_chain: Vec::new(),
         };
         let eph = [5u8; 32];
         let rnd = [6u8; 32];
@@ -1690,11 +1780,47 @@ mod tests {
     }
 
     #[test]
+    fn server_auth_block_round_trips_bounded_delegation_envelope() {
+        let e1 = [11u8; 32];
+        let transcript = [12u8; 32];
+        let block = ServerAuthBlock {
+            server_static_public_key: [13u8; 32],
+            server_identity_binding: vec![14u8; crate::identity::IDENTITY_BINDING_WIRE_LEN],
+            server_delegation_chain: vec![1, 0, 2, 0xAA, 0xBB],
+        };
+        let ephemeral = [15u8; 32];
+        let random = [16u8; 32];
+        let ciphertext = encrypt_server_auth(
+            &e1,
+            &transcript,
+            &block,
+            &ephemeral,
+            &random,
+            CRYPTO_PROFILE,
+        )
+        .expect("bounded delegation envelope");
+        let decoded = decrypt_server_auth(
+            &e1,
+            &transcript,
+            &ciphertext,
+            &ephemeral,
+            &random,
+            CRYPTO_PROFILE,
+        )
+        .expect("bounded delegation envelope");
+        assert_eq!(
+            decoded.server_delegation_chain,
+            block.server_delegation_chain
+        );
+    }
+
+    #[test]
     fn wrong_transcript_fails_decryption() {
         let e1 = [1u8; 32];
         let block = ServerAuthBlock {
             server_static_public_key: [3u8; 32],
             server_identity_binding: vec![4u8; 16],
+            server_delegation_chain: Vec::new(),
         };
         let ct = encrypt_server_auth(
             &e1,

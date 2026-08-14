@@ -3,9 +3,10 @@
 //! persist to the node database under the peer namespace (storage.md §16.4);
 //! after a restart the table is restored so operational hints survive.
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use blake2::{Blake2s256, Digest};
-use umc_crypto::signatures::IdentityPublicKey;
+use umc_crypto::signatures::{IdentityKeyPair, IdentityPublicKey};
 use umc_discovery::bootstrap::{BootstrapBundle, BootstrapError};
 use umc_discovery::dht::{DhtRecord, DhtTable, RECORD_LIFETIME_MS};
 use umc_discovery::hints::{
@@ -18,11 +19,71 @@ use umc_discovery::table::{CandidateTable, TableError};
 use umc_storage::sqlite::SqliteStore;
 use umc_storage::store::{Namespace, Store, StoreError};
 use umc_types::runtime::Instant;
-use umc_wire::frames::misc::PeerHintFrame;
+use umc_wire::frames::misc::{PeerHintFrame, ServiceHintFrame};
 
 /// Default candidate capacity (discovery.md §6).
 #[allow(dead_code)] // used by daemon config wiring in Phase 12
 pub const DEFAULT_TABLE_CAP: usize = umc_discovery::table::DEFAULT_TABLE_CAP;
+pub const MAX_SERVICE_HINTS: usize = 64;
+/// Aggregate remote-hint cap across all authenticated peers. Per-peer caps
+/// alone would still permit an attacker to consume memory by opening many
+/// sessions and publishing one bounded hint on each.
+pub const MAX_REMOTE_SERVICE_HINTS: usize = 1_024;
+pub const MAX_SERVICE_HINT_LIFETIME_MS: u64 = 24 * 60 * 60 * 1_000;
+
+/// An opaque application service advertisement received over an authenticated
+/// session. The daemon indexes protocol ids but never interprets metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceHintRecord {
+    pub peer_endpoint_id: [u8; 32],
+    pub protocol_id: Vec<u8>,
+    pub endpoint_hint: Vec<u8>,
+    pub metadata: Vec<u8>,
+    pub expiration_time: u64,
+    pub signature: Vec<u8>,
+    pub public: bool,
+}
+
+fn service_hint_message(
+    protocol_id: &[u8],
+    endpoint_hint: &[u8],
+    metadata: &[u8],
+    expiration_time: u64,
+) -> [u8; 32] {
+    let mut hasher = Blake2s256::new();
+    hasher.update(b"UMP-SERVICE-HINT-v1");
+    hasher.update(u16::try_from(protocol_id.len()).unwrap_or(u16::MAX).to_be_bytes());
+    hasher.update(protocol_id);
+    hasher.update(u16::try_from(endpoint_hint.len()).unwrap_or(u16::MAX).to_be_bytes());
+    hasher.update(endpoint_hint);
+    hasher.update(u16::try_from(metadata.len()).unwrap_or(u16::MAX).to_be_bytes());
+    hasher.update(metadata);
+    hasher.update(expiration_time.to_be_bytes());
+    hasher.finalize().into()
+}
+
+fn validate_service_hint_fields(
+    protocol_id: &[u8],
+    endpoint_hint: &[u8],
+    metadata: &[u8],
+    expiration_time: u64,
+    now: Instant,
+) -> Result<(), String> {
+    if protocol_id.is_empty() || protocol_id.len() > umc_wire::frames::misc::MAX_PROTOCOL_ID {
+        return Err("service protocol id exceeds bounds".into());
+    }
+    if endpoint_hint.len() > umc_wire::frames::misc::MAX_ENDPOINT_HINT
+        || metadata.len() > umc_wire::frames::misc::MAX_SERVICE_METADATA
+    {
+        return Err("service hint field exceeds bounds".into());
+    }
+    if expiration_time <= now.0
+        || expiration_time.saturating_sub(now.0) > MAX_SERVICE_HINT_LIFETIME_MS
+    {
+        return Err("service hint expiration is outside the bounded lifetime".into());
+    }
+    Ok(())
+}
 
 /// Wire form of a persisted candidate (storage.md §16.4): `PeerCandidate`
 /// does not derive `serde`, so this mirror is what gets serialized. Enum
@@ -287,6 +348,8 @@ pub struct DiscoveryService {
     pub providers: ProviderManager,
     store: Option<Arc<SqliteStore>>,
     realm_marker: [u8; 32],
+    local_service_hints: Vec<ServiceHintRecord>,
+    remote_service_hints: HashMap<[u8; 32], Vec<ServiceHintRecord>>,
 }
 
 impl std::fmt::Debug for DiscoveryService {
@@ -297,12 +360,39 @@ impl std::fmt::Debug for DiscoveryService {
             .field("providers", &self.providers)
             .field("store_attached", &self.store.is_some())
             .field("realm_marker", &"[redacted]")
+            .field("local_service_hints", &self.local_service_hints.len())
+            .field("remote_service_hint_peers", &self.remote_service_hints.len())
             .finish()
     }
 }
 
 #[allow(dead_code)] // record_candidate/build_hint wired to PEER_HINT loop in Phase 12
 impl DiscoveryService {
+    fn trim_remote_service_hints(&mut self) {
+        let mut total = self
+            .remote_service_hints
+            .values()
+            .map(Vec::len)
+            .sum::<usize>();
+        while total > MAX_REMOTE_SERVICE_HINTS {
+            let Some((peer, hints)) = self
+                .remote_service_hints
+                .iter_mut()
+                .find(|(_, hints)| !hints.is_empty())
+            else {
+                break;
+            };
+            hints.remove(0);
+            total = total.saturating_sub(1);
+            if hints.is_empty() {
+                // Removing the empty peer entry keeps the map itself bounded
+                // by active hint owners rather than historical sessions.
+                let peer = *peer;
+                self.remote_service_hints.remove(&peer);
+            }
+        }
+    }
+
     #[must_use]
     pub fn new(cap: usize) -> Self {
         Self::new_with_realm(cap, umc_handshake::xx::public_realm_marker())
@@ -316,7 +406,170 @@ impl DiscoveryService {
             providers: ProviderManager::new(cap),
             store: None,
             realm_marker,
+            local_service_hints: Vec::new(),
+            remote_service_hints: HashMap::new(),
         }
+    }
+
+    /// Publishes one locally signed, opaque application service hint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a field or lifetime exceeds the protocol bound.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_service_hint(
+        &mut self,
+        identity: &IdentityKeyPair,
+        protocol_id: Vec<u8>,
+        endpoint_hint: Vec<u8>,
+        metadata: Vec<u8>,
+        expiration_time: u64,
+        public: bool,
+        now: Instant,
+    ) -> Result<ServiceHintRecord, String> {
+        validate_service_hint_fields(
+            &protocol_id,
+            &endpoint_hint,
+            &metadata,
+            expiration_time,
+            now,
+        )?;
+        let signature = identity
+            .sign(&service_hint_message(
+                &protocol_id,
+                &endpoint_hint,
+                &metadata,
+                expiration_time,
+            ))
+            .to_vec();
+        let record = ServiceHintRecord {
+            peer_endpoint_id: umc_handshake::identity::endpoint_id(&identity.public()),
+            protocol_id,
+            endpoint_hint,
+            metadata,
+            expiration_time,
+            signature,
+            public,
+        };
+        self.local_service_hints.retain(|existing| {
+            !(existing.protocol_id == record.protocol_id
+                && existing.endpoint_hint == record.endpoint_hint)
+        });
+        if self.local_service_hints.len() >= MAX_SERVICE_HINTS {
+            self.local_service_hints.remove(0);
+        }
+        self.local_service_hints.push(record.clone());
+        Ok(record)
+    }
+
+    /// Accepts a signed hint from an authenticated peer. The transport
+    /// authenticates the session, while the identity signature prevents a
+    /// stale or cross-session relay from becoming the authority for content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed, expired, unauthenticated, or
+    /// conflicting hints.
+    pub fn accept_service_hint(
+        &mut self,
+        peer_endpoint_id: [u8; 32],
+        peer_identity_public_key: Option<&[u8; 32]>,
+        frame: &ServiceHintFrame,
+        now: Instant,
+    ) -> Result<(), String> {
+        validate_service_hint_fields(
+            &frame.protocol_id,
+            &frame.endpoint_hint,
+            &frame.metadata,
+            frame.expiration_time,
+            now,
+        )?;
+        if frame.signature.len() != 64 {
+            return Err("service hint signature length is invalid".into());
+        }
+        let Some(peer_identity_public_key) = peer_identity_public_key else {
+            return Err("service hint signer key is unavailable".into());
+        };
+        let public_key = IdentityPublicKey(*peer_identity_public_key);
+        if umc_handshake::identity::endpoint_id(&public_key) != peer_endpoint_id
+            || !public_key.verify(
+                &service_hint_message(
+                    &frame.protocol_id,
+                    &frame.endpoint_hint,
+                    &frame.metadata,
+                    frame.expiration_time,
+                ),
+                frame.signature.as_slice(),
+            )
+        {
+            return Err("service hint signature verification failed".into());
+        }
+        let records = self.remote_service_hints.entry(peer_endpoint_id).or_default();
+        records.retain(|existing| {
+            !(existing.protocol_id == frame.protocol_id
+                && existing.endpoint_hint == frame.endpoint_hint)
+        });
+        if records.len() >= MAX_SERVICE_HINTS {
+            records.remove(0);
+        }
+        records.push(ServiceHintRecord {
+            peer_endpoint_id,
+            protocol_id: frame.protocol_id.clone(),
+            endpoint_hint: frame.endpoint_hint.clone(),
+            metadata: frame.metadata.clone(),
+            expiration_time: frame.expiration_time,
+            signature: frame.signature.clone(),
+            public: true,
+        });
+        self.trim_remote_service_hints();
+        Ok(())
+    }
+
+    /// Returns active local and remote hints, optionally restricted to one
+    /// application protocol identifier. Expired records are removed eagerly.
+    pub fn service_hints(
+        &mut self,
+        protocol_id: Option<&[u8]>,
+        now: Instant,
+    ) -> Vec<ServiceHintRecord> {
+        self.local_service_hints
+            .retain(|hint| hint.expiration_time > now.0);
+        self.remote_service_hints.retain(|_, hints| {
+            hints.retain(|hint| hint.expiration_time > now.0);
+            !hints.is_empty()
+        });
+        let mut records = self
+            .local_service_hints
+            .iter()
+            .filter(|hint| hint.public)
+            .cloned()
+            .collect::<Vec<_>>();
+        records.extend(
+            self.remote_service_hints
+                .values()
+                .flat_map(|hints| hints.iter().filter(|hint| hint.public).cloned()),
+        );
+        if let Some(protocol_id) = protocol_id {
+            records.retain(|hint| hint.protocol_id.as_slice() == protocol_id);
+        }
+        records
+    }
+
+    /// Builds the public local hints to carry in the next protected packet.
+    pub fn service_hint_frames(&mut self, now: Instant) -> Vec<ServiceHintFrame> {
+        self.local_service_hints
+            .retain(|hint| hint.expiration_time > now.0);
+        self.local_service_hints
+            .iter()
+            .filter(|hint| hint.public)
+            .map(|hint| ServiceHintFrame {
+                protocol_id: hint.protocol_id.clone(),
+                endpoint_hint: hint.endpoint_hint.clone(),
+                metadata: hint.metadata.clone(),
+                expiration_time: hint.expiration_time,
+                signature: hint.signature.clone(),
+            })
+            .collect()
     }
 
     /// Registers a discovery provider for lifecycle-managed refreshes.
@@ -430,6 +683,39 @@ impl DiscoveryService {
             }
         }
         Ok(())
+    }
+
+    /// Apply bounded candidates and removals emitted by an external carrier.
+    /// Carrier-native source attribution is preserved; malformed/expired
+    /// entries are rejected by the same table and lifetime rules as built-ins.
+    pub fn apply_external_batch(
+        &mut self,
+        batch: &umc_plugin::runtime::DiscoveryBatch,
+        now: Instant,
+    ) -> usize {
+        for candidate_id in &batch.removed {
+            self.remove_candidate(*candidate_id);
+        }
+        let mut admitted = 0;
+        for candidate in batch.candidates.iter().cloned() {
+            if candidate.is_expired(now) {
+                continue;
+            }
+            if self.record_candidate(candidate, now).is_ok() {
+                admitted += 1;
+            }
+        }
+        admitted
+    }
+
+    /// Remove candidate and its persisted peer record.
+    pub fn remove_candidate(&mut self, candidate_id: u64) {
+        self.candidates.remove(candidate_id);
+        if let Some(store) = &self.store {
+            if let Err(error) = store.delete(Namespace::Peer, &candidate_key(candidate_id)) {
+                log::warn!("[discovery] failed to remove candidate {candidate_id}: {error:?}");
+            }
+        }
     }
 
     /// Advertise this node's explicitly configured public endpoints. These
@@ -829,6 +1115,74 @@ mod tests {
             ),
             Err(HintError::MeshAuthentication)
         );
+    }
+
+    #[test]
+    fn service_hint_signing_exchange_is_bounded_and_authenticated() {
+        let identity = IdentityKeyPair::from_seed([41u8; 32]);
+        let peer_endpoint = umc_handshake::identity::endpoint_id(&identity.public());
+        let mut sender = DiscoveryService::new(10);
+        let published = sender
+            .publish_service_hint(
+                &identity,
+                b"org.example.chat/1".to_vec(),
+                b"endpoint-token".to_vec(),
+                b"opaque".to_vec(),
+                500,
+                true,
+                Instant(100),
+            )
+            .expect("publish");
+        assert_eq!(published.peer_endpoint_id, peer_endpoint);
+        let frame = sender.service_hint_frames(Instant(101)).pop().expect("frame");
+        let mut receiver = DiscoveryService::new(10);
+        receiver
+            .accept_service_hint(peer_endpoint, Some(&identity.public().0), &frame, Instant(101))
+            .expect("accept");
+        assert_eq!(receiver.service_hints(Some(b"org.example.chat/1"), Instant(102)).len(), 1);
+
+        let mut tampered = frame.clone();
+        tampered.metadata[0] ^= 1;
+        assert!(receiver
+            .accept_service_hint(peer_endpoint, Some(&identity.public().0), &tampered, Instant(102))
+            .is_err());
+        assert!(receiver
+            .accept_service_hint(peer_endpoint, None, &frame, Instant(102))
+            .is_err());
+    }
+
+    #[test]
+    fn remote_service_hints_have_an_aggregate_memory_cap() {
+        let mut receiver = DiscoveryService::new(10);
+        for seed in 0..(MAX_REMOTE_SERVICE_HINTS + 32) {
+            let mut seed_bytes = [0u8; 32];
+            seed_bytes[..8].copy_from_slice(&(seed as u64).to_be_bytes());
+            let identity = IdentityKeyPair::from_seed(seed_bytes);
+            let endpoint = umc_handshake::identity::endpoint_id(&identity.public());
+            let mut sender = DiscoveryService::new(1);
+            sender
+                .publish_service_hint(
+                    &identity,
+                    b"org.example.cap/1".to_vec(),
+                    seed.to_be_bytes().to_vec(),
+                    Vec::new(),
+                    500,
+                    true,
+                    Instant(100),
+                )
+                .expect("publish");
+            let frame = sender
+                .service_hint_frames(Instant(101))
+                .pop()
+                .expect("frame");
+            receiver
+                .accept_service_hint(endpoint, Some(&identity.public().0), &frame, Instant(101))
+                .expect("accept");
+        }
+        let count = receiver
+            .service_hints(Some(b"org.example.cap/1"), Instant(102))
+            .len();
+        assert!(count <= MAX_REMOTE_SERVICE_HINTS);
     }
 
     fn temp_store() -> std::sync::Arc<umc_storage::sqlite::SqliteStore> {

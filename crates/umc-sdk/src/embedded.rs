@@ -16,9 +16,12 @@ use umc_carrier::types::LinkEvent;
 use umc_control::events::{event_filter_digest, EventResumeCursor, EVENT_CURSOR_TTL_MS};
 use umc_control::proto::umc::api::v1 as api;
 use umc_core::node::{Node, NodeConfig, NodeIdentity};
-use umc_core::trust::{TrustState, TrustStore};
+use umc_core::revocation::RevocationStore;
+use umc_core::trust::{DelegationStore, TrustState, TrustStore};
+use umc_core::trust_statement::{RevocationSubject, SignedDelegation, SignedRevocation};
 use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
 use umc_storage::store::Store;
+use umc_types::edition::CoreEdition;
 use umc_types::runtime::{Clock, EntropySource, Instant};
 
 use crate::client::ClientError;
@@ -32,10 +35,42 @@ const EMBEDDED_EVENT_MAX_BACKLOG: usize = 1_024;
 const EMBEDDED_EVENT_MAX_BACKLOG_BYTES: usize = 4 * 1024 * 1024;
 const EMBEDDED_PRIMARY_RECORD: &[u8] = b"embedded/node-identity";
 const EMBEDDED_ENDPOINT_RECORD_PREFIX: &[u8] = b"embedded/endpoint/";
+const MAX_SERVICE_HINT_LIFETIME_MS: i64 = 24 * 60 * 60 * 1_000;
+
+fn service_hint_message(
+    protocol_id: &[u8],
+    endpoint_hint: &[u8],
+    metadata: &[u8],
+    expiration_time: u64,
+) -> [u8; 32] {
+    use blake2::{Blake2s256, Digest};
+    let mut hasher = Blake2s256::new();
+    hasher.update(b"UMP-SERVICE-HINT-v1");
+    hasher.update(
+        u16::try_from(protocol_id.len())
+            .unwrap_or(u16::MAX)
+            .to_be_bytes(),
+    );
+    hasher.update(protocol_id);
+    hasher.update(
+        u16::try_from(endpoint_hint.len())
+            .unwrap_or(u16::MAX)
+            .to_be_bytes(),
+    );
+    hasher.update(endpoint_hint);
+    hasher.update(
+        u16::try_from(metadata.len())
+            .unwrap_or(u16::MAX)
+            .to_be_bytes(),
+    );
+    hasher.update(metadata);
+    hasher.update(expiration_time.to_be_bytes());
+    hasher.finalize().into()
+}
 
 struct EmbeddedStorage {
     keystore: umc_storage::keystore::Keystore,
-    store: Arc<umc_storage::sqlite::SqliteStore>,
+    store: Arc<dyn Store>,
 }
 
 struct CarrierHandle(Arc<dyn umc_carrier::Carrier + Send + Sync>);
@@ -54,7 +89,7 @@ impl std::fmt::Debug for EmbeddedStorage {
         formatter
             .debug_struct("EmbeddedStorage")
             .field("keystore", &"protected")
-            .field("store", &"sqlite")
+            .field("store", &"abstract")
             .finish()
     }
 }
@@ -93,7 +128,7 @@ impl EmbeddedStorage {
             }
             Err(error) => return Err(format!("load embedded primary identity: {error:?}")),
         };
-        let store = Arc::new(
+        let store: Arc<dyn Store> = Arc::new(
             umc_storage::sqlite::SqliteStore::open(&root.join("node.db"))
                 .map_err(|error| format!("open embedded store: {error:?}"))?,
         );
@@ -131,6 +166,42 @@ impl EmbeddedStorage {
             });
         }
         Ok((Self { keystore, store }, identity, endpoints))
+    }
+
+    fn open_memory(
+        root: &Path,
+        password: &[u8],
+    ) -> Result<(Self, NodeIdentity, Vec<PersistedEndpoint>), String> {
+        std::fs::create_dir_all(root)
+            .map_err(|error| format!("create embedded storage: {error}"))?;
+        let keystore = umc_storage::keystore::Keystore::open(root.join("keystore.ks"), password)
+            .map_err(|error| format!("open embedded keystore: {error:?}"))?;
+        let identity = match keystore.load(
+            umc_storage::keystore::KeyClass::IdentitySigning,
+            EMBEDDED_PRIMARY_RECORD,
+        ) {
+            Ok(seeds) => identity_from_seeds(&seeds, "embedded primary identity")?,
+            Err(umc_storage::keystore::KeystoreError::UnsupportedClass) => {
+                let identity = NodeIdentity::generate(&EmbeddedEntropy);
+                keystore
+                    .store(
+                        umc_storage::keystore::KeyClass::IdentitySigning,
+                        EMBEDDED_PRIMARY_RECORD,
+                        &identity_seeds(&identity),
+                    )
+                    .map_err(|error| format!("store embedded primary identity: {error:?}"))?;
+                identity
+            }
+            Err(error) => return Err(format!("load embedded primary identity: {error:?}")),
+        };
+        Ok((
+            Self {
+                keystore,
+                store: Arc::new(umc_storage::memory::MemoryStore::new()),
+            },
+            identity,
+            Vec::new(),
+        ))
     }
 
     fn persist_new_identity(
@@ -179,12 +250,26 @@ impl EmbeddedStorage {
 pub struct EmbeddedConfig {
     /// Label assigned to the initial in-process endpoint.
     pub endpoint_label: String,
+    /// Product edition for the embedded core. Embedded and daemon backends
+    /// use the same edition vocabulary and remain wire-compatible.
+    pub edition: CoreEdition,
+    /// Metadata backend for embedded persistence. Memory is explicitly
+    /// ephemeral; `SQLite` remains the durable default.
+    pub storage_backend: EmbeddedStorageBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddedStorageBackend {
+    Sqlite,
+    Memory,
 }
 
 impl Default for EmbeddedConfig {
     fn default() -> Self {
         Self {
             endpoint_label: "default".into(),
+            edition: CoreEdition::Standard,
+            storage_backend: EmbeddedStorageBackend::Sqlite,
         }
     }
 }
@@ -194,7 +279,7 @@ struct EmbeddedEndpoint {
     summary: api::IdentitySummary,
     /// Additional endpoint identities are kept inside the backend; the
     /// initial endpoint is the identity already owned by `Node`.
-    _identity: Option<NodeIdentity>,
+    identity: Option<NodeIdentity>,
 }
 
 #[derive(Debug)]
@@ -273,6 +358,7 @@ struct EmbeddedSubscription {
 /// Mutable in-process backend used by [`crate::Client`].
 #[derive(Debug)]
 pub(crate) struct EmbeddedBackend {
+    edition: CoreEdition,
     generation: u64,
     next_handle: u64,
     next_stream_id: u64,
@@ -296,6 +382,7 @@ pub(crate) struct EmbeddedBackend {
     event_history_next_sequence: u64,
     event_history: VecDeque<(u64, api::Event)>,
     event_history_bytes: usize,
+    service_hints: Vec<crate::discovery::ServiceHint>,
 }
 
 impl EmbeddedBackend {
@@ -337,8 +424,15 @@ impl EmbeddedBackend {
         let entropy = Arc::new(EmbeddedEntropy);
         let (storage, identity, persisted_endpoints) = match storage_config {
             Some((root, password)) => {
-                let (storage, identity, endpoints) =
-                    EmbeddedStorage::open(&root, &password).map_err(ClientError::Internal)?;
+                let (storage, identity, endpoints) = match config.storage_backend {
+                    EmbeddedStorageBackend::Sqlite => {
+                        EmbeddedStorage::open(&root, &password).map_err(ClientError::Internal)?
+                    }
+                    EmbeddedStorageBackend::Memory => {
+                        EmbeddedStorage::open_memory(&root, &password)
+                            .map_err(ClientError::Internal)?
+                    }
+                };
                 (Some(storage), identity, endpoints)
             }
             None => (None, NodeIdentity::generate(entropy.as_ref()), Vec::new()),
@@ -362,6 +456,7 @@ impl EmbeddedBackend {
             entropy,
         );
         let mut backend = Self {
+            edition: config.edition,
             generation,
             next_handle: 0,
             next_stream_id: 0,
@@ -383,6 +478,7 @@ impl EmbeddedBackend {
             event_history_next_sequence: 0,
             event_history: VecDeque::new(),
             event_history_bytes: 0,
+            service_hints: Vec::new(),
         };
         let carrier_type = backend.carrier.0.type_id().0;
         backend.carrier_instances.insert(
@@ -434,11 +530,22 @@ impl EmbeddedBackend {
                 return (api::StatusCode::DeadlineExceeded as i32, Vec::new());
             }
         }
+        if matches!(
+            service,
+            "DiscoveryService" | "BundleService" | "RelayService"
+        ) && !self.configured_edition().supports_optional_service(service)
+        {
+            return (api::StatusCode::Unimplemented as i32, Vec::new());
+        }
         match (service, method) {
             ("IdentityService", "CreateIdentity") => self.create_identity(payload),
             ("IdentityService", "ListIdentities") => self.list_identities(payload),
             ("IdentityService", "GetIdentity") => self.get_identity(payload),
             ("IdentityService", "ImportIdentity") => self.import_identity(payload),
+            ("IdentityService", "CreateDelegation") => self.create_delegation(payload),
+            ("IdentityService", "ImportDelegation") => self.import_delegation(payload),
+            ("IdentityService", "ListDelegations") => self.list_delegations(payload),
+            ("IdentityService", "RevokeDelegation") => self.revoke_delegation(payload),
             ("ApplicationService", "RegisterApplication") => self.register_application(payload),
             ("ApplicationService", "UnregisterApplication") => self.unregister_application(payload),
             ("ApplicationService", "OpenListener") => self.open_listener(payload),
@@ -472,10 +579,17 @@ impl EmbeddedBackend {
             ("CarrierService", "Dial") => self.dial_carrier(payload),
             ("CarrierService", "ListLinks") => self.list_links(payload),
             ("CarrierService", "CloseLink") => self.close_link(payload),
+            ("DiscoveryService", "ListCandidates") => Self::list_discovery_candidates(),
+            ("DiscoveryService", "PublishServiceHint") => self.publish_service_hint(payload),
+            ("DiscoveryService", "DiscoverServices") => self.discover_services(payload),
             ("EventService", "Subscribe") => self.subscribe_events(payload),
             ("EventService", "Unsubscribe") => self.unsubscribe_events(payload),
             _ => (api::StatusCode::Unimplemented as i32, Vec::new()),
         }
+    }
+
+    fn configured_edition(&self) -> CoreEdition {
+        self.edition
     }
 
     fn create_endpoint(
@@ -519,7 +633,7 @@ impl EmbeddedBackend {
             handle,
             EmbeddedEndpoint {
                 summary: summary.clone(),
-                _identity: identity,
+                identity,
             },
         );
         self.publish_event(
@@ -690,6 +804,182 @@ impl EmbeddedBackend {
         label
     }
 
+    fn delegation_store(&self) -> Option<&dyn Store> {
+        self.storage.as_ref().map(|storage| storage.store.as_ref())
+    }
+
+    fn create_delegation(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        let Ok(request) = api::CreateDelegationRequest::decode(payload) else {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        };
+        let Some(handle) = request.identity_handle else {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        };
+        let Some(endpoint) = self.endpoints.get(&handle.value) else {
+            return (api::StatusCode::NotFound as i32, Vec::new());
+        };
+        let identity = endpoint
+            .identity
+            .as_ref()
+            .unwrap_or(&self.node.config.identity);
+        let Ok(delegated_public_key) =
+            <[u8; 32]>::try_from(request.delegated_public_key.as_slice())
+        else {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        };
+        if request.expires_at_unix_ms <= 0 || request.root_capabilities.is_empty() {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        }
+        let expires_at = u64::try_from(request.expires_at_unix_ms).unwrap_or(0);
+        let Ok(certificate) = SignedDelegation::sign(
+            &identity.identity,
+            delegated_public_key,
+            request.allowed_capabilities,
+            now_ms(),
+            expires_at,
+            1,
+        ) else {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        };
+        if !certificate
+            .allowed_capabilities
+            .iter()
+            .all(|capability| request.root_capabilities.contains(capability))
+        {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        }
+        let Some(store) = self.delegation_store() else {
+            return (api::StatusCode::FailedPrecondition as i32, Vec::new());
+        };
+        let Ok(chain) =
+            umc_core::trust::encode_delegation_chain(std::slice::from_ref(&certificate))
+        else {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        };
+        if DelegationStore::new(store)
+            .accept_chain(
+                &identity.identity.public(),
+                &request.root_capabilities,
+                std::slice::from_ref(&certificate),
+                now_ms(),
+            )
+            .is_err()
+        {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        }
+        encoded_ok(&api::CreateDelegationResponse {
+            certificate: certificate.to_bytes().unwrap_or_default(),
+            delegation_chain: chain,
+            root_public_key: identity.identity.public().0.to_vec(),
+        })
+    }
+
+    fn import_delegation(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        let Ok(request) = api::ImportDelegationRequest::decode(payload) else {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        };
+        let Ok(root) = <[u8; 32]>::try_from(request.root_public_key.as_slice()) else {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        };
+        let Ok(chain) = umc_core::trust::decode_delegation_chain(&request.delegation_chain) else {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        };
+        let Some(store) = self.delegation_store() else {
+            return (api::StatusCode::FailedPrecondition as i32, Vec::new());
+        };
+        let Ok(authority) = DelegationStore::new(store).accept_chain(
+            &umc_crypto::signatures::IdentityPublicKey(root),
+            &request.root_capabilities,
+            &chain,
+            now_ms(),
+        ) else {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        };
+        encoded_ok(&api::ImportDelegationResponse {
+            delegated_public_key: authority.public_key.0.to_vec(),
+            delegation_chain: request.delegation_chain,
+        })
+    }
+
+    fn list_delegations(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        if api::ListDelegationsRequest::decode(payload).is_err() {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        }
+        let Some(store) = self.delegation_store() else {
+            return encoded_ok(&api::ListDelegationsResponse {
+                delegations: Vec::new(),
+            });
+        };
+        let Ok(chains) = DelegationStore::new(store).valid_chains(now_ms()) else {
+            return (api::StatusCode::Internal as i32, Vec::new());
+        };
+        encoded_ok(&api::ListDelegationsResponse {
+            delegations: chains
+                .into_iter()
+                .filter_map(|chain| {
+                    let leaf = chain.certificates.last()?;
+                    Some(api::DelegationSummary {
+                        root_public_key: chain.root_public_key.0.to_vec(),
+                        delegated_public_key: leaf.delegated_public_key.to_vec(),
+                        depth: u32::try_from(chain.certificates.len()).ok()?,
+                        sequence: leaf.sequence,
+                        expires_at_unix_ms: leaf.expires_at_ms,
+                        capabilities: leaf.allowed_capabilities.clone(),
+                    })
+                })
+                .collect(),
+        })
+    }
+
+    fn revoke_delegation(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        let Ok(request) = api::RevokeDelegationRequest::decode(payload) else {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        };
+        let Some(handle) = request.identity_handle else {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        };
+        let Some(endpoint) = self.endpoints.get(&handle.value) else {
+            return (api::StatusCode::NotFound as i32, Vec::new());
+        };
+        let identity = endpoint
+            .identity
+            .as_ref()
+            .unwrap_or(&self.node.config.identity);
+        let Ok(leaf) = <[u8; 32]>::try_from(request.delegated_public_key.as_slice()) else {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        };
+        let Some(store) = self.delegation_store() else {
+            return (api::StatusCode::FailedPrecondition as i32, Vec::new());
+        };
+        let Ok(Some(chain)) =
+            DelegationStore::new(store).valid_chain_containing_public_key(&leaf, now_ms())
+        else {
+            return (api::StatusCode::NotFound as i32, Vec::new());
+        };
+        if chain.root_public_key != identity.identity.public()
+            || request.sequence == 0
+            || request.expires_at_unix_ms <= 0
+        {
+            return (api::StatusCode::PermissionDenied as i32, Vec::new());
+        }
+        let Ok(statement) = SignedRevocation::sign(
+            &identity.identity,
+            RevocationSubject::Delegation(leaf),
+            request.sequence,
+            now_ms(),
+            u64::try_from(request.expires_at_unix_ms).unwrap_or(0),
+        ) else {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        };
+        if RevocationStore::new(store)
+            .accept_delegation_signed(&statement, &chain.root_public_key, &leaf, now_ms())
+            .is_err()
+        {
+            return (api::StatusCode::Conflict as i32, Vec::new());
+        }
+        encoded_ok(&api::RevokeDelegationResponse {})
+    }
+
     #[allow(clippy::too_many_lines)]
     fn register_application(&mut self, payload: &[u8]) -> (i32, Vec<u8>) {
         let Ok(request) = api::RegisterApplicationRequest::decode(payload) else {
@@ -857,6 +1147,13 @@ impl EmbeddedBackend {
         {
             return (api::StatusCode::InvalidArgument as i32, Vec::new());
         }
+        if request
+            .policy
+            .as_ref()
+            .is_some_and(|policy| policy.allow_early_data)
+        {
+            return (api::StatusCode::Unimplemented as i32, Vec::new());
+        }
         let application_id = application.value.clone();
         if !self.listeners.insert(application_id.clone()) {
             return (api::StatusCode::AlreadyExists as i32, Vec::new());
@@ -910,6 +1207,13 @@ impl EmbeddedBackend {
         };
         if !app.protocols.contains(&request.protocol_id) || request.destination_hint.is_empty() {
             return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        }
+        if request
+            .policy
+            .as_ref()
+            .is_some_and(|policy| policy.allow_early_data)
+        {
+            return (api::StatusCode::Unimplemented as i32, Vec::new());
         }
         if !self.carrier_instance_running(&self.carrier_handle) {
             return (api::StatusCode::Unavailable as i32, Vec::new());
@@ -1680,6 +1984,98 @@ impl EmbeddedBackend {
             request.reason.into_bytes(),
         );
         encoded_ok(&api::CloseLinkResponse {})
+    }
+
+    fn list_discovery_candidates() -> (i32, Vec<u8>) {
+        encoded_ok(&api::ListCandidatesResponse {
+            candidates: Vec::new(),
+            total: 0,
+        })
+    }
+
+    fn publish_service_hint(&mut self, payload: &[u8]) -> (i32, Vec<u8>) {
+        let Ok(request) = api::PublishServiceHintRequest::decode(payload) else {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        };
+        let now = now_unix_ms();
+        if request.protocol_id.is_empty()
+            || request.protocol_id.len() > umc_wire::frames::misc::MAX_PROTOCOL_ID
+            || request.endpoint_hint.len() > umc_wire::frames::misc::MAX_ENDPOINT_HINT
+            || request.metadata.len() > umc_wire::frames::misc::MAX_SERVICE_METADATA
+            || request.expires_at_unix_ms <= now
+            || request.expires_at_unix_ms.saturating_sub(now) > MAX_SERVICE_HINT_LIFETIME_MS
+        {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        }
+        let expiration = u64::try_from(request.expires_at_unix_ms).unwrap_or(u64::MAX);
+        let signature = self
+            .node
+            .config
+            .identity
+            .identity
+            .sign(&service_hint_message(
+                request.protocol_id.as_bytes(),
+                &request.endpoint_hint,
+                &request.metadata,
+                expiration,
+            ))
+            .to_vec();
+        let hint = crate::discovery::ServiceHint {
+            peer_endpoint_id: self.node.config.identity.endpoint_id().to_vec(),
+            protocol_id: request.protocol_id,
+            endpoint_hint: request.endpoint_hint,
+            metadata: request.metadata,
+            expires_at_unix_ms: request.expires_at_unix_ms,
+            signature,
+            public: request.public,
+        };
+        self.service_hints.retain(|existing| {
+            !(existing.protocol_id == hint.protocol_id
+                && existing.endpoint_hint == hint.endpoint_hint)
+        });
+        if self.service_hints.len() >= 64 {
+            self.service_hints.remove(0);
+        }
+        self.service_hints.push(hint.clone());
+        encoded_ok(&api::PublishServiceHintResponse {
+            hint: Some(api::ServiceHintSummary {
+                peer_endpoint_id: hint.peer_endpoint_id,
+                protocol_id: hint.protocol_id,
+                endpoint_hint: hint.endpoint_hint,
+                metadata: hint.metadata,
+                expires_at_unix_ms: hint.expires_at_unix_ms,
+                signature: hint.signature,
+                public: hint.public,
+            }),
+        })
+    }
+
+    fn discover_services(&mut self, payload: &[u8]) -> (i32, Vec<u8>) {
+        let Ok(request) = api::DiscoverServicesRequest::decode(payload) else {
+            return (api::StatusCode::InvalidArgument as i32, Vec::new());
+        };
+        let now = now_unix_ms();
+        self.service_hints
+            .retain(|hint| hint.expires_at_unix_ms > now);
+        let hints = self
+            .service_hints
+            .iter()
+            .filter(|hint| {
+                hint.public
+                    && (request.protocol_id.is_empty() || hint.protocol_id == request.protocol_id)
+            })
+            .cloned()
+            .map(|hint| api::ServiceHintSummary {
+                peer_endpoint_id: hint.peer_endpoint_id,
+                protocol_id: hint.protocol_id,
+                endpoint_hint: hint.endpoint_hint,
+                metadata: hint.metadata,
+                expires_at_unix_ms: hint.expires_at_unix_ms,
+                signature: hint.signature,
+                public: hint.public,
+            })
+            .collect();
+        encoded_ok(&api::DiscoverServicesResponse { hints })
     }
 
     fn carrier_instance_summary(
@@ -2612,6 +3008,7 @@ mod tests {
     use prost::Message;
     use umc_control::proto::umc::api::v1 as api;
     use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
+    use umc_types::edition::CoreEdition;
 
     #[test]
     fn embedded_event_backlog_stays_charged_until_ack_and_reports_state_gap() {
@@ -2802,6 +3199,53 @@ mod tests {
         assert_eq!(second.resume_token, first.resume_token);
     }
 
+    #[test]
+    fn embedded_rejects_deferred_early_data_requests() {
+        let config = super::EmbeddedConfig::default();
+        let mut backend = super::EmbeddedBackend::new(&config).expect("embedded backend");
+        let endpoint = backend
+            .endpoints
+            .values()
+            .next()
+            .expect("default endpoint")
+            .summary
+            .endpoint_id
+            .clone();
+        let register = api::RegisterApplicationRequest {
+            application_name: "early-data-test".into(),
+            requested_endpoint_ids: vec![endpoint],
+            requested_protocol_ids: vec!["org.example.early/1".into()],
+            ..Default::default()
+        };
+        let (status, payload) = backend.request_raw(
+            "ApplicationService",
+            "RegisterApplication",
+            &register.encode_to_vec(),
+            None,
+        );
+        assert_eq!(status, api::StatusCode::Ok as i32);
+        let application = api::RegisterApplicationResponse::decode(payload.as_slice())
+            .expect("registration response")
+            .application_handle;
+        let request = api::ConnectRequest {
+            application_handle: application,
+            destination_hint: vec![7; 32],
+            protocol_id: "org.example.early/1".into(),
+            policy: Some(api::ConnectionPolicy {
+                allow_early_data: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (status, _) = backend.request_raw(
+            "ApplicationService",
+            "Connect",
+            &request.encode_to_vec(),
+            None,
+        );
+        assert_eq!(status, api::StatusCode::Unimplemented as i32);
+    }
+
     #[tokio::test]
     async fn embedded_event_wait_honors_future_deadline_instead_of_would_blocking() {
         let mut client = crate::Client::embedded();
@@ -2819,6 +3263,58 @@ mod tests {
                 .await,
             Err(ClientError::DeadlineExceeded)
         ));
+    }
+
+    #[tokio::test]
+    async fn embedded_discovery_candidate_listing_is_bounded_and_non_secret() {
+        let mut client = crate::Client::embedded();
+        let candidates = client
+            .list_discovery_candidates()
+            .await
+            .expect("discovery listing");
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn embedded_service_hint_publish_and_discover_round_trip() {
+        let mut client = crate::Client::embedded();
+        let expires_at = super::now_unix_ms().saturating_add(60_000);
+        let published = client
+            .publish_service_hint(
+                "org.example.chat/1".into(),
+                b"chat.example.invalid".to_vec(),
+                br#"{"region":"test"}"#.to_vec(),
+                expires_at,
+                true,
+            )
+            .await
+            .expect("publish hint");
+        assert_eq!(published.protocol_id, "org.example.chat/1");
+        assert_eq!(published.endpoint_hint, b"chat.example.invalid");
+        assert_eq!(published.signature.len(), 64);
+
+        let discovered = client
+            .discover_services(Some("org.example.chat/1".into()))
+            .await
+            .expect("discover hints");
+        assert_eq!(discovered, vec![published]);
+
+        client
+            .publish_service_hint(
+                "org.example.chat/1".into(),
+                b"private-only".to_vec(),
+                Vec::new(),
+                expires_at,
+                false,
+            )
+            .await
+            .expect("publish private hint");
+        let discovered = client
+            .discover_services(Some("org.example.chat/1".into()))
+            .await
+            .expect("discover public hints");
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].endpoint_hint, b"chat.example.invalid");
     }
 
     #[tokio::test]
@@ -3489,6 +3985,8 @@ mod tests {
         ));
         let config = super::EmbeddedConfig {
             endpoint_label: "persisted".into(),
+            edition: CoreEdition::Standard,
+            ..Default::default()
         };
         let expected_endpoint = {
             let mut client = crate::Client::embedded_with_storage(
@@ -3551,12 +4049,35 @@ mod tests {
             crate::Client::embedded_with_storage(
                 super::EmbeddedConfig {
                     endpoint_label: "persisted".into(),
+                    edition: CoreEdition::Standard,
+                    ..Default::default()
                 },
                 &root,
                 b"wrong-password",
             ),
             Err(ClientError::Internal(_))
         ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn memory_embedded_backend_uses_store_trait_without_sqlite_file() {
+        let root = std::env::temp_dir().join(format!(
+            "umc-sdk-embedded-memory-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let config = super::EmbeddedConfig {
+            endpoint_label: "memory".into(),
+            edition: CoreEdition::Lite,
+            storage_backend: super::EmbeddedStorageBackend::Memory,
+        };
+        let mut client =
+            crate::Client::embedded_with_storage(config, &root, b"embedded-memory-test-password")
+                .expect("memory backend");
+        let endpoint = client.load_endpoint("memory").await.expect("endpoint");
+        assert_eq!(endpoint.endpoint_id().len(), 32);
+        assert!(!root.join("node.db").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 }

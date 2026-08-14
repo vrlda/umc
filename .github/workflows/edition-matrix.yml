@@ -1,0 +1,36 @@
+name: Edition matrix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  profiles:
+    name: ${{ matrix.edition }} profile
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - edition: lite
+            features: edition-lite
+            binary: umcd-lite
+          - edition: standard
+            features: edition-standard
+            binary: umcd
+          - edition: extended
+            features: edition-extended
+            binary: umcd-extended
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.80.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check profile
+        run: cargo check -p umcd --no-default-features --features ${{ matrix.features }} --locked
+      - name: Test profile
+        run: cargo test -p umcd --no-default-features --features ${{ matrix.features }} --locked --no-fail-fast
+      - name: Build named artifact
+        run: cargo build -p umcd --release --no-default-features --features ${{ matrix.features }} --bin ${{ matrix.binary }} --locked

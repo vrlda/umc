@@ -188,6 +188,7 @@ mod tests {
             key: key.clone(),
             state: RouteState::Usable,
             next_hop: hop.into(),
+            carrier_type: None,
             metadata: vec![],
             source_peer: vec![],
             created_at: now,

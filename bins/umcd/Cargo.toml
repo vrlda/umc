@@ -3,10 +3,27 @@ name = "umcd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autobins = false
 
 [[bin]]
 name = "umcd"
 path = "src/main.rs"
+
+[[bin]]
+name = "umcd-lite"
+path = "src/bin/umcd-lite.rs"
+required-features = ["edition-lite"]
+
+[[bin]]
+name = "umcd-extended"
+path = "src/bin/umcd-extended.rs"
+required-features = ["edition-extended"]
+
+[features]
+default = ["edition-standard"]
+edition-lite = []
+edition-standard = []
+edition-extended = []
 
 [dependencies]
 umc-types = { path = "../../crates/umc-types" }
@@ -22,6 +39,7 @@ umc-carrier-tcp = { path = "../../carriers/umc-carrier-tcp" }
 umc-carrier-tls = { path = "../../carriers/umc-carrier-tls" }
 umc-carrier-udp = { path = "../../carriers/umc-carrier-udp" }
 umc-carrier-lan = { path = "../../carriers/umc-carrier-lan" }
+blake2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
@@ -33,7 +51,7 @@ umc-discovery = { path = "../../crates/umc-discovery" }
 umc-relay = { path = "../../crates/umc-relay" }
 umc-routing = { path = "../../crates/umc-routing" }
 umc-metrics = { path = "../../crates/umc-metrics" }
-blake2 = "0.10"
+umc-plugin = { path = "../../crates/umc-plugin" }
 log = "0.4"
 env_logger = "0.11"
 

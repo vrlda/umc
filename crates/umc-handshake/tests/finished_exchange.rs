@@ -82,7 +82,12 @@ fn drive_round_trip() -> DriveContext {
         &server_auth_transcript,
         &umc_handshake::xx::ServerAuthBlock {
             server_static_public_key: server_static.public().0,
-            server_identity_binding: binding.signed_bytes(),
+            server_identity_binding: {
+                let mut bytes = binding.signed_bytes();
+                bytes.extend_from_slice(&binding.signature);
+                bytes
+            },
+            server_delegation_chain: Vec::new(),
         },
         &server_ephemeral.public().0,
         &server_random,

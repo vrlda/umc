@@ -30,6 +30,7 @@ const DEFAULT_DATA_DIR: &str = "~/.local/share/umc";
 const DEFAULT_CONFIG_JSON: &str = r#"{
   "data_dir": "~/.local/share/umc",
   "control_socket": "~/.local/run/umc.sock",
+  "edition": "standard",
   "profile": "standard",
   "carriers": ["ump.tcp/1", "ump.udp/1"],
   "mesh": false,
@@ -44,6 +45,7 @@ const DEFAULT_CONFIG_JSON: &str = r#"{
 const DEFAULT_CONFIG_JSON: &str = r#"{
   "data_dir": "~/.local/share/umc",
   "control_socket": "\\\\.\\pipe\\umc",
+  "edition": "standard",
   "profile": "standard",
   "carriers": ["ump.tcp/1", "ump.udp/1"],
   "mesh": false,
@@ -58,6 +60,7 @@ const DEFAULT_CONFIG_JSON: &str = r#"{
 const DEFAULT_CONFIG_JSON: &str = r#"{
   "data_dir": "~/.local/share/umc",
   "control_socket": "~/.local/run/umc.sock",
+  "edition": "standard",
   "profile": "standard",
   "carriers": ["ump.tcp/1", "ump.udp/1"],
   "mesh": false,

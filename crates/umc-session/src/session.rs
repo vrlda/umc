@@ -99,6 +99,10 @@ pub struct SessionConfig {
 pub struct Session {
     pub role: Role,
     pub state: SessionState,
+    /// Monotonic clock sample captured at construction. Runtime adapters use
+    /// this to correlate session lifetime with their injected clock; tests can
+    /// inspect it to prove no wall clock is consulted by the protocol core.
+    pub created_at: Instant,
     local_keys: PacketKeys,
     remote_keys: PacketKeys,
     /// Header protection keys (wire-format §18), derived from the traffic
@@ -206,8 +210,7 @@ impl std::fmt::Debug for Session {
 impl Session {
     /// Create a session with negotiated traffic secrets.
     ///
-    /// The `clock` parameter is reserved for the runtime and is currently
-    /// ignored; it is kept for API stability.
+    /// `clock` supplies the monotonic epoch used by this session.
     ///
     /// # Errors
     ///
@@ -215,7 +218,6 @@ impl Session {
     /// [`DEFAULT_DCID_LEN`] bytes, and [`SessionError::BadKeys`] if a traffic
     /// secret cannot be expanded into packet keys.
     pub fn new(config: SessionConfig, clock: &dyn Clock) -> Result<Self, SessionError> {
-        let _ = clock;
         if config.dcid.len() != DEFAULT_DCID_LEN {
             return Err(SessionError::BadConnectionId);
         }
@@ -230,6 +232,7 @@ impl Session {
         Ok(Self {
             role: config.role,
             state: SessionState::Active,
+            created_at: clock.now(),
             local_keys: PacketKeys::from_traffic_secret(&config.local_traffic_secret)
                 .map_err(|_| SessionError::BadKeys)?,
             remote_keys: PacketKeys::from_traffic_secret(&config.remote_traffic_secret)
@@ -673,8 +676,37 @@ impl Session {
         now: Instant,
         payload: &[u8],
     ) -> Result<Option<Vec<u8>>, SessionError> {
-        let _ = clock;
         self.build_outbound_on_path(self.primary_path_id, clock, now, payload)
+    }
+
+    /// Build an outbound packet using the injected runtime clock. This is the
+    /// production entry point; [`Self::build_outbound`] remains the explicit
+    /// timestamp helper used by deterministic protocol simulations.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same packet-space, congestion, amplification, and packet
+    /// assembly errors as [`Self::build_outbound`].
+    pub fn build_outbound_now(
+        &mut self,
+        clock: &dyn Clock,
+        payload: &[u8],
+    ) -> Result<Option<Vec<u8>>, SessionError> {
+        self.build_outbound_at(clock.now(), payload)
+    }
+
+    /// Build an outbound packet at an explicit protocol timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same packet-space, congestion, amplification, and packet
+    /// assembly errors as [`Self::build_outbound`].
+    pub fn build_outbound_at(
+        &mut self,
+        now: Instant,
+        payload: &[u8],
+    ) -> Result<Option<Vec<u8>>, SessionError> {
+        self.build_outbound_inner(self.primary_path_id, now, payload)
     }
 
     /// Build an outbound packet on a specific validated (or currently
@@ -691,12 +723,43 @@ impl Session {
     pub fn build_outbound_on_path(
         &mut self,
         path_id: u64,
-        clock: &dyn Clock,
+        _clock: &dyn Clock,
         now: Instant,
         payload: &[u8],
     ) -> Result<Option<Vec<u8>>, SessionError> {
-        let _ = clock;
         self.build_outbound_inner(path_id, now, payload)
+    }
+
+    /// Build an outbound packet on a selected path at an explicit protocol
+    /// timestamp. Alias makes timestamped simulation calls self-documenting.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same packet-space, congestion, amplification, and packet
+    /// assembly errors as [`Self::build_outbound_on_path`].
+    pub fn build_outbound_on_path_at(
+        &mut self,
+        path_id: u64,
+        now: Instant,
+        payload: &[u8],
+    ) -> Result<Option<Vec<u8>>, SessionError> {
+        self.build_outbound_inner(path_id, now, payload)
+    }
+
+    /// Build an outbound packet on a selected path using the injected runtime
+    /// clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same packet-space, congestion, amplification, and packet
+    /// assembly errors as [`Self::build_outbound_on_path`].
+    pub fn build_outbound_on_path_now(
+        &mut self,
+        path_id: u64,
+        clock: &dyn Clock,
+        payload: &[u8],
+    ) -> Result<Option<Vec<u8>>, SessionError> {
+        self.build_outbound_inner(path_id, clock.now(), payload)
     }
 
     fn build_outbound_inner(
@@ -1066,6 +1129,9 @@ impl Session {
             return Err(SessionError::StreamLimit);
         }
         let is_new = !self.streams.contains_key(&f.stream_id);
+        if is_new && !f.open {
+            return Err(SessionError::ProtocolViolation);
+        }
         let stream = self.streams.entry(f.stream_id).or_insert_with(|| {
             Stream::new(
                 f.stream_id,
@@ -1078,6 +1144,17 @@ impl Session {
             stream.unidirectional = f.unidirectional;
         } else if stream.unidirectional != f.unidirectional {
             return Err(SessionError::InvalidStreamId);
+        }
+        if is_new {
+            stream.metadata.clone_from(&f.metadata);
+            stream.recv_opened = true;
+        } else if f.open {
+            if stream.protocol_id != f.protocol_id || stream.metadata != f.metadata {
+                return Err(SessionError::ProtocolViolation);
+            }
+            stream.recv_opened = true;
+        } else if !stream.recv_opened || !f.protocol_id.is_empty() || !f.metadata.is_empty() {
+            return Err(SessionError::ProtocolViolation);
         }
         if matches!(
             stream.recv_state,
@@ -1870,6 +1947,9 @@ pub enum SessionError {
     /// The peer used an invalid stream initiator or direction bit pattern
     /// (wire-format.md §29).
     InvalidStreamId,
+    /// The peer changed stream opening metadata or placed opening fields on a
+    /// non-opening frame.
+    ProtocolViolation,
     /// The session already holds [`MAX_STREAMS_PER_SESSION`] concurrent
     /// streams: opening a new one is refused (resource-limits.md §20).
     StreamLimit,
@@ -2286,6 +2366,33 @@ mod tests {
     }
 
     #[test]
+    fn opening_metadata_is_bound_and_non_opening_fields_rejected() {
+        let mut s = session();
+        let mut opening = stream_frame(0, 0, b"abc", false);
+        opening.protocol_id = b"org.example.chat/1".to_vec();
+        opening.metadata = b"v1".to_vec();
+        s.apply_stream_frame(&opening).expect("opening");
+
+        let mut duplicate = opening.clone();
+        duplicate.data.clear();
+        assert!(s.apply_stream_frame(&duplicate).is_ok());
+
+        let mut conflicting = opening.clone();
+        conflicting.protocol_id = b"org.example.other/1".to_vec();
+        assert_eq!(
+            s.apply_stream_frame(&conflicting),
+            Err(SessionError::ProtocolViolation)
+        );
+
+        let mut later = stream_frame(0, 3, b"x", false);
+        later.protocol_id = b"org.example.chat/1".to_vec();
+        assert_eq!(
+            s.apply_stream_frame(&later),
+            Err(SessionError::ProtocolViolation)
+        );
+    }
+
+    #[test]
     fn closed_stream_id_rejects_further_delivery() {
         let mut s = session();
         // Deliver the full stream (fin at offset 3), read it to EOF.
@@ -2352,6 +2459,30 @@ mod tests {
         assert!(server.validate_stream_id(6, 0, true));
         assert!(!server.validate_stream_id(4, 0, true));
         assert!(server.validate_stream_id(1, 1, false));
+    }
+
+    #[test]
+    fn constructor_records_injected_clock_epoch() {
+        struct FixedClock;
+        impl Clock for FixedClock {
+            fn now(&self) -> Instant {
+                Instant(42_000)
+            }
+        }
+        let session = Session::new(
+            SessionConfig {
+                role: Role::Client,
+                dcid: vec![0; DEFAULT_DCID_LEN],
+                local_traffic_secret: [1; 32],
+                remote_traffic_secret: [2; 32],
+                initial_max_data: 1_000_000,
+                initial_max_stream_data: DEFAULT_INITIAL_MAX_STREAM_DATA,
+                max_ack_delay_ms: 25,
+            },
+            &FixedClock,
+        )
+        .expect("session");
+        assert_eq!(session.created_at, Instant(42_000));
     }
 
     #[test]

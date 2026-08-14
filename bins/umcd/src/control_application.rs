@@ -9,7 +9,7 @@ use crate::cancellation::CancellationHandle;
 use crate::relay_link::RelayLink;
 use crate::server::push_event;
 use crate::runtime_adapters::OsEntropy;
-use crate::state::{wall_now, ApplicationRegistration, RuntimeState};
+use crate::state::{wall_now, ApplicationRegistration, IdentityRef, PrivacyRouteState, RuntimeState};
 use prost::Message;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +18,36 @@ use umc_control::proto::umc::api::v1 as api;
 use umc_routing::types::{RouteKey, RouteScope, RouteState};
 use umc_session::datagram::Datagram;
 use umc_types::runtime::EntropySource;
+
+fn delegated_identity_for_endpoint(
+    state: &RuntimeState,
+    endpoint_id: &[u8],
+) -> Result<Option<umc_core::node::DelegatedIdentity>, String> {
+    if endpoint_id.is_empty() || state.node_identity.endpoint_id().as_slice() == endpoint_id {
+        return Ok(None);
+    }
+    let Some(IdentityRef::Secondary(secondary)) = state.identity_by_endpoint(endpoint_id)
+    else {
+        return Err("local endpoint is not registered".into());
+    };
+    let public_key = secondary.identity.identity.public();
+    let chain = umc_core::trust::DelegationStore::new(state.store.as_ref())
+        .valid_chain_for_public_key(&public_key.0, wall_now().0)
+        .map_err(|error| format!("delegation lookup: {error:?}"))?
+        .ok_or_else(|| "local endpoint has no authorized delegation chain".to_string())?;
+    umc_core::revocation::RevocationStore::new(state.store.as_ref())
+        .check_delegation(&chain, wall_now().0)
+        .map_err(|error| format!("delegated endpoint revoked: {error:?}"))?;
+    Ok(Some(umc_core::node::DelegatedIdentity {
+        identity: umc_core::node::NodeIdentity {
+            identity: secondary.identity.identity.clone(),
+            static_handshake: secondary.identity.static_handshake.clone(),
+        },
+        binding: secondary.binding.clone(),
+        delegation_chain: umc_core::trust::encode_delegation_chain(&chain.certificates)
+            .map_err(|error| format!("delegation encoding: {error:?}"))?,
+    }))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StaticDialTarget {
@@ -191,8 +221,15 @@ fn resolve_connect_target(
     connect: &api::ConnectRequest,
     direct: bool,
 ) -> Result<StaticDialTarget, i32> {
-    let target = resolve_static_peer(&state.config, &connect.destination_hint)
-        .map_err(|_| api::StatusCode::NotFound as i32)?;
+    let target = match resolve_static_peer(&state.config, &connect.destination_hint) {
+        Ok(target) => target,
+        Err(_) if !direct && connect.destination_hint.len() == 32 => StaticDialTarget {
+            carrier: "ump.relay/1".into(),
+            address: String::new(),
+            endpoint_id: connect.destination_hint.as_slice().try_into().expect("32-byte id"),
+        },
+        Err(_) => return Err(api::StatusCode::NotFound as i32),
+    };
     if direct && reject_disallowed_carrier(state, connect, &target) {
         return Err(api::StatusCode::FailedPrecondition as i32);
     }
@@ -224,7 +261,101 @@ fn relay_route_allowed(connect: &api::ConnectRequest) -> bool {
         })
 }
 
+fn connect_route_budgets(route: &api::RoutePolicy) -> (usize, usize) {
+    let maximum_hops = if route.maximum_hops == 0 {
+        match route_scope(route.scope) {
+            RouteScope::LinkLocal => 1,
+            RouteScope::LocalMesh => 4,
+            RouteScope::Introduced => 6,
+            RouteScope::General => umc_routing::types::DEFAULT_HOP_LIMIT,
+        }
+    } else {
+        u64::from(route.maximum_hops)
+    };
+    let maximum_relays = if route.maximum_relays == 0 {
+        umc_routing::paths::DEFAULT_MAX_RELAYS
+    } else {
+        usize::try_from(route.maximum_relays).unwrap_or(usize::MAX)
+    };
+    (
+        usize::try_from(maximum_hops).unwrap_or(usize::MAX),
+        maximum_relays,
+    )
+}
+
+fn private_connect_probe(
+    target: &StaticDialTarget,
+    route: &api::RoutePolicy,
+) -> api::ProbeRouteRequest {
+    api::ProbeRouteRequest {
+        destination_hint: target.endpoint_id.to_vec(),
+        policy: Some(route.clone()),
+        wait_for_usable: false,
+    }
+}
+
+/// Inspect the route portion of an outbound Connect without performing the
+/// handshake. The live control worker uses this preflight before dispatching
+/// Connect so it can wait for a route response without holding the daemon
+/// runtime mutex. `None` means the request is a direct/non-private connect;
+/// `Some(true/false)` reports whether a usable authenticated relay is present.
+pub(crate) fn connect_route_probe_for_wait(
+    state: &mut RuntimeState,
+    request: &api::Request,
+    fanout: bool,
+) -> Result<Option<bool>, i32> {
+    let Ok(connect) = api::ConnectRequest::decode(request.payload.as_slice()) else {
+        return Err(api::StatusCode::InvalidArgument as i32);
+    };
+    let private_route = state
+        .config
+        .effective_privacy_profile()
+        .includes(umc_core::privacy::PrivacyProfile::P2);
+    if !private_route {
+        return Ok(None);
+    }
+    validate_connect_route_policy(&connect)?;
+    if !relay_route_allowed(&connect) {
+        return Err(api::StatusCode::FailedPrecondition as i32);
+    }
+    let target = resolve_connect_target(state, &connect, false)?;
+    let route = connect
+        .policy
+        .as_ref()
+        .and_then(|policy| policy.route.as_ref())
+        .expect("relay_route_allowed requires a route policy");
+    if fanout {
+        let probe = private_connect_probe(&target, route);
+        let mut payload = Vec::new();
+        Message::encode(&probe, &mut payload)
+            .map_err(|_| api::StatusCode::Internal as i32)?;
+        let probe_request = api::Request {
+            request_id: request.request_id,
+            service: "RouteService".into(),
+            method: "ProbeRoute".into(),
+            payload,
+            ..Default::default()
+        };
+        if !crate::server::probe_route_for_connect(state, &probe_request) {
+            return Err(api::StatusCode::Unavailable as i32);
+        }
+    }
+    Ok(Some(
+        !relay_peers_for_destination(state, &target.endpoint_id, route).is_empty(),
+    ))
+}
+
 fn validate_connect_route_policy(connect: &api::ConnectRequest) -> Result<(), i32> {
+    if connect
+        .policy
+        .as_ref()
+        .is_some_and(|policy| policy.allow_early_data)
+    {
+        // UMP/1 keeps replayable 0-RTT outside the supported product
+        // profile.  Reject it explicitly instead of silently treating the
+        // request as a normal full handshake.
+        return Err(api::StatusCode::Unimplemented as i32);
+    }
     let Some(route) = connect
         .policy
         .as_ref()
@@ -241,6 +372,16 @@ fn validate_connect_route_policy(connect: &api::ConnectRequest) -> Result<(), i3
     // stronger trust state must not silently downgrade to that evidence.
     if route.minimum_trust > api::TrustState::Observed as i32 {
         return Err(api::StatusCode::FailedPrecondition as i32);
+    }
+    // Keep Connect's negotiated route envelope within the same protocol
+    // bounds enforced by route probes and path construction. Zero retains the
+    // scope-specific default; non-zero values must be representable by the
+    // relay/path machinery instead of being silently truncated downstream.
+    if u64::from(route.maximum_hops) > umc_routing::types::MAX_HOP_LIMIT
+        || usize::try_from(route.maximum_relays)
+            .map_or(true, |relays| relays > umc_routing::paths::MAX_PATH_HOPS)
+    {
+        return Err(api::StatusCode::InvalidArgument as i32);
     }
     Ok(())
 }
@@ -358,6 +499,74 @@ fn relay_peers_for_destination(
     peers
 }
 
+/// Convert the selected private-route evidence into the deliberately coarse
+/// privacy facts exposed by `GetSession`. The route metadata is authenticated
+/// and bounded before it reaches this helper; only hop bounds cross the
+/// control-plane boundary, never peer identifiers or failure domains.
+pub(crate) fn private_route_privacy_state(
+    state: &RuntimeState,
+    destination: &[u8; 32],
+    route: &api::RoutePolicy,
+) -> PrivacyRouteState {
+    let scope = route_scope(route.scope);
+    let now = state.node.clock.as_ref().now();
+    let mut policy = route.clone();
+    if policy
+        .allowed_carrier_types
+        .iter()
+        .any(|carrier| carrier == "ump.relay/1")
+    {
+        policy.allowed_carrier_types.clear();
+    }
+    let mut hop_counts = Vec::new();
+    for destination_hash in [
+        crate::session_task::hash_destination(destination),
+        *destination,
+    ] {
+        let key = RouteKey {
+            destination_profile: 0,
+            destination_hash,
+            scope,
+            policy_class: 0,
+        };
+        for record in state.routing.diverse_route_candidates(
+            &key,
+            now,
+            umc_routing::cache::DEFAULT_CACHE_TARGET,
+        ) {
+            if record.state != RouteState::Usable
+                || !crate::server::route_candidate_eligible(
+                    state,
+                    &record,
+                    &policy,
+                    scope,
+                    true,
+                )
+            {
+                continue;
+            }
+            if let Ok(hops) = umc_routing::paths::decode_path_metadata(&record.metadata) {
+                if !hops.is_empty() {
+                    hop_counts.push(u32::try_from(hops.len()).unwrap_or(u32::MAX));
+                }
+            }
+        }
+    }
+    if hop_counts.is_empty() {
+        return PrivacyRouteState {
+            reason: "private route metadata unavailable".into(),
+            ..Default::default()
+        };
+    }
+    hop_counts.sort_unstable();
+    PrivacyRouteState {
+        min_hops: hop_counts[0],
+        max_hops: *hop_counts.last().expect("non-empty hop counts"),
+        anonymous_authorization: false,
+        reason: String::new(),
+    }
+}
+
 #[allow(dead_code)]
 fn relay_peer_for_destination(
     state: &RuntimeState,
@@ -403,6 +612,7 @@ fn connect_transport_blocking(
     target: &StaticDialTarget,
     deadline: umc_types::runtime::Instant,
     cancellation: Option<CancellationHandle>,
+    delegated: Option<umc_core::node::DelegatedIdentity>,
 ) -> Result<umc_core::node::ConnectedTransport, String> {
     let expected_endpoint_id = target.endpoint_id;
     let remaining_ms = deadline
@@ -414,14 +624,76 @@ fn connect_transport_blocking(
     let operation_deadline = std::time::Instant::now()
         .checked_add(std::time::Duration::from_millis(remaining_ms))
         .ok_or_else(|| "deadline exceeded".to_string())?;
-    let future = state.node.connect_transport_with_deadline(
-        &target.carrier,
-        target.address.clone(),
-        Some(expected_endpoint_id),
-        operation_deadline,
-    );
-    let operation = async move {
-        future.await.map_err(|error| match error {
+
+    // Consume a peer ticket before attempting IK resumption. Deleting first
+    // makes the ticket single-use even if the process crashes after sending
+    // the hello; a stale/invalid ticket simply falls through to XX.
+    let ticket = umc_storage::records::load_session_ticket(
+        state.store.as_ref(),
+        &expected_endpoint_id,
+        state.node.clock.as_ref().now().0,
+    )
+    .ok()
+    .flatten();
+    if delegated.is_none() {
+      if let Some(ticket) = ticket {
+        let secret = ticket.resumption_secret.as_slice().try_into().ok();
+        let consumed = umc_storage::records::delete_session_ticket(
+            state.store.as_ref(),
+            &expected_endpoint_id,
+        )
+        .is_ok();
+        if let (Some(secret), true) = (secret, consumed) {
+            let future = state.node.connect_resumed_transport(
+                &target.carrier,
+                target.address.clone(),
+                &ticket.ticket,
+                &secret,
+            );
+            let operation = async move {
+                future.await.map_err(|error| match error {
+                    umc_core::node::NodeError::DeadlineExceeded => "deadline exceeded".into(),
+                    other => format!("resume connect: {other:?}"),
+                })
+            };
+            let operation = race_deadline_or_cancellation(operation, remaining_ms, cancellation.clone());
+            let resumed = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+                    return Err("outbound connect requires a multi-thread runtime".into());
+                }
+                tokio::task::block_in_place(|| handle.block_on(operation))
+            } else {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("connect runtime: {error}"))?;
+                runtime.block_on(operation)
+            };
+            if let Ok(mut connection) = resumed {
+                connection.peer_endpoint_id = expected_endpoint_id;
+                return Ok(connection);
+            }
+        }
+      }
+    }
+    let operation = async {
+        let result = if let Some(delegated) = delegated {
+            state.node.connect_transport_with_delegated_identity_and_deadline(
+                &target.carrier,
+                target.address.clone(),
+                Some(expected_endpoint_id),
+                operation_deadline,
+                delegated,
+            ).await
+        } else {
+            state.node.connect_transport_with_deadline(
+                &target.carrier,
+                target.address.clone(),
+                Some(expected_endpoint_id),
+                operation_deadline,
+            ).await
+        };
+        result.map_err(|error| match error {
             umc_core::node::NodeError::DeadlineExceeded => "deadline exceeded".into(),
             other => format!("connect: {other:?}"),
         })
@@ -439,15 +711,22 @@ fn connect_transport_blocking(
             .map_err(|error| format!("connect runtime: {error}"))?;
         runtime.block_on(operation)
     };
-    result
+    result.map(|mut connection| {
+        connection.peer_endpoint_id = expected_endpoint_id;
+        connection
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn connect_transport_relay_blocking(
     state: &mut RuntimeState,
     target: &StaticDialTarget,
     relay_peer: Vec<u8>,
+    maximum_hops: usize,
+    maximum_relays: usize,
     deadline: umc_types::runtime::Instant,
     cancellation: Option<CancellationHandle>,
+    delegated: Option<umc_core::node::DelegatedIdentity>,
 ) -> Result<umc_core::node::ConnectedTransport, String> {
     let remaining_ms = deadline
         .duration_since(state.node.clock.as_ref().now())
@@ -470,7 +749,12 @@ fn connect_transport_relay_blocking(
         state.bus.clone(),
         relay_peer,
         circuit_id,
-        crate::session_task::privacy_route_token_with_nonce(&target.endpoint_id, route_nonce),
+        crate::session_task::privacy_route_token_with_policy(
+            &target.endpoint_id,
+            route_nonce,
+            maximum_hops,
+            maximum_relays,
+        ),
     );
     state
         .relay_endpoint_handoffs
@@ -478,14 +762,24 @@ fn connect_transport_relay_blocking(
     let operation_deadline = std::time::Instant::now()
         .checked_add(std::time::Duration::from_millis(remaining_ms))
         .ok_or_else(|| "deadline exceeded".to_string())?;
-    let future = state.node.connect_transport_over_link_with_deadline(
-        "ump.relay/1",
-        Box::new(link),
-        Some(target.endpoint_id),
-        operation_deadline,
-    );
-    let operation = async move {
-        future.await.map_err(|error| match error {
+    let operation = async {
+        let result = if let Some(delegated) = delegated {
+            state.node.connect_transport_over_link_with_delegated_identity_and_deadline(
+                "ump.relay/1",
+                Box::new(link),
+                Some(target.endpoint_id),
+                operation_deadline,
+                delegated,
+            ).await
+        } else {
+            state.node.connect_transport_over_link_with_deadline(
+                "ump.relay/1",
+                Box::new(link),
+                Some(target.endpoint_id),
+                operation_deadline,
+            ).await
+        };
+        result.map_err(|error| match error {
             umc_core::node::NodeError::DeadlineExceeded => "deadline exceeded".into(),
             other => format!("connect: {other:?}"),
         })
@@ -566,6 +860,31 @@ pub(crate) fn connect(
         Ok(target) => target,
         Err(status) => return (status, None),
     };
+    let local_endpoint_id = if connect.local_endpoint_id.is_empty() {
+        state.node_identity.endpoint_id().to_vec()
+    } else {
+        connect.local_endpoint_id.clone()
+    };
+    let registered_endpoint = state
+        .application_registrations
+        .get(&application)
+        .is_some_and(|registration| {
+            registration.requested_endpoint_ids.is_empty()
+                || registration
+                    .requested_endpoint_ids
+                    .iter()
+                    .any(|endpoint| endpoint == &local_endpoint_id)
+        });
+    if !registered_endpoint {
+        return (api::StatusCode::PermissionDenied as i32, None);
+    }
+    let delegated = match delegated_identity_for_endpoint(state, &local_endpoint_id) {
+        Ok(delegated) => delegated,
+        Err(error) => {
+            log::debug!("[application] local delegated endpoint rejected: {error}");
+            return (api::StatusCode::FailedPrecondition as i32, None);
+        }
+    };
     let Some(runtime) = state.self_arc.upgrade() else {
         return (api::StatusCode::Unavailable as i32, None);
     };
@@ -573,6 +892,25 @@ pub(crate) fn connect(
         .policy
         .as_ref()
         .and_then(|policy| policy.route.as_ref());
+    if private_route {
+        if let Some(route) = relay_policy {
+            let probe = private_connect_probe(&target, route);
+            let mut payload = Vec::new();
+            if Message::encode(&probe, &mut payload).is_err() {
+                return (api::StatusCode::Internal as i32, None);
+            }
+            let probe_request = api::Request {
+                request_id: 1,
+                service: "RouteService".into(),
+                method: "ProbeRoute".into(),
+                payload,
+                ..Default::default()
+            };
+            if !crate::server::probe_route_for_connect(state, &probe_request) {
+                return (api::StatusCode::Unavailable as i32, None);
+            }
+        }
+    }
     let relay_peers = if private_route {
         relay_policy.map_or_else(Vec::new, |route| {
             relay_peers_for_destination(state, &target.endpoint_id, route)
@@ -591,13 +929,24 @@ pub(crate) fn connect(
     let connection = match if private_route {
         let mut last_error = "no eligible relay route".to_string();
         let mut connected = None;
+        let (maximum_hops, maximum_relays) = relay_policy.map_or(
+            (
+                usize::try_from(umc_routing::types::DEFAULT_HOP_LIMIT)
+                    .expect("default hop limit fits"),
+                umc_routing::paths::DEFAULT_MAX_RELAYS,
+            ),
+            connect_route_budgets,
+        );
         for relay_peer in relay_peers {
             match connect_transport_relay_blocking(
                 state,
                 &target,
                 relay_peer.clone(),
+                maximum_hops,
+                maximum_relays,
                 deadline,
                 cancellation.clone(),
+                delegated.clone(),
             ) {
                 Ok(connection) => {
                     connected = Some(connection);
@@ -623,7 +972,7 @@ pub(crate) fn connect(
         }
         connected.ok_or(last_error)
     } else {
-        connect_transport_blocking(state, &target, deadline, cancellation)
+        connect_transport_blocking(state, &target, deadline, cancellation, delegated)
     } {
         Ok(connection) => connection,
         Err(error) if error == "deadline exceeded" => {
@@ -649,9 +998,19 @@ pub(crate) fn connect(
         connection.dcid,
         connection.secrets.client,
         connection.secrets.server,
-        Some(connection.secrets.stateless_reset),
-        None,
+        if connection.resumed {
+            None
+        } else {
+            Some(connection.secrets.stateless_reset)
+        },
+        if connection.resumed {
+            None
+        } else {
+            Some(connection.secrets.resumption)
+        },
         connection.peer_endpoint_id,
+        connection.peer_static_handshake_public_key,
+        connection.peer_identity_public_key,
         crate::state::wall_now(),
         state.config.effective_privacy_profile() as u8,
         umc_session::session::Role::Client,
@@ -662,6 +1021,13 @@ pub(crate) fn connect(
             return (api::StatusCode::Unavailable as i32, None);
         }
     };
+    if private_route {
+        if let Some(route) = relay_policy {
+            state
+                .privacy_routes
+                .insert(session_id, private_route_privacy_state(state, &target.endpoint_id, route));
+        }
+    }
     if state
         .application_data
         .bind_session_owned(
@@ -941,6 +1307,9 @@ pub(crate) fn open_listener(
     if !open.protocol_id.is_empty() && open.protocol_id.as_bytes() != handle.value.as_slice() {
         return (api::StatusCode::InvalidArgument as i32, None);
     }
+    if open.policy.as_ref().is_some_and(|policy| policy.allow_early_data) {
+        return (api::StatusCode::Unimplemented as i32, None);
+    }
     let maximum_pending_sessions = open.policy.as_ref().map_or(
         crate::application_data::MAX_APPLICATION_PENDING_SESSIONS,
         |policy| usize::try_from(policy.maximum_pending_sessions).unwrap_or(usize::MAX),
@@ -1054,7 +1423,7 @@ fn send_session_payload(
         .try_lock()
         .map_err(|_| api::StatusCode::ResourceExhausted as i32)?;
     let packet = session
-        .build_outbound(state.node.clock.as_ref(), now, payload)
+        .build_outbound_at(now, payload)
         .map_err(|error| session_error_status(&error))?
         .ok_or(api::StatusCode::Unavailable as i32)?;
     session.touch(now);
@@ -1473,7 +1842,7 @@ pub(crate) fn write_stream(
         .streams
         .get(&stream_id)
         .map_or(0, |stream| stream.next_send_offset.saturating_sub(before));
-    let packet = match session.build_outbound(state.node.clock.as_ref(), now, &payload) {
+    let packet = match session.build_outbound_at(now, &payload) {
         Ok(Some(packet)) => {
             session.touch(now);
             packet
@@ -1740,7 +2109,7 @@ pub(crate) fn send_datagram(
     let Some(payload) = session.pop_outbound_datagram_payload(now.0) else {
         return (api::StatusCode::Unavailable as i32, None);
     };
-    let packet = match session.build_outbound(state.node.clock.as_ref(), now, &payload) {
+    let packet = match session.build_outbound_at(now, &payload) {
         Ok(Some(packet)) => {
             session.touch(now);
             packet
@@ -2329,6 +2698,55 @@ mod tests {
     }
 
     #[test]
+    fn private_route_privacy_state_reports_authenticated_hop_range() {
+        let mut state = state();
+        let destination = [3u8; 32];
+        let relay = [7u8; 32];
+        let metadata = umc_routing::paths::encode_path_metadata(&[
+            umc_routing::paths::PathHop {
+                peer: relay.to_vec(),
+                scope: RouteScope::General,
+                failure_domain: Vec::new(),
+                relay: true,
+            },
+            umc_routing::paths::PathHop {
+                peer: destination.to_vec(),
+                scope: RouteScope::General,
+                failure_domain: Vec::new(),
+                relay: false,
+            },
+        ])
+        .expect("path metadata");
+        let now = state.node.clock.as_ref().now();
+        let _ = state.routing.record_route_response_with_evidence(
+            RouteKey {
+                destination_profile: 0,
+                destination_hash: crate::session_task::hash_destination(&destination),
+                scope: RouteScope::General,
+                policy_class: 0,
+            },
+            "07".repeat(32),
+            60_000,
+            now,
+            None,
+            metadata,
+            Some("ump.relay/1".into()),
+        );
+        let privacy = private_route_privacy_state(
+            &state,
+            &destination,
+            &api::RoutePolicy {
+                scope: api::RouteScope::General as i32,
+                allow_relay: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(privacy.min_hops, 2);
+        assert_eq!(privacy.max_hops, 2);
+        assert!(privacy.reason.is_empty());
+    }
+
+    #[test]
     fn connect_route_policy_rejects_invalid_and_unavailable_trust_floors() {
         let invalid_scope = api::ConnectRequest {
             policy: Some(api::ConnectionPolicy {
@@ -2373,6 +2791,55 @@ mod tests {
         assert_eq!(
             validate_connect_route_policy(&unavailable_trust),
             Err(api::StatusCode::FailedPrecondition as i32)
+        );
+
+        let early_data = api::ConnectRequest {
+            policy: Some(api::ConnectionPolicy {
+                allow_early_data: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_connect_route_policy(&early_data),
+            Err(api::StatusCode::Unimplemented as i32)
+        );
+    }
+
+    #[test]
+    fn connect_route_policy_rejects_hop_and_relay_limits_above_protocol_bounds() {
+        let excessive_hops = api::ConnectRequest {
+            policy: Some(api::ConnectionPolicy {
+                route: Some(api::RoutePolicy {
+                    maximum_hops: u32::try_from(umc_routing::types::MAX_HOP_LIMIT)
+                        .expect("protocol hop limit fits")
+                        + 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_connect_route_policy(&excessive_hops),
+            Err(api::StatusCode::InvalidArgument as i32)
+        );
+
+        let excessive_relays = api::ConnectRequest {
+            policy: Some(api::ConnectionPolicy {
+                route: Some(api::RoutePolicy {
+                    maximum_relays: u32::try_from(umc_routing::paths::MAX_PATH_HOPS)
+                        .expect("protocol relay limit fits")
+                        + 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_connect_route_policy(&excessive_relays),
+            Err(api::StatusCode::InvalidArgument as i32)
         );
     }
 
@@ -2601,6 +3068,47 @@ mod tests {
                 0xcc, 0xdd, 0xee, 0xff
             ]
         );
+    }
+
+    #[test]
+    fn private_connect_target_accepts_authenticated_mesh_endpoint_without_static_peer() {
+        let mut state = state();
+        let endpoint = [0xabu8; 32];
+        let connect = api::ConnectRequest {
+            destination_hint: endpoint.to_vec(),
+            policy: Some(api::ConnectionPolicy {
+                route: Some(api::RoutePolicy {
+                    allow_relay: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let target = resolve_connect_target(&mut state, &connect, false)
+            .expect("private mesh target must not require static peer config");
+        assert_eq!(target.endpoint_id, endpoint);
+        assert_eq!(target.carrier, "ump.relay/1");
+        assert!(target.address.is_empty());
+    }
+
+    #[test]
+    fn private_connect_probe_binds_target_and_route_policy() {
+        let target = StaticDialTarget {
+            carrier: "ump.relay/1".into(),
+            address: String::new(),
+            endpoint_id: [0x42; 32],
+        };
+        let route = api::RoutePolicy {
+            maximum_hops: 5,
+            maximum_relays: 2,
+            allow_relay: true,
+            ..Default::default()
+        };
+        let probe = private_connect_probe(&target, &route);
+        assert_eq!(probe.destination_hint, target.endpoint_id);
+        assert_eq!(probe.policy, Some(route));
+        assert!(!probe.wait_for_usable);
     }
 
     #[test]

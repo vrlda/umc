@@ -276,12 +276,19 @@ pub fn dial_all(state: &Arc<Mutex<RuntimeState>>, peers: &[StaticPeerConfig]) {
         }
         let result = {
             let mut state = state.lock().expect("runtime state");
+            let store = state.store.clone();
             let node = &mut state.node;
             let carrier_name = carrier.clone();
             let address = peer.address.clone();
             let handle = tokio::runtime::Handle::current();
             tokio::task::block_in_place(|| {
-                handle.block_on(node.connect_transport(&carrier_name, address, Some(endpoint_id)))
+                handle.block_on(connect_with_ticket(
+                    &store,
+                    node,
+                    &carrier_name,
+                    address,
+                    Some(endpoint_id),
+                ))
             })
         };
         match result {
@@ -302,9 +309,11 @@ pub fn dial_all(state: &Arc<Mutex<RuntimeState>>, peers: &[StaticPeerConfig]) {
                     connection.dcid,
                     connection.secrets.client,
                     connection.secrets.server,
-                    Some(connection.secrets.stateless_reset),
-                    None,
+                    if connection.resumed { None } else { Some(connection.secrets.stateless_reset) },
+                    if connection.resumed { None } else { Some(connection.secrets.resumption) },
                     peer_endpoint_id,
+                    connection.peer_static_handshake_public_key,
+                    connection.peer_identity_public_key,
                     crate::state::wall_now(),
                     selected_privacy,
                     umc_session::session::Role::Client,
@@ -430,9 +439,12 @@ fn dial_one(
     }
     let result = {
         let mut state = state.lock().expect("runtime state");
+        let store = state.store.clone();
         let handle = tokio::runtime::Handle::current();
         tokio::task::block_in_place(|| {
-            handle.block_on(state.node.connect_transport(
+            handle.block_on(connect_with_ticket(
+                &store,
+                &mut state.node,
                 &carrier_name,
                 address.clone(),
                 expected_endpoint_id,
@@ -455,9 +467,11 @@ fn dial_one(
                 connection.dcid,
                 connection.secrets.client,
                 connection.secrets.server,
-                Some(connection.secrets.stateless_reset),
-                None,
+                if connection.resumed { None } else { Some(connection.secrets.stateless_reset) },
+                if connection.resumed { None } else { Some(connection.secrets.resumption) },
                 peer_endpoint_id,
+                connection.peer_static_handshake_public_key,
+                connection.peer_identity_public_key,
                 crate::state::wall_now(),
                 selected_privacy,
                 umc_session::session::Role::Client,
@@ -481,6 +495,36 @@ fn dial_one(
             None
         }
     }
+}
+
+async fn connect_with_ticket(
+    store: &umc_storage::sqlite::SqliteStore,
+    node: &mut umc_core::node::Node,
+    carrier: &str,
+    address: String,
+    expected_endpoint_id: Option<[u8; 32]>,
+) -> Result<umc_core::node::ConnectedTransport, umc_core::node::NodeError> {
+    if let Some(endpoint_id) = expected_endpoint_id {
+        if let Ok(Some(ticket)) = umc_storage::records::load_session_ticket(
+            store,
+            &endpoint_id,
+            node.clock.as_ref().now().0,
+        ) {
+            let secret = ticket.resumption_secret.as_slice().try_into().ok();
+            let _ = umc_storage::records::delete_session_ticket(store, &endpoint_id);
+            if let Some(secret) = secret {
+                if let Ok(mut connection) = node
+                    .connect_resumed_transport(carrier, address.clone(), &ticket.ticket, &secret)
+                    .await
+                {
+                    connection.peer_endpoint_id = endpoint_id;
+                    return Ok(connection);
+                }
+            }
+        }
+    }
+    node.connect_transport(carrier, address, expected_endpoint_id)
+        .await
 }
 
 #[cfg(test)]

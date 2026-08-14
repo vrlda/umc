@@ -1,0 +1,38 @@
+name: Native keychain evidence
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 0"
+
+env:
+  CARGO_TERM_COLOR: always
+  UMC_NATIVE_KEYCHAIN_TEST: "1"
+
+jobs:
+  native-keychain:
+    name: Native keychain (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux Secret Service needs a user D-Bus session and a running
+        # desktop credential service, which GitHub's headless runner does not
+        # provide. Linux remains fail-closed when that backend is unavailable;
+        # the native desktop stores are exercised here.
+        os: [macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - uses: arduino/setup-protoc@v3
+        if: runner.os == 'Windows'
+        with:
+          version: "28.3"
+      - uses: Swatinem/rust-cache@v2
+      - name: Run native keychain round-trip
+        run: cargo test --locked -p umc-storage --test native_keychain -- --ignored --nocapture
+      - name: Run native restore-anchor round-trip
+        run: cargo test --locked -p umcd state::tests::native_platform_restore_anchor_round_trips -- --ignored --nocapture

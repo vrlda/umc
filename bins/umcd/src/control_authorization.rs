@@ -149,7 +149,9 @@ fn required_capability(service: &str, method: &str) -> Option<api::Capability> {
             | "RevokeInvitation",
         ) => Some(C::PeerAdmin),
         ("PeerService", "SetTrustState" | "BlockPeer" | "UnblockPeer") => Some(C::TrustAdmin),
-        ("PeerService" | "DiscoveryService", "ListCandidates") => Some(C::DiscoveryRead),
+        ("PeerService" | "DiscoveryService", "ListCandidates")
+        | ("DiscoveryService", "DiscoverServices") => Some(C::DiscoveryRead),
+        ("DiscoveryService", "PublishServiceHint") => Some(C::DiscoveryRun),
 
         ("SessionService", "ListSessions" | "GetSession" | "ListStreams") => Some(C::SessionRead),
         ("SessionService", "CloseSession") => Some(C::SessionClose),
@@ -168,12 +170,17 @@ fn required_capability(service: &str, method: &str) -> Option<api::Capability> {
             "OpenCircuit" | "CloseCircuit" | "UpdateRelayPolicy" | "CloseRelayCircuit",
         ) => Some(C::RelayAdmin),
 
-        ("IdentityService", "ListIdentities" | "GetIdentity") => Some(C::IdentityRead),
+        ("IdentityService", "ListIdentities" | "GetIdentity" | "ListDelegations") => {
+            Some(C::IdentityRead)
+        }
         ("IdentityService", "CreateIdentity" | "ImportIdentity") => Some(C::IdentityCreate),
         ("IdentityService", "RotateHandshakeKey" | "RotateIdentityKey") => Some(C::IdentityRotate),
         ("IdentityService", "ExportPublicIdentity") => Some(C::IdentityExportPublic),
         ("IdentityService", "ExportSecretIdentity") => Some(C::IdentityExportSecret),
         ("IdentityService", "DeleteIdentity") => Some(C::IdentityDelete),
+        ("IdentityService", "CreateDelegation" | "ImportDelegation" | "RevokeDelegation") => {
+            Some(C::IdentityDelegate)
+        }
 
         (
             "CarrierService",

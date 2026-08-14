@@ -6,7 +6,8 @@
 
 use crate::types::RouteScope;
 
-pub const DEFAULT_MAX_RELAYS: usize = 3;
+/// Stable v0.1 route default; the protocol hard maximum remains 16.
+pub const DEFAULT_MAX_RELAYS: usize = 4;
 pub const MAX_PATH_HOPS: usize = 32;
 pub const MAX_PATH_EXCLUSIONS: usize = 32;
 pub const MAX_PEER_ID: usize = 64;
@@ -375,6 +376,12 @@ impl PathBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_relay_count_matches_v01_contract() {
+        assert_eq!(DEFAULT_MAX_RELAYS, 4);
+        assert_eq!(PathPolicy::default().max_relays, 4);
+    }
 
     fn hop(peer: u8, scope: RouteScope, domain: u8, relay: bool) -> PathHop {
         PathHop {

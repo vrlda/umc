@@ -10,6 +10,8 @@ pub enum ForwardError {
     ReplicationLimit,
     DoNotReplicate,
     NotFound,
+    Unauthenticated,
+    StoreForwardNotAllowed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +19,9 @@ pub struct Contact {
     pub destination_hint: Vec<u8>,
     pub peer: Vec<u8>,
     pub expires_at: Instant,
+    pub authenticated: bool,
+    pub store_forward_allowed: bool,
+    pub local_scope_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -39,9 +44,18 @@ pub fn select_for_contact<'a>(
 ) -> Result<Vec<&'a crate::manager::BundleRecord>, ForwardError> {
     let records: Vec<_> = manager
         .records_iter()
+        .filter(|_| contact.authenticated && contact.store_forward_allowed)
+        .filter(|_| contact.expires_at > now)
         .filter(|r| r.destination_hint == contact.destination_hint)
         .filter(|r| r.expires_at > now)
-        .filter(|r| r.status != BundleStatus::Forwarded && r.status != BundleStatus::Delivered)
+        .filter(|r| {
+            matches!(
+                r.status,
+                BundleStatus::Received | BundleStatus::CustodyAccepted
+            )
+        })
+        .filter(|r| !r.do_not_replicate)
+        .filter(|r| !r.local_scope_only || contact.local_scope_only)
         .filter(|r| r.replication_count < r.replication_limit)
         .collect();
     Ok(records)
@@ -59,15 +73,17 @@ pub fn handoff(
     id: &[u8; 32],
     peer: &[u8],
 ) -> Result<ForwardResult, ForwardError> {
-    let record = manager.record_mut(id).ok_or(ForwardError::NotFound)?;
-    record.replication_count += 1;
-    if record.replication_count > record.replication_limit {
-        return Err(ForwardError::ReplicationLimit);
+    let record = manager.record(id).ok_or(ForwardError::NotFound)?;
+    if record.do_not_replicate {
+        return Err(ForwardError::DoNotReplicate);
     }
-    record.status = BundleStatus::Forwarded;
     let payload = manager
         .get_payload(id)
         .map_err(|_| ForwardError::NotFound)?;
+    manager.mark_forwarded(id).map_err(|error| match error {
+        crate::manager::BundleError::ReplicationLimit => ForwardError::ReplicationLimit,
+        _ => ForwardError::NotFound,
+    })?;
     Ok(ForwardResult {
         id: *id,
         payload,
@@ -116,6 +132,9 @@ mod tests {
             destination_hint: b"dest-hint".to_vec(),
             peer: b"peer-b".to_vec(),
             expires_at: Instant(u64::MAX),
+            authenticated: true,
+            store_forward_allowed: true,
+            local_scope_only: false,
         };
         let selected = select_for_contact(&m, &contact, Instant(1)).unwrap();
         assert_eq!(selected.len(), 1);
@@ -144,6 +163,9 @@ mod tests {
             destination_hint: b"other-hint".to_vec(),
             peer: b"p".to_vec(),
             expires_at: Instant(u64::MAX),
+            authenticated: true,
+            store_forward_allowed: true,
+            local_scope_only: false,
         };
         assert!(select_for_contact(&m, &contact, Instant(1))
             .unwrap()
@@ -169,5 +191,70 @@ mod tests {
             handoff(&mut m, &id, b"peer").unwrap_err(),
             ForwardError::ReplicationLimit
         );
+    }
+
+    #[test]
+    fn unauthenticated_or_disallowed_contacts_are_not_selected() {
+        let mut m = manager();
+        m.admit(
+            b"payload",
+            b"s",
+            b"dest-hint",
+            1,
+            DEFAULT_LIFETIME_MS,
+            3,
+            false,
+            Instant(0),
+        )
+        .unwrap();
+        for (authenticated, store_forward_allowed) in [(false, true), (true, false)] {
+            let contact = Contact {
+                destination_hint: b"dest-hint".to_vec(),
+                peer: b"peer".to_vec(),
+                expires_at: Instant(u64::MAX),
+                authenticated,
+                store_forward_allowed,
+                local_scope_only: false,
+            };
+            assert!(select_for_contact(&m, &contact, Instant(1))
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn expired_contact_and_forwarded_bundle_are_not_selected() {
+        let mut m = manager();
+        let id = m
+            .admit(
+                b"payload",
+                b"s",
+                b"dest-hint",
+                1,
+                DEFAULT_LIFETIME_MS,
+                3,
+                false,
+                Instant(0),
+            )
+            .unwrap();
+        let expired_contact = Contact {
+            destination_hint: b"dest-hint".to_vec(),
+            peer: b"peer".to_vec(),
+            expires_at: Instant(1),
+            authenticated: true,
+            store_forward_allowed: true,
+            local_scope_only: false,
+        };
+        assert!(select_for_contact(&m, &expired_contact, Instant(1))
+            .unwrap()
+            .is_empty());
+        m.mark_forwarded(&id).unwrap();
+        let live_contact = Contact {
+            expires_at: Instant(u64::MAX),
+            ..expired_contact
+        };
+        assert!(select_for_contact(&m, &live_contact, Instant(2))
+            .unwrap()
+            .is_empty());
     }
 }

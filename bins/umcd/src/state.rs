@@ -13,7 +13,6 @@ use crate::runtime_adapters::{OsClock, OsEntropy, TokioAdaptor};
 use crate::session_bus::SessionBus;
 use crate::session_manager::SessionControl;
 use crate::session_manager::SessionManager;
-#[cfg(not(test))]
 use blake2::{Blake2s256, Digest};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -35,20 +34,20 @@ use umc_core::revocation::{
 };
 use umc_core::trust::{TrustLevel, TrustState, TrustStore};
 use umc_core::well_known::WELL_KNOWN_APP;
+use umc_core::stream_dispatch::StreamDispatcher;
 use umc_crypto::signatures::{IdentityKeyPair, StaticHandshakeKeyPair};
 use umc_discovery::invitation::InvitationStore;
 use umc_discovery::limit::EnumerationGuard;
-use umc_handshake::identity::IdentityBinding;
+use umc_handshake::identity::{IdentityBinding, IdentityRotationProof};
 use umc_metrics::Registry;
-use umc_storage::keychain::KeychainError;
-#[cfg(not(test))]
-use umc_storage::keychain::{OsKeychain, SecretStore};
+use umc_storage::keychain::{KeychainError, OsKeychain, SecretStore};
 use umc_storage::keystore::{KeyClass, Keystore, KeystoreError};
 use umc_storage::objects::ObjectStore;
 use umc_storage::quota::QuotaAccount;
 use umc_storage::sqlite::SqliteStore;
 use umc_storage::store::{Namespace, Store};
 use umc_types::runtime::{Clock, EntropySource, Instant};
+use umc_plugin::runtime::ExternalCarrier;
 
 /// Keystore file name inside the keystore directory (core.md §19).
 pub(crate) const KEYSTORE_FILE: &str = "keystore.ks";
@@ -164,10 +163,29 @@ pub(crate) fn load_identity_registry(
         Err(e) => return Err(format!("keystore load: {e:?}")),
     };
     let binding = match ks.load(KeyClass::IdentitySigning, BINDING_RECORD) {
-        Ok(bytes) => binding_from_record(&identity, &bytes)
-            .ok_or_else(|| "keystore: malformed binding record".to_string())?,
+        Ok(bytes) => {
+            let binding = binding_from_record(&identity, &bytes)
+                .ok_or_else(|| "keystore: malformed binding record".to_string())?;
+            // Migrate pre-capability bindings in place. The sequence and
+            // validity window remain stable; only the signed capability
+            // commitment changes from the historical zero placeholder.
+            if binding.capabilities_hash == [0u8; 32] {
+                let migrated = IdentityBinding::sign(
+                    &identity.identity,
+                    &identity.static_handshake.public(),
+                    binding.not_before,
+                    binding.not_after,
+                    binding.sequence,
+                    capability_hash_for_config(config),
+                );
+                persist_binding(&ks, &identity, &migrated)?;
+                migrated
+            } else {
+                binding
+            }
+        }
         Err(KeystoreError::UnsupportedClass) => {
-            let binding = default_binding(&identity);
+            let binding = default_binding(&identity, config);
             persist_binding(&ks, &identity, &binding)?;
             binding
         }
@@ -229,16 +247,22 @@ pub(crate) fn load_or_create_identity(config: &NodeConfig) -> Result<NodeIdentit
 }
 
 /// The default binding for a fresh identity: sequence 0, valid from epoch
-/// through the maximum not-after, all-zero capabilities hash (the v1
-/// capability set is not yet computed — handshake.md §33).
-fn default_binding(identity: &NodeIdentity) -> IdentityBinding {
+/// through the maximum not-after, and bound to the secure-by-default P0
+/// capability set (handshake.md §33, compatibility.md §5.4).
+fn default_binding(identity: &NodeIdentity, config: &NodeConfig) -> IdentityBinding {
     IdentityBinding::sign(
         &identity.identity,
         &identity.static_handshake.public(),
         0,
         u64::MAX,
         0,
-        [0u8; 32],
+        capability_hash_for_config(config),
+    )
+}
+
+fn capability_hash_for_config(config: &NodeConfig) -> [u8; 32] {
+    umc_handshake::xx::capabilities_hash_for_minimum_privacy(
+        config.effective_privacy_profile().as_str().as_bytes(),
     )
 }
 
@@ -362,36 +386,22 @@ pub(crate) fn wall_now() -> Instant {
 /// generation that an older snapshot cannot roll back.
 pub(crate) const RESTORE_ANCHOR_FILE: &str = ".restore-anchor";
 const RESTORE_ANCHOR_KEY: &[u8] = b"runtime/restore-anchor";
-#[cfg(not(test))]
 const PLATFORM_RESTORE_ANCHOR_PREFIX: &str = "restore-anchor-v1/";
 
-/// Reads the external restore generation. A missing or malformed anchor is
-/// treated as generation zero and logged; startup still fails closed when the
-/// persisted database anchor disagrees with the external value.
-pub(crate) fn read_restore_anchor(data_dir: &std::path::Path) -> u64 {
+pub(crate) fn read_restore_anchor_checked(data_dir: &std::path::Path) -> Result<u64, String> {
     let path = data_dir.join(RESTORE_ANCHOR_FILE);
     match std::fs::read_to_string(&path) {
-        Ok(value) => match value.trim().parse::<u64>() {
-            Ok(generation) => generation,
-            Err(error) => {
-                log::warn!(
-                    "[restore] ignoring malformed anchor {}: {error}",
-                    path.display()
-                );
-                0
-            }
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => {
-            log::warn!("[restore] cannot read anchor {}: {error}", path.display());
-            0
-        }
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| format!("malformed restore anchor {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(format!("cannot read restore anchor {}: {error}", path.display())),
     }
 }
 
 /// Stable, non-sensitive keychain reference for one node data directory. The
 /// path itself never enters the OS credential store account name.
-#[cfg(not(test))]
 fn platform_restore_anchor_reference(data_dir: &std::path::Path) -> String {
     let mut hasher = Blake2s256::new();
     hasher.update(b"UMC-RESTORE-ANCHOR-v1\0");
@@ -406,18 +416,9 @@ fn platform_restore_anchor_reference(data_dir: &std::path::Path) -> String {
     reference
 }
 
-/// Reads the external OS-keychain generation. The native keychain is an
-/// independent store from the backup payload; missing or unavailable native
-/// backends are reported to the caller so the file anchor can remain the
-/// bounded fallback.
-#[cfg(test)]
-#[allow(clippy::unnecessary_wraps)]
-fn read_platform_restore_anchor(_data_dir: &std::path::Path) -> Result<Option<u64>, KeychainError> {
-    Ok(None)
-}
-
-#[cfg(not(test))]
-fn read_platform_restore_anchor(data_dir: &std::path::Path) -> Result<Option<u64>, KeychainError> {
+fn read_platform_restore_anchor_native(
+    data_dir: &std::path::Path,
+) -> Result<Option<u64>, KeychainError> {
     let keychain = OsKeychain;
     match keychain.get_secret(&platform_restore_anchor_reference(data_dir)) {
         Ok(bytes) if bytes.len() == 8 => Ok(Some(u64::from_be_bytes(
@@ -429,13 +430,46 @@ fn read_platform_restore_anchor(data_dir: &std::path::Path) -> Result<Option<u64
     }
 }
 
+fn write_platform_restore_anchor_native(
+    data_dir: &std::path::Path,
+    generation: u64,
+) -> Result<(), KeychainError> {
+    OsKeychain.set_secret(
+        &platform_restore_anchor_reference(data_dir),
+        &generation.to_be_bytes(),
+    )
+}
+
+/// Reads the external OS-keychain generation. The native keychain is an
+/// independent store from the backup payload; missing or unavailable native
+/// backends are reported to the caller so the file anchor can remain the
+/// bounded fallback.
+#[cfg(test)]
+#[allow(clippy::unnecessary_wraps)]
+fn read_platform_restore_anchor(data_dir: &std::path::Path) -> Result<Option<u64>, KeychainError> {
+    if std::env::var_os("UMC_NATIVE_KEYCHAIN_TEST").is_some() {
+        read_platform_restore_anchor_native(data_dir)
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(not(test))]
+fn read_platform_restore_anchor(data_dir: &std::path::Path) -> Result<Option<u64>, KeychainError> {
+    read_platform_restore_anchor_native(data_dir)
+}
+
 #[cfg(test)]
 #[allow(clippy::unnecessary_wraps)]
 fn write_platform_restore_anchor(
-    _data_dir: &std::path::Path,
-    _generation: u64,
+    data_dir: &std::path::Path,
+    generation: u64,
 ) -> Result<(), KeychainError> {
-    Ok(())
+    if std::env::var_os("UMC_NATIVE_KEYCHAIN_TEST").is_some() {
+        write_platform_restore_anchor_native(data_dir, generation)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(not(test))]
@@ -443,19 +477,7 @@ fn write_platform_restore_anchor(
     data_dir: &std::path::Path,
     generation: u64,
 ) -> Result<(), KeychainError> {
-    #[cfg(test)]
-    {
-        let _ = (data_dir, generation);
-        return Ok(());
-    }
-    #[cfg(not(test))]
-    {
-        let keychain = OsKeychain;
-        keychain.set_secret(
-            &platform_restore_anchor_reference(data_dir),
-            &generation.to_be_bytes(),
-        )
-    }
+    write_platform_restore_anchor_native(data_dir, generation)
 }
 
 /// Advances and atomically persists the external restore generation.
@@ -463,7 +485,7 @@ fn write_platform_restore_anchor(
 /// # Errors
 /// Returns a message when the anchor cannot be written or renamed into place.
 pub(crate) fn advance_restore_anchor(data_dir: &std::path::Path) -> Result<u64, String> {
-    let file_generation = read_restore_anchor(data_dir);
+    let file_generation = read_restore_anchor_checked(data_dir)?;
     let platform_generation = match read_platform_restore_anchor(data_dir) {
         Ok(value) => value.unwrap_or(0),
         Err(error) => {
@@ -493,7 +515,7 @@ fn reconcile_restore_anchor(
     store: &dyn Store,
     data_dir: &std::path::Path,
 ) -> Result<Option<String>, String> {
-    let file_external = read_restore_anchor(data_dir);
+    let file_external = read_restore_anchor_checked(data_dir)?;
     let platform_external = match read_platform_restore_anchor(data_dir) {
         Ok(value) => value,
         Err(error) => {
@@ -659,6 +681,7 @@ pub struct ApplicationRegistration {
     pub resume_token: Vec<u8>,
 }
 
+
 /// The daemon's shared runtime context.
 pub struct RuntimeState {
     pub config: NodeConfig,
@@ -745,10 +768,24 @@ pub struct RuntimeState {
     /// accept task holds a clone of each `Arc`, while this map gives
     /// `StopCarrier` an idempotent close path for the underlying resource.
     pub carrier_listeners: HashMap<Vec<u8>, Arc<dyn Listener + Send + Sync>>,
+    /// Process-isolated external carriers owned by control-created instances.
+    pub external_carriers: HashMap<Vec<u8>, ExternalCarrier>,
     /// Live session registry (core.md §9.5); populated by the accept loops.
     pub sessions: Arc<SessionManager>,
     /// Session transport objects addressable by live application handles.
     pub session_controls: HashMap<u64, Arc<SessionControl>>,
+    /// Bounded privacy-path facts captured when a private session is
+    /// negotiated. Only hop bounds and a diagnostic are retained; route
+    /// topology never crosses the control API boundary.
+    pub privacy_routes: HashMap<u64, PrivacyRouteState>,
+    /// Authenticated mapping from endpoint identity to its static handshake
+    /// key. Bundle destination hints may use either representation.
+    pub peer_static_handshake_keys: HashMap<[u8; 32], [u8; 32]>,
+    /// Authenticated mapping from endpoint identity to its signing key. Used
+    /// to verify opaque application service hints received after handshake.
+    pub peer_identity_public_keys: HashMap<[u8; 32], [u8; 32]>,
+    /// Sessions that explicitly negotiated delayed-delivery capability.
+    pub store_forward_sessions: HashSet<u64>,
     /// Outbound carrier links created through `CarrierService.Dial`. Keeping
     /// ownership here makes link handles independent from session handles and
     /// lets lifecycle operations close/drain them deterministically.
@@ -793,6 +830,9 @@ pub struct RuntimeState {
     /// installed at startup so `org.umc.app/1` streams dispatch end to end.
     #[allow(dead_code)] // app registration over the control API lands in Phase 10
     pub apps: AppRegistry,
+    /// Per-session stream protocol bindings; prevents later frames from
+    /// changing application ownership after OPEN classification.
+    pub stream_dispatcher: StreamDispatcher,
     /// Per-application inbound stream channels: session tasks forward
     /// received stream data into the application's channel.
     pub app_channels: Arc<Mutex<HashMap<Vec<u8>, AppTx>>>,
@@ -827,6 +867,14 @@ pub struct RuntimeState {
     pub shutdown_requested: Arc<AtomicBool>,
     /// Released once shutdown completes; the main task waits on it.
     pub shutdown_channel: mpsc::Sender<()>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PrivacyRouteState {
+    pub min_hops: u32,
+    pub max_hops: u32,
+    pub anonymous_authorization: bool,
+    pub reason: String,
 }
 
 /// One daemon-owned raw outbound carrier link.
@@ -991,6 +1039,12 @@ impl RuntimeState {
         let mut routing = RoutingService::new();
         routing.attach_store(store.clone());
         routing.restore(store.as_ref(), started_at);
+        // Generate the process instance identity before restoring relay state.
+        // Its high 64 bits form a fresh epoch, preventing a rapid restart
+        // from colliding with a prior daemon's durable circuit records.
+        let mut server_instance_id = [0u8; 16];
+        OsEntropy.fill(&mut server_instance_id);
+        let relay_epoch = u64::from_be_bytes(server_instance_id[..8].try_into().unwrap());
         let mut bundle = BundleService::new(bundle_objects, bundle_quota, events.clone());
         bundle.attach_store(store.clone());
         // Expiry comparison uses the node clock: the daemon's bundle
@@ -1001,6 +1055,13 @@ impl RuntimeState {
         match bundle.restore(store.as_ref(), bundle_now) {
             Ok(count) => log::info!("[bundle] restored {count} bundle(s) from metadata"),
             Err(e) => log::error!("[bundle] metadata restore failed: {e}"),
+        }
+        let mut relay = RelayService::new(events.clone());
+        relay.attach_store(store.clone());
+        relay.set_epoch(relay_epoch);
+        match relay.restore(store.as_ref(), started_at) {
+            Ok(count) => log::info!("[relay] restored {count} circuit lease(s)"),
+            Err(error) => log::error!("[relay] lease restore failed: {error}"),
         }
         // The event log persists under the api namespace (core.md §15
         // audit logging): prior history is restored into the ring so the
@@ -1027,8 +1088,6 @@ impl RuntimeState {
             }
         }
 
-        let mut server_instance_id = [0u8; 16];
-        OsEntropy.fill(&mut server_instance_id);
         let mut event_cursor_key = [0u8; 32];
         OsEntropy.fill(&mut event_cursor_key);
         let mut deletion_plan_key = [0u8; 32];
@@ -1067,14 +1126,19 @@ impl RuntimeState {
             carrier_registry_initialized: false,
             listeners: Vec::new(),
             carrier_listeners: HashMap::new(),
+            external_carriers: HashMap::new(),
             sessions: Arc::new(SessionManager::new()),
             session_controls: HashMap::new(),
+            privacy_routes: HashMap::new(),
+            peer_static_handshake_keys: HashMap::new(),
+            peer_identity_public_keys: HashMap::new(),
+            store_forward_sessions: HashSet::new(),
             carrier_links: HashMap::new(),
             self_arc: std::sync::Weak::new(),
             bus: Arc::new(Mutex::new(SessionBus::new())),
             discovery,
             invitations: InvitationStore::new(),
-            relay: RelayService::new(events.clone()),
+            relay,
             relay_endpoint_handoffs: HashMap::new(),
             bundle,
             routing,
@@ -1085,6 +1149,7 @@ impl RuntimeState {
             token_grants,
             metrics: Arc::new(Registry::new()),
             apps,
+            stream_dispatcher: StreamDispatcher::default(),
             app_channels: Arc::new(Mutex::new(HashMap::new())),
             application_protocols: HashMap::new(),
             application_principals: HashMap::new(),
@@ -1280,7 +1345,7 @@ impl RuntimeState {
                 now.saturating_add(lifetime_ms)
             },
             old_sequence.saturating_add(1),
-            [0u8; 32],
+            capability_hash_for_config(&self.config),
         );
         let path = self.config.resolved_keystore_dir().join(KEYSTORE_FILE);
         let ks =
@@ -1327,13 +1392,19 @@ impl RuntimeState {
     /// # Errors
     /// Returns a message when the handle is unknown or the keystore write
     /// fails.
-    pub fn rotate_identity_key(&mut self, handle: &[u8]) -> Result<IdentityBinding, String> {
+    pub fn rotate_identity_key(
+        &mut self,
+        handle: &[u8],
+    ) -> Result<(IdentityBinding, IdentityRotationProof), String> {
         let now = wall_now().0;
         let (is_primary, index) = self.resolve_target(handle)?;
-        let old_sequence = if is_primary {
-            self.primary_binding.sequence
+        let (old_identity, old_binding) = if is_primary {
+            (self.node_identity.identity.clone(), self.primary_binding.clone())
         } else {
-            self.secondaries[index].binding.sequence
+            (
+                self.secondaries[index].identity.identity.clone(),
+                self.secondaries[index].binding.clone(),
+            )
         };
         let identity = NodeIdentity::generate(&OsEntropy);
         let binding = IdentityBinding::sign(
@@ -1341,9 +1412,18 @@ impl RuntimeState {
             &identity.static_handshake.public(),
             now,
             u64::MAX,
-            old_sequence.saturating_add(1),
-            [0u8; 32],
+            old_binding.sequence.saturating_add(1),
+            capability_hash_for_config(&self.config),
         );
+        let rotation_proof = IdentityRotationProof::sign(
+            &old_identity,
+            &old_binding,
+            &identity.identity,
+            &binding,
+            now,
+            u64::MAX,
+        )
+        .map_err(|error| format!("rotation proof: {error:?}"))?;
         let path = self.config.resolved_keystore_dir().join(KEYSTORE_FILE);
         let ks =
             Keystore::open(path, &keystore_password()).map_err(|e| format!("keystore: {e:?}"))?;
@@ -1373,7 +1453,7 @@ impl RuntimeState {
             persist_secondary(&ks, &updated)?;
             self.secondaries[index] = updated;
         }
-        Ok(binding)
+        Ok((binding, rotation_proof))
     }
 
     /// `IdentityService.CreateIdentity` (task F2): generate a fresh
@@ -1400,7 +1480,7 @@ impl RuntimeState {
                 now.saturating_add(lifetime_ms)
             },
             0,
-            [0u8; 32],
+            capability_hash_for_config(&self.config),
         );
         let path = self.config.resolved_keystore_dir().join(KEYSTORE_FILE);
         let ks =
@@ -1658,6 +1738,14 @@ mod tests {
         std::env::remove_var("UMC_KEYSTORE_PASSWORD");
     }
 
+    struct NativeAnchorCleanup(String);
+
+    impl Drop for NativeAnchorCleanup {
+        fn drop(&mut self) {
+            let _ = OsKeychain.delete_secret(&self.0);
+        }
+    }
+
     fn build(config: NodeConfig) -> RuntimeState {
         let (tx, _rx) = mpsc::channel(1);
         RuntimeState::new(config, tx).expect("runtime state")
@@ -1685,6 +1773,17 @@ mod tests {
                 .expect_err("revoked peer must be refused");
             assert!(error.contains("IDENTITY_REVOKED"), "{error}");
         });
+    }
+
+    #[test]
+    fn fresh_binding_commits_capability_hash() {
+        let identity = NodeIdentity::generate(&OsEntropy);
+        let config = fresh_config();
+        let binding = default_binding(&identity, &config);
+        assert_eq!(
+            binding.capabilities_hash,
+            umc_handshake::xx::capabilities_hash_for_minimum_privacy(b"p0")
+        );
     }
 
     #[test]
@@ -1795,9 +1894,13 @@ mod tests {
             let config = fresh_config();
             let mut first = build(config.clone());
             let old_endpoint = first.node_identity.endpoint_id();
-            first
+            let old_binding = first.primary_binding.clone();
+            let (new_binding, proof) = first
                 .rotate_identity_key(crate::state::NODE_IDENTITY_RECORD)
                 .expect("rotation");
+            proof
+                .verify(&old_binding, &new_binding, wall_now().0, 300_000)
+                .expect("dual-signed rotation proof");
             let new_endpoint = first.node_identity.endpoint_id();
             assert_ne!(new_endpoint, old_endpoint, "a full identity change");
             assert_eq!(
@@ -1984,10 +2087,66 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("anchor dir");
-        assert_eq!(read_restore_anchor(&dir), 0);
+        assert_eq!(read_restore_anchor_checked(&dir).expect("missing anchor"), 0);
         assert_eq!(advance_restore_anchor(&dir).expect("first anchor"), 1);
         assert_eq!(advance_restore_anchor(&dir).expect("second anchor"), 2);
-        assert_eq!(read_restore_anchor(&dir), 2);
+        assert_eq!(read_restore_anchor_checked(&dir).expect("valid anchor"), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_restore_anchor_fails_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "umcd-malformed-restore-anchor-{}-{}",
+            std::process::id(),
+            wall_now().0
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("anchor dir");
+        std::fs::write(dir.join(RESTORE_ANCHOR_FILE), b"not-a-generation\n")
+            .expect("malformed anchor");
+        let error = advance_restore_anchor(&dir).expect_err("malformed anchor must fail closed");
+        assert!(error.contains("malformed restore anchor"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "requires an interactive native credential-store session"]
+    fn native_platform_restore_anchor_round_trips() {
+        assert_eq!(
+            std::env::var("UMC_NATIVE_KEYCHAIN_TEST").as_deref(),
+            Ok("1"),
+            "set UMC_NATIVE_KEYCHAIN_TEST=1 when invoking the native smoke test"
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "umcd-native-restore-anchor-{}-{}",
+            std::process::id(),
+            wall_now().0
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("anchor dir");
+        let reference = platform_restore_anchor_reference(&dir);
+        let _cleanup = NativeAnchorCleanup(reference.clone());
+        let _ = OsKeychain.delete_secret(&reference);
+
+        assert_eq!(
+            read_platform_restore_anchor(&dir).expect("initial platform read"),
+            None
+        );
+        assert_eq!(advance_restore_anchor(&dir).expect("first native anchor"), 1);
+        assert_eq!(
+            read_platform_restore_anchor(&dir).expect("first platform read"),
+            Some(1)
+        );
+        assert_eq!(advance_restore_anchor(&dir).expect("second native anchor"), 2);
+        assert_eq!(
+            read_platform_restore_anchor(&dir).expect("second platform read"),
+            Some(2)
+        );
+
+        OsKeychain
+            .delete_secret(&reference)
+            .expect("native anchor cleanup");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

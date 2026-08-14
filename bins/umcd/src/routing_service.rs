@@ -32,6 +32,7 @@ pub struct RouteRequestContext {
     pub max_hops: u64,
     pub max_relays: usize,
     pub allow_relay: bool,
+    pub allow_store_forward: bool,
     expires_at: Instant,
 }
 
@@ -98,6 +99,7 @@ impl RoutingService {
             umc_routing::types::DEFAULT_HOP_LIMIT,
             umc_routing::paths::DEFAULT_MAX_RELAYS,
             true,
+            false,
             now,
         );
     }
@@ -121,6 +123,7 @@ impl RoutingService {
             umc_routing::types::DEFAULT_HOP_LIMIT,
             umc_routing::paths::DEFAULT_MAX_RELAYS,
             true,
+            false,
             now,
         );
     }
@@ -139,6 +142,7 @@ impl RoutingService {
         max_hops: u64,
         max_relays: usize,
         allow_relay: bool,
+        allow_store_forward: bool,
         now: Instant,
     ) {
         self.prune_request_contexts(now);
@@ -161,6 +165,7 @@ impl RoutingService {
                 max_hops: max_hops.clamp(1, umc_routing::types::MAX_HOP_LIMIT),
                 max_relays: max_relays.min(umc_routing::paths::MAX_PATH_HOPS),
                 allow_relay,
+                allow_store_forward,
                 expires_at: now + Duration::from_millis(REVERSE_RETENTION_MS),
             },
         );
@@ -229,6 +234,7 @@ impl RoutingService {
                 },
                 state: RouteState::Candidate,
                 next_hop: String::from_utf8_lossy(&snapshot.next_hop).into_owned(),
+                carrier_type: snapshot.carrier_type,
                 metadata: snapshot.metadata,
                 source_peer: vec![],
                 created_at,
@@ -251,6 +257,7 @@ impl RoutingService {
         let snapshot = records::RouteRecordSnapshot {
             key_hash: record.key.destination_hash.to_vec(),
             next_hop: record.next_hop.as_bytes().to_vec(),
+            carrier_type: record.carrier_type.clone(),
             lifetime_ms: record
                 .expires_at
                 .duration_since(record.created_at)
@@ -355,11 +362,35 @@ impl RoutingService {
         upstream: Option<Vec<u8>>,
         metadata: Vec<u8>,
     ) -> RouteRecord {
+        self.record_route_response_with_evidence(
+            key,
+            next_hop,
+            lifetime_ms,
+            now,
+            upstream,
+            metadata,
+            None,
+        )
+    }
+
+    /// Records a response with authenticated adjacent carrier evidence.
+    #[must_use]
+    pub fn record_route_response_with_evidence(
+        &mut self,
+        key: RouteKey,
+        next_hop: String,
+        lifetime_ms: u64,
+        now: Instant,
+        upstream: Option<Vec<u8>>,
+        metadata: Vec<u8>,
+        carrier_type: Option<String>,
+    ) -> RouteRecord {
         let scope = key.scope;
         let record = RouteRecord {
             key,
             state: RouteState::Usable,
             next_hop,
+            carrier_type,
             metadata,
             source_peer: upstream.unwrap_or_default(),
             created_at: now,
@@ -525,6 +556,21 @@ mod tests {
             b"carrier=ump.tcp/1\0trust=3\0hops=1".to_vec(),
         );
         assert_eq!(record.metadata, b"carrier=ump.tcp/1\0trust=3\0hops=1");
+    }
+
+    #[test]
+    fn route_response_retains_authenticated_carrier_evidence() {
+        let mut routing = RoutingService::new();
+        let record = routing.record_route_response_with_evidence(
+            key(8),
+            "hop-a".into(),
+            1_000,
+            Instant(0),
+            None,
+            Vec::new(),
+            Some("ump.tcp/1".into()),
+        );
+        assert_eq!(record.carrier_type.as_deref(), Some("ump.tcp/1"));
     }
 
     #[test]
@@ -725,7 +771,15 @@ mod tests {
                 Instant(0),
             )
             .unwrap();
-        let _ = routing.record_route_response(key(7), rid, "hop-a".into(), 600_000, Instant(1));
+        let _ = routing.record_route_response_with_evidence(
+            key(7),
+            "hop-a".into(),
+            600_000,
+            Instant(1),
+            None,
+            Vec::new(),
+            Some("ump.tcp/1".into()),
+        );
         // A freshly learned route is usable and persisted to the store.
         assert_eq!(
             routing.find_route(&key(7), Instant(1)).unwrap().state,
@@ -734,6 +788,7 @@ mod tests {
         let persisted = umc_storage::records::list_routes(store.as_ref()).unwrap();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].next_hop, b"hop-a");
+        assert_eq!(persisted[0].carrier_type.as_deref(), Some("ump.tcp/1"));
         drop(routing);
 
         // A new service over the same store restores the route, but only as
@@ -745,6 +800,7 @@ mod tests {
             .find_route(&key(7), Instant(1000))
             .expect("restored route");
         assert_eq!(found.next_hop, "hop-a");
+        assert_eq!(found.carrier_type.as_deref(), Some("ump.tcp/1"));
         assert_eq!(found.state, RouteState::Candidate);
     }
 }

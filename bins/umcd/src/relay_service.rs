@@ -1,13 +1,17 @@
 //! Relay service (relay.md §8-24): the daemon's in-memory circuit registry,
 //! admission, forwarding, and closure. Persistence lands in Phase 12; the
-//! registry is process-local for now.
+//! transport bindings are process-local, while bounded circuit leases and
+//! replay fences are persisted for restart recovery.
 use crate::event_log::{DaemonEvent, DaemonEvents};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use umc_storage::records::{self, RelayCircuitRecord};
+use umc_storage::store::Store;
 use umc_relay::admission::{evaluate_open, AdmissionDecision, AdmissionLimits, RelayPolicy};
 use umc_relay::circuit::{Circuit, CircuitState};
 use umc_relay::close::{close_circuit, drain_circuit, expiry_reason, RelayReason};
 use umc_relay::forward::{accept_upstream_data, ForwardError};
+use umc_relay::multi::{MultipathReceive, MultipathScheduler};
 use umc_relay::status::RelayStatus;
 use umc_types::runtime::Instant;
 use umc_wire::frames::relay::{RelayCloseFrame, RelayDataFrame, RelayOpenFrame, RelayStatusFrame};
@@ -26,6 +30,7 @@ pub struct CircuitOpenRequest {
     pub flags: u8,
     pub bidirectional: bool,
     pub private_handling: bool,
+    pub multipath: bool,
     /// Peer endpoint id the opener wants relayed data delivered to
     /// (`RELAY_OPEN.next_hop_hint`); empty means no forwarding target.
     pub destination_hint: Vec<u8>,
@@ -38,10 +43,10 @@ pub struct CircuitOpenResult {
     pub granted_lifetime_ms: u64,
     pub granted_byte_quota: u64,
     pub maximum_relay_payload: usize,
+    pub multipath_granted: bool,
 }
 
 /// Process-local circuit registry with admission policy.
-#[derive(Debug)]
 pub struct RelayService {
     circuits: HashMap<u64, Circuit>,
     next_circuit_id: u64,
@@ -70,6 +75,20 @@ pub struct RelayService {
     /// Circuits whose downstream leg has received `ACCEPTED`. Nested opens
     /// remain paired but cannot forward until this gate is set.
     ready_circuits: HashSet<u64>,
+    /// Optional negotiated multipath state. The scheduler owns path
+    /// selection, byte accounting, deduplication, and ordered release; the
+    /// paired circuit remains the legacy single-path fallback.
+    multipath: HashMap<u64, MultipathScheduler>,
+    /// Upstream circuit -> alternate downstream circuit ids. The primary
+    /// reciprocal leg remains in `paired_circuits`; this bounded list holds
+    /// only additional paths negotiated for multipath circuits.
+    multipath_destinations: HashMap<u64, HashMap<u64, u64>>,
+    multipath_reverse: HashMap<u64, (u64, u64)>,
+    multipath_frame_metadata: HashMap<(u64, u64), (bool, bool, bool)>,
+    /// Sources for which the asynchronous `MULTIPATH_GRANTED` update has
+    /// already been emitted. The initial open status is deliberately false;
+    /// the grant is a one-time transition after the second leg authenticates.
+    multipath_grant_sent: HashSet<u64>,
     /// Bounded data accepted while a nested downstream open is in flight.
     pending_data: HashMap<u64, VecDeque<RelayDataFrame>>,
     /// Bounded replay state for `RELAY_OPEN`. An identical duplicate receives
@@ -77,8 +96,21 @@ pub struct RelayService {
     /// using the same wire ID is surfaced as a conflict.
     open_replays: HashMap<(u64, u64), RelayOpenReplay>,
     open_replay_order: VecDeque<(u64, u64)>,
+    replay_fences: HashMap<u64, Instant>,
+    persistence: Option<Arc<dyn Store + Send + Sync>>,
+    epoch: u64,
     pub limits: AdmissionLimits,
     events: Arc<Mutex<DaemonEvents>>,
+}
+
+impl std::fmt::Debug for RelayService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayService")
+            .field("circuits", &self.circuits)
+            .field("epoch", &self.epoch)
+            .field("persisted", &self.persistence.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// One control-surface circuit snapshot (task F4): the circuit clone plus
@@ -127,6 +159,18 @@ pub enum RelayOpenDisposition {
     Conflict,
 }
 
+fn circuit_state_code(state: CircuitState) -> u8 {
+    match state {
+        CircuitState::Opening => 0,
+        CircuitState::Active => 1,
+        CircuitState::HalfClosedUpstream => 2,
+        CircuitState::HalfClosedDownstream => 3,
+        CircuitState::Closing => 4,
+        CircuitState::Draining => 5,
+        CircuitState::Closed => 6,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RelayOpenReplay {
     request: RelayOpenFrame,
@@ -149,15 +193,178 @@ impl RelayService {
             internal_to_wire: HashMap::new(),
             paired_circuits: HashMap::new(),
             ready_circuits: HashSet::new(),
+            multipath: HashMap::new(),
+            multipath_destinations: HashMap::new(),
+            multipath_reverse: HashMap::new(),
+            multipath_frame_metadata: HashMap::new(),
+            multipath_grant_sent: HashSet::new(),
             pending_data: HashMap::new(),
             open_replays: HashMap::new(),
             open_replay_order: VecDeque::new(),
+            replay_fences: HashMap::new(),
+            persistence: None,
+            epoch: 0,
             limits: AdmissionLimits {
                 policy: RelayPolicy::Community,
                 ..AdmissionLimits::default()
             },
             events,
         }
+    }
+
+    pub fn attach_store(&mut self, store: Arc<dyn Store + Send + Sync>) {
+        self.persistence = Some(store);
+    }
+
+    pub fn set_epoch(&mut self, epoch: u64) {
+        self.epoch = epoch;
+    }
+
+    /// Restores unexpired circuit leases without restoring dead transport
+    /// bindings. Restored circuits remain `Opening` until an authenticated
+    /// adjacent session rebinds the owner peer.
+    pub fn restore(&mut self, store: &dyn Store, now: Instant) -> Result<usize, String> {
+        let records = records::list_relay_circuits(store)
+            .map_err(|e| format!("relay restore: {e:?}"))?;
+        // A circuit can have one record per daemon epoch while a previous
+        // process is being drained. Only the newest epoch is authoritative;
+        // otherwise an older live lease could resurrect beside a newer close
+        // tombstone for the same circuit id.
+        let mut latest = HashMap::new();
+        for record in records {
+            latest
+                .entry(record.circuit_id)
+                .and_modify(|current: &mut RelayCircuitRecord| {
+                    if record.epoch > current.epoch {
+                        *current = record.clone();
+                    }
+                })
+                .or_insert(record);
+        }
+        let mut restored = 0;
+        for record in latest.into_values() {
+            if now.0 >= record.replay_until_ms {
+                let _ = records::delete_relay_circuit(store, record.circuit_id, record.epoch);
+                continue;
+            }
+            self.next_circuit_id = self.next_circuit_id.max(record.circuit_id.saturating_add(1));
+            self.replay_fences
+                .insert(record.circuit_id, Instant(record.replay_until_ms));
+            // A closed record is a durable replay tombstone, not a live
+            // circuit. It must remain fenced until the bounded replay window
+            // expires, but it must never be restored as an active lease.
+            if record.state >= circuit_state_code(CircuitState::Closing)
+                || now.0 >= record.expires_at_ms
+            {
+                continue;
+            }
+            let mut circuit = Circuit::new(
+                record.circuit_id,
+                now,
+                record.expires_at_ms.saturating_sub(now.0),
+                record.granted_byte_quota,
+                record.bidirectional,
+                record.private_handling,
+            );
+            if record.multipath_granted {
+                self.multipath
+                    .insert(record.circuit_id, MultipathScheduler::new(64));
+            }
+            circuit.expires_at = Instant(record.expires_at_ms);
+            circuit.next_relay_sequence = record.next_upstream_sequence;
+            circuit.peer_next_relay_sequence = record.next_downstream_sequence;
+            circuit.state = CircuitState::Opening;
+            circuit.idle_deadline = Instant(record.expires_at_ms);
+            circuit.last_activity = now;
+            self.destination_hints.insert(record.circuit_id, record.destination_peer.clone());
+            self.circuits_by_owner.entry(record.owner_peer.clone()).or_default().push(record.circuit_id);
+            self.circuits.insert(record.circuit_id, circuit);
+            restored += 1;
+        }
+        Ok(restored)
+    }
+
+    fn persist_circuit(&self, circuit_id: u64, _now: Instant) -> Result<(), String> {
+        let Some(store) = &self.persistence else { return Ok(()); };
+        let Some(circuit) = self.circuits.get(&circuit_id) else { return Ok(()); };
+        let owner_peer = self
+            .circuits_by_owner
+            .iter()
+            .find_map(|(peer, ids)| ids.contains(&circuit_id).then(|| peer.clone()))
+            .unwrap_or_default();
+        let destination_peer = self.destination_hints.get(&circuit_id).cloned().unwrap_or_default();
+        let record = RelayCircuitRecord {
+            circuit_id,
+            epoch: self.epoch,
+            owner_peer,
+            destination_peer,
+            expires_at_ms: circuit.expires_at.0,
+            replay_until_ms: circuit.expires_at.0.saturating_add(10_000),
+            granted_byte_quota: circuit.granted_byte_quota,
+            bidirectional: circuit.bidirectional,
+            private_handling: circuit.private_handling,
+            multipath_granted: self.multipath.contains_key(&circuit_id),
+            next_upstream_sequence: circuit.next_relay_sequence,
+            next_downstream_sequence: circuit.peer_next_relay_sequence,
+            state: circuit_state_code(circuit.state),
+        };
+        self.remove_other_epochs(store.as_ref(), circuit_id)?;
+        records::save_relay_circuit(store.as_ref(), &record)
+            .map_err(|e| format!("relay persist: {e:?}"))
+    }
+
+    fn persist_closed_circuit(
+        &self,
+        circuit_id: u64,
+        circuit: &Circuit,
+        owner_peer: Vec<u8>,
+        destination_peer: Vec<u8>,
+        replay_until_ms: u64,
+    ) -> Result<(), String> {
+        let Some(store) = &self.persistence else { return Ok(()); };
+        let record = RelayCircuitRecord {
+            circuit_id,
+            epoch: self.epoch,
+            owner_peer,
+            destination_peer,
+            expires_at_ms: circuit.expires_at.0,
+            replay_until_ms,
+            granted_byte_quota: circuit.granted_byte_quota,
+            bidirectional: circuit.bidirectional,
+            private_handling: circuit.private_handling,
+            multipath_granted: self.multipath.contains_key(&circuit_id),
+            next_upstream_sequence: circuit.next_relay_sequence,
+            next_downstream_sequence: circuit.peer_next_relay_sequence,
+            state: circuit_state_code(CircuitState::Closed),
+        };
+        self.remove_other_epochs(store.as_ref(), circuit_id)?;
+        records::save_relay_circuit(store.as_ref(), &record)
+            .map_err(|e| format!("relay persist tombstone: {e:?}"))
+    }
+
+    fn remove_other_epochs(&self, store: &dyn Store, circuit_id: u64) -> Result<(), String> {
+        for record in records::list_relay_circuits(store)
+            .map_err(|e| format!("relay list epochs: {e:?}"))?
+            .into_iter()
+            .filter(|record| record.circuit_id == circuit_id && record.epoch != self.epoch)
+        {
+            records::delete_relay_circuit(store, record.circuit_id, record.epoch)
+                .map_err(|e| format!("relay delete stale epoch: {e:?}"))?;
+        }
+        Ok(())
+    }
+
+    fn delete_persisted_circuit(&self, circuit_id: u64) -> Result<(), String> {
+        let Some(store) = &self.persistence else { return Ok(()); };
+        for record in records::list_relay_circuits(store.as_ref())
+            .map_err(|e| format!("relay list for delete: {e:?}"))?
+            .into_iter()
+            .filter(|record| record.circuit_id == circuit_id)
+        {
+            records::delete_relay_circuit(store.as_ref(), record.circuit_id, record.epoch)
+                .map_err(|e| format!("relay delete: {e:?}"))?;
+        }
+        Ok(())
     }
 
     /// Evaluate `RELAY_OPEN` and allocate a circuit when admitted (relay.md
@@ -193,8 +400,14 @@ impl RelayService {
             ),
             other => return Err(format!("open refused: {other:?}")),
         };
+        let multipath_requested = request.multipath
+            && self.limits.allow_multipath
+            && self.limits.max_multipath_paths >= 2;
+        while self.replay_fences.contains_key(&self.next_circuit_id) {
+            self.next_circuit_id = self.next_circuit_id.saturating_add(1);
+        }
         let circuit_id = self.next_circuit_id;
-        self.next_circuit_id += 1;
+        self.next_circuit_id = self.next_circuit_id.saturating_add(1);
         let circuit = Circuit::new(
             circuit_id,
             now,
@@ -203,6 +416,11 @@ impl RelayService {
             request.bidirectional,
             request.private_handling,
         );
+        if multipath_requested {
+            let mut scheduler = MultipathScheduler::new(64);
+            let _ = scheduler.add_path(0, 1);
+            self.multipath.insert(circuit_id, scheduler);
+        }
         self.circuits.insert(circuit_id, circuit);
         self.destination_hints
             .insert(circuit_id, request.destination_hint.clone());
@@ -210,6 +428,7 @@ impl RelayService {
             .entry(owner_peer.clone())
             .or_default()
             .push(circuit_id);
+        let _ = self.persist_circuit(circuit_id, now);
         // A relay circuit is a paired pair of directional legs. Match a new
         // leg only with an unpaired reciprocal leg (owner and destination
         // exchange); never fall back to whichever circuit happened to be
@@ -232,6 +451,9 @@ impl RelayService {
                 self.paired_circuits.insert(reciprocal, circuit_id);
                 self.ready_circuits.insert(circuit_id);
                 self.ready_circuits.insert(reciprocal);
+                if let Some(scheduler) = self.multipath.get_mut(&circuit_id) {
+                    let _ = scheduler.add_path(0, 1);
+                }
             }
         }
         self.events.lock().expect("event log").push(DaemonEvent {
@@ -244,6 +466,7 @@ impl RelayService {
             granted_lifetime_ms,
             granted_byte_quota,
             maximum_relay_payload,
+            multipath_granted: false,
         })
     }
 
@@ -439,6 +662,9 @@ impl RelayService {
             .insert(destination_circuit_id, source_circuit_id);
         self.ready_circuits.insert(source_circuit_id);
         self.ready_circuits.insert(destination_circuit_id);
+        if let Some(scheduler) = self.multipath.get_mut(&source_circuit_id) {
+            let _ = scheduler.add_path(0, 1);
+        }
         if let Err(error) = self.bind_wire_circuit(
             destination_session,
             destination_wire_id,
@@ -456,6 +682,8 @@ impl RelayService {
             }
             return Err(error);
         }
+        let _ = self.persist_circuit(source_circuit_id, now);
+        let _ = self.persist_circuit(destination_circuit_id, now);
         self.events.lock().expect("event log").push(DaemonEvent {
             kind: "circuit_destination_attached".into(),
             at_ms: now.0,
@@ -524,6 +752,9 @@ impl RelayService {
             .insert(source_circuit_id, downstream_circuit_id);
         self.paired_circuits
             .insert(downstream_circuit_id, source_circuit_id);
+        if let Some(scheduler) = self.multipath.get_mut(&source_circuit_id) {
+            let _ = scheduler.add_path(0, 1);
+        }
         if let Err(error) = self.bind_wire_circuit(
             downstream_session,
             downstream_wire_id,
@@ -550,6 +781,8 @@ impl RelayService {
             }
             return Err(error);
         }
+        let _ = self.persist_circuit(source_circuit_id, now);
+        let _ = self.persist_circuit(downstream_circuit_id, now);
         self.events.lock().expect("event log").push(DaemonEvent {
             kind: "circuit_downstream_attached".into(),
             at_ms: now.0,
@@ -557,6 +790,88 @@ impl RelayService {
                 "circuit {source_circuit_id} -> downstream circuit {downstream_circuit_id}"
             ),
         });
+        Ok(downstream_circuit_id)
+    }
+
+    /// Attach an additional authenticated downstream leg for a negotiated
+    /// multipath circuit. Unlike the primary pair, alternate legs are kept in
+    /// a private path map and never replace the primary reciprocal mapping.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    pub fn attach_additional_downstream_leg(
+        &mut self,
+        source_circuit_id: u64,
+        downstream_circuit_id: u64,
+        downstream_session: u64,
+        downstream_wire_id: u64,
+        source_peer: &[u8],
+        _downstream_peer: &[u8],
+        path_id: u64,
+        weight: u16,
+        now: Instant,
+    ) -> Result<u64, String> {
+        if source_circuit_id == downstream_circuit_id {
+            return Err("upstream and downstream circuits must differ".into());
+        }
+        if !self.multipath.contains_key(&source_circuit_id) {
+            return Err("multipath was not negotiated for circuit".into());
+        }
+        if self
+            .multipath_destinations
+            .get(&source_circuit_id)
+            .is_some_and(|paths| paths.contains_key(&path_id))
+        {
+            return Err("multipath path id already exists".into());
+        }
+        let source = self
+            .circuits
+            .get(&source_circuit_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown circuit {source_circuit_id}"))?;
+        if !self.circuits.contains_key(&downstream_circuit_id) {
+            return Err(format!("unknown circuit {downstream_circuit_id}"));
+        }
+        self.destination_hints
+            .insert(downstream_circuit_id, source_peer.to_vec());
+        self.circuit_owners
+            .insert(downstream_circuit_id, downstream_session);
+        if let Some(downstream) = self.circuits.get_mut(&downstream_circuit_id) {
+            downstream.expires_at = downstream.expires_at.min(source.expires_at);
+            downstream.idle_deadline = downstream.idle_deadline.min(source.idle_deadline);
+            downstream.granted_byte_quota =
+                downstream.granted_byte_quota.min(source.granted_byte_quota);
+            downstream.bidirectional &= source.bidirectional;
+            downstream.private_handling &= source.private_handling;
+        }
+        if let Err(error) = self.bind_wire_circuit(
+            downstream_session,
+            downstream_wire_id,
+            downstream_circuit_id,
+        ) {
+            self.ready_circuits.remove(&downstream_circuit_id);
+            self.circuit_owners.remove(&downstream_circuit_id);
+            self.destination_hints.remove(&downstream_circuit_id);
+            return Err(error);
+        }
+        if let Err(error) = self.add_multipath_destination(
+            source_circuit_id,
+            downstream_circuit_id,
+            path_id,
+            weight,
+        ) {
+            self.circuit_owners.remove(&downstream_circuit_id);
+            self.destination_hints.remove(&downstream_circuit_id);
+            self.wire_to_internal
+                .retain(|(session, _), internal| {
+                    !(*session == downstream_session && *internal == downstream_circuit_id)
+                });
+            self.internal_to_wire
+                .remove(&(downstream_session, downstream_circuit_id));
+            self.ready_circuits.remove(&downstream_circuit_id);
+            return Err(error);
+        }
+        let _ = self.persist_circuit(source_circuit_id, now);
+        let _ = self.persist_circuit(downstream_circuit_id, now);
         Ok(downstream_circuit_id)
     }
 
@@ -646,6 +961,149 @@ impl RelayService {
         self.ready_circuits.contains(&circuit_id)
     }
 
+    #[must_use]
+    pub fn circuit_multipath_granted(&self, circuit_id: u64) -> bool {
+        self.multipath
+            .get(&circuit_id)
+            .is_some_and(|scheduler| scheduler.usable_path_count() >= 2)
+    }
+
+    /// Build the one-time status update that tells the upstream opener that
+    /// an alternate downstream leg is now authenticated and schedulable.
+    /// The update is emitted only after two usable paths exist, never merely
+    /// because a pending nested open was allocated.
+    pub fn multipath_grant_status(
+        &mut self,
+        downstream_internal: u64,
+        now: Instant,
+    ) -> Option<(u64, RelayStatusFrame)> {
+        let (source, _) = self.multipath_reverse.get(&downstream_internal).copied()?;
+        if !self.circuit_multipath_granted(source)
+            || !self.multipath_grant_sent.insert(source)
+        {
+            return None;
+        }
+        let upstream_session = self.circuit_owners.get(&source).copied()?;
+        let circuit = self.circuits.get(&source)?;
+        Some((
+            upstream_session,
+            RelayStatusFrame {
+                circuit_id: self.wire_circuit_id(upstream_session, source),
+                status_sequence: 1,
+                status_code: RelayStatus::Accepted as u64,
+                bidirectional_granted: circuit.bidirectional,
+                private_handling_granted: circuit.private_handling,
+                multipath_granted: true,
+                downstream_authenticated: true,
+                retryable: false,
+                granted_lifetime: circuit.expires_at.0.saturating_sub(now.0),
+                granted_byte_quota: circuit.granted_byte_quota,
+                maximum_relay_payload: self.limits.max_payload as u64,
+                diagnostic: Vec::new(),
+                authentication: Vec::new(),
+            },
+        ))
+    }
+
+    /// Enable one authenticated downstream path for a negotiated multipath
+    /// circuit. Path identifiers are local to the circuit and never exposed
+    /// as endpoint identities.
+    #[allow(dead_code)]
+    pub fn add_multipath_path(
+        &mut self,
+        circuit_id: u64,
+        path_id: u64,
+        weight: u16,
+    ) -> Result<(), String> {
+        let scheduler = self
+            .multipath
+            .get_mut(&circuit_id)
+            .ok_or_else(|| "multipath was not negotiated for circuit".to_string())?;
+        if scheduler.usable_path_count() >= self.limits.max_multipath_paths
+            && scheduler.path_stats(path_id).is_none()
+        {
+            return Err("multipath path limit reached".into());
+        }
+        scheduler
+            .add_path(path_id, weight)
+            .map_err(|error| format!("multipath path: {error:?}"))
+    }
+
+    #[allow(dead_code)]
+    pub fn fail_multipath_path(&mut self, circuit_id: u64, path_id: u64) -> Result<(), String> {
+        self.multipath
+            .get_mut(&circuit_id)
+            .ok_or_else(|| "multipath was not negotiated for circuit".to_string())?
+            .fail_path(path_id)
+            .map_err(|error| format!("multipath path: {error:?}"))
+    }
+
+    /// Mark the alternate path whose authenticated destination peer failed.
+    /// Returns `true` when a path was retired; callers can retry the same
+    /// already-admitted frame without charging upstream sequence/quota twice.
+    pub fn fail_multipath_destination(&mut self, circuit_id: u64, destination: &[u8]) -> bool {
+        let Some(paths) = self.multipath_destinations.get(&circuit_id) else {
+            return false;
+        };
+        let Some((path_id, _)) = paths.iter().find(|(_, destination_circuit)| {
+            self.destination_hints
+                .get(destination_circuit)
+                .is_some_and(|peer| peer.as_slice() == destination)
+        }) else {
+            return false;
+        };
+        self.fail_multipath_path(circuit_id, *path_id).is_ok()
+    }
+
+    /// Add an alternate downstream leg after a second authenticated nested
+    /// `RELAY_OPEN` succeeds. The primary pair remains unchanged; this path
+    /// participates in weighted scheduling only after its status is accepted.
+    #[allow(dead_code)]
+    pub fn add_multipath_destination(
+        &mut self,
+        source_circuit_id: u64,
+        destination_circuit_id: u64,
+        path_id: u64,
+        weight: u16,
+    ) -> Result<(), String> {
+        if !self.multipath.contains_key(&source_circuit_id) {
+            return Err("multipath was not negotiated for circuit".into());
+        }
+        self.multipath_destinations
+            .entry(source_circuit_id)
+            .or_default()
+            .insert(path_id, destination_circuit_id);
+        self.multipath_reverse
+            .insert(destination_circuit_id, (source_circuit_id, path_id));
+        if let Err(error) = self.add_multipath_path(source_circuit_id, path_id, weight) {
+            self.multipath_destinations
+                .get_mut(&source_circuit_id)
+                .expect("path inserted")
+                .remove(&path_id);
+            self.multipath_reverse.remove(&destination_circuit_id);
+            return Err(error);
+        }
+        let _ = self.fail_multipath_path(source_circuit_id, path_id);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn activate_multipath_path(&mut self, circuit_id: u64, path_id: u64) -> Result<(), String> {
+        self.multipath
+            .get_mut(&circuit_id)
+            .ok_or_else(|| "multipath was not negotiated for circuit".to_string())?
+            .activate_path(path_id)
+            .map_err(|error| format!("multipath path: {error:?}"))
+    }
+
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn multipath_path(&self, circuit_id: u64) -> Option<u64> {
+        self.multipath
+            .get(&circuit_id)
+            .and_then(|scheduler| scheduler.clone().select_path().ok())
+    }
+
     /// Whether the circuit has any paired downstream leg, even if that leg
     /// is still waiting for its `RELAY_OPEN` acceptance.
     #[must_use]
@@ -691,9 +1149,15 @@ impl RelayService {
             .paired_circuits
             .get(&downstream_internal)
             .copied()
+            .or_else(|| self.multipath_reverse.get(&downstream_internal).map(|(source, _)| *source))
             .ok_or_else(|| "downstream circuit has no upstream leg".to_string())?;
         self.ready_circuits.insert(downstream_internal);
         self.ready_circuits.insert(upstream_internal);
+        if let Some((source, path_id)) = self.multipath_reverse.get(&downstream_internal).copied() {
+            if let Some(scheduler) = self.multipath.get_mut(&source) {
+                let _ = scheduler.activate_path(path_id);
+            }
+        }
         let mut queued = self
             .pending_data
             .remove(&upstream_internal)
@@ -720,15 +1184,29 @@ impl RelayService {
         if !self.downstream_ready(upstream.circuit_id) {
             return Err("downstream leg is still opening".into());
         }
+        let reverse_source = self.multipath_reverse.get(&upstream.circuit_id).copied();
+        let logical_source = reverse_source.map_or(upstream.circuit_id, |(source, _)| source);
         let destination = self
             .destination_hints
             .get(&upstream.circuit_id)
             .ok_or_else(|| format!("unknown circuit {}", upstream.circuit_id))?;
         let destination = destination.clone();
-        let dest_circuit = self
-            .paired_circuits
-            .get(&upstream.circuit_id)
-            .copied()
+        let primary_dest = reverse_source
+            .map(|_| logical_source)
+            .or_else(|| self.paired_circuits.get(&logical_source).copied());
+        let selected_path = reverse_source.is_none().then(|| {
+            self.multipath
+                .get_mut(&logical_source)
+                .and_then(|scheduler| scheduler.select_path().ok())
+        })
+        .flatten();
+        let dest_circuit = selected_path
+            .and_then(|path_id| {
+                self.multipath_destinations
+                    .get(&logical_source)
+                    .and_then(|paths| paths.get(&path_id).copied())
+            })
+            .or(primary_dest)
             .filter(|circuit_id| {
                 self.circuits
                     .get(circuit_id)
@@ -740,6 +1218,15 @@ impl RelayService {
             .get_mut(&dest_circuit)
             .ok_or_else(|| format!("unknown destination circuit {dest_circuit}"))?
             .allocate_sequence();
+        if let (Some(scheduler), Some(path_id)) = (
+            self.multipath.get_mut(&logical_source),
+            selected_path,
+        ) {
+            scheduler
+                .record_sent(path_id, upstream.data.len() as u64)
+                .map_err(|error| format!("multipath accounting: {error:?}"))?;
+        }
+        let _ = self.persist_circuit(dest_circuit, now);
         let frame = RelayDataFrame {
             circuit_id: self
                 .circuit_owner(dest_circuit)
@@ -787,6 +1274,7 @@ impl RelayService {
             .paired_circuits
             .get(&downstream_internal)
             .copied()
+            .or_else(|| self.multipath_reverse.get(&downstream_internal).map(|(source, _)| *source))
             .ok_or_else(|| "downstream circuit has no upstream leg".to_string())?;
         let upstream_session = self
             .circuit_owners
@@ -843,6 +1331,7 @@ impl RelayService {
     ///
     /// Returns a message for unknown circuits, closed circuits, replayed
     /// sequences, oversized or empty payloads, and quota exhaustion.
+    #[allow(dead_code)]
     pub fn accept_upstream(
         &mut self,
         circuit_id: u64,
@@ -851,31 +1340,121 @@ impl RelayService {
         data: &[u8],
         now: Instant,
     ) -> Result<(), String> {
-        let circuit = self
-            .circuits
-            .get_mut(&circuit_id)
-            .ok_or_else(|| format!("unknown circuit {circuit_id}"))?;
-        if circuit.state == CircuitState::HalfClosedUpstream {
-            return Err("forward rejected: upstream direction already half-closed".into());
-        }
-        match accept_upstream_data(circuit, sequence, fin, data, self.limits.max_payload) {
-            Ok(_) => {
-                // A relay circuit is allocated in `Opening` until its first
-                // valid payload arrives. Keep rejected data from activating
-                // the circuit (relay.md §9.2).
-                if circuit.state == CircuitState::Opening {
-                    circuit.accept(now);
+        self.accept_upstream_frames(circuit_id, sequence, fin, false, false, data, now)
+            .map(|_| ())
+    }
+
+    /// Accept one frame and return the contiguous logical frames released by
+    /// the circuit-wide multipath receive sequence. The legacy wrapper above
+    /// keeps unit-test and control callers that only need admission intact.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_upstream_frames(
+        &mut self,
+        circuit_id: u64,
+        sequence: u64,
+        fin: bool,
+        ack_requested: bool,
+        high_priority: bool,
+        data: &[u8],
+        now: Instant,
+    ) -> Result<Vec<RelayDataFrame>, String> {
+        let logical_source = self
+            .multipath_reverse
+            .get(&circuit_id)
+            .map_or(circuit_id, |(source, _)| *source);
+        if self.multipath.contains_key(&logical_source) {
+            let received = self
+                .multipath
+                .get_mut(&logical_source)
+                .ok_or_else(|| "multipath scheduler is unavailable".to_string())?
+                .accept(sequence, data)
+                .map_err(|error| format!("multipath receive: {error:?}"))?;
+            match received {
+                MultipathReceive::Duplicate => return Ok(Vec::new()),
+                MultipathReceive::Buffered => {
+                    self.multipath_frame_metadata
+                        .insert((logical_source, sequence), (fin, ack_requested, high_priority));
+                    return Ok(Vec::new());
                 }
-                if fin {
-                    umc_relay::forward::apply_fin(circuit, true)
-                        .map_err(|error| format!("forward rejected: {error:?}"))?;
+                MultipathReceive::Delivered(released) => {
+                    self.multipath_frame_metadata
+                        .insert((logical_source, sequence), (fin, ack_requested, high_priority));
+                    let mut frames = Vec::with_capacity(released.len());
+                    for (released_sequence, released_data) in released {
+                        let (released_fin, released_ack, released_priority) = self
+                            .multipath_frame_metadata
+                            .remove(&(logical_source, released_sequence))
+                            .unwrap_or((false, false, false));
+                        self.accept_upstream_single(
+                            logical_source,
+                            released_sequence,
+                            released_fin,
+                            &released_data,
+                            now,
+                        )?;
+                        frames.push(RelayDataFrame {
+                            circuit_id,
+                            relay_sequence: released_sequence,
+                            fin: released_fin,
+                            ack_requested: released_ack,
+                            high_priority: released_priority,
+                            data: released_data,
+                        });
+                    }
+                    return Ok(frames);
                 }
-                circuit.touch(now);
-                Ok(())
             }
-            Err(ForwardError::DuplicateDiscarded) => Ok(()),
-            Err(e) => Err(format!("forward rejected: {e:?}")),
         }
+        self.accept_upstream_single(circuit_id, sequence, fin, data, now)?;
+        Ok(vec![RelayDataFrame {
+            circuit_id,
+            relay_sequence: sequence,
+            fin,
+            ack_requested,
+            high_priority,
+            data: data.to_vec(),
+        }])
+    }
+
+    fn accept_upstream_single(
+        &mut self,
+        circuit_id: u64,
+        sequence: u64,
+        fin: bool,
+        data: &[u8],
+        now: Instant,
+    ) -> Result<(), String> {
+        let accepted = {
+            let circuit = self
+                .circuits
+                .get_mut(&circuit_id)
+                .ok_or_else(|| format!("unknown circuit {circuit_id}"))?;
+            if circuit.state == CircuitState::HalfClosedUpstream {
+                return Err("forward rejected: upstream direction already half-closed".into());
+            }
+            match accept_upstream_data(circuit, sequence, fin, data, self.limits.max_payload) {
+                Ok(_) => {
+                    // A relay circuit is allocated in `Opening` until its first
+                    // valid payload arrives. Keep rejected data from activating
+                    // the circuit (relay.md §9.2).
+                    if circuit.state == CircuitState::Opening {
+                        circuit.accept(now);
+                    }
+                    if fin {
+                        umc_relay::forward::apply_fin(circuit, true)
+                            .map_err(|error| format!("forward rejected: {error:?}"))?;
+                    }
+                    circuit.touch(now);
+                    true
+                }
+                Err(ForwardError::DuplicateDiscarded) => false,
+                Err(e) => return Err(format!("forward rejected: {e:?}")),
+            }
+        };
+        if accepted {
+            let _ = self.persist_circuit(circuit_id, now);
+        }
+        Ok(())
     }
 
     /// Advance relay lifetime/idle expiry and closing drains. Expiring a
@@ -883,6 +1462,17 @@ impl RelayService {
     /// IDs needed for close notifications; metadata is retained through the
     /// two-stage drain and then purged.
     pub fn sweep(&mut self, now: Instant) -> Vec<RelayExpiryNotification> {
+        let expired_fences: Vec<u64> = self
+            .replay_fences
+            .iter()
+            .filter_map(|(circuit_id, deadline)| {
+                (now >= *deadline && !self.circuits.contains_key(circuit_id)).then_some(*circuit_id)
+            })
+            .collect();
+        for circuit_id in expired_fences {
+            let _ = self.delete_persisted_circuit(circuit_id);
+            self.replay_fences.remove(&circuit_id);
+        }
         let ids: Vec<u64> = self.circuits.keys().copied().collect();
         let mut notifications = Vec::new();
         for circuit_id in ids {
@@ -927,6 +1517,7 @@ impl RelayService {
             if let Some(circuit) = self.circuits.get_mut(&circuit_id) {
                 close_circuit(circuit, reason, now, None);
             }
+            let _ = self.persist_circuit(circuit_id, now);
             if let Some(paired) = paired_id {
                 if let Some(circuit) = self.circuits.get_mut(&paired) {
                     if !matches!(
@@ -935,6 +1526,7 @@ impl RelayService {
                     ) {
                         close_circuit(circuit, reason, now, None);
                     }
+                    let _ = self.persist_circuit(paired, now);
                 }
             }
             self.events.lock().expect("event log").push(DaemonEvent {
@@ -964,7 +1556,41 @@ impl RelayService {
     }
 
     fn purge_closed_circuit(&mut self, circuit_id: u64, now: Instant) {
+        let replay_until = self
+            .replay_fences
+            .entry(circuit_id)
+            .or_insert_with(|| Instant(now.0.saturating_add(10_000)))
+            .0;
+        if let Some(circuit) = self.circuits.get(&circuit_id).cloned() {
+            let owner_peer = self
+                .circuits_by_owner
+                .iter()
+                .find_map(|(peer, ids)| ids.contains(&circuit_id).then(|| peer.clone()))
+                .unwrap_or_default();
+            let destination_peer = self.destination_hints.get(&circuit_id).cloned().unwrap_or_default();
+            let _ = self.persist_closed_circuit(
+                circuit_id,
+                &circuit,
+                owner_peer,
+                destination_peer,
+                replay_until,
+            );
+        }
         self.circuits.remove(&circuit_id);
+        self.multipath.remove(&circuit_id);
+        self.multipath_grant_sent.remove(&circuit_id);
+        if let Some(paths) = self.multipath_destinations.remove(&circuit_id) {
+            for destination in paths.values() {
+                self.multipath_reverse.remove(destination);
+            }
+        }
+        self.multipath_reverse.remove(&circuit_id);
+        self.multipath_frame_metadata
+            .retain(|(source, _), _| *source != circuit_id);
+        self.multipath_destinations.retain(|_, paths| {
+            paths.retain(|_, destination| *destination != circuit_id);
+            !paths.is_empty()
+        });
         self.circuit_owners.remove(&circuit_id);
         self.wire_to_internal
             .retain(|_, internal| *internal != circuit_id);
@@ -1019,6 +1645,23 @@ impl RelayService {
             }
         }
         for leg in &legs {
+            let replay_until = now.0.saturating_add(10_000);
+            self.replay_fences.insert(*leg, Instant(replay_until));
+            if let Some(circuit) = self.circuits.get(leg).cloned() {
+                let owner_peer = self
+                    .circuits_by_owner
+                    .iter()
+                    .find_map(|(peer, ids)| ids.contains(leg).then(|| peer.clone()))
+                    .unwrap_or_default();
+                let destination_peer = self.destination_hints.get(leg).cloned().unwrap_or_default();
+                let _ = self.persist_closed_circuit(
+                    *leg,
+                    &circuit,
+                    owner_peer,
+                    destination_peer,
+                    replay_until,
+                );
+            }
             self.circuit_owners.remove(leg);
             self.wire_to_internal
                 .retain(|_, internal| *internal != *leg);
@@ -1027,6 +1670,20 @@ impl RelayService {
             self.destination_hints.remove(leg);
             self.ready_circuits.remove(leg);
             self.pending_data.remove(leg);
+            self.multipath.remove(leg);
+            self.multipath_grant_sent.remove(leg);
+            if let Some(paths) = self.multipath_destinations.remove(leg) {
+                for destination in paths.values() {
+                    self.multipath_reverse.remove(destination);
+                }
+            }
+            self.multipath_reverse.remove(leg);
+            self.multipath_frame_metadata
+                .retain(|(source, _), _| *source != *leg);
+            self.multipath_destinations.retain(|_, paths| {
+                paths.retain(|_, destination| *destination != *leg);
+                !paths.is_empty()
+            });
             self.circuits_by_owner.retain(|_, owned| {
                 owned.retain(|id| *id != *leg);
                 !owned.is_empty()
@@ -1096,11 +1753,29 @@ impl RelayService {
 mod tests {
     use super::*;
     use crate::session_bus::SessionBus;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use umc_storage::sqlite::SqliteStore;
     use umc_wire::frames::relay::RelayCloseFrame as WireRelayCloseFrame;
     use umc_wire::frames::relay::RelayDataFrame as WireRelayDataFrame;
 
+    static STORE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn service() -> RelayService {
         RelayService::new(Arc::new(Mutex::new(DaemonEvents::new(200))))
+    }
+
+    fn temp_store() -> Arc<SqliteStore> {
+        let dir = std::env::temp_dir().join(format!("umcd-relay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let serial = STORE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Arc::new(
+            SqliteStore::open(&dir.join(format!("relay-{stamp}-{serial}.db"))).unwrap(),
+        )
     }
 
     fn open_request() -> CircuitOpenRequest {
@@ -1111,6 +1786,7 @@ mod tests {
             flags: 0,
             bidirectional: true,
             private_handling: false,
+            multipath: false,
             destination_hint: Vec::new(),
         }
     }
@@ -1149,6 +1825,41 @@ mod tests {
             next_hop_hint: Vec::new(),
             authorization: Vec::new(),
         }
+    }
+
+    #[test]
+    fn relay_leases_restore_and_fence_replayed_ids() {
+        let store = temp_store();
+        let mut first = service();
+        first.attach_store(store.clone());
+        first.set_epoch(7);
+        let opened = first
+            .open_circuit(&open_request(), b"owner".to_vec(), Instant(1_000))
+            .unwrap();
+        assert_eq!(umc_storage::records::list_relay_circuits(store.as_ref()).unwrap().len(), 1);
+
+        let mut restarted = service();
+        restarted.attach_store(store.clone());
+        restarted.set_epoch(8);
+        assert_eq!(restarted.restore(store.as_ref(), Instant(2_000)).unwrap(), 1);
+        assert_eq!(restarted.circuit_count(), 1);
+        assert_eq!(restarted.next_circuit_id, opened.circuit_id + 1);
+        assert_eq!(
+            restarted.observe_open(41, &open_frame(opened.circuit_id, 1_024)),
+            RelayOpenDisposition::New
+        );
+        let replacement = restarted
+            .open_circuit(&open_request(), b"new-owner".to_vec(), Instant(2_000))
+            .unwrap();
+        assert_ne!(replacement.circuit_id, opened.circuit_id);
+
+        restarted.sweep(Instant(700_000));
+        restarted.sweep(Instant(702_000));
+        restarted.sweep(Instant(703_000));
+        restarted.sweep(Instant(715_000));
+        assert!(umc_storage::records::list_relay_circuits(store.as_ref())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1442,6 +2153,99 @@ mod tests {
                 .0
                 .circuit_id,
             11
+        );
+    }
+
+    #[test]
+    fn negotiated_multipath_fails_over_and_preserves_circuit_sequence() {
+        let mut relay = service();
+        let mut request = open_request();
+        request.flags = 0x08;
+        request.multipath = true;
+        request.destination_hint = b"peer-d".to_vec();
+        let source = relay
+            .open_circuit(&request, b"peer-a".to_vec(), Instant(0))
+            .unwrap();
+        assert!(!source.multipath_granted);
+        relay.record_circuit_owner(source.circuit_id, 10);
+        relay.bind_wire_circuit(10, 11, source.circuit_id).unwrap();
+
+        let primary = relay
+            .open_circuit(&request, b"peer-b".to_vec(), Instant(0))
+            .unwrap()
+            .circuit_id;
+        relay
+            .attach_downstream_leg(
+                source.circuit_id,
+                primary,
+                20,
+                22,
+                b"peer-a",
+                b"peer-b",
+                Instant(0),
+            )
+            .unwrap();
+        let mut primary_status = status(0, RelayStatus::Accepted as u64);
+        primary_status.circuit_id = 22;
+        relay.activate_downstream(20, &primary_status).unwrap();
+        let alternate = relay
+            .open_circuit(&request, b"peer-c".to_vec(), Instant(0))
+            .unwrap()
+            .circuit_id;
+        relay
+            .attach_additional_downstream_leg(
+                source.circuit_id,
+                alternate,
+                30,
+                33,
+                b"peer-a",
+                b"peer-c",
+                1,
+                1,
+                Instant(0),
+            )
+            .unwrap();
+        relay.activate_multipath_path(source.circuit_id, 1).unwrap();
+        assert!(relay.circuit_multipath_granted(source.circuit_id));
+        let (_, grant) = relay
+            .multipath_grant_status(alternate, Instant(1))
+            .expect("second accepted path grants multipath");
+        assert_eq!(grant.status_sequence, 1);
+        assert!(grant.multipath_granted);
+        assert!(relay.multipath_grant_status(alternate, Instant(1)).is_none());
+
+        let first = RelayDataFrame {
+            circuit_id: source.circuit_id,
+            relay_sequence: 0,
+            fin: false,
+            ack_requested: false,
+            high_priority: false,
+            data: b"first".to_vec(),
+        };
+        let (_, first_bytes) = relay.forward_data_frame(&first, Instant(1)).unwrap();
+        let (_, first_len) = umc_wire::varint::decode(&first_bytes).unwrap();
+        assert_eq!(
+            RelayDataFrame::decode(&first_bytes[first_len..])
+                .unwrap()
+                .0
+                .circuit_id,
+            22
+        );
+
+        relay.fail_multipath_path(source.circuit_id, 0).unwrap();
+        let second = RelayDataFrame {
+            relay_sequence: 1,
+            data: b"second".to_vec(),
+            ..first
+        };
+        let (_, second_bytes) = relay.forward_data_frame(&second, Instant(2)).unwrap();
+        let (_, second_len) = umc_wire::varint::decode(&second_bytes).unwrap();
+        assert_eq!(
+            RelayDataFrame::decode(&second_bytes[second_len..])
+                .unwrap()
+                .0
+                .circuit_id,
+            33
         );
     }
 

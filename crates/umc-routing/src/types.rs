@@ -51,6 +51,9 @@ pub struct RouteRecord {
     pub key: RouteKey,
     pub state: RouteState,
     pub next_hop: String,
+    /// Authenticated carrier type observed on the adjacent session.
+    /// `None` means this legacy/local record has no carrier proof.
+    pub carrier_type: Option<String>,
     pub metadata: Vec<u8>,
     pub source_peer: Vec<u8>,
     pub created_at: Instant,
@@ -122,6 +125,7 @@ mod tests {
             },
             state: RouteState::Candidate,
             next_hop: "peer-a".into(),
+            carrier_type: None,
             metadata: vec![],
             source_peer: vec![1],
             created_at: now,
@@ -152,6 +156,7 @@ mod tests {
             },
             state: RouteState::Usable,
             next_hop: "x".into(),
+            carrier_type: None,
             metadata: vec![],
             source_peer: vec![],
             created_at: now,
@@ -177,6 +182,7 @@ mod tests {
             },
             state: RouteState::Usable,
             next_hop: "x".into(),
+            carrier_type: None,
             metadata: vec![],
             source_peer: vec![],
             created_at: now,

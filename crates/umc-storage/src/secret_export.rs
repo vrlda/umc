@@ -21,12 +21,17 @@ pub const RECIPIENT_EXPORT_MAGIC: &[u8] = b"UMC-IDENTITY-RECIPIENT-v1\0";
 /// OS-keychain envelope. The keychain reference is authenticated as local
 /// context, preventing an envelope from being silently moved between items.
 pub const KEYCHAIN_EXPORT_MAGIC: &[u8] = b"UMC-IDENTITY-KEYCHAIN-v1\0";
+/// Whole-backup envelope. Backup payloads use a separate domain so an
+/// identity export cannot be misinterpreted as a backup archive.
+pub const BACKUP_EXPORT_MAGIC: &[u8] = b"UMC-BACKUP-v1\0";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 /// Identity exports are small; this bound also limits work and allocation on
 /// an untrusted import request.
 pub const MAX_EXPORT_BYTES: usize = 64 * 1024;
+/// Bounded upper limit for a password-protected backup archive.
+pub const MAX_BACKUP_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretExportError {
@@ -54,10 +59,29 @@ pub enum SecretExportError {
 /// [`SecretExportError::TooLarge`] for empty or oversized plaintext, or
 /// [`SecretExportError::AuthenticationFailed`] if sealing fails.
 pub fn seal(passphrase: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, SecretExportError> {
+    seal_with_magic(passphrase, plaintext, EXPORT_MAGIC, MAX_EXPORT_BYTES)
+}
+
+/// Encrypts a whole backup archive with the same Argon2id/ChaCha20-Poly1305
+/// envelope as identity exports, but with backup-specific domain separation.
+///
+/// # Errors
+/// Returns [`SecretExportError::EmptyPassphrase`] for an empty password or
+/// [`SecretExportError::TooLarge`] when the archive exceeds its bound.
+pub fn seal_backup(passphrase: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, SecretExportError> {
+    seal_with_magic(passphrase, plaintext, BACKUP_EXPORT_MAGIC, MAX_BACKUP_BYTES)
+}
+
+fn seal_with_magic(
+    passphrase: &[u8],
+    plaintext: &[u8],
+    magic: &[u8],
+    max_bytes: usize,
+) -> Result<Vec<u8>, SecretExportError> {
     if passphrase.is_empty() {
         return Err(SecretExportError::EmptyPassphrase);
     }
-    if plaintext.is_empty() || plaintext.len() > MAX_EXPORT_BYTES {
+    if plaintext.is_empty() || plaintext.len() > max_bytes {
         return Err(SecretExportError::TooLarge);
     }
 
@@ -72,14 +96,13 @@ pub fn seal(passphrase: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, SecretExport
             Nonce::from_slice(&nonce),
             Payload {
                 msg: plaintext,
-                aad: EXPORT_MAGIC,
+                aad: magic,
             },
         )
         .map_err(|_| SecretExportError::AuthenticationFailed)?;
 
-    let mut envelope =
-        Vec::with_capacity(EXPORT_MAGIC.len() + SALT_LEN + NONCE_LEN + ciphertext.len());
-    envelope.extend_from_slice(EXPORT_MAGIC);
+    let mut envelope = Vec::with_capacity(magic.len() + SALT_LEN + NONCE_LEN + ciphertext.len());
+    envelope.extend_from_slice(magic);
     envelope.extend_from_slice(&salt);
     envelope.extend_from_slice(&nonce);
     envelope.extend_from_slice(&ciphertext);
@@ -95,17 +118,36 @@ pub fn seal(passphrase: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, SecretExport
 /// [`SecretExportError::TooLarge`] for oversized plaintext, or
 /// [`SecretExportError::AuthenticationFailed`] when authentication fails.
 pub fn open(passphrase: &[u8], envelope: &[u8]) -> Result<Vec<u8>, SecretExportError> {
+    open_with_magic(passphrase, envelope, EXPORT_MAGIC, MAX_EXPORT_BYTES)
+}
+
+/// Opens a password-protected whole-backup archive.
+///
+/// # Errors
+/// Returns [`SecretExportError::Malformed`] for an invalid envelope,
+/// [`SecretExportError::AuthenticationFailed`] for a wrong password, or
+/// [`SecretExportError::TooLarge`] for an oversized archive.
+pub fn open_backup(passphrase: &[u8], envelope: &[u8]) -> Result<Vec<u8>, SecretExportError> {
+    open_with_magic(passphrase, envelope, BACKUP_EXPORT_MAGIC, MAX_BACKUP_BYTES)
+}
+
+fn open_with_magic(
+    passphrase: &[u8],
+    envelope: &[u8],
+    magic: &[u8],
+    max_bytes: usize,
+) -> Result<Vec<u8>, SecretExportError> {
     if passphrase.is_empty() {
         return Err(SecretExportError::EmptyPassphrase);
     }
-    let header_len = EXPORT_MAGIC.len() + SALT_LEN + NONCE_LEN;
-    if envelope.len() < header_len + TAG_LEN || !envelope.starts_with(EXPORT_MAGIC) {
+    let header_len = magic.len() + SALT_LEN + NONCE_LEN;
+    if envelope.len() < header_len + TAG_LEN || !envelope.starts_with(magic) {
         return Err(SecretExportError::Malformed);
     }
-    let salt_start = EXPORT_MAGIC.len();
+    let salt_start = magic.len();
     let nonce_start = salt_start + SALT_LEN;
     let ciphertext = &envelope[nonce_start + NONCE_LEN..];
-    if ciphertext.len() - TAG_LEN > MAX_EXPORT_BYTES {
+    if ciphertext.len() - TAG_LEN > max_bytes {
         return Err(SecretExportError::TooLarge);
     }
     let key = derive_key(passphrase, &envelope[salt_start..nonce_start]);
@@ -115,7 +157,7 @@ pub fn open(passphrase: &[u8], envelope: &[u8]) -> Result<Vec<u8>, SecretExportE
             Nonce::from_slice(&envelope[nonce_start..nonce_start + NONCE_LEN]),
             Payload {
                 msg: ciphertext,
-                aad: EXPORT_MAGIC,
+                aad: magic,
             },
         )
         .map_err(|_| SecretExportError::AuthenticationFailed)

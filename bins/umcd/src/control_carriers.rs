@@ -18,6 +18,8 @@ use umc_carrier::error::CarrierErrorKind;
 use umc_carrier::Listener;
 use umc_control::proto::umc::api::v1 as api;
 use umc_types::runtime::EntropySource;
+use umc_plugin::process::ProcessConfig;
+use umc_plugin::runtime::ExternalCarrier;
 
 pub(crate) const CARRIER_HANDLE_LEN: usize = 16;
 
@@ -89,6 +91,10 @@ pub(crate) fn type_is_running(state: &RuntimeState, type_id: &str) -> bool {
             instance.type_id == type_id
                 && instance_state(instance) == api::CarrierInstanceState::Running
         })
+}
+
+fn is_external_type(type_id: &str) -> bool {
+    type_id.starts_with("plugin:")
 }
 
 /// Dispatch the lifecycle methods that have a control-plane registry backing.
@@ -175,7 +181,13 @@ fn create_instance(state: &mut RuntimeState, request: &api::Request) -> (i32, Op
     if create.type_id.is_empty() {
         return (api::StatusCode::InvalidArgument as i32, None);
     }
-    if state.node.carrier(&create.type_id).is_none() {
+    let Ok(edition) = state.config.core_edition() else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if !edition.supports_carrier(&create.type_id) {
+        return (api::StatusCode::Unimplemented as i32, None);
+    }
+    if state.node.carrier(&create.type_id).is_none() && !is_external_type(&create.type_id) {
         return (api::StatusCode::NotFound as i32, None);
     }
     let Ok(options) = materialize_options(&create.options, Vec::new()) else {
@@ -199,8 +211,12 @@ fn create_instance(state: &mut RuntimeState, request: &api::Request) -> (i32, Op
         },
         options,
         revision: 1,
-        external_plugin: false,
-        isolation_state: "in-process".into(),
+        external_plugin: is_external_type(&type_id),
+        isolation_state: if is_external_type(&type_id) {
+            "stopped".into()
+        } else {
+            "in-process".into()
+        },
     };
     let message = instance_message(&instance);
     state.carrier_instances.insert(handle, instance);
@@ -279,12 +295,31 @@ fn start_carrier(state: &mut RuntimeState, request: &api::Request) -> (i32, Opti
     }
     let type_id = instance.type_id.clone();
     let options = instance.options.clone();
-    if state.node.carrier(&type_id).is_none() {
+    let Ok(edition) = state.config.core_edition() else {
+        return (api::StatusCode::InvalidArgument as i32, None);
+    };
+    if !edition.supports_carrier(&type_id) {
+        return (api::StatusCode::Unimplemented as i32, None);
+    }
+    if state.node.carrier(&type_id).is_none() && !is_external_type(&type_id) {
         if let Some(instance) = state.carrier_instances.get_mut(handle) {
             instance.state = api::CarrierInstanceState::Failed as i32;
             instance.revision = instance.revision.saturating_add(1);
         }
         return (api::StatusCode::FailedPrecondition as i32, None);
+    }
+    if is_external_type(&type_id) && !state.external_carriers.contains_key(&handle_key) {
+        let Ok(carrier) = launch_external(state, &type_id, &options) else {
+            if let Some(instance) = state.carrier_instances.get_mut(handle) {
+                instance.state = api::CarrierInstanceState::Failed as i32;
+                instance.isolation_state = "failed".into();
+                instance.revision = instance.revision.saturating_add(1);
+            }
+            return (api::StatusCode::FailedPrecondition as i32, None);
+        };
+        state.node.unregister_carrier(&type_id);
+        state.node.register_carrier(Box::new(carrier.clone()));
+        state.external_carriers.insert(handle_key.clone(), carrier);
     }
     let resource_started = match start_listener(state, &handle_key, &type_id, &options) {
         Ok(started) => started,
@@ -309,6 +344,9 @@ fn start_carrier(state: &mut RuntimeState, request: &api::Request) -> (i32, Opti
             .expect("carrier instance checked above");
         if started {
             instance.state = api::CarrierInstanceState::Running as i32;
+            if instance.external_plugin {
+                instance.isolation_state = "running".into();
+            }
             instance.revision = instance.revision.saturating_add(1);
         }
         instance_message(instance)
@@ -322,6 +360,116 @@ fn start_carrier(state: &mut RuntimeState, request: &api::Request) -> (i32, Opti
     let mut payload = Vec::new();
     Message::encode(&response, &mut payload).expect("encode started carrier instance");
     (api::StatusCode::Ok as i32, Some(payload))
+}
+
+fn launch_external(
+    _state: &RuntimeState,
+    type_id: &str,
+    options: &[api::ConfigEntry],
+) -> Result<ExternalCarrier, String> {
+    let command = option_value(options, "plugin_command")
+        .ok_or_else(|| "plugin_command is required for external carriers".to_string())?;
+    let capabilities = option_value(options, "plugin_capabilities")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let supports_dial = option_value(options, "supports_dial")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    let supports_listen = option_value(options, "supports_listen")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    let supports_discovery = option_value(options, "supports_discovery")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    let shared_memory_size = option_value(options, "plugin_shared_memory_size")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|size| *size > 0);
+    let shared_memory_threshold = option_value(options, "plugin_shared_memory_threshold")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(umc_plugin::shared_memory::DEFAULT_THRESHOLD);
+    let sandbox_mode = match option_value(options, "plugin_sandbox")
+        .unwrap_or_else(|| "disabled".into())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "strict" => umc_plugin::sandbox::SandboxMode::Strict,
+        "best-effort" | "besteffort" => umc_plugin::sandbox::SandboxMode::BestEffort,
+        "disabled" | "off" => umc_plugin::sandbox::SandboxMode::Disabled,
+        _ => return Err("plugin_sandbox must be strict, best-effort, or disabled".into()),
+    };
+    let manifest_path = option_value(options, "plugin_manifest_path");
+    let manifest = manifest_path
+        .as_deref()
+        .map(std::fs::read)
+        .transpose()
+        .map_err(|error| format!("plugin manifest read failed: {error}"))?
+        .map(|bytes| {
+            serde_json::from_slice::<umc_plugin::manifest::ExternalPluginManifest>(&bytes)
+                .map_err(|error| format!("plugin manifest parse failed: {error}"))
+        })
+        .transpose()?;
+    let trusted_manifest_keys = option_value(options, "plugin_trusted_key")
+        .map(|value| decode_manifest_key(&value))
+        .transpose()?;
+    let require_signed_manifest = option_value(options, "plugin_require_signed_manifest")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    let process = ProcessConfig {
+        command: command.into(),
+        args: option_value(options, "plugin_args")
+            .map(|value| value.split_whitespace().map(ToOwned::to_owned).collect())
+            .unwrap_or_default(),
+        plugin_name: type_id.to_string(),
+        granted_capabilities: capabilities,
+        config_blob: serde_json::to_vec(
+            &options
+                .iter()
+                .filter(|entry| !entry.sensitive_present)
+                .map(|entry| (&entry.key, &entry.value))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| error.to_string())?,
+        maximum_packet_size: 64 * 1024,
+        shared_memory_size,
+        shared_memory_threshold,
+        sandbox_mode,
+        manifest,
+        trusted_manifest_keys: trusted_manifest_keys.into_iter().collect(),
+        require_signed_manifest,
+        ..ProcessConfig::default()
+    };
+    ExternalCarrier::launch(
+        type_id.to_string(),
+        process,
+        ExternalCarrier::capabilities_for_with_discovery(
+            type_id,
+            supports_listen,
+            supports_dial,
+            supports_discovery,
+        ),
+    )
+    .map_err(|error| format!("external plugin launch failed: {error:?}"))
+}
+
+fn decode_manifest_key(value: &str) -> Result<umc_crypto::signatures::IdentityPublicKey, String> {
+    let bytes = decode_hex(value)?;
+    let key: [u8; umc_crypto::signatures::PUBLIC_KEY_LEN] = bytes
+        .try_into()
+        .map_err(|_| "plugin_trusted_key must be 32-byte hex".to_string())?;
+    Ok(umc_crypto::signatures::IdentityPublicKey(key))
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+    if value.len() % 2 != 0 {
+        return Err("hex value must have even length".into());
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|offset| {
+            u8::from_str_radix(&value[offset..offset + 2], 16)
+                .map_err(|_| "invalid hex value".to_string())
+        })
+        .collect()
 }
 
 /// Starts a concrete listener for a control-created instance when its public
@@ -419,6 +567,12 @@ fn stop_carrier(state: &mut RuntimeState, request: &api::Request) -> (i32, Optio
     let carrier_type = instance.type_id.clone();
     if let Some(listener) = state.carrier_listeners.remove(&handle_key) {
         let _ = listener.close();
+    }
+    if let Some(carrier) = state.external_carriers.remove(&handle_key) {
+        if let Err(error) = carrier.shutdown() {
+            log::warn!("[carrier] external plugin shutdown failed: {error:?}");
+        }
+        state.node.unregister_carrier(&carrier_type);
     }
     if !stop.drain_links {
         let raw_handles: Vec<Vec<u8>> = state
@@ -604,6 +758,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
     #[test]
     fn materialize_options_redacts_secrets_and_applies_clear() {
         let options = materialize_options(
@@ -652,6 +808,37 @@ mod tests {
             Vec::new(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn lite_rejects_external_plugin_instance() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "umcd-carrier-edition-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let config = crate::config::NodeConfig {
+            data_dir,
+            edition: "lite".into(),
+            ..crate::config::NodeConfig::default()
+        };
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let mut state = RuntimeState::new(config, shutdown_tx).expect("state");
+        let request = api::CreateCarrierInstanceRequest {
+            type_id: "plugin:example".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let mut payload = Vec::new();
+        request.encode(&mut payload).expect("encode create");
+        let request = api::Request {
+            payload,
+            ..Default::default()
+        };
+
+        let (status, _) = create_instance(&mut state, &request);
+        assert_eq!(status, api::StatusCode::Unimplemented as i32);
+        assert!(state.carrier_instances.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -26,6 +26,10 @@ umc_status umc_client_connect(umc_handle_t *, const char *socket, const char *cl
 umc_status umc_client_request(umc_handle_t *, const char *service, const char *method,
                               const uint8_t *payload, size_t payload_len,
                               umc_bytes *response);
+umc_status umc_client_request_with_deadline(umc_handle_t *, const char *service,
+                                            const char *method, const uint8_t *payload,
+                                            size_t payload_len, int64_t deadline_unix_ms,
+                                            umc_bytes *response);
 umc_status umc_client_close(umc_handle_t *);
 void umc_bytes_free(umc_bytes bytes);
 void umc_status_free(umc_status status);

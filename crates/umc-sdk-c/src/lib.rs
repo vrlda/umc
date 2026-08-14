@@ -1,4 +1,4 @@
-//! Small stable C ABI over the Rust SDK (sdk.md §31).
+//! Small experimental C ABI over the Rust SDK (sdk.md §31).
 //!
 //! The ABI deliberately exposes only byte-oriented request/response calls;
 //! typed protobuf payloads remain versioned by the Control API schema. Handles
@@ -9,7 +9,7 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
 use umc_sdk::client::{Client, ClientError};
 
-const ABI_VERSION: &[u8] = b"umc-sdk-c/0.1.0\0";
+const ABI_VERSION: &[u8] = b"umc-sdk-c/0.2.0\0";
 const MAX_C_ABI_PAYLOAD: usize = 1024 * 1024;
 
 #[derive(Debug)]
@@ -179,11 +179,42 @@ pub unsafe extern "C" fn umc_client_request(
     payload_len: usize,
     out_response: *mut umc_bytes,
 ) -> umc_status {
+    umc_client_request_with_deadline(
+        handle,
+        service,
+        method,
+        payload,
+        payload_len,
+        0,
+        out_response,
+    )
+}
+
+/// Sends one raw Control API request with an absolute Unix-millisecond
+/// deadline. A value of zero preserves the daemon's bounded default.
+///
+/// # Safety
+///
+/// The pointer and string requirements are identical to
+/// [`umc_client_request`].
+#[no_mangle]
+pub unsafe extern "C" fn umc_client_request_with_deadline(
+    handle: *mut umc_handle_t,
+    service: *const c_char,
+    method: *const c_char,
+    payload: *const u8,
+    payload_len: usize,
+    deadline_unix_ms: i64,
+    out_response: *mut umc_bytes,
+) -> umc_status {
     if out_response.is_null() {
         return error_status(3, "null response buffer");
     }
     (*out_response).data = ptr::null_mut();
     (*out_response).len = 0;
+    if deadline_unix_ms < 0 {
+        return error_status(3, "negative deadline");
+    }
     let service = match string_arg(service, "service") {
         Ok(value) => value,
         Err(status) => return status,
@@ -210,9 +241,12 @@ pub unsafe extern "C" fn umc_client_request(
     let Some(client) = state.client.as_mut() else {
         return error_status(8, "client is not connected");
     };
-    let result = state
-        .runtime
-        .block_on(client.request(&service, &method, bytes));
+    let result = state.runtime.block_on(client.request_with_deadline(
+        &service,
+        &method,
+        bytes,
+        (deadline_unix_ms != 0).then_some(deadline_unix_ms),
+    ));
     let response = match result {
         Ok(response) => response,
         Err(error) => return map_error(&error),
@@ -281,7 +315,7 @@ mod tests {
     fn version_and_handle_lifecycle() {
         assert_eq!(
             unsafe { CStr::from_ptr(umc_sdk_version()) }.to_bytes_with_nul(),
-            b"umc-sdk-c/0.1.0\0"
+            b"umc-sdk-c/0.2.0\0"
         );
         let handle = umc_client_new();
         assert!(!handle.is_null());
@@ -309,6 +343,32 @@ mod tests {
         assert_eq!(status.code, 9);
         assert!(response.data.is_null());
         assert_eq!(response.len, 0);
+        unsafe {
+            umc_status_free(status);
+            umc_client_close(handle);
+        }
+    }
+
+    #[test]
+    fn deadline_request_rejects_negative_deadline_before_transport() {
+        let handle = umc_client_new();
+        assert!(!handle.is_null());
+        let mut response = umc_bytes {
+            data: ptr::null_mut(),
+            len: 0,
+        };
+        let status = unsafe {
+            umc_client_request_with_deadline(
+                handle,
+                c"NodeAdmin".as_ptr(),
+                c"GetStatus".as_ptr(),
+                ptr::null(),
+                0,
+                -1,
+                &mut response,
+            )
+        };
+        assert_eq!(status.code, 3);
         unsafe {
             umc_status_free(status);
             umc_client_close(handle);

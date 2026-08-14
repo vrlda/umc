@@ -8,6 +8,7 @@ license.workspace = true
 umc-types = { path = "../../crates/umc-types" }
 umc-carrier = { path = "../../crates/umc-carrier" }
 tokio = { version = "1", features = ["rt", "net", "sync", "time"] }
+socket2 = { version = "0.5", features = ["all"] }
 
 [lints]
 workspace = true

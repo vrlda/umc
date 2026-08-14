@@ -1,0 +1,17 @@
+[package]
+name = "umc-chat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "umc-chat"
+path = "src/main.rs"
+
+[dependencies]
+umc-sdk = { path = "../../crates/umc-sdk" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

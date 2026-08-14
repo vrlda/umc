@@ -7,6 +7,7 @@ use crate::state::KEYSTORE_FILE;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use umc_storage::secret_export::{open_backup, seal_backup, MAX_BACKUP_BYTES};
 use umc_storage::keystore::{KeyClass, Keystore};
 use umc_storage::sqlite::{SqliteStore, SCHEMA_VERSION};
 use umc_storage::store::StoreError;
@@ -14,6 +15,9 @@ use umc_storage::store::StoreError;
 /// Backup format version; restores refuse manifests with a newer version
 /// (storage.md §20.2, §21.2).
 pub const FORMAT_VERSION: u64 = 1;
+const ARCHIVE_MAGIC: &[u8] = b"UMC-BACKUP-ARCHIVE-v1\0";
+const MAX_ARCHIVE_FILES: usize = 16_384;
+const MAX_ARCHIVE_PATH_BYTES: usize = 4 * 1024;
 
 /// The backup manifest (storage.md §20.1-20.2): format + creation time +
 /// data-dir binding + the list of files it contains.
@@ -116,13 +120,180 @@ pub fn backup(config: &NodeConfig, out_dir: &Path) -> Result<(), String> {
         ),
         files,
         file_hashes,
-        storage_generation: crate::state::read_restore_anchor(&data_dir),
+        storage_generation: crate::state::read_restore_anchor_checked(&data_dir)?,
         node_identity: Some(node_identity),
     };
     let json = serde_json::to_string_pretty(&manifest)
         .map_err(|e| format!("backup: serialize manifest: {e}"))?;
     std::fs::write(out_dir.join("manifest.json"), json)
         .map_err(|e| format!("backup: write manifest: {e}"))
+}
+
+/// Creates a password-protected, authenticated whole-backup archive. The
+/// existing directory format remains available for operators that need to
+/// inspect or transfer individual files; this path is the protected default
+/// for portable backup artifacts.
+pub fn backup_encrypted(config: &NodeConfig, out_file: &Path, passphrase: &[u8]) -> Result<(), String> {
+    if passphrase.is_empty() {
+        return Err("backup: encryption passphrase must not be empty".into());
+    }
+    let data_dir = config.resolved_data_dir();
+    let out_abs = out_file.canonicalize().unwrap_or_else(|_| out_file.to_path_buf());
+    let data_abs = data_dir.canonicalize().unwrap_or_else(|_| data_dir.clone());
+    if out_abs == data_abs || out_abs.starts_with(&data_abs) {
+        return Err("backup: output file must not be inside the data dir".into());
+    }
+    let staging = out_file.with_extension(format!("staging-{}", std::process::id()));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .map_err(|e| format!("backup: clear staging {}: {e}", staging.display()))?;
+    }
+    let result = (|| {
+        backup(config, &staging)?;
+        let plaintext = encode_archive(&staging)?;
+        let envelope = seal_backup(passphrase, &plaintext)
+            .map_err(|e| format!("backup: encrypt archive: {e:?}"))?;
+        let temporary = out_file.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&temporary, envelope)
+            .map_err(|e| format!("backup: write {}: {e}", temporary.display()))?;
+        std::fs::rename(&temporary, out_file)
+            .map_err(|e| format!("backup: install {}: {e}", out_file.display()))
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+/// Restores a password-protected whole-backup archive through the same
+/// hostile-input validation and staged swap as directory backups.
+pub fn restore_encrypted(config: &NodeConfig, in_file: &Path, passphrase: &[u8]) -> Result<(), String> {
+    if passphrase.is_empty() {
+        return Err("restore: encryption passphrase must not be empty".into());
+    }
+    let envelope = std::fs::read(in_file)
+        .map_err(|e| format!("restore refused: read {}: {e}", in_file.display()))?;
+    let plaintext = open_backup(passphrase, &envelope)
+        .map_err(|e| format!("restore refused: decrypt archive: {e:?}"))?;
+    let staging = in_file.with_extension(format!("restore-staging-{}", std::process::id()));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .map_err(|e| format!("restore: clear staging {}: {e}", staging.display()))?;
+    }
+    let result = (|| {
+        decode_archive(&plaintext, &staging)?;
+        restore(config, &staging)
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+fn encode_archive(root: &Path) -> Result<Vec<u8>, String> {
+    let mut files = Vec::new();
+    collect_all_files(root, root, &mut files)?;
+    files.sort();
+    if files.len() > MAX_ARCHIVE_FILES {
+        return Err("backup: archive contains too many files".into());
+    }
+    let mut output = Vec::new();
+    output.extend_from_slice(ARCHIVE_MAGIC);
+    output.extend_from_slice(
+        &u32::try_from(files.len())
+            .map_err(|_| "backup: archive file count overflow".to_string())?
+            .to_be_bytes(),
+    );
+    for relative in files {
+        let path = safe_manifest_path(root, &relative)?;
+        let bytes = std::fs::read(&path)
+            .map_err(|e| format!("backup: read archive file {relative}: {e}"))?;
+        if relative.len() > MAX_ARCHIVE_PATH_BYTES || bytes.len() > MAX_BACKUP_BYTES {
+            return Err("backup: archive member exceeds bounds".into());
+        }
+        let next = output.len()
+            .checked_add(4 + 8 + relative.len() + bytes.len())
+            .ok_or_else(|| "backup: archive size overflow".to_string())?;
+        if next > MAX_BACKUP_BYTES {
+            return Err("backup: archive exceeds size bound".into());
+        }
+        output.extend_from_slice(
+            &u32::try_from(relative.len())
+                .map_err(|_| "backup: archive path length overflow".to_string())?
+                .to_be_bytes(),
+        );
+        output.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        output.extend_from_slice(relative.as_bytes());
+        output.extend_from_slice(&bytes);
+    }
+    Ok(output)
+}
+
+fn decode_archive(bytes: &[u8], root: &Path) -> Result<(), String> {
+    if bytes.len() < ARCHIVE_MAGIC.len() + 4 || !bytes.starts_with(ARCHIVE_MAGIC) {
+        return Err("restore refused: malformed backup archive".into());
+    }
+    let mut cursor = ARCHIVE_MAGIC.len();
+    let count = read_u32(bytes, &mut cursor)? as usize;
+    if count == 0 || count > MAX_ARCHIVE_FILES {
+        return Err("restore refused: invalid archive member count".into());
+    }
+    std::fs::create_dir_all(root).map_err(|e| format!("restore: create staging: {e}"))?;
+    for _ in 0..count {
+        let path_len = read_u32(bytes, &mut cursor)? as usize;
+        let size = usize::try_from(read_u64(bytes, &mut cursor)?)
+            .map_err(|_| "restore refused: archive member size overflow".to_string())?;
+        if path_len == 0 || path_len > MAX_ARCHIVE_PATH_BYTES || size > MAX_BACKUP_BYTES {
+            return Err("restore refused: archive member exceeds bounds".into());
+        }
+        let path_end = cursor.checked_add(path_len).ok_or_else(|| "restore refused: archive overflow".to_string())?;
+        let relative = std::str::from_utf8(bytes.get(cursor..path_end).ok_or_else(|| "restore refused: truncated archive path".to_string())?)
+            .map_err(|_| "restore refused: archive path is not UTF-8".to_string())?;
+        cursor = path_end;
+        let data_end = cursor.checked_add(size).ok_or_else(|| "restore refused: archive overflow".to_string())?;
+        let payload = bytes.get(cursor..data_end).ok_or_else(|| "restore refused: truncated archive member".to_string())?;
+        cursor = data_end;
+        let path = safe_manifest_path(root, relative)?;
+        if path.exists() {
+            return Err("restore refused: duplicate archive member".into());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("restore: create archive dir: {e}"))?;
+        }
+        std::fs::write(path, payload).map_err(|e| format!("restore: write archive member: {e}"))?;
+    }
+    if cursor != bytes.len() {
+        return Err("restore refused: trailing archive bytes".into());
+    }
+    Ok(())
+}
+
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, String> {
+    let end = cursor.checked_add(4).ok_or_else(|| "restore refused: archive overflow".to_string())?;
+    let value = u32::from_be_bytes(bytes.get(*cursor..end).ok_or_else(|| "restore refused: truncated archive".to_string())?.try_into().expect("slice length"));
+    *cursor = end;
+    Ok(value)
+}
+
+fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
+    let end = cursor.checked_add(8).ok_or_else(|| "restore refused: archive overflow".to_string())?;
+    let value = u64::from_be_bytes(bytes.get(*cursor..end).ok_or_else(|| "restore refused: truncated archive".to_string())?.try_into().expect("slice length"));
+    *cursor = end;
+    Ok(value)
+}
+
+fn collect_all_files(root: &Path, current: &Path, files: &mut Vec<String>) -> Result<(), String> {
+    let entries = std::fs::read_dir(current).map_err(|e| format!("backup: enumerate {}: {e}", current.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("backup: enumerate archive: {e}"))?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|e| format!("backup: inspect archive: {e}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("backup: refusing symlink {}", path.display()));
+        }
+        if metadata.is_dir() {
+            collect_all_files(root, &path, files)?;
+        } else if metadata.is_file() {
+            files.push(path.strip_prefix(root).expect("archive path under root").to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(())
 }
 
 pub fn restore(config: &NodeConfig, in_dir: &Path) -> Result<(), String> {
@@ -138,7 +309,7 @@ pub fn restore(config: &NodeConfig, in_dir: &Path) -> Result<(), String> {
 
     let data_dir = config.resolved_data_dir();
     validate_manifest(in_dir, &manifest)?;
-    let current_generation = crate::state::read_restore_anchor(&data_dir);
+    let current_generation = crate::state::read_restore_anchor_checked(&data_dir)?;
     if manifest.storage_generation < current_generation {
         return Err(format!(
             "restore refused: backup generation {} is older than current generation {current_generation}",
@@ -623,6 +794,7 @@ mod tests {
         let route = RouteRecordSnapshot {
             key_hash: vec![7u8; 32],
             next_hop: b"peer-a".to_vec(),
+            carrier_type: None,
             lifetime_ms: 600_000,
             learned_at_ms: 42,
             scope: 3,
@@ -755,6 +927,18 @@ mod tests {
             .resolved_data_dir()
             .join("node.db.pre-restore")
             .exists());
+    }
+
+    #[test]
+    fn backup_refuses_malformed_restore_anchor() {
+        let config = seeded_config();
+        seed_data_dir(&config);
+        let data_dir = config.resolved_data_dir();
+        std::fs::write(data_dir.join(crate::state::RESTORE_ANCHOR_FILE), b"invalid\n")
+            .expect("malformed anchor");
+        let backup_dir = temp_dir("malformed-anchor");
+        let error = backup(&config, &backup_dir).expect_err("backup must fail closed");
+        assert!(error.contains("malformed restore anchor"), "{error}");
     }
 
     #[test]
@@ -905,6 +1089,22 @@ mod tests {
         assert_eq!(copied.schema_version().unwrap(), SCHEMA_VERSION);
         let routes = list_routes(&copied).unwrap();
         assert_eq!(routes.len(), 1);
+    }
+
+    #[test]
+    fn encrypted_backup_round_trip_and_wrong_password_refusal() {
+        let source = seeded_config();
+        let seed = seed_data_dir(&source);
+        let encrypted = temp_dir("encrypted").with_extension("umcb");
+        backup_encrypted(&source, &encrypted, b"correct horse").unwrap();
+        let bytes = std::fs::read(&encrypted).unwrap();
+        assert!(!bytes.windows(seed.keystore_bytes.len()).any(|window| window == seed.keystore_bytes));
+
+        let target = seeded_config();
+        assert!(restore_encrypted(&target, &encrypted, b"wrong horse").is_err());
+        restore_encrypted(&target, &encrypted, b"correct horse").unwrap();
+        let restored = SqliteStore::open(&target.resolved_data_dir().join("node.db")).unwrap();
+        assert_eq!(list_routes(&restored).unwrap().len(), 1);
     }
 }
 

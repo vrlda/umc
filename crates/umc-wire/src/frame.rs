@@ -60,6 +60,7 @@ pub enum Frame {
     PeerHint(crate::frames::misc::PeerHintFrame),
     ServiceHint(crate::frames::misc::ServiceHintFrame),
     DhtLookup(crate::frames::misc::DhtLookupFrame),
+    RevocationBatch(crate::frames::misc::RevocationBatchFrame),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,6 +429,14 @@ pub fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, FrameError> {
                         return Err(FrameError::Truncated);
                     }
                     out.push(Frame::DhtLookup(frame));
+                } else if ty == FrameType::REVOCATION_BATCH {
+                    let start = pos - len;
+                    let (frame, used) =
+                        crate::frames::misc::RevocationBatchFrame::decode(&payload[start..pos])?;
+                    if used != len {
+                        return Err(FrameError::Truncated);
+                    }
+                    out.push(Frame::RevocationBatch(frame));
                 }
             }
         }
@@ -530,6 +539,23 @@ mod tests {
         assert_eq!(
             decode_frames(&[0x0F, 0x05, 0xAA]),
             Err(FrameError::Truncated)
+        );
+    }
+
+    #[test]
+    fn revocation_batch_round_trips_as_optional_length_delimited() {
+        let encoded = crate::frames::misc::RevocationBatchFrame {
+            payload: b"RS\x01\x00\x00".to_vec(),
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            decode_frames(&encoded).unwrap(),
+            vec![Frame::RevocationBatch(
+                crate::frames::misc::RevocationBatchFrame {
+                    payload: b"RS\x01\x00\x00".to_vec(),
+                }
+            )]
         );
     }
 }
