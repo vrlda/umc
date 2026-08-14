@@ -9,7 +9,7 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
 use umc_sdk::client::{Client, ClientError};
 
-const ABI_VERSION: &[u8] = b"umc-sdk-c/0.2.1\0";
+const ABI_VERSION: &[u8] = b"umc-sdk-c/0.2.2\0";
 const MAX_C_ABI_PAYLOAD: usize = 1024 * 1024;
 
 #[derive(Debug)]
@@ -315,7 +315,7 @@ mod tests {
     fn version_and_handle_lifecycle() {
         assert_eq!(
             unsafe { CStr::from_ptr(umc_sdk_version()) }.to_bytes_with_nul(),
-            b"umc-sdk-c/0.2.1\0"
+            b"umc-sdk-c/0.2.2\0"
         );
         let handle = umc_client_new();
         assert!(!handle.is_null());

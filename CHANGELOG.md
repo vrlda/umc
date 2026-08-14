@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2 — 2026-08-14
+
+### Fixed
+
+- Install `protoc` in the edition matrix before compiling the plugin build
+  script, so all three profile artifacts are checked consistently.
+
 ## 0.2.1 — 2026-08-14
 
 ### Fixed

@@ -16,7 +16,7 @@ editions share UMP/1, identities, realm admission, and compatible carriers.
 Set `"edition": "lite"`, `"standard"`, or `"extended"` in the node config;
 unsupported Extended capabilities stay unadvertised until implemented.
 
-The current release is `0.2.1`. It includes the Rust SDK plus dependency-free
+The current release is `0.2.2`. It includes the Rust SDK plus dependency-free
 local Control API bindings for Python, TypeScript/Node.js, Go, Kotlin/JVM, and
 Swift. These bindings use the same versioned protobuf envelope and local
 authorization boundary as the daemon; they do not create parallel protocols or
@@ -233,7 +233,7 @@ model before treating the runtime as production-secure.
 
 ## Roadmap
 
-The following items are intentionally outside the current `0.2.1` baseline.
+The following items are intentionally outside the current `0.2.2` baseline.
 They are planned extensions, not advertised capabilities, and are designed to
 remain wire-compatible with the existing UMP/1 mesh:
 

@@ -45,7 +45,7 @@ def signing_drill(repo: Path, directory: Path) -> str:
         signature = temp / "manifest.sig"
         trusted = temp / "trusted"
         trusted.mkdir()
-        manifest.write_text('{"manifest_version":1,"release":"0.2.1"}\n', encoding="utf-8")
+        manifest.write_text('{"manifest_version":1,"release":"0.2.2"}\n', encoding="utf-8")
         subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(private)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["openssl", "pkey", "-in", str(private), "-pubout", "-out", str(public)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["openssl", "pkeyutl", "-sign", "-inkey", str(private), "-rawin", "-in", str(manifest), "-out", str(signature)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -53,7 +53,7 @@ def signing_drill(repo: Path, directory: Path) -> str:
         (trusted / f"{key_id}.pem").write_bytes(public.read_bytes())
         manifest_with_signing = temp / "manifest-signed.json"
         manifest_with_signing.write_text(
-            json.dumps({"manifest_version": 1, "release": "0.2.1", "signing": {"threshold": 1, "signatures": [{"key_id": key_id, "file": "manifest.sig"}]}}, sort_keys=True) + "\n",
+            json.dumps({"manifest_version": 1, "release": "0.2.2", "signing": {"threshold": 1, "signatures": [{"key_id": key_id, "file": "manifest.sig"}]}}, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         # Re-sign the exact manifest verified by the threshold checker.
