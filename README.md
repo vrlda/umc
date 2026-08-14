@@ -5,8 +5,8 @@ runtime for decentralized applications. It gives applications secure,
 portable communication across direct links, local networks, relays, and
 intermittent transports without requiring a central service.
 
-UMC is the reusable core. Applications, browsers, websites, and VPN products
-build on it but remain separate projects.
+UMC provides a shared protocol, identity, transport, and routing foundation for
+decentralized applications and network services.
 
 UMC is one interoperable ecosystem with three editions: `lite` for constrained
 devices, `standard` for normal nodes (the current baseline), and `extended` for
