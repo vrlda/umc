@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.3 — 2026-08-14
+
+### Fixed
+
+- Use Ubuntu's `protobuf-compiler` package in the edition matrix instead of
+  downloading `protoc` through a rate-limited external action.
+
 ## 0.2.2 — 2026-08-14
 
 ### Fixed

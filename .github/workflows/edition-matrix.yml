@@ -27,12 +27,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.80.0
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "28.3"
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux keychain build dependencies
-        run: sudo apt-get update && sudo apt-get install --yes pkg-config libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install --yes pkg-config libdbus-1-dev protobuf-compiler
       - name: Check profile
         run: cargo check -p umcd --no-default-features --features ${{ matrix.features }} --locked
       - name: Test profile
