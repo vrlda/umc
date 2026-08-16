@@ -69,6 +69,11 @@ separate meshes.
 | `examples/chat` | Interactive terminal chat over a reliable UMC stream (embedded loopback demo). |
 | `examples/file-transfer` | Bounded chunked file transfer with BLAKE2s-256 integrity verification. |
 
+## Testing
+
+The repository includes 1,500+ automated tests across protocol, routing,
+session, transport, security, storage, and SDK behavior.
+
 ## Quick start
 
 Install the CLI and daemon on Unix/macOS:
