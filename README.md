@@ -3,7 +3,7 @@
 Universal Mesh Core (UMC) is a lightweight, identity-addressed networking
 runtime for decentralized applications. It gives applications secure,
 portable communication across direct links, local networks, relays, and
-intermittent transports without requiring a central service.
+bounded delayed-delivery transports without requiring a central service.
 
 UMC provides a shared protocol, identity, transport, and routing foundation for
 decentralized applications and network services.
@@ -31,7 +31,8 @@ separate meshes.
   key updates, connection IDs, path validation, migration, and resumable
   sessions.
 - **Multiple carriers** — TCP streams, TLS streams, UDP datagrams, and LAN
-  discovery through a small carrier interface that can be extended by plugins.
+  discovery through a small carrier interface with supervised external-plugin
+  support.
 - **Routing and relaying** — route discovery, bounded multi-hop paths,
   relay circuits, onion-wrapped hop transitions, path diversity, loop and
   duplicate suppression, and per-peer forwarding quotas.
@@ -44,6 +45,9 @@ separate meshes.
 - **Node administration** — the `umcd` daemon, a versioned local Control API,
   persistent configuration and state, diagnostics, event inspection, peer and
   route management, and invitation lifecycle commands.
+- **Storage and key protection** — bounded SQLite/object storage, migrations,
+  backups, recipient-key envelopes, and platform keychain adapters for local
+  secret protection.
 - **Developer interfaces** — Rust daemon-backed and embedded SDKs, an
   experimental byte-oriented C ABI, dependency-free Python, TypeScript/Node,
   Go, Kotlin/JVM, and Swift Control API clients, plus the `umc` command-line
@@ -71,8 +75,10 @@ separate meshes.
 
 ## Testing
 
-The repository includes 1,500+ automated tests across protocol, routing,
-session, transport, security, storage, and SDK behavior.
+The checked-in source contains 1,200+ Rust unit and async test functions across
+protocol, routing, session, transport, security, storage, and SDK behavior.
+Additional integration, property-based, fuzz-smoke, binding, carrier-
+interoperability, and operational checks run through the repository workflows.
 
 ## Quick start
 
@@ -216,8 +222,9 @@ The Unix daemon uses a protected Unix-domain control socket. Windows uses a
 local-only named pipe with the same framed control API and handshake; the
 stdlib Python client accepts either endpoint (for example,
 `r"\\.\pipe\umc"` on Windows). TCP, TLS, UDP, LAN, embedded transport,
-storage, routing, and security behavior are covered by the implementation and
-automated checks.
+storage, routing, and security behavior have dedicated implementation and
+regression checks. These are bounded engineering evidence, not a substitute
+for an external security audit.
 
 Network peers cannot use UMP sessions to browse, open, read, or modify arbitrary
 host-filesystem paths. Session and relay frames carry authenticated opaque
@@ -229,6 +236,14 @@ host path or retrieve arbitrary local file bytes. Administrative operations
 management) remain behind the local Control API, OS transport gate, and API
 capability checks. The file-transfer example is an application that the
 operator runs and authorizes; it is not a daemon filesystem service.
+
+## Assurance and interoperability
+
+The repository workflows exercise independent UMP/1 protocol vectors, live
+TCP/UDP/TLS carrier interoperability, fuzz-smoke and protocol-coverage gates,
+dependency and security checks, optional Linux aarch64 evidence, release
+baselines, and operational drills. Their artifacts document reproducible
+checks; they do not claim external certification.
 
 UMC's privacy and topology mechanisms are bounded: it does not claim a global
 topology database or unrestricted multipath (the supported profile provides
